@@ -9,14 +9,18 @@
 - 书架、发现、目录和阅读进度
 - 导入基础规则书源，按书源搜索和阅读
 - 导入 TXT、EPUB，本地书籍也能整本下载
+- 翻页与滚动两种阅读方式；窄屏单栏，宽屏双栏；点按/键盘/拖拽滑动翻页，章末跨章并浮现章节名
 - 字号、行距、主题、系统听书、替换净化和选文笔记
 - DSH 运行时每小时检查更新，重新打开后补查
 - 本机持久化和备份恢复，备份不包含密码、Cookie 或令牌
+- 3D 书架：three.js 按需加载，可转视角、滚轮换层、点书翻开，也可切回列表
 - 桌面与手机布局
 
 ## 安装
 
 需要 DSH 0.2.2-alpha.3，以及 Node.js 24.9.0 或更高版本。
+
+修改 `src/three-entry.js` 后运行 `npm run build:three`，生成随插件分发的 `client.three.js`。
 
 ```bash
 git clone https://github.com/JUNQINGV587/mo-reader.git

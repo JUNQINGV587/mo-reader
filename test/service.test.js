@@ -20,7 +20,7 @@ test('all contracted methods are discovered by the Stage-3 Remote markers', asyn
   const { service } = await serviceFixture()
   const discovered = remoteMethods(service).map(marker => marker.exportName ?? marker.method)
   assert.deepEqual(discovered, [...REMOTE_METHODS])
-  assert.equal(new Set(discovered).size, 19)
+  assert.equal(new Set(discovered).size, 20)
 })
 
 test('real gateway SRC descriptor accepts every Remote signature', async () => {

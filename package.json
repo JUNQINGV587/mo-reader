@@ -26,13 +26,15 @@
   "files": [
     "index.js",
     "client.js",
+    "client.three.js",
     "lib/**/*.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg"
   ],
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "build:three": "node scripts/build-three.mjs"
   },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
@@ -57,6 +59,8 @@
   },
   "devDependencies": {
     "@deepseek-ai/dsh-api-gateway": "0.2.2-alpha.3",
-    "@deepseek-ai/dsh-storage-json": "0.2.2-alpha.3"
+    "@deepseek-ai/dsh-storage-json": "0.2.2-alpha.3",
+    "esbuild": "^0.28.2",
+    "three": "^0.187.0"
   }
 }

@@ -15,7 +15,7 @@ import { base64ToBuffer, clone, id, MAX_ARCHIVE_BYTES, MAX_TEXT_BYTES, now, page
 export const REMOTE_METHODS = Object.freeze([
   'state', 'importSource', 'removeSource', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
   'saveProgress', 'download', 'cancelJob', 'checkUpdates', 'importLocal', 'setSettings', 'saveNote', 'deleteNote',
-  'exportBackup', 'importBackup',
+  'exportBackup', 'importBackup', 'fetchCover',
 ])
 
 function assertObject(value, label = 'arguments') {
@@ -29,6 +29,7 @@ export class ReaderService extends TypertRemoteService {
     super(ctx, 'reader')
     this.engine = options.engine ?? new SourceEngine(options)
     this.runningJobs = new Map()
+    this.coverCache = new Map()
     this.disposed = false
     const service = this
     for (const name of REMOTE_METHODS) {
@@ -383,6 +384,27 @@ export class ReaderService extends TypertRemoteService {
     await this.db.chapters.deleteMany(oldIds)
     for (const chapter of imported.chapters) await this.db.chapters.put(chapter.id, chapter)
     return this.bookView(book)
+  }
+
+  async fetchCover(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    if (!book.coverUrl) throw new ReaderError('reader/not-found', '这本书没有封面。')
+    const url = String(book.coverUrl)
+    const cached = this.coverCache.get(url)
+    if (cached) {
+      this.coverCache.delete(url)
+      this.coverCache.set(url, cached)
+      return { dataUrl: cached, cached: true }
+    }
+    const response = await fetchRemote(url, { maxBytes: 2 * 1024 * 1024 })
+    const contentType = String(response.headers['content-type'] || '').split(';')[0].trim().toLowerCase()
+    if (!contentType.startsWith('image/')) throw new ReaderError('reader/parse-error', '封面地址返回的不是图片。')
+    const dataUrl = `data:${contentType};base64,${response.buffer.toString('base64')}`
+    this.coverCache.set(url, dataUrl)
+    while (this.coverCache.size > 24) this.coverCache.delete(this.coverCache.keys().next().value)
+    return { dataUrl, cached: false }
   }
 
   async setSettings(args) {
