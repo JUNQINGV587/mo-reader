@@ -1,0 +1,62 @@
+{
+  "name": "@local/mo-reader",
+  "version": "0.1.0",
+  "private": true,
+  "description": "墨读：在 DSH 中使用基础规则书源和本地书籍阅读。",
+  "author": "JUNQINGV587",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JUNQINGV587/mo-reader.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JUNQINGV587/mo-reader/issues"
+  },
+  "homepage": "https://github.com/JUNQINGV587/mo-reader#readme",
+  "engines": {
+    "node": ">=24.9.0"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib/**/*.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "4.0.6-alpha.2",
+    "@deepseek-ai/dsh-storage-domain": "0.2.2-alpha.3",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.2-alpha.3",
+    "cheerio": "^1.1.2",
+    "iconv-lite": "^0.6.3",
+    "jsonpath-plus": "^10.3.0",
+    "jszip": "^3.10.1",
+    "zod": "4.6.7"
+  },
+  "overrides": {
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-api-gateway": "0.2.2-alpha.3",
+    "@deepseek-ai/dsh-storage-json": "0.2.2-alpha.3"
+  }
+}

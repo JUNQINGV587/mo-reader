@@ -1,0 +1,465 @@
+import { Service } from '@deepseek-ai/cordis'
+import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { createBackup, parseBackup } from './lib/backup.js'
+import { ReaderError } from './lib/errors.js'
+import { fetchRemote } from './lib/http.js'
+import { importEpub, importedSource, importTxt } from './lib/importers.js'
+import { ACTIVE_JOBS, createJob, jobView, transitionJob } from './lib/jobs.js'
+import { applyReplacements } from './lib/replacements.js'
+import { assertSettingKeys, normalizeSettings } from './lib/settings.js'
+import { normalizeSource } from './lib/rules.js'
+import { SourceEngine } from './lib/source-engine.js'
+import { DEFAULT_SETTINGS, entries, openReaderStorage } from './lib/storage.js'
+import { base64ToBuffer, clone, id, MAX_ARCHIVE_BYTES, MAX_TEXT_BYTES, now, pageNumber, requiredString, stableId, textToBuffer } from './lib/utils.js'
+
+export const REMOTE_METHODS = Object.freeze([
+  'state', 'importSource', 'removeSource', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
+  'saveProgress', 'download', 'cancelJob', 'checkUpdates', 'importLocal', 'setSettings', 'saveNote', 'deleteNote',
+  'exportBackup', 'importBackup',
+])
+
+function assertObject(value, label = 'arguments') {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ReaderError('reader/invalid-input', `${label} must be an object.`)
+}
+
+export class ReaderService extends TypertRemoteService {
+  static inject = ['storageDomain', 'timer']
+
+  constructor(ctx, options = {}) {
+    super(ctx, 'reader')
+    this.engine = options.engine ?? new SourceEngine(options)
+    this.runningJobs = new Map()
+    this.disposed = false
+    const service = this
+    for (const name of REMOTE_METHODS) {
+      Remote(name)(null, {
+        name,
+        private: false,
+        static: false,
+        addInitializer(fn) { fn.call(service) },
+      })
+    }
+  }
+
+  async [Service.init]() {
+    this.db = await openReaderStorage(this.ctx)
+    this.ctx.effect(() => async () => {
+      this.disposed = true
+      for (const job of entries(this.db.jobs)) {
+        if (ACTIVE_JOBS.has(job.status)) await this.db.jobs.put(job.id, transitionJob(job, 'cancel'))
+      }
+      await Promise.allSettled([...this.runningJobs.values()])
+      await this.db.domain.close()
+    }, 'reader: close storage and jobs')
+    this.stopUpdates = this.ctx.interval(() => {
+      this.checkUpdates().catch(error => this.log('warn', 'Scheduled update check failed', error))
+    }, 3_600_000)
+    for (const job of entries(this.db.jobs)) {
+      if (job.status === 'running') await this.db.jobs.put(job.id, transitionJob(job, 'recover'))
+    }
+    try {
+      await this.checkUpdates()
+    } catch (error) {
+      this.log('warn', 'Startup update check failed', error)
+    }
+    for (const job of entries(this.db.jobs)) if (job.status === 'queued') this.scheduleJob(job.id)
+  }
+
+  log(level, message, error) {
+    const logger = this.ctx.logger
+    if (logger && typeof logger[level] === 'function') logger[level]('%s: %s', message, error?.message ?? error ?? '')
+  }
+
+  assertReady() {
+    if (!this.db || this.disposed) throw new ReaderError('reader/unavailable', 'Reader service is not ready.')
+  }
+
+  source(sourceId) {
+    const source = this.db.sources.get(requiredString(sourceId, 'sourceId'))
+    if (!source) throw new ReaderError('reader/not-found', `Source ${sourceId} not found.`)
+    return source
+  }
+
+  book(bookId) {
+    const book = this.db.books.get(requiredString(bookId, 'bookId'))
+    if (!book) throw new ReaderError('reader/not-found', `Book ${bookId} not found.`)
+    return book
+  }
+
+  chapters(bookId) {
+    return entries(this.db.chapters).filter(chapter => chapter.bookId === bookId).sort((a, b) => a.index - b.index)
+  }
+
+  chapterView(chapter) {
+    return {
+      id: chapter.id,
+      bookId: chapter.bookId,
+      index: chapter.index,
+      title: chapter.title,
+      url: chapter.url,
+      downloaded: typeof chapter.text === 'string',
+      downloadedAt: chapter.downloadedAt,
+    }
+  }
+
+  bookView(book) {
+    const chapters = this.chapters(book.id)
+    const downloaded = chapters.filter(chapter => typeof chapter.text === 'string').length
+    const readIndex = book.progress ? chapters.findIndex(chapter => chapter.id === book.progress.chapterId) : -1
+    const status = book.download?.status === 'completed' && downloaded < chapters.length ? 'partial' : book.download?.status ?? (downloaded ? 'partial' : 'none')
+    return {
+      ...clone(book),
+      unread: Math.max(0, readIndex < 0 ? chapters.length : chapters.length - readIndex - 1),
+      lastRead: clone(book.progress ?? null),
+      download: { status, total: chapters.length, done: downloaded, jobId: book.download?.jobId, auto: book.download?.auto === true },
+    }
+  }
+
+  async state() {
+    this.assertReady()
+    return {
+      sources: [importedSource(), ...entries(this.db.sources)].map(clone),
+      books: entries(this.db.books).map(book => this.bookView(book)),
+      jobs: entries(this.db.jobs).map(jobView),
+      settings: clone(this.db.settings.get()),
+      notes: entries(this.db.notes).map(clone),
+    }
+  }
+
+  async importSource(args) {
+    args ??= {}
+    this.assertReady()
+    assertObject(args)
+    let text = args.text
+    if (text === undefined && args.url !== undefined) {
+      const response = await fetchRemote(requiredString(args.url, 'url', 4096), { allowHttp: args.allowHttp === true, maxBytes: 2 * 1024 * 1024 })
+      text = response.text
+    }
+    if (typeof text !== 'string') throw new ReaderError('reader/invalid-input', 'importSource requires text or url.')
+    let raw
+    try {
+      raw = JSON.parse(text)
+    } catch (error) {
+      throw new ReaderError('reader/invalid-source', '书源不是有效 JSON。', undefined, { cause: error })
+    }
+    const source = normalizeSource(raw, { allowHttp: args.allowHttp === true })
+    await this.db.sources.put(source.id, source)
+    return clone(source)
+  }
+
+  async removeSource(args) {
+    args ??= {}
+    this.assertReady()
+    const source = this.source(args.id)
+    if (entries(this.db.books).some(book => book.sourceId === source.id)) throw new ReaderError('reader/source-in-use', '请先从书架移除该书源的书籍。')
+    await this.db.sources.delete(source.id)
+    return { removed: true, id: source.id }
+  }
+
+  async search(args) {
+    args ??= {}
+    this.assertReady()
+    return this.engine.search(this.source(args.sourceId), { query: requiredString(args.query, 'query', 500), page: pageNumber(args.page) })
+  }
+
+  async discover(args) {
+    args ??= {}
+    this.assertReady()
+    return this.engine.discover(this.source(args.sourceId), { exploreIndex: args.exploreIndex ?? 0, page: pageNumber(args.page) })
+  }
+
+  async addBook(args) {
+    args ??= {}
+    this.assertReady()
+    const source = this.source(args.sourceId)
+    const bookUrl = requiredString(args.bookUrl, 'bookUrl', 4096)
+    const info = await this.engine.bookInfo(source, bookUrl)
+    if (!info.name) throw new ReaderError('reader/parse-error', '书籍详情缺少 name；请完善 bookInfo 规则。')
+    const timestamp = now()
+    const bookId = stableId('book', source.id, bookUrl)
+    const previous = this.db.books.get(bookId)
+    const book = {
+      ...info,
+      id: bookId,
+      sourceId: source.id,
+      bookUrl,
+      name: String(info.name).trim(),
+      local: false,
+      addedAt: previous?.addedAt ?? timestamp,
+      updatedAt: timestamp,
+      progress: previous?.progress ?? null,
+      download: previous?.download ?? { status: 'none', auto: false },
+    }
+    await this.db.books.put(book.id, book)
+    if (args.download === true) {
+      const job = await this.download({ bookId: book.id })
+      return { ...this.bookView(book), download: { ...this.bookView(book).download, status: 'queued', jobId: job.id } }
+    }
+    return this.bookView(book)
+  }
+
+  async removeBook(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    for (const job of entries(this.db.jobs).filter(job => job.bookId === book.id)) {
+      if (ACTIVE_JOBS.has(job.status)) await this.db.jobs.put(job.id, transitionJob(job, 'cancel'))
+      await this.db.jobs.delete(job.id)
+    }
+    await this.db.chapters.deleteMany(this.chapters(book.id).map(chapter => chapter.id))
+    await this.db.notes.deleteMany(entries(this.db.notes).filter(note => note.bookId === book.id).map(note => note.id))
+    await this.db.books.delete(book.id)
+    return { removed: true, id: book.id }
+  }
+
+  async syncToc(book, fresh) {
+    const old = new Map(this.chapters(book.id).map(chapter => [chapter.id, chapter]))
+    const chapters = fresh.map(chapter => {
+      const cached = old.get(chapter.id)
+      return cached ? { ...chapter, text: cached.text, html: cached.html, downloadedAt: cached.downloadedAt } : chapter
+    })
+    const freshIds = new Set(chapters.map(chapter => chapter.id))
+    await this.db.chapters.deleteMany([...old.keys()].filter(chapterId => !freshIds.has(chapterId)))
+    for (const chapter of chapters) await this.db.chapters.put(chapter.id, chapter)
+    const latest = this.db.books.get(book.id) ?? book
+    await this.db.books.put(book.id, { ...latest, latestChapter: chapters.at(-1)?.title, lastCheckedAt: now(), updatedAt: now() })
+    return chapters
+  }
+
+  async toc(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const cached = this.chapters(book.id)
+    if (cached.length && args.refresh !== true) return cached.map(chapter => this.chapterView(chapter))
+    if (book.local) return cached.map(chapter => this.chapterView(chapter))
+    const fresh = await this.engine.toc(this.source(book.sourceId), book)
+    return (await this.syncToc(book, fresh)).map(chapter => this.chapterView(chapter))
+  }
+
+  async chapter(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const chapterId = requiredString(args.chapterId, 'chapterId')
+    let chapter = this.db.chapters.get(chapterId)
+    if (!chapter || chapter.bookId !== book.id) throw new ReaderError('reader/not-found', `Chapter ${chapterId} not found in this book.`)
+    if (typeof chapter.text !== 'string') {
+      if (book.local) throw new ReaderError('reader/not-found', 'Local chapter cache is missing.')
+      const content = await this.engine.content(this.source(book.sourceId), book, chapter)
+      chapter = { ...chapter, text: content.text, html: content.html, downloadedAt: now() }
+      await this.db.chapters.put(chapter.id, chapter)
+    }
+    return { ...this.chapterView(chapter), text: applyReplacements(chapter.text, this.db.settings.get().replacements), downloaded: true }
+  }
+
+  async saveProgress(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const chapter = this.db.chapters.get(requiredString(args.chapterId, 'chapterId'))
+    if (!chapter || chapter.bookId !== book.id) throw new ReaderError('reader/not-found', 'Progress chapter does not belong to this book.')
+    const offset = args.offset ?? 0
+    const percent = args.percent ?? 0
+    if (!Number.isSafeInteger(offset) || offset < 0 || typeof percent !== 'number' || !Number.isFinite(percent) || percent < 0 || percent > 100) {
+      throw new ReaderError('reader/invalid-input', 'offset must be a non-negative integer and percent must be between 0 and 100.')
+    }
+    const progress = { chapterId: chapter.id, offset, percent, updatedAt: now() }
+    await this.db.books.put(book.id, { ...book, progress, updatedAt: now() })
+    return clone(progress)
+  }
+
+  async download(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const existing = entries(this.db.jobs).find(job => job.bookId === book.id && job.type === 'download' && ACTIVE_JOBS.has(job.status))
+    if (existing) return jobView(existing)
+    const total = this.chapters(book.id).length
+    const job = createJob({ bookId: book.id, total })
+    await this.db.jobs.put(job.id, job)
+    await this.db.books.put(book.id, { ...book, download: { status: 'queued', jobId: job.id, auto: true }, updatedAt: now() })
+    this.scheduleJob(job.id)
+    return jobView(job)
+  }
+
+  scheduleJob(jobId) {
+    if (this.disposed || this.runningJobs.has(jobId)) return
+    const promise = this.runJob(jobId)
+      .catch(error => this.log('error', `Job ${jobId} could not update persisted state`, error))
+      .finally(() => this.runningJobs.delete(jobId))
+    this.runningJobs.set(jobId, promise)
+    return promise
+  }
+
+  async runJob(jobId) {
+    try {
+      let job = this.db.jobs.get(jobId)
+      if (!job || job.status !== 'queued') return
+      job = transitionJob(job, 'start')
+      await this.db.jobs.put(job.id, job)
+      if (job.type !== 'download') throw new ReaderError('reader/job-state', `Unknown job type ${job.type}.`)
+      const book = this.book(job.bookId)
+      const chapters = book.local ? this.chapters(book.id) : await this.syncToc(book, await this.engine.toc(this.source(book.sourceId), book))
+      job = this.db.jobs.get(jobId)
+      if (!job || job.status !== 'running') return
+      job = { ...job, total: chapters.length, updatedAt: now() }
+      await this.db.jobs.put(job.id, job)
+      for (const chapter of chapters) {
+        job = this.db.jobs.get(jobId)
+        if (!job || job.status !== 'running' || this.disposed) return
+        if (typeof chapter.text !== 'string') {
+          const content = await this.engine.content(this.source(book.sourceId), book, chapter)
+          job = this.db.jobs.get(jobId)
+          if (!job || job.status !== 'running' || this.disposed) return
+          await this.db.chapters.put(chapter.id, { ...chapter, ...content, downloadedAt: now() })
+        }
+        job = transitionJob(this.db.jobs.get(jobId), 'chapter')
+        await this.db.jobs.put(job.id, job)
+      }
+      job = this.db.jobs.get(jobId)
+      if (!job || job.status !== 'running') return
+      await this.db.jobs.put(jobId, transitionJob(job, 'complete'))
+      const latestBook = this.book(book.id)
+      await this.db.books.put(book.id, { ...latestBook, download: { status: 'completed', jobId, auto: true }, updatedAt: now() })
+    } catch (error) {
+      const job = this.db.jobs.get(jobId)
+      if (job && ACTIVE_JOBS.has(job.status)) await this.db.jobs.put(jobId, transitionJob(job, 'fail', { error: error.message }))
+      const book = this.db.books.get(job?.bookId)
+      if (book) await this.db.books.put(book.id, { ...book, download: { ...book.download, status: 'failed', jobId }, updatedAt: now() })
+      this.log('warn', `Download job ${jobId} failed`, error)
+    }
+  }
+
+  async cancelJob(args) {
+    args ??= {}
+    this.assertReady()
+    const jobId = requiredString(args.jobId, 'jobId')
+    const job = this.db.jobs.get(jobId)
+    if (!job) throw new ReaderError('reader/not-found', `Job ${jobId} not found.`)
+    const next = transitionJob(job, 'cancel')
+    await this.db.jobs.put(jobId, next)
+    const book = this.db.books.get(job.bookId)
+    if (book) await this.db.books.put(book.id, { ...book, download: { ...book.download, status: 'cancelled', jobId }, updatedAt: now() })
+    return jobView(next)
+  }
+
+  async checkUpdates() {
+    this.assertReady()
+    const result = { checked: 0, updated: 0, errors: [] }
+    for (const original of entries(this.db.books).filter(book => !book.local)) {
+      result.checked += 1
+      try {
+        const before = new Set(this.chapters(original.id).map(chapter => chapter.id))
+        const fresh = await this.engine.toc(this.source(original.sourceId), original)
+        const chapters = await this.syncToc(original, fresh)
+        const added = chapters.filter(chapter => !before.has(chapter.id))
+        if (added.length) {
+          result.updated += 1
+          if (original.download?.auto && this.db.settings.get().autoDownloadNewChapters) await this.download({ bookId: original.id })
+        }
+      } catch (error) {
+        result.errors.push({ bookId: original.id, message: error.message })
+      }
+    }
+    return result
+  }
+
+  async importLocal(args) {
+    args ??= {}
+    this.assertReady()
+    assertObject(args)
+    const name = requiredString(args.name, 'name', 200)
+    if (!['txt', 'epub'].includes(args.format)) throw new ReaderError('reader/invalid-input', "format must be 'txt' or 'epub'.")
+    if ((args.text === undefined) === (args.base64 === undefined)) throw new ReaderError('reader/invalid-input', 'Provide exactly one of text or base64.')
+    const buffer = args.text !== undefined
+      ? textToBuffer(args.text)
+      : base64ToBuffer(args.base64, args.format === 'txt' ? MAX_TEXT_BYTES : MAX_ARCHIVE_BYTES)
+    const imported = args.format === 'txt' ? importTxt(name, buffer.toString('utf8')) : await importEpub(name, buffer)
+    const previous = this.db.books.get(imported.book.id)
+    const book = previous ? { ...imported.book, addedAt: previous.addedAt, progress: previous.progress } : imported.book
+    await this.db.books.put(book.id, book)
+    const oldIds = this.chapters(book.id).map(chapter => chapter.id)
+    await this.db.chapters.deleteMany(oldIds)
+    for (const chapter of imported.chapters) await this.db.chapters.put(chapter.id, chapter)
+    return this.bookView(book)
+  }
+
+  async setSettings(args) {
+    const partial = args ?? {}
+    this.assertReady()
+    assertObject(partial, 'settings')
+    assertSettingKeys(partial)
+    const settings = normalizeSettings(partial, this.db.settings.get())
+    if (typeof settings.autoDownloadNewChapters !== 'boolean') throw new ReaderError('reader/invalid-settings', 'autoDownloadNewChapters must be boolean.')
+    await this.db.settings.set(settings)
+    return clone(settings)
+  }
+
+  async saveNote(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const chapter = this.db.chapters.get(requiredString(args.chapterId, 'chapterId'))
+    if (!chapter || chapter.bookId !== book.id) throw new ReaderError('reader/not-found', 'Note chapter does not belong to this book.')
+    const text = requiredString(args.text, 'text', 100000)
+    const timestamp = now()
+    const previous = args.id === undefined ? undefined : this.db.notes.get(requiredString(args.id, 'id'))
+    if (args.id !== undefined && !previous) throw new ReaderError('reader/not-found', 'Note not found.')
+    if (previous && previous.bookId !== book.id) throw new ReaderError('reader/invalid-input', 'Cannot move a note to another book.')
+    const color = args.color ?? previous?.color ?? '#f2c94c'
+    if (typeof color !== 'string' || color.length > 32) throw new ReaderError('reader/invalid-input', 'Invalid note color.')
+    const note = {
+      id: previous?.id ?? id('note'),
+      bookId: book.id,
+      chapterId: chapter.id,
+      text,
+      quote: args.quote === undefined ? previous?.quote ?? '' : String(args.quote).slice(0, 100000),
+      color,
+      createdAt: previous?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+    }
+    await this.db.notes.put(note.id, note)
+    return clone(note)
+  }
+
+  async deleteNote(args) {
+    args ??= {}
+    this.assertReady()
+    const noteId = requiredString(args.id, 'id')
+    if (!this.db.notes.get(noteId)) throw new ReaderError('reader/not-found', 'Note not found.')
+    await this.db.notes.delete(noteId)
+    return { removed: true, id: noteId }
+  }
+
+  async exportBackup() {
+    this.assertReady()
+    return createBackup({
+      sources: entries(this.db.sources),
+      books: entries(this.db.books),
+      chapters: entries(this.db.chapters),
+      settings: this.db.settings.get(),
+      notes: entries(this.db.notes),
+    })
+  }
+
+  async importBackup(args) {
+    args ??= {}
+    this.assertReady()
+    if (this.runningJobs.size) throw new ReaderError('reader/busy', '请先取消或等待下载任务结束。')
+    const backup = parseBackup(args.data)
+    await this.db.jobs.deleteMany(entries(this.db.jobs).map(job => job.id))
+    await this.db.chapters.deleteMany(entries(this.db.chapters).map(chapter => chapter.id))
+    await this.db.notes.deleteMany(entries(this.db.notes).map(note => note.id))
+    await this.db.books.deleteMany(entries(this.db.books).map(book => book.id))
+    await this.db.sources.deleteMany(entries(this.db.sources).map(source => source.id))
+    for (const source of backup.sources) await this.db.sources.put(source.id, source)
+    for (const book of backup.books) await this.db.books.put(book.id, book)
+    for (const chapter of backup.chapters) await this.db.chapters.put(chapter.id, chapter)
+    for (const note of backup.notes) await this.db.notes.put(note.id, note)
+    await this.db.settings.set({ ...DEFAULT_SETTINGS, ...backup.settings })
+    return this.state()
+  }
+}
+
+export default ReaderService
