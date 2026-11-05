@@ -1,6 +1,6 @@
 # ADR-0002: three.js 统一 WebGL 与真 3D 书架
 
-- Status: Accepted
+- Status: Superseded by [ADR-0004](0004-native-webgl-and-2d-shelf.md)
 - Date: 2026-11-04
 - Deciders: JUNQINGV587, DSH agent
 - Issue: [#1](https://github.com/JUNQINGV587/mo-reader/issues/1)

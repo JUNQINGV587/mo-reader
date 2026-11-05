@@ -35,7 +35,6 @@ window.__ModuleLoader__.load({
       animations: true,
       motionQuality: 'auto',
       ambience: 'full',
-      shelfMotion: true,
       reducedMotion: 'system',
     };
 
@@ -74,6 +73,31 @@ window.__ModuleLoader__.load({
         const untranslatedLeft = anchorLeft + pageIndex * pageStep;
         const column = Math.floor((untranslatedLeft - layoutLeft + 1) / step);
         return Math.max(0, Math.min(pages - 1, column));
+      },
+    });
+
+    // Pure scroll-driven motion math for the scroll reader: progress, axis
+    // thickness and smoothing are DOM-free so the node tests can pin them.
+    const scrollMotion = Object.freeze({
+      progress(value) {
+        return Math.max(0, Math.min(1, Number(value) || 0));
+      },
+      axis(progress, viewport, options = {}) {
+        const height = Math.max(0, Number(viewport) || 0);
+        if (options.short || !(height > 0)) return { top: 0, bottom: 0, visible: false };
+        const ratio = scrollMotion.progress(progress);
+        const min = 5;
+        const max = Math.min(44, Math.max(24, height * 0.06));
+        const top = options.still ? min : min + ratio * (max - min);
+        const bottom = options.still ? min : min + (1 - ratio) * (max - min);
+        return { top, bottom, visible: true, min, max };
+      },
+      smooth(current, target, dt, lambda = 7) {
+        const step = 1 - Math.exp(-lambda * Math.max(1, Number(dt) || 1) / 1000);
+        return Number(current) + (Number(target) - Number(current)) * step;
+      },
+      velocity(previous, current, dt) {
+        return (Number(current) - Number(previous)) * 1000 / Math.max(16, Number(dt) || 16);
       },
     });
 
@@ -145,93 +169,85 @@ window.__ModuleLoader__.load({
         h('span', null, (book.name || book.title || '书').slice(0, 1)));
     }
 
-    function Shelf3D({ ctx, books, theme, quality, ambience = 'full', reducedMotion = false, onOpen, onFallback }) {
-      const hostRef = useRef(null);
-      const apiRef = useRef(null);
-      const openRef = useRef(onOpen);
-      const coversRef = useRef(new Map());
-      const [status, setStatus] = useState('loading');
-      const [error, setError] = useState('');
-      openRef.current = onOpen;
-      const shelveOpen = (book, detail) => {
-        const host = hostRef.current;
-        const hostRect = host?.getBoundingClientRect?.();
-        const panelNode = host?.closest?.('.mr-root') || host;
-        const panelRect = panelNode?.getBoundingClientRect?.();
-        let snapshot = '';
-        try { snapshot = apiRef.current?.snapshot?.() || ''; } catch { snapshot = ''; }
-        const bookId = String(book?.id || book?.bookId || '');
-        openRef.current?.(book, {
-          rect: detail?.rect || null,
-          snapshot,
-          shelf: hostRect ? { left: hostRect.left, top: hostRect.top, width: hostRect.width, height: hostRect.height } : null,
-          panel: panelRect ? { left: panelRect.left, top: panelRect.top, width: panelRect.width, height: panelRect.height } : null,
-          cover: coversRef.current.get(bookId) || '',
-          coverCrop: detail?.rect && hostRect
-            ? { left: detail.rect.left - hostRect.left, top: detail.rect.top - hostRect.top }
-            : null,
-          bookId,
-        });
-      };
-      useEffect(() => {
-        let active = true;
-        let api = null;
-        let cancelled = false;
-        (async () => {
-          try {
-            if (!supportsWebGL()) { if (active) { setStatus('off'); onFallback?.(); } return; }
-            if (typeof require.async !== 'function') throw new Error('当前 DSH 版本不支持按需加载');
-            const chunk = await require.async('./client.three.js');
-            if (cancelled || !active) return;
-            api = chunk.mountShelf(hostRef.current, {
-              books,
-              theme,
-              quality,
-              ambience,
-              reducedMotion,
-              onOpen: (book, detail) => shelveOpen(book, detail),
-              onError: (cause) => { if (active) { setStatus('error'); setError(cause.message || '3D 书架出错'); } },
-              coverLoader: async (book) => {
-                const bookId = book.id || book.bookId;
-                if (!bookId) return null;
-                try {
-                  const value = await call(ctx, 'fetchCover', { bookId });
-                  const source = value?.dataUrl || null;
-                  if (source) coversRef.current.set(String(bookId), source);
-                  return source;
-                } catch {
-                  return null;
-                }
-              },
-            });
-            if (cancelled || !active) { api.dispose(); return; }
-            apiRef.current = api;
-            setStatus('ready');
-          } catch (cause) {
-            if (active) { setStatus('error'); setError(cause.message || '3D 书架加载失败'); }
-          }
-        })();
-        return () => {
-          cancelled = true;
-          active = false;
-          api?.dispose();
-          apiRef.current = null;
-        };
-      }, []);
-      useEffect(() => { apiRef.current?.setBooks(books); }, [books]);
-      useEffect(() => { apiRef.current?.setTheme(theme); }, [theme]);
-      useEffect(() => { apiRef.current?.setQuality(quality); }, [quality]);
-      useEffect(() => { apiRef.current?.setAmbience(ambience); }, [ambience]);
-      return h('div', { className: 'mr-shelf3d' },
-        h('div', { ref: hostRef, className: 'mr-shelf3d-host' }),
-        status === 'loading' ? h('div', { className: 'mr-shelf3d-status' }, '正在搭书架…') : null,
-        status === 'error' ? h('div', { className: 'mr-shelf3d-status error' },
-          h('span', null, error),
-          h(Button, { onClick: onFallback }, '切回列表')) : null,
-        status === 'ready' ? h('div', { className: 'mr-shelf3d-hint' }, '拖动转视角 · 滚轮换层 · 点书翻开') : null);
+    const SHELF_MAX_BOOKS = 48;
+
+    function shelfLayout(books = []) {
+      const list = (Array.isArray(books) ? books : []).slice(0, SHELF_MAX_BOOKS);
+      const lastRead = list.find((book) => {
+        const progress = book.lastRead || book.progress;
+        return progress && (Number(progress.percent) > 0 || progress.chapterId);
+      }) || list[0] || null;
+      return { books: list, count: list.length, lastRead, faces: 1 };
     }
 
-    function Library({ books, onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality, ambience, reducedMotion = false, shelfMotion = true }) {
+    function hashHue(text) {
+      let hash = 0;
+      const value = String(text || '');
+      for (let index = 0; index < value.length; index += 1) hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+      return hash % 360;
+    }
+
+    function ShelfBoard({ books, reducedMotion = false, onOpen }) {
+      const layout = shelfLayout(books);
+      const open = (book, event) => {
+        const scope = event.currentTarget.closest?.('.mr-shelf-hero, .mr-shelf-book') || event.currentTarget;
+        const cover = scope.querySelector?.('.mr-shelf-cover') || event.currentTarget.querySelector?.('.mr-shelf-cover');
+        const rect = cover?.getBoundingClientRect?.() || scope.getBoundingClientRect?.();
+        const panelNode = event.currentTarget.closest?.('.mr-root') || event.currentTarget;
+        const panel = panelNode?.getBoundingClientRect?.();
+        onOpen?.(book, {
+          rect: rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null,
+          panel: panel ? { left: panel.left, top: panel.top, width: panel.width, height: panel.height } : null,
+          cover: book.coverUrl || book.cover || '',
+          bookId: String(book.id || book.bookId || ''),
+        });
+      };
+      const coverNode = (book, name) => {
+        const display = name.replace(/\.(?:txt|epub|md|pdf)$/i, '');
+        const latin = !/[\u3400-\u9fff]/.test(display);
+        const cover = book.coverUrl || book.cover || '';
+        return h('span', { className: 'mr-shelf-cover', style: { '--mr-hue': hashHue(name) } },
+          h('span', { className: `mr-shelf-fallback${latin ? ' mr-latin' : ''}` },
+            h('span', { className: 'mr-shelf-fallback-title' }, display),
+            h('span', { className: 'mr-shelf-seal', 'aria-hidden': 'true' }, display.slice(0, 1))),
+          cover ? h('img', { src: cover, alt: '', loading: 'lazy', onError: (event) => { event.currentTarget.style.visibility = 'hidden'; } }) : null);
+      };
+      const lastRead = layout.lastRead;
+      const progress = lastRead ? (lastRead.lastRead || lastRead.progress || {}) : {};
+      const rawPercent = Number(progress.percent);
+      const percent = Number.isFinite(rawPercent) ? Math.max(0, Math.min(100, Math.round(rawPercent))) : 0;
+      const chapter = progress.chapterTitle || (Number.isInteger(progress.chapterIndex) ? `第 ${progress.chapterIndex + 1} 章` : '');
+      const heroTitle = lastRead ? String(lastRead.name || lastRead.title || '未命名') : '';
+      const byline = lastRead ? [lastRead.author, chapter, percent > 0 ? `已读 ${percent}%` : ''].filter(Boolean).join(' · ') : '';
+      return h('div', { className: `mr-shelf${reducedMotion ? ' mr-reduced' : ''}` },
+        lastRead ? h('section', { className: 'mr-shelf-hero', 'aria-label': '继续阅读' },
+          h('button', { className: 'mr-shelf-hero-cover', type: 'button', 'aria-label': `继续阅读 ${heroTitle}`, onClick: (event) => open(lastRead, event) }, coverNode(lastRead, heroTitle)),
+          h('div', { className: 'mr-shelf-hero-info' },
+            h('p', { className: 'mr-shelf-eyebrow' }, '继续阅读'),
+            h('h3', { className: 'mr-shelf-hero-title' }, heroTitle),
+            byline ? h('p', { className: 'mr-shelf-hero-by' }, byline) : null,
+            h('div', { className: 'mr-shelf-progress', 'aria-hidden': 'true' }, h('i', { style: { width: `${percent}%` } })),
+            h('button', { className: 'mr-shelf-cta', type: 'button', onClick: (event) => open(lastRead, event) }, '继续阅读'))) : null,
+        h('div', { className: 'mr-shelf-library' },
+          h('div', { className: 'mr-shelf-library-head' }, h('h3', null, '全部书籍'), h('span', null, `${layout.count} 本`)),
+          h('div', { className: 'mr-shelf-grid' },
+            layout.books.map((book, index) => {
+              const id = book.id || book.bookId || index;
+              const name = String(book.name || book.title || '未命名');
+              return h('button', {
+                key: `book-${id}`,
+                className: 'mr-shelf-book',
+                type: 'button',
+                'aria-label': `${name}${book.author ? `，${book.author}` : ''}`,
+                title: name,
+                onClick: (event) => open(book, event),
+              },
+              coverNode(book, name),
+              h('span', { className: 'mr-shelf-meta' }, h('strong', null, name), book.author ? h('small', null, book.author) : null));
+            }))));
+    }
+
+    function Library({ books, onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality, ambience, reducedMotion = false }) {
       if (!books.length) return h(Empty, {
         title: '书架还是空的', detail: '去发现搜书，或导入本地书籍。',
       });
@@ -243,8 +259,8 @@ window.__ModuleLoader__.load({
               h('button', { className: view === 'shelf' ? 'active' : '', onClick: () => onView('shelf') }, '书架'),
               h('button', { className: view === 'list' ? 'active' : '', onClick: () => onView('list') }, '列表')),
             h(Button, { icon: 'refresh', onClick: onCheck, disabled: busy }, '补查'))),
-        view === 'shelf' && shelfMotion !== false
-          ? h(Shelf3D, { ctx, books, theme, quality, ambience, reducedMotion, onOpen, onFallback: () => onView('list') })
+        view === 'shelf'
+          ? h(ShelfBoard, { books, reducedMotion, onOpen })
           : h('div', { className: 'mr-book-grid' }, books.map((book) => {
           const id = book.id || book.bookId;
           const name = book.name || book.title || '未命名';
@@ -332,7 +348,6 @@ window.__ModuleLoader__.load({
             h('button', { className: `mr-mode-choice ${settings.mode === 'scroll' ? 'active' : ''}`, onClick: () => onSettings({ mode: 'scroll' }) }, '滚动'))),
           h('div', { className: 'mr-setting-row' }, h('span', null, '默认翻页'), h('div', { className: 'mr-mode-picker' },
             h('button', { className: `mr-mode-choice ${(settings.flipStyle || 'slide') === 'slide' ? 'active' : ''}`, onClick: () => onSettings({ flipStyle: 'slide' }) }, '滑动'),
-            h('button', { className: `mr-mode-choice ${settings.flipStyle === 'curl' ? 'active' : ''}`, onClick: () => onSettings({ flipStyle: 'curl' }) }, '卷曲'),
             h('button', { className: `mr-mode-choice ${settings.flipStyle === 'flip' ? 'active' : ''}`, onClick: () => onSettings({ flipStyle: 'flip' }) }, '翻转'),
             h('button', { className: `mr-mode-choice ${settings.flipStyle === 'fade' ? 'active' : ''}`, onClick: () => onSettings({ flipStyle: 'fade' }) }, '淡入'))),
           h('div', { className: 'mr-setting-row' }, h('span', null, '动画开关'), h('div', { className: 'mr-mode-picker' },
@@ -346,9 +361,6 @@ window.__ModuleLoader__.load({
             h('button', { className: `mr-mode-choice ${(settings.ambience || 'full') === 'full' ? 'active' : ''}`, onClick: () => onSettings({ ambience: 'full' }) }, '完整'),
             h('button', { className: `mr-mode-choice ${settings.ambience === 'paper' ? 'active' : ''}`, onClick: () => onSettings({ ambience: 'paper' }) }, '仅纸张'),
             h('button', { className: `mr-mode-choice ${settings.ambience === 'off' ? 'active' : ''}`, onClick: () => onSettings({ ambience: 'off' }) }, '关闭'))),
-          h('div', { className: 'mr-setting-row' }, h('span', null, '书架动效'), h('div', { className: 'mr-mode-picker' },
-            h('button', { className: `mr-mode-choice ${settings.shelfMotion === false ? '' : 'active'}`, onClick: () => onSettings({ shelfMotion: true }) }, '开'),
-            h('button', { className: `mr-mode-choice ${settings.shelfMotion === false ? 'active' : ''}`, onClick: () => onSettings({ shelfMotion: false }) }, '关'))),
           h('div', { className: 'mr-setting-row' }, h('span', null, '减弱动态'), h('div', { className: 'mr-mode-picker' },
             h('button', { className: `mr-mode-choice ${(settings.reducedMotion || 'system') === 'system' ? 'active' : ''}`, onClick: () => onSettings({ reducedMotion: 'system' }) }, '跟随系统'),
             h('button', { className: `mr-mode-choice ${settings.reducedMotion === 'on' ? 'active' : ''}`, onClick: () => onSettings({ reducedMotion: 'on' }) }, '开启'),
@@ -372,42 +384,6 @@ window.__ModuleLoader__.load({
             h(Button, { icon: 'upload', onClick: () => backupRef.current?.click(), disabled: busy }, '恢复'),
             h('input', { ref: backupRef, type: 'file', accept: '.json,application/json', hidden: true, onChange: async (e) => { const file = e.target.files?.[0]; if (file) onImport(file); e.target.value = ''; } }))),
         h('section', { className: 'mr-panel mr-roadmap' }, h('h3', null, '分期说明'), h('p', null, '当前为文字核心版。高兼容脚本、AI 与多媒体将在后续阶段提供。')));
-    }
-
-    function capturePageCanvas(view, article) {
-      const rect = view.getBoundingClientRect();
-      const scale = Math.min(2, window.devicePixelRatio || 1);
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.max(1, Math.round(rect.width * scale));
-      canvas.height = Math.max(1, Math.round(rect.height * scale));
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return canvas;
-      ctx.scale(scale, scale);
-      const reader = view.closest('.mr-reader') || document.body;
-      ctx.fillStyle = getComputedStyle(reader).backgroundColor || '#f5efe3';
-      ctx.fillRect(0, 0, rect.width, rect.height);
-      const range = document.createRange();
-      const walker = document.createTreeWalker(article, NodeFilter.SHOW_TEXT);
-      let node;
-      while ((node = walker.nextNode())) {
-        const text = node.textContent || '';
-        if (!text.trim() || !node.parentElement) continue;
-        const style = getComputedStyle(node.parentElement);
-        ctx.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
-        ctx.fillStyle = style.color;
-        ctx.textBaseline = 'middle';
-        for (let index = 0; index < text.length; index += 1) {
-          const char = text[index];
-          if (!char.trim()) continue;
-          range.setStart(node, index);
-          range.setEnd(node, index + 1);
-          const box = range.getBoundingClientRect();
-          if (!box.width || !box.height) continue;
-          if (box.right < rect.left || box.left > rect.right || box.bottom < rect.top || box.top > rect.bottom) continue;
-          ctx.fillText(char, box.left - rect.left, box.top - rect.top + box.height / 2);
-        }
-      }
-      return canvas;
     }
 
     function ReaderView({ ctx, book, settings, onSettings, onBookSettings, notes, onClose, onSaveNote, onDeleteNote, notify, deferMs = 0 }) {
@@ -441,7 +417,6 @@ window.__ModuleLoader__.load({
       const [dragOffset, setDragOffset] = useState(0);
       const [chapterVeil, setChapterVeil] = useState('');
       const [flipStyle, setFlipStyle] = useState(prefFlipStyle);
-      const [curling, setCurling] = useState(false);
       const [turning, setTurning] = useState(false);
       const [fadeIn, setFadeIn] = useState(false);
       const scrollRef = useRef(null);
@@ -451,15 +426,13 @@ window.__ModuleLoader__.load({
       const pendingPercentRef = useRef(null);
       const dragRef = useRef(null);
       const suppressClickRef = useRef(false);
-      const curlingRef = useRef(false);
-      const curlRef = useRef(null);
-      const curlHostRef = useRef(null);
       const turnHostRef = useRef(null);
       const turnRef = useRef(false);
       const turnTimer = useRef(null);
       const readerThreeRef = useRef(null);
       const ambienceHostRef = useRef(null);
       const ambienceRef = useRef(null);
+      const scrollMotionRef = useRef({ target: 0, current: 0, velocity: 0, settle: 0 });
       const drawerRef = useRef('');
       drawerRef.current = drawer;
       const veilTimer = useRef(null);
@@ -482,11 +455,6 @@ window.__ModuleLoader__.load({
       };
       const chooseFlip = (value) => { setFlipStyle(value); persistPref('flipStyle', value); };
       useEffect(() => () => {
-        curlingRef.current = false;
-        curlRef.current?.dispose?.();
-        curlRef.current = null;
-        curlHostRef.current?.remove?.();
-        curlHostRef.current = null;
         clearTimeout(turnTimer.current);
         turnHostRef.current?.remove?.();
         turnHostRef.current = null;
@@ -500,7 +468,7 @@ window.__ModuleLoader__.load({
         let api = null;
         (async () => {
           try {
-            const module = readerThreeRef.current || await require.async('./client.three.js');
+            const module = readerThreeRef.current || await require.async('./client.gl.js');
             readerThreeRef.current = module;
             if (!active || !ambienceHostRef.current) return;
             if (!module || typeof module.mountAmbience !== 'function') return;
@@ -528,7 +496,7 @@ window.__ModuleLoader__.load({
         const total = pageCount > 1 ? (pageIndex + Math.min(1, scrollPercent / 100)) / pageCount : (scrollPercent || 0) / 100;
         ambienceRef.current?.setProgress(total);
       }, [scrollPercent, pageIndex, pageCount]);
-      useEffect(() => { ambienceRef.current?.setSeam(turning || curling ? 0.45 : 0, 0.5); }, [turning, curling]);
+      useEffect(() => { ambienceRef.current?.setSeam(turning ? 0.45 : 0, 0.5); }, [turning]);
       useEffect(() => {
         const api = ambienceRef.current;
         if (!api) return;
@@ -551,6 +519,35 @@ window.__ModuleLoader__.load({
           window.clearTimeout(timer);
         };
       }, []);
+      useEffect(() => {
+        if (mode !== 'scroll' || !chapter || motionOff) return undefined;
+        const el = scrollRef.current;
+        if (!el) return undefined;
+        const state = scrollMotionRef.current;
+        let frame = 0;
+        let last = 0;
+        const tick = (now) => {
+          const dt = Math.min(64, now - (last || now));
+          last = now;
+          const max = Math.max(1, el.scrollHeight - el.clientHeight);
+          const target = scrollMotion.progress(el.scrollTop / max);
+          const previous = state.current;
+          state.target = target;
+          state.velocity = scrollMotion.smooth(state.velocity, scrollMotion.velocity(previous, target, dt), dt, 8);
+          state.current = scrollMotion.smooth(state.current, target, dt, 7);
+          const axes = scrollMotion.axis(state.current, el.clientHeight, {
+            short: el.scrollHeight <= el.clientHeight + 1,
+            still: motionOff,
+          });
+          ambienceRef.current?.setScroll?.(state.current, state.velocity, axes);
+          frame = window.requestAnimationFrame(tick);
+        };
+        frame = window.requestAnimationFrame(tick);
+        return () => {
+          window.cancelAnimationFrame(frame);
+          window.clearTimeout(state.settle);
+        };
+      }, [mode, chapter, motionOff]);
       const chapterIdAt = (index = chapterIndex) => {
         const item = toc[index];
         return item && (item.id || item.chapterId || item.url || item.chapterUrl || String(index));
@@ -743,7 +740,12 @@ window.__ModuleLoader__.load({
         if (!scrollRef.current || chapterIndex < 0) return;
         const el = scrollRef.current;
         const max = Math.max(1, el.scrollHeight - el.clientHeight);
+        scrollMotionRef.current.target = scrollMotion.progress(el.scrollTop / max);
         commitProgress(Math.round(el.scrollTop / max * 100), 0);
+        window.clearTimeout(scrollMotionRef.current.settle);
+        scrollMotionRef.current.settle = window.setTimeout(() => {
+          scrollMotionRef.current.target = scrollMotion.progress(el.scrollTop / max);
+        }, 120);
       };
 
       const makeNote = () => {
@@ -762,77 +764,6 @@ window.__ModuleLoader__.load({
         setPageIndex(next);
         pageIndexRef.current = next;
         commitProgress(paginationMath.percentForPage(next, pageCount));
-      };
-      const finishCurl = () => {
-        curlingRef.current = false;
-        setCurling(false);
-        const active = curlRef.current;
-        curlRef.current = null;
-        active?.dispose?.();
-        curlHostRef.current?.remove?.();
-        curlHostRef.current = null;
-      };
-      const mountCurlOverlay = (module, snapshot, rect, direction) => {
-        const host = document.createElement('div');
-        host.className = 'mr-curl-host';
-        Object.assign(host.style, {
-          position: 'fixed', left: `${rect.left}px`, top: `${rect.top}px`,
-          width: `${rect.width}px`, height: `${rect.height}px`, zIndex: '9000', pointerEvents: 'none',
-        });
-        document.body.appendChild(host);
-        curlHostRef.current = host;
-        curlRef.current = module.mountCurl(host, {
-          canvas: snapshot,
-          width: rect.width,
-          height: rect.height,
-          direction,
-          onDone: finishCurl,
-          onError: finishCurl,
-        });
-      };
-      const startCurl = async (delta) => {
-        const view = pagedRef.current;
-        const article = articleRef.current;
-        const target = pageIndexRef.current + delta;
-        if (!view || !article || target < 0 || target >= pageCount || curlingRef.current) return;
-        const snapshot = capturePageCanvas(view, article);
-        const rect = view.getBoundingClientRect();
-        curlingRef.current = true;
-        setCurling(true);
-        try {
-          const module = readerThreeRef.current || await require.async('./client.three.js');
-          readerThreeRef.current = module;
-          if (!module || typeof module.mountCurl !== 'function') throw new Error('卷曲模块不可用');
-          goPage(target);
-          await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-          if (!curlingRef.current || !view.isConnected) return;
-          mountCurlOverlay(module, snapshot, rect, delta);
-        } catch (cause) {
-          finishCurl();
-          goPage(target);
-        }
-      };
-      const startChapterCurl = async (dir) => {
-        const view = pagedRef.current;
-        const article = articleRef.current;
-        const index = chapterIndex + dir;
-        if (!toc[index]) return;
-        if (!view || !article || curlingRef.current || turnRef.current) { openChapter(index, false, dir > 0 ? 0 : 100); return; }
-        const snapshot = capturePageCanvas(view, article);
-        const rect = view.getBoundingClientRect();
-        curlingRef.current = true;
-        setCurling(true);
-        openChapter(index, false, dir > 0 ? 0 : 100);
-        try {
-          const module = readerThreeRef.current || await require.async('./client.three.js');
-          readerThreeRef.current = module;
-          if (!module || typeof module.mountCurl !== 'function') throw new Error('卷曲模块不可用');
-          await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-          if (!curlingRef.current || !view.isConnected) return;
-          mountCurlOverlay(module, snapshot, rect, dir);
-        } catch (cause) {
-          finishCurl();
-        }
       };
       const buildTurnSheet = () => {
         const view = pagedRef.current;
@@ -873,7 +804,7 @@ window.__ModuleLoader__.load({
           transformStyle: 'preserve-3d', backfaceVisibility: 'hidden', willChange: 'transform, opacity',
         });
         const clone = article.cloneNode(true);
-        clone.classList.remove('mr-dragging', 'mr-curling', 'mr-turning', 'mr-fade-in');
+        clone.classList.remove('mr-dragging', 'mr-turning', 'mr-fade-in');
         Object.assign(clone.style, {
           position: 'absolute', left: `${layoutLeft - pageLeft}px`, top: '0px',
           width: `${layoutWidth}px`, height: `${layoutHeight}px`, margin: '0',
@@ -943,12 +874,11 @@ window.__ModuleLoader__.load({
         if (!toc[index]) return;
         const percent = dir > 0 ? 0 : 100;
         if (motionOff || !webglRef.current) { openChapter(index, false, percent); return; }
-        if (flipStyle === 'curl') { startChapterCurl(dir); return; }
         beginTurn(flipStyle === 'slide' ? 'slide' : flipStyle, dir, null);
         openChapter(index, false, percent);
       };
       const turnPage = (delta) => {
-        if (!delta || loading || curlingRef.current || turnRef.current) return;
+        if (!delta || loading || turnRef.current) return;
         const next = pageIndexRef.current + delta;
         if (next < 0) {
           if (chapterIndex > 0) turnChapter(-1);
@@ -959,7 +889,6 @@ window.__ModuleLoader__.load({
           return;
         }
         if (motionOff || !webglRef.current) { goPage(next); return; }
-        if (flipStyle === 'curl') { startCurl(delta); return; }
         if (flipStyle === 'flip' || flipStyle === 'fade') {
           if (beginTurn(flipStyle, delta, next)) return;
         }
@@ -1085,7 +1014,7 @@ window.__ModuleLoader__.load({
       }, [mode, drawer, pageCount, pageIndex, chapterIndex, toc.length, loading]);
 
       const toggleMode = () => {
-        if (curlingRef.current || turnRef.current) return;
+        if (turnRef.current) return;
         if (mode === 'paged') {
           setMode('scroll');
           persistPref('mode', 'scroll');
@@ -1105,7 +1034,7 @@ window.__ModuleLoader__.load({
         ? pageIndexRef.current < pageCount - 1 || chapterIndex + 1 < toc.length
         : pageIndexRef.current > 0 || chapterIndex > 0;
       const onPagedPointerDown = (event) => {
-        if (mode !== 'paged' || drawer || loading || curlingRef.current || turnRef.current || event.button > 0) return;
+        if (mode !== 'paged' || drawer || loading || turnRef.current || event.button > 0) return;
         if (event.target?.closest?.('button,a,input,textarea,select')) return;
         const view = pagedRef.current;
         const rect = view?.getBoundingClientRect();
@@ -1154,7 +1083,7 @@ window.__ModuleLoader__.load({
       const onPagedPointerUp = (event) => endPagedDrag(event, false);
       const onPagedPointerCancel = (event) => endPagedDrag(event, true);
       const onPagedClick = (event) => {
-        if (curlingRef.current || turnRef.current || suppressClickRef.current) return;
+        if (turnRef.current || suppressClickRef.current) return;
         if (event.target?.closest?.('button,a,input,textarea,select')) return;
         const selection = window.getSelection?.();
         if (selection && !selection.isCollapsed) return;
@@ -1196,7 +1125,7 @@ window.__ModuleLoader__.load({
           : { className: 'mr-chapter-scroll', ref: scrollRef, onScroll },
           loading ? h('div', { className: 'mr-loading' }, '正在打开章节…') : error ? h('div', { className: 'mr-error-block' }, h('p', null, error), h(Button, { onClick: () => { if (toc.length && failedIndex >= 0) openChapter(failedIndex); else { setLoading(true); setError(''); setRetryNonce((value) => value + 1); } } }, '重试')) :
             h('article', mode === 'paged'
-              ? { className: `mr-chapter mr-paged-chapter${dragging ? ' mr-dragging' : ''}${curling ? ' mr-curling' : ''}${turning ? ' mr-turning' : ''}${fadeIn ? ' mr-fade-in' : ''}`, ref: articleRef, style: pagedArticleStyle }
+              ? { className: `mr-chapter mr-paged-chapter${dragging ? ' mr-dragging' : ''}${turning ? ' mr-turning' : ''}${fadeIn ? ' mr-fade-in' : ''}`, ref: articleRef, style: pagedArticleStyle }
               : { className: 'mr-chapter', style: { fontSize: `${settings.fontSize || 20}px`, lineHeight: settings.lineHeight || 1.9 } },
             chapterNodes),
           chapterVeil ? h('div', { className: `mr-chapter-veil${chapterVeil ? ' show' : ''}`, key: chapterVeil }, chapterVeil) : null),
@@ -1204,9 +1133,9 @@ window.__ModuleLoader__.load({
           h(Button, { kind: 'text', icon: 'back', disabled: chapterIndex <= 0 || loading, onClick: () => openChapter(chapterIndex - 1) }, '上一章'),
           mode === 'paged'
             ? h('div', { className: 'mr-page-nav' },
-              h('button', { className: 'mr-page-btn', disabled: curling || turning || (pageIndex <= 0 && chapterIndex <= 0), onClick: () => turnPage(-1), 'aria-label': '上一页' }, '‹'),
+              h('button', { className: 'mr-page-btn', disabled: turning || (pageIndex <= 0 && chapterIndex <= 0), onClick: () => turnPage(-1), 'aria-label': '上一页' }, '‹'),
               h('span', null, `${Math.min(pageCount, pageIndex + 1)} / ${pageCount}`),
-              h('button', { className: 'mr-page-btn', disabled: curling || turning || (pageIndex >= pageCount - 1 && chapterIndex + 1 >= toc.length), onClick: () => turnPage(1), 'aria-label': '下一页' }, '›'))
+              h('button', { className: 'mr-page-btn', disabled: turning || (pageIndex >= pageCount - 1 && chapterIndex + 1 >= toc.length), onClick: () => turnPage(1), 'aria-label': '下一页' }, '›'))
             : h('span', null, chapterIndex >= 0 ? `${Math.round((chapterIndex + 1) / Math.max(1, toc.length) * 100)}%` : ''),
           h(Button, { kind: 'text', icon: 'next', disabled: chapterIndex + 1 >= toc.length || loading, onClick: () => openChapter(chapterIndex + 1) }, '下一章')),
         drawer ? h('div', { className: 'mr-drawer-backdrop', onClick: () => setDrawer('') }) : null,
@@ -1222,7 +1151,6 @@ window.__ModuleLoader__.load({
               h('button', { className: `mr-mode-choice ${mode === 'scroll' ? 'active' : ''}`, onClick: () => { setMode('scroll'); persistPref('mode', 'scroll'); } }, '滚动')),
             h('label', null, '翻页效果'), h('div', { className: 'mr-mode-picker' },
               h('button', { className: `mr-mode-choice ${flipStyle === 'slide' ? 'active' : ''}`, onClick: () => chooseFlip('slide') }, '滑动'),
-              h('button', { className: `mr-mode-choice ${flipStyle === 'curl' ? 'active' : ''}`, onClick: () => chooseFlip('curl') }, '卷曲'),
               h('button', { className: `mr-mode-choice ${flipStyle === 'flip' ? 'active' : ''}`, onClick: () => chooseFlip('flip') }, '翻转'),
               h('button', { className: `mr-mode-choice ${flipStyle === 'fade' ? 'active' : ''}`, onClick: () => chooseFlip('fade') }, '淡入')),
             h('label', null, '氛围'), h('div', { className: 'mr-mode-picker' },
@@ -1247,7 +1175,6 @@ window.__ModuleLoader__.load({
       const doneRef = useRef(onDone);
       doneRef.current = onDone;
       const panel = data.panel;
-      const shelf = data.shelf;
       const from = data.rect;
       useEffect(() => {
         const node = coverRef.current;
@@ -1271,18 +1198,11 @@ window.__ModuleLoader__.load({
       const width = from ? Math.max(36, from.width) : 80;
       const height = from ? Math.max(52, from.height) : 112;
       const name = String(data.book?.name || data.book?.title || '书');
-      const cropStyle = data.snapshot && shelf && data.coverCrop ? {
-        backgroundImage: `url(${data.snapshot})`,
-        backgroundSize: `${shelf.width}px ${shelf.height}px`,
-        backgroundPosition: `${-data.coverCrop.left}px ${-data.coverCrop.top}px`,
-        backgroundRepeat: 'no-repeat',
-      } : null;
-      const coverStyle = { left: `${left}px`, top: `${top}px`, width: `${width}px`, height: `${height}px`, ...(cropStyle || {}) };
+      const coverStyle = { left: `${left}px`, top: `${top}px`, width: `${width}px`, height: `${height}px` };
       return h('div', { className: 'mr-open-shift', style: { left: `${panel.left}px`, top: `${panel.top}px`, width: `${panel.width}px`, height: `${panel.height}px` } },
         h('div', { className: 'mr-open-veil', style: { background: backdrop } }),
-        shelf && data.snapshot ? h('div', { className: 'mr-open-shelf', style: { left: `${shelf.left - panel.left}px`, top: `${shelf.top - panel.top}px`, width: `${shelf.width}px`, height: `${shelf.height}px`, backgroundImage: `url(${data.snapshot})` } }) : null,
         h('div', { ref: coverRef, className: 'mr-open-cover', style: coverStyle },
-          cropStyle ? null : data.cover ? h('img', { src: data.cover, alt: '' }) : h('span', null, name.slice(0, 1))));
+          data.cover ? h('img', { src: data.cover, alt: '' }) : h('span', null, name.slice(0, 1))));
     }
 
     function ReaderApp({ ctx }) {
@@ -1403,9 +1323,9 @@ window.__ModuleLoader__.load({
         catch (cause) { notify(cause.message || String(cause), 'error'); }
       };
       const saveNote = (note) => run(() => call(ctx, 'saveNote', note), '笔记已保存');
-      const motionOff = prefersReducedMotion() || settings.reducedMotion === 'on' || settings.animations === false || settings.shelfMotion === false;
+      const motionOff = prefersReducedMotion() || settings.reducedMotion === 'on' || settings.animations === false;
       const openBook = (book, detail) => {
-        if (!detail?.rect || !detail?.panel || !detail?.snapshot || motionOff || !supportsWebGL()) { setOpening(null); setReading(book); return; }
+        if (!detail?.rect || !detail?.panel || motionOff) { setOpening(null); setReading(book); return; }
         setOpening({ ...detail, book, theme: settings.readerTheme || 'paper' });
         setReading(book);
       };
@@ -1424,7 +1344,7 @@ window.__ModuleLoader__.load({
         h('section', { className: 'mr-content' },
           h(Notice, { notice, onClose: () => setNotice(null) }),
           loading ? h('div', { className: 'mr-loading' }, '正在打开墨读…') : null,
-          !loading && tab === 'library' ? h(Library, { books, busy, view: shelfView, onView: setShelfView, ctx, theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: prefersReducedMotion() || settings.reducedMotion === 'on', shelfMotion: settings.shelfMotion !== false, onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}), onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
+          !loading && tab === 'library' ? h(Library, { books, busy, view: shelfView, onView: setShelfView, ctx, theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: prefersReducedMotion() || settings.reducedMotion === 'on', onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}), onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, selectedSource, onSource: (sourceId) => { setSelectedSource(sourceId); setResults(null); setResultSource(''); }, onSearch: search, onAdd: addBook, results, busy }) : null,
           !loading && tab === 'sources' ? h(Sources, { sources, busy, onImport: importSource, onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
           !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy }) : null)));
@@ -1443,12 +1363,37 @@ window.__ModuleLoader__.load({
 .mr-view-toggle{display:inline-flex;padding:3px;border:1px solid var(--mr-border);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}
 .mr-view-toggle button{min-height:30px;padding:4px 12px;border:0;border-radius:7px;background:transparent;color:var(--mr-muted);font-size:12px}
 .mr-view-toggle button.active{background:var(--dsw-alias-bg-layer-2);color:var(--mr-text);font-weight:650}
-.mr-shelf3d{position:relative;height:min(68vh,620px);min-height:380px;border:1px solid var(--mr-border);border-radius:16px;overflow:hidden;background:#241b15;box-shadow:inset 0 0 60px #0004}
-.mr-shelf3d-host{position:absolute;inset:0}
-.mr-shelf3d-host canvas{display:block;width:100%;height:100%}
-.mr-shelf3d-status{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:#f4e7cf;font-size:13px;background:#241b15cc;text-align:center;padding:20px}
-.mr-shelf3d-status.error{color:#ffd9cf}
-.mr-shelf3d-hint{position:absolute;left:16px;bottom:14px;color:#f4e7cfaa;font-size:11px;letter-spacing:.03em;pointer-events:none}
+.mr-shelf{display:flex;flex-direction:column;gap:26px}
+.mr-shelf-hero{display:grid;grid-template-columns:132px 1fr;gap:24px;align-items:center;padding:20px 24px;border:1px solid #e6ddcf;border-radius:18px;background:linear-gradient(180deg,#faf6ee,#f3ebdd);box-shadow:inset 0 1px 0 #fff9,0 18px 36px -30px #5a4028}
+.mr-shelf-hero-cover{width:132px;padding:0;border:0;background:transparent;color:inherit;border-radius:3px;cursor:pointer}
+.mr-shelf-hero-info{min-width:0}
+.mr-shelf-eyebrow{margin:0 0 8px;color:#756a5b;font-size:12px;letter-spacing:.14em}
+.mr-shelf-hero-title{margin:0 0 8px;color:#2f2a23;font-size:22px;line-height:1.3;letter-spacing:-.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mr-shelf-hero-by{margin:0 0 14px;color:#756a5b;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mr-shelf-progress{height:4px;border-radius:2px;background:#e6ddcf;overflow:hidden;margin:0 0 16px}
+.mr-shelf-progress i{display:block;height:100%;background:#3f6b57;border-radius:2px}
+.mr-shelf-cta{min-height:38px;padding:7px 18px;border:0;border-radius:9px;background:#2f2a23;color:#f8f3e9;font-size:13px;font-weight:600;cursor:pointer}
+.mr-shelf-cta:hover{background:#1f1b16}
+.mr-shelf-library-head{display:flex;align-items:baseline;justify-content:space-between;margin:0 0 14px}
+.mr-shelf-library-head h3{margin:0;color:#2f2a23;font-size:16px;font-weight:650}
+.mr-shelf-library-head span{color:#756a5b;font-size:12px}
+.mr-shelf-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:30px 24px}
+.mr-shelf-book{display:flex;flex-direction:column;gap:8px;min-width:0;padding:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer;appearance:none;border-radius:3px}
+.mr-shelf-book:focus-visible{outline:2px solid #3f6b57;outline-offset:4px}
+.mr-shelf-book:hover .mr-shelf-cover{transform:translateY(-4px)}
+.mr-shelf-cover{position:relative;display:block;aspect-ratio:2/3;border-radius:2px 3px 3px 2px;overflow:hidden;background:linear-gradient(150deg,hsl(var(--mr-hue,32) 16% 38%),hsl(var(--mr-hue,32) 20% 26%));box-shadow:-1px 0 0 #0000001f inset,2px 0 0 #efe6d5 inset,0 12px 18px -12px #3c2a1a73,0 2px 3px #3c2a1a1f;transition:transform .18s cubic-bezier(.2,.8,.2,1)}
+.mr-shelf-cover::before{content:'';position:absolute;inset:0 auto 0 0;width:6px;background:linear-gradient(90deg,#0000002e,#00000000);z-index:2;pointer-events:none}
+.mr-shelf-cover::after{content:'';position:absolute;inset:0 0 0 auto;width:3px;background:linear-gradient(90deg,#f1e8d8,#e2d7c4);z-index:2;pointer-events:none}
+.mr-shelf-cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.mr-shelf-fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:12px 9px 28px}
+.mr-shelf-fallback-title{writing-mode:vertical-rl;font-family:'Songti SC','STSong','Noto Serif SC',serif;font-size:12.5px;line-height:1.5;letter-spacing:.12em;color:#f4ead8;max-height:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-shadow:0 1px 2px #0000004d}
+.mr-shelf-fallback.mr-latin .mr-shelf-fallback-title{writing-mode:horizontal-tb;font-family:'Inter',Georgia,serif;font-size:12px;line-height:1.5;letter-spacing:.02em;max-width:100%;white-space:normal;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;text-align:center}
+.mr-shelf-seal{position:absolute;right:14px;bottom:12px;display:flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:3px;background:#a3412f;color:#f8efe0;font-family:'Songti SC','STSong',serif;font-size:11px;line-height:1;box-shadow:0 1px 0 #ffffff33 inset}
+.mr-shelf-meta{display:block;min-width:0}
+.mr-shelf-meta strong{display:block;font-size:12px;line-height:1.45;font-weight:500;color:#2f2a23;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mr-shelf-meta small{display:block;font-size:11px;color:#756a5b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.mr-shelf.mr-reduced .mr-shelf-cover{transition:none}
+@media (max-width: 720px){.mr-shelf-hero{grid-template-columns:104px 1fr;gap:16px;padding:16px;align-items:start}.mr-shelf-hero-cover{width:104px}.mr-shelf-hero-title{font-size:18px}.mr-shelf-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:22px 14px}}
 .mr-button{min-height:38px;padding:7px 13px;border:1px solid var(--mr-border);border-radius:9px;background:var(--dsw-alias-bg-layer-1);color:var(--mr-text);display:inline-flex;align-items:center;justify-content:center;gap:6px;font-size:13px;white-space:nowrap}.mr-button:hover:not(:disabled){border-color:var(--mr-accent)}.mr-button.primary{background:var(--mr-accent);border-color:var(--mr-accent);color:var(--dsw-alias-bg-base)}.mr-button.soft{background:color-mix(in srgb,var(--mr-accent) 12%,var(--dsw-alias-bg-layer-1));color:var(--mr-accent)}.mr-button.text{border-color:transparent;background:transparent;color:var(--mr-muted);padding-inline:8px}.mr-button.danger{color:var(--dsw-alias-state-error-primary)}.mr-button.icon{width:40px;height:40px;min-height:40px;padding:0;border-color:transparent;background:transparent;color:inherit}
 .mr-book-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(225px,1fr));gap:16px}.mr-book-card{border:1px solid var(--mr-border);background:var(--dsw-alias-bg-layer-1);border-radius:14px;overflow:hidden;transition:border-color .15s,transform .15s}.mr-book-card:hover{border-color:color-mix(in srgb,var(--mr-accent) 45%,var(--mr-border));transform:translateY(-1px)}.mr-book-open{border:0;background:transparent;color:inherit;width:100%;padding:18px 16px 12px;display:flex;gap:14px;text-align:left;min-width:0}.mr-book-info{min-width:0;flex:1}.mr-book-title-row{display:flex;gap:6px;align-items:flex-start}.mr-book-info h3{font-size:16px;line-height:1.4;margin:1px 0 8px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.mr-book-info p,.mr-book-info small{margin:0;color:var(--mr-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}.mr-book-info small{font-size:11px;margin-top:12px}.mr-badge{flex:0 0 auto;background:var(--dsw-alias-state-error-primary);color:white;font-size:10px;padding:2px 6px;border-radius:10px}.mr-book-actions{display:flex;justify-content:space-between;border-top:1px solid var(--mr-border);padding:3px 8px}
 .mr-cover{position:relative;flex:0 0 66px;width:66px;height:94px;border-radius:6px;background:linear-gradient(145deg,color-mix(in srgb,var(--mr-accent) 35%,var(--dsw-alias-bg-layer-2)),var(--dsw-alias-bg-layer-2));box-shadow:0 4px 12px #0002;overflow:hidden;display:flex;align-items:center;justify-content:center}.mr-cover.small{width:52px;height:74px;flex-basis:52px}.mr-cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1}.mr-cover>span{font-family:serif;font-size:28px;color:var(--mr-accent);opacity:.65}
@@ -1458,24 +1403,22 @@ window.__ModuleLoader__.load({
 .mr-setting-row{display:flex;align-items:center;justify-content:space-between;gap:20px;margin:15px 0;font-size:13px}.mr-stepper{display:flex;align-items:center;gap:12px}.mr-stepper strong{min-width:42px;text-align:center}.mr-theme-picker{display:flex;gap:10px}.mr-swatch{width:34px;height:34px;border-radius:50%;border:2px solid transparent;box-shadow:0 0 0 1px var(--mr-border)}.mr-swatch.active{border-color:var(--mr-accent);box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),0 0 0 4px var(--mr-accent)}.mr-swatch.paper{background:#f4ecdc}.mr-swatch.light{background:#fff}.mr-swatch.green{background:#e3eee5}.mr-swatch.dark{background:#202522}.mr-roadmap p{color:var(--mr-muted);font-size:12px;line-height:1.7;margin:0}
 .mr-notice{position:sticky;top:-20px;z-index:20;margin:-12px auto 16px;max-width:760px;padding:11px 13px;border-radius:10px;background:var(--dsw-alias-bg-overlay);border:1px solid var(--mr-border);box-shadow:0 5px 20px #0002;display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px}.mr-notice.error{border-color:var(--dsw-alias-state-error-primary)}.mr-notice.success{border-color:var(--dsw-alias-state-success-primary)}.mr-notice button{border:0;background:transparent;color:inherit;padding:4px;display:flex}.mr-loading{text-align:center;color:var(--mr-muted);font-size:13px;padding:36px}.mr-error-block{text-align:center;padding:50px 20px;color:var(--dsw-alias-state-error-primary)}
 .mr-reader{--reader-bg:#f4ecdc;--reader-text:#342f27;--reader-muted:#857b68;--reader-border:#d9cfbb;height:100%;min-height:0;display:flex;flex-direction:column;position:relative;overflow:hidden;background:var(--reader-bg);color:var(--reader-text)}.mr-reader.theme-light{--reader-bg:#fff;--reader-text:#292d2b;--reader-muted:#7b817e;--reader-border:#e3e6e4}.mr-reader.theme-green{--reader-bg:#e3eee5;--reader-text:#2d3c31;--reader-muted:#708275;--reader-border:#c5d5c9}.mr-reader.theme-dark{--reader-bg:#202522;--reader-text:#d4d9d5;--reader-muted:#87918b;--reader-border:#3b4540}.mr-reader-header{height:58px;flex:0 0 58px;display:flex;align-items:center;gap:3px;padding:0 14px;border-bottom:1px solid var(--reader-border);background:var(--reader-bg);z-index:3}.mr-reader-heading{flex:1;min-width:0;text-align:center}.mr-reader-heading strong,.mr-reader-heading small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mr-reader-heading strong{font-size:14px}.mr-reader-heading small{font-size:10px;color:var(--reader-muted);margin-top:3px}.mr-reading-progress{height:2px;background:var(--mr-accent,var(--dsw-alias-brand-primary));position:absolute;top:57px;left:0;z-index:4;transition:width .2s}
-.mr-chapter-scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain}.mr-paged-view{flex:1;min-height:0;overflow:hidden;position:relative;padding:0 20px;touch-action:pan-y}.mr-paged-chapter{width:100%;height:100%;margin:0 auto;padding:42px 0 34px;box-sizing:border-box;column-fill:auto;will-change:transform;transition:transform .18s ease-out}.mr-paged-chapter.mr-dragging{transition:none;user-select:none;cursor:grabbing}.mr-paged-chapter.mr-curling{transition:none}.mr-paged-chapter.mr-turning{transition:none}.mr-paged-chapter.mr-fade-in{animation:mr-page-fade .24s ease both}@keyframes mr-page-fade{from{opacity:.2}to{opacity:1}}.mr-turn-host{contain:layout paint}.mr-turn-shade{position:absolute;inset:0;pointer-events:none;opacity:0;background:linear-gradient(90deg,rgba(0,0,0,.04),rgba(0,0,0,.22) 60%,rgba(0,0,0,.45))}@media (prefers-reduced-motion:reduce){.mr-chapter-veil{animation-duration:.3s}.mr-paged-chapter{transition:none}}.mr-reader.mr-reduced .mr-paged-chapter{transition:none}.mr-reader.mr-reduced .mr-chapter-veil{animation-duration:.3s}.mr-reader.mr-reduced .mr-paged-chapter.mr-fade-in{animation:none}.mr-curl-overlay{position:absolute;inset:0;width:100%;height:100%;z-index:7;pointer-events:none}.mr-chapter.mr-paged-chapter{width:100%}.mr-chapter-veil{position:absolute;left:50%;top:46%;transform:translate(-50%,-50%);z-index:6;pointer-events:none;padding:10px 16px;border-radius:10px;background:color-mix(in srgb,var(--reader-bg) 88%,transparent);color:var(--reader-muted);font-size:13px;letter-spacing:.08em;box-shadow:0 8px 24px #0002;animation:mr-veil-in 1.05s ease both}.mr-chapter-veil.show{opacity:1}@keyframes mr-veil-in{0%{opacity:0;transform:translate(-50%,-42%)}18%,70%{opacity:1;transform:translate(-50%,-50%)}100%{opacity:0;transform:translate(-50%,-54%)}}.mr-chapter{width:min(100% - 40px,720px);margin:0 auto;padding:46px 0 70px;font-family:Georgia,'Noto Serif SC','Songti SC',serif}.font-sans .mr-chapter{font-family:system-ui,'Noto Sans SC',sans-serif}.mr-mode-toggle{border:1px solid var(--reader-border);background:transparent;color:var(--reader-muted);border-radius:7px;padding:5px 8px;font-size:11px;line-height:1;min-height:28px;white-space:nowrap}.mr-mode-toggle:hover{color:var(--reader-text)}.mr-mode-picker{display:flex;gap:8px;margin:0 0 14px}.mr-mode-choice{flex:1;border:1px solid var(--reader-border);background:transparent;color:var(--reader-muted);border-radius:8px;padding:8px;font-size:13px}.mr-mode-choice.active{border-color:var(--reader-accent);color:var(--reader-accent);background:color-mix(in srgb,var(--reader-accent) 10%,transparent)}.mr-page-nav{display:flex;align-items:center;gap:8px}.mr-page-btn{width:34px;height:34px;border:1px solid var(--reader-border);border-radius:8px;background:transparent;color:var(--reader-text);font-size:20px;line-height:1;display:flex;align-items:center;justify-content:center}.mr-page-btn:disabled{opacity:.35}.mr-page-nav span{min-width:52px;text-align:center;font-variant-numeric:tabular-nums}.mr-chapter h1{font-size:1.35em;line-height:1.5;margin:0 0 32px;font-weight:650}.mr-chapter p{margin:0 0 1em;text-align:justify;overflow-wrap:anywhere}.mr-chapter-end{display:flex;justify-content:center;padding:28px 0;color:var(--reader-muted);font-size:12px}.mr-reader-footer{height:50px;flex:0 0 50px;border-top:1px solid var(--reader-border);display:flex;align-items:center;justify-content:space-between;padding:0 18px;color:var(--reader-muted);font-size:11px;background:var(--reader-bg)}
+.mr-chapter-scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;mask-image:linear-gradient(to bottom,transparent 0,#000 1.6em,#000 calc(100% - 1.6em),transparent 100%);-webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 1.6em,#000 calc(100% - 1.6em),transparent 100%)}.mr-paged-view{flex:1;min-height:0;overflow:hidden;position:relative;padding:0 20px;touch-action:pan-y}.mr-paged-chapter{width:100%;height:100%;margin:0 auto;padding:42px 0 34px;box-sizing:border-box;column-fill:auto;will-change:transform;transition:transform .18s ease-out}.mr-paged-chapter.mr-dragging{transition:none;user-select:none;cursor:grabbing}.mr-paged-chapter.mr-turning{transition:none}.mr-paged-chapter.mr-fade-in{animation:mr-page-fade .24s ease both}@keyframes mr-page-fade{from{opacity:.2}to{opacity:1}}.mr-turn-host{contain:layout paint}.mr-turn-shade{position:absolute;inset:0;pointer-events:none;opacity:0;background:linear-gradient(90deg,rgba(0,0,0,.04),rgba(0,0,0,.22) 60%,rgba(0,0,0,.45))}@media (prefers-reduced-motion:reduce){.mr-chapter-veil{animation-duration:.3s}.mr-paged-chapter{transition:none}}.mr-reader.mr-reduced .mr-paged-chapter{transition:none}.mr-reader.mr-reduced .mr-chapter-veil{animation-duration:.3s}.mr-reader.mr-reduced .mr-paged-chapter.mr-fade-in{animation:none}.mr-chapter.mr-paged-chapter{width:100%}.mr-chapter-veil{position:absolute;left:50%;top:46%;transform:translate(-50%,-50%);z-index:6;pointer-events:none;padding:10px 16px;border-radius:10px;background:color-mix(in srgb,var(--reader-bg) 88%,transparent);color:var(--reader-muted);font-size:13px;letter-spacing:.08em;box-shadow:0 8px 24px #0002;animation:mr-veil-in 1.05s ease both}.mr-chapter-veil.show{opacity:1}@keyframes mr-veil-in{0%{opacity:0;transform:translate(-50%,-42%)}18%,70%{opacity:1;transform:translate(-50%,-50%)}100%{opacity:0;transform:translate(-50%,-54%)}}.mr-chapter{width:min(100% - 40px,720px);margin:0 auto;padding:46px 0 70px;font-family:Georgia,'Noto Serif SC','Songti SC',serif}.font-sans .mr-chapter{font-family:system-ui,'Noto Sans SC',sans-serif}.mr-mode-toggle{border:1px solid var(--reader-border);background:transparent;color:var(--reader-muted);border-radius:7px;padding:5px 8px;font-size:11px;line-height:1;min-height:28px;white-space:nowrap}.mr-mode-toggle:hover{color:var(--reader-text)}.mr-mode-picker{display:flex;gap:8px;margin:0 0 14px}.mr-mode-choice{flex:1;border:1px solid var(--reader-border);background:transparent;color:var(--reader-muted);border-radius:8px;padding:8px;font-size:13px}.mr-mode-choice.active{border-color:var(--reader-accent);color:var(--reader-accent);background:color-mix(in srgb,var(--reader-accent) 10%,transparent)}.mr-page-nav{display:flex;align-items:center;gap:8px}.mr-page-btn{width:34px;height:34px;border:1px solid var(--reader-border);border-radius:8px;background:transparent;color:var(--reader-text);font-size:20px;line-height:1;display:flex;align-items:center;justify-content:center}.mr-page-btn:disabled{opacity:.35}.mr-page-nav span{min-width:52px;text-align:center;font-variant-numeric:tabular-nums}.mr-chapter h1{font-size:1.35em;line-height:1.5;margin:0 0 32px;font-weight:650}.mr-chapter p{margin:0 0 1em;text-align:justify;overflow-wrap:anywhere}.mr-chapter-end{display:flex;justify-content:center;padding:28px 0;color:var(--reader-muted);font-size:12px}.mr-reader-footer{height:50px;flex:0 0 50px;border-top:1px solid var(--reader-border);display:flex;align-items:center;justify-content:space-between;padding:0 18px;color:var(--reader-muted);font-size:11px;background:var(--reader-bg)}
 .mr-drawer-backdrop{position:absolute;inset:0;background:#0004;z-index:8}.mr-drawer{position:absolute;top:0;right:0;bottom:0;width:min(390px,88%);z-index:9;background:var(--reader-bg);border-left:1px solid var(--reader-border);box-shadow:-12px 0 30px #0002;display:flex;flex-direction:column}.mr-drawer-head{height:58px;flex:0 0 58px;padding:0 14px 0 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--reader-border)}.mr-drawer-head h2{font-size:16px}.mr-toc{overflow-y:auto;padding:8px}.mr-toc button{display:block;width:100%;min-height:42px;text-align:left;padding:10px 12px;border:0;border-radius:7px;background:transparent;color:var(--reader-text);font-size:13px;line-height:1.5}.mr-toc button:hover,.mr-toc button.active{background:color-mix(in srgb,var(--reader-text) 8%,transparent)}.mr-toc button.active{color:var(--mr-accent,var(--dsw-alias-brand-primary));font-weight:600}.mr-drawer-body{padding:20px;overflow-y:auto}.mr-drawer-body>label{display:block;font-size:12px;color:var(--reader-muted);margin:20px 0 9px}.mr-drawer-body>label:first-child{margin-top:0}.mr-drawer-body input[type=range],.mr-drawer-body select{width:100%}.mr-note-editor textarea{width:100%;resize:vertical;background:transparent;color:var(--reader-text);border-color:var(--reader-border)}.mr-note-editor .mr-button{margin-top:8px}.mr-notes{margin-top:20px}.mr-notes article{border-top:1px solid var(--reader-border);padding:14px 0;font-size:13px}.mr-notes blockquote,.mr-drawer-body>blockquote{margin:0 0 12px;padding:9px 12px;border-left:3px solid var(--reader-muted);color:var(--reader-muted);font-size:12px;line-height:1.6;overflow-wrap:anywhere}.mr-notes p{line-height:1.6;white-space:pre-wrap}
 .mr-open-shift{position:fixed;z-index:80;overflow:hidden;pointer-events:none;contain:layout paint}
 .mr-open-veil{position:absolute;inset:0;opacity:.96;animation:mr-open-veil .46s ease-out both}
 @keyframes mr-open-veil{0%{opacity:.96}40%{opacity:1}100%{opacity:0}}
-.mr-open-shelf{position:absolute;background-size:100% 100%;background-repeat:no-repeat;animation:mr-open-shelf .46s ease-out both;-webkit-mask-image:radial-gradient(115% 88% at 50% 46%,#000 58%,rgba(0,0,0,.55) 82%,transparent 100%);mask-image:radial-gradient(115% 88% at 50% 46%,#000 58%,rgba(0,0,0,.55) 82%,transparent 100%)}
-@keyframes mr-open-shelf{0%,38%{opacity:1}100%{opacity:0}}
 .mr-open-cover{position:absolute;border-radius:5px;overflow:hidden;transform-origin:50% 50%;will-change:transform,opacity;box-shadow:0 24px 60px rgba(0,0,0,.34),0 5px 14px rgba(0,0,0,.22);background:#cbb99b}
 .mr-open-cover img{display:block;width:100%;height:100%;object-fit:cover}
 .mr-open-cover span{display:flex;align-items:center;justify-content:center;width:100%;height:100%;font-family:Georgia,'Noto Serif SC',serif;font-size:24px;color:#4a3d2c;background:linear-gradient(150deg,#dfcfae,#bfa986)}
 .mr-open-spine{position:absolute;left:0;top:0;bottom:0;width:5px;background:linear-gradient(90deg,rgba(0,0,0,.28),rgba(255,255,255,.12) 62%,transparent)}
 .mr-ambience{position:absolute;inset:0;z-index:0;overflow:hidden;pointer-events:none;contain:strict}.mr-ambience canvas{display:block;width:100%;height:100%}.mr-reader-header,.mr-reader-footer{position:relative;z-index:3}.mr-chapter-scroll,.mr-paged-view{position:relative;z-index:2}.mr-loading,.mr-error-block{position:relative;z-index:2}
-@media(max-width:720px){.mr-root{flex-direction:column;padding-left:88px}.mr-section-actions{width:100%;justify-content:space-between}.mr-shelf3d{height:58vh;min-height:340px}.mr-shelf3d-hint{left:12px;bottom:10px;font-size:10px}.mr-reader{padding-left:88px}.mr-paged-view{padding:0 14px}.mr-mode-toggle{display:none}.mr-reader-heading small{display:none}.mr-reader-heading strong{max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-content{order:1;padding:20px 14px}.mr-section-head{flex-wrap:wrap;margin-bottom:18px}.mr-section-head h2{font-size:22px;white-space:nowrap}.mr-book-grid{grid-template-columns:1fr;gap:10px}.mr-book-open{padding:13px}.mr-book-actions{position:relative}.mr-searchbar{flex-wrap:wrap}.mr-searchbar select{max-width:none;width:100%}.mr-searchbar input{flex:1}.mr-result{align-items:flex-start;padding:12px;gap:10px}.mr-result .mr-button{align-self:center;padding-inline:9px}.mr-result-info .mr-intro{-webkit-line-clamp:1}.mr-source-row{flex-wrap:wrap}.mr-source-row .mr-tag{display:none}.mr-panel{padding:16px}.mr-notice{top:-12px}.mr-reader-header{padding:0 5px}.mr-reader-heading strong{font-size:12px}.mr-chapter{width:calc(100% - 34px);padding-top:30px}.mr-chapter h1{margin-bottom:24px}.mr-drawer{left:88px;right:0;width:auto}}
+@media(max-width:720px){.mr-root{flex-direction:column;padding-left:88px}.mr-section-actions{width:100%;justify-content:space-between}.mr-reader{padding-left:88px}.mr-paged-view{padding:0 14px}.mr-mode-toggle{display:none}.mr-reader-heading small{display:none}.mr-reader-heading strong{max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-content{order:1;padding:20px 14px}.mr-section-head{flex-wrap:wrap;margin-bottom:18px}.mr-section-head h2{font-size:22px;white-space:nowrap}.mr-book-grid{grid-template-columns:1fr;gap:10px}.mr-book-open{padding:13px}.mr-book-actions{position:relative}.mr-searchbar{flex-wrap:wrap}.mr-searchbar select{max-width:none;width:100%}.mr-searchbar input{flex:1}.mr-result{align-items:flex-start;padding:12px;gap:10px}.mr-result .mr-button{align-self:center;padding-inline:9px}.mr-result-info .mr-intro{-webkit-line-clamp:1}.mr-source-row{flex-wrap:wrap}.mr-source-row .mr-tag{display:none}.mr-panel{padding:16px}.mr-notice{top:-12px}.mr-reader-header{padding:0 5px}.mr-reader-heading strong{font-size:12px}.mr-chapter{width:calc(100% - 34px);padding-top:30px}.mr-chapter h1{margin-bottom:24px}.mr-drawer{left:88px;right:0;width:auto}}
 `;
 
     return {
       inject: ['slots', 'layout', 'remote'],
-      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath } } : {}),
+      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, scrollMotion } } : {}),
       async apply(ctx) {
         const unmount = await ctx.remote.$mount(readerContribution);
         const ui = ctx.inject(['remote.reader'], (inner) => {

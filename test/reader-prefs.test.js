@@ -10,7 +10,8 @@ test('settings defaults carry mode/flipStyle and validate both enums', () => {
   assert.equal(DEFAULT_SETTINGS.flipStyle, 'slide')
   assert.equal(normalizeSettings({}).mode, 'scroll')
   assert.equal(normalizeSettings({ mode: 'scroll' }).mode, 'scroll')
-  assert.equal(normalizeSettings({ flipStyle: 'curl' }).flipStyle, 'curl')
+  assert.equal(normalizeSettings({ flipStyle: 'curl' }).flipStyle, 'flip')
+  assert.equal(ReaderDomain.global.schema.parse({ ...DEFAULT_SETTINGS, flipStyle: 'curl' }).flipStyle, 'flip')
   assert.throws(() => normalizeSettings({ mode: 'book' }), /mode/)
   assert.throws(() => normalizeSettings({ flipStyle: 'spin' }), /flipStyle/)
 })
@@ -33,11 +34,11 @@ test('setBookSettings writes, merges, clears a key and clears all overrides', as
   assert.equal(db.books.get(book.id).readerPrefs.mode, 'scroll')
 
   const merged = await service.setBookSettings({ bookId: book.id, flipStyle: 'curl', ambience: 'paper' })
-  assert.deepEqual(merged.readerPrefs, { mode: 'scroll', flipStyle: 'curl', ambience: 'paper' })
-  assert.deepEqual((await service.state()).books[0].readerPrefs, { mode: 'scroll', flipStyle: 'curl', ambience: 'paper' })
+  assert.deepEqual(merged.readerPrefs, { mode: 'scroll', flipStyle: 'flip', ambience: 'paper' })
+  assert.deepEqual((await service.state()).books[0].readerPrefs, { mode: 'scroll', flipStyle: 'flip', ambience: 'paper' })
 
   const dropped = await service.setBookSettings({ bookId: book.id, mode: null })
-  assert.deepEqual(dropped.readerPrefs, { flipStyle: 'curl', ambience: 'paper' })
+  assert.deepEqual(dropped.readerPrefs, { flipStyle: 'flip', ambience: 'paper' })
 
   const cleared = await service.setBookSettings({ bookId: book.id, clear: true })
   assert.equal(cleared.readerPrefs, null)
@@ -63,7 +64,7 @@ test('backup keeps readerPrefs and still strips credentials', async () => {
   assert.equal(restored.books[0].progress.offset, 12)
 })
 
-const MOTION_KEYS = ['mode', 'flipStyle', 'animations', 'motionQuality', 'ambience', 'shelfMotion', 'reducedMotion']
+const MOTION_KEYS = ['mode', 'flipStyle', 'animations', 'motionQuality', 'ambience', 'reducedMotion']
 
 test('a global record written before the motion keys parses with defaults', () => {
   const legacy = { ...DEFAULT_SETTINGS }
@@ -74,7 +75,6 @@ test('a global record written before the motion keys parses with defaults', () =
   assert.equal(parsed.animations, true)
   assert.equal(parsed.motionQuality, 'auto')
   assert.equal(parsed.ambience, 'full')
-  assert.equal(parsed.shelfMotion, true)
   assert.equal(parsed.reducedMotion, 'system')
   assert.throws(() => ReaderDomain.global.schema.parse({ ...DEFAULT_SETTINGS, reducedMotion: 'sometimes' }))
 })

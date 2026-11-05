@@ -1,6 +1,6 @@
 # ADR-0001: 混合渲染的 WebGL 阅读动效
 
-- Status: Accepted; amended by [ADR-0002](0002-threejs-webgl-and-3d-shelf.md)
+- Status: Accepted; amended by [ADR-0002](0002-threejs-webgl-and-3d-shelf.md); further amended by [ADR-0004](0004-native-webgl-and-2d-shelf.md)
 - Date: 2026-11-04
 - Deciders: JUNQINGV587, DSH agent
 - Issue: [#1](https://github.com/JUNQINGV587/mo-reader/issues/1)
@@ -42,11 +42,11 @@ Negative:
 - **纯 WebGL 文字**：拒绝。文字会糊，选择/朗读/无障碍全丢。
 - **CSS-only 卷曲**：拒绝。分条 transform 会切字，和“流畅”目标冲突；用户选混合。
 - **html2canvas**：拒绝。增加依赖与体积，CSS/字体保真不可控；页面结构已知，自己画更稳。
-- **three.js**：已被 [ADR-0002](0002-threejs-webgl-and-3d-shelf.md) 取代。原判断是 2.5D 页面变形 + 全屏光影/粒子用原生 WebGL 更划算；维护者确认书架要真 3D 并选择“全局统一”后，three.js 作为共享懒加载 chunk 进入，只负责 WebGL 像素，文字仍是 DOM。
+- **three.js**：先后被 [ADR-0002](0002-threejs-webgl-and-3d-shelf.md) 引入、又被 [ADR-0004](0004-native-webgl-and-2d-shelf.md) 移除。当前阅读页用原生 WebGL，书架用 2D，文字仍是 DOM。
 
 ## Revisit
 
-ADR-0002 已取代本 ADR 的 three.js 取舍；以下条件仍保留：
+ADR-0002 引入、ADR-0004 去掉了 three.js；以下条件仍保留：
 
 - 如果 three.js chunk 的 gzip/首开时间或低端机 fps 不过验收，考虑书架专用 chunk 或 OGL/regl。
 - 如果 DSH 宿主不能稳定服务 package-local chunk，退回单包并重新评估体积。

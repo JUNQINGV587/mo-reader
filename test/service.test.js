@@ -101,7 +101,7 @@ test('local TXT/EPUB API and settings validation need no network', async () => {
   assert.equal(JSON.parse(backup).settings.readerTheme, 'dark')
   await service.importBackup({ data: backup })
   assert.equal(service.db.settings.get().fontSize, 22)
-  const motion = { animations: false, motionQuality: 'low', ambience: 'paper', shelfMotion: false, reducedMotion: 'on' }
+  const motion = { animations: false, motionQuality: 'low', ambience: 'paper', reducedMotion: 'on' }
   assert.deepEqual(await service.setSettings(motion), { ...service.db.settings.get(), ...motion })
   assert.equal(service.db.settings.get().ambience, 'paper')
   await assert.rejects(() => service.setSettings({ ambience: 'dim' }), /ambience/)
