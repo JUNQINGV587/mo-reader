@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><title>curl probe</title>
+<style>html,body{margin:0;background:#e9e2d2}#host{position:fixed;left:20px;top:20px;width:min(100vw - 40px, 900px);height:calc(100vh - 40px)}#c{display:none}</style>
+<div id="host"></div><canvas id="c"></canvas>
+<script type="importmap">{"imports":{"three":"/node_modules/three/build/three.module.js"}}</script>
+<script type="module">
+const q = new URLSearchParams(location.search);
+const mod = await import(q.get('src') || '/src/three-entry.js');
+const { mountCurl } = mod;
+const W = Number(q.get('w') || 872), H = Number(q.get('h') || 705);
+const src = document.createElement('canvas');
+src.width = W; src.height = H;
+const ctx = src.getContext('2d');
+const plain = q.get('plain') === '1';
+ctx.fillStyle = '#f4ecdc'; ctx.fillRect(0, 0, W, H);
+if (plain) { ctx.fillStyle = '#c0392b'; ctx.fillRect(0, 0, 8, H); }
+// 左边界与顶部彩色标尺，便于发现错位/条带
+for (let i = 0; !plain && i < 20; i += 1) { ctx.fillStyle = i % 2 ? '#c0392b' : '#2c3e50'; ctx.fillRect(0, i * (H / 20), 26, H / 20); }
+ctx.fillStyle = '#1f2933'; ctx.font = '600 26px Georgia, serif';
+for (let line = 0; !plain && line < 16; line += 1) ctx.fillText(`第 ${line + 1} 行：卷曲纹理探针 — 0123456789 ABCDEFGHIJ`, 44, 60 + line * 40);
+// 细网格：出现条带/拉伸最容易看出来
+ctx.strokeStyle = 'rgba(60,90,140,.35)'; ctx.lineWidth = 1;
+for (let x = 0; !plain && x <= W; x += 20) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+for (let y = 0; !plain && y <= H; y += 20) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+const host = document.getElementById('host');
+const duration = Number(q.get('d') || 4000);
+const direction = Number(q.get('dir') || 1);
+window.__probe = { duration, direction, started: performance.now(), done: false };
+const handle = mountCurl(host, { canvas: src, width: W, height: H, direction, duration,
+  onDone: () => { window.__probe.done = true; window.__probe.endedAt = performance.now(); } });
+window.__probe.handle = !!handle;
+</script>
