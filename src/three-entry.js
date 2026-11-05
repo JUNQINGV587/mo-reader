@@ -1244,15 +1244,15 @@ export function mountCurl(host, options = {}) {
   texture.magFilter = LinearFilter
   texture.generateMipmaps = false
   const material = new ShaderMaterial({
-    transparent: true,
-    depthWrite: false,
+    transparent: false,
+    depthWrite: true,
+    depthTest: true,
     side: DoubleSide,
     uniforms: {
       uMap: { value: texture },
       uProgress: { value: 0 },
       uDirection: { value: direction < 0 ? -1 : 1 },
       uAspect: { value: aspect },
-      uFade: { value: 1 },
     },
     vertexShader: `
       uniform float uProgress;
@@ -1266,9 +1266,7 @@ export function mountCurl(host, options = {}) {
         float front = uDirection > 0.0 ? 1.0 - uProgress * 1.22 : uProgress * 1.22 - 0.22;
         float d = (uv.x - front) * uDirection;
         vShade = 1.0;
-        if (d > 0.30) {
-          p.x = -100.0;
-        } else if (d > 0.0) {
+        if (d > 0.0) {
           float t = d / 0.30;
           float angle = t * 1.5708;
           float radius = 0.30 * uAspect;
@@ -1282,12 +1280,17 @@ export function mountCurl(host, options = {}) {
     `,
     fragmentShader: `
       uniform sampler2D uMap;
-      uniform float uFade;
+      uniform float uProgress;
+      uniform float uDirection;
       varying vec2 vUv;
       varying float vShade;
       void main() {
+        float front = uDirection > 0.0 ? 1.0 - uProgress * 1.22 : uProgress * 1.22 - 0.22;
+        // 页尾仍在网格内；片元阶段丢弃，避免退化三角形横跨页面。
+        float d = (vUv.x - front) * uDirection;
+        if (d > 0.30) discard;
         vec4 color = texture2D(uMap, vUv);
-        gl_FragColor = vec4(color.rgb * vShade, color.a * uFade);
+        gl_FragColor = vec4(color.rgb * vShade, color.a);
       }
     `,
   })
@@ -1314,7 +1317,7 @@ export function mountCurl(host, options = {}) {
     const raw = Math.min(1, Math.max(0, (performance.now() - started) / duration))
     const eased = raw < 0.5 ? 4 * raw * raw * raw : 1 - Math.pow(-2 * raw + 2, 3) / 2
     material.uniforms.uProgress.value = eased
-    material.uniforms.uFade.value = 1 - Math.max(0, (eased - 0.88) / 0.12)
+    dom.style.opacity = String(1 - Math.max(0, (eased - 0.88) / 0.12))
     renderer.render(scene, camera)
     if (raw >= 1) { finish('end'); return }
     frame = requestAnimationFrame(tick)

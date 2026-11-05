@@ -1,63 +1,77 @@
-# 卷曲翻页（Phase 3）实机录屏证据 · 2026-11-05
+# 卷曲翻页横向条带：复现、修复与验证 · 2026-11-05
 
-对应 Issue：JUNQINGV587/mo-reader#8（补 Phase 3 卷曲 680ms 真实录屏）。
+对应 Issue：JUNQINGV587/mo-reader#9；原始录屏同时补齐 JUNQINGV587/mo-reader#8 的 Phase 3 证据。
 
-## 结论先说
+## 结论
 
-- **动画确实跑起来了，时长与实现一致**：`mountCurl` 默认 `duration = 680`（`src/three-entry.js:1222`），实测 overlay 节点存在 697ms（宿主时钟 764ms→1461ms），翻页推进正常（4/6 → 5/6、6/6 → 1/6 均验证过）。
-- **翻完文字可正常选中**：录完后 `.mr-curl-host` 已移除，DOM 文字层回归；脚本在 `.mr-paged-chapter` 内建立 Range，`getSelection()` 返回 `"1段。天"`。
-- **发现异常：卷曲过程中会出现横向条带**。页面区域被数十条横带替代，每条带是页面纹理被压成一行后横向拉伸；同一帧里未被条带覆盖的部分正常。多次录制中都出现，但**不是每一帧**，出现时机不固定（有的 run 在第 60–150ms，有的在 800ms 之后，4000ms 慢放探针里约在 1968–2136ms）。
-- **尚未能定根因**，也**尚不能排除采集端伪影**：证据来自无 GPU 的 headless Chromium（SwiftShader 软件渲染）。详见「已知边界」。
+- **最终产品决定**：默认阅读方式改为上下滚动，不再把卷曲动画作为默认路径。卷曲仍可在设置中手动选择，iPad Safari 的横向条带是已知问题，不阻塞滚动阅读。
+- **真机与软件渲染均复现**：维护者在 iPad + Safari 看到「花屏、很多横线」；本机 headless Chromium / SwiftShader 也能稳定复现。因此这是产品渲染缺陷，不是截图伪影。
+- **本机已确认一个缺陷点**：原顶点着色器把 `d > 0.30` 的顶点直接送到 `p.x = -100.0`，与折边邻点形成横跨页面的退化/巨大三角形。移除屏外位移并在片元阶段丢弃页尾后，Chromium/SwiftShader 不再出现该条带。
+- **真机问题尚未解决**：维护者重启 DSH、彻底关闭并重开 Safari 标签页后仍复现。因此屏外位移不是唯一根因，#9 必须保持打开。
+- **当前单变量实验**：按维护者确认的需求基线，纸张改为 `transparent:false`、恢复 `depthWrite/depthTest`，末尾淡出从 shader uniform 移到 DOM canvas `style.opacity`。接口、回调、680ms 时长与翻页交互不变；该项仍需 iPad Safari 验收。
 
 ## 产物
 
 | 文件 | 内容 |
 | --- | --- |
-| `curl-680ms.gif` | 真实 3080 页面里一次卷曲翻页的 screencast 抽帧（620px 宽，21 帧，约 680ms），第 4 帧可见条带 |
-| `app-stripes-60ms.jpg` | 条带最清楚的一帧（相对动画开始 +60ms，原尺寸 1440×813） |
-| `probe-stripes-2136ms.jpg` | 隔离探针在 4000ms 慢放、+2136ms 的同一现象（合成纹理，不经过 DOM 快照） |
-| `probe.html` | 隔离探针页：用合成 canvas 直接调用 `mountCurl`，可复现 |
+| `curl-680ms.gif` | 修复前真实 3080 页面卷曲录屏抽帧，第 4 帧可见条带 |
+| `app-stripes-60ms.jpg` | 修复前真实页面条带最明显的一帧 |
+| `probe-stripes-2136ms.jpg` | 修复前 4000ms 慢放隔离探针的条带 |
+| `probe-original-65.png` | 原实现固定在原始进度 0.65：页面被黑色横带覆盖，stripe score = 7 |
+| `probe-fixed-65.png` | 修复后同一进度与几何：文字、纸面与卷曲正常，stripe score = 0 |
+| `app-fixed-680ms.jpg` | 修复后真实页面 680ms 动画中的代表帧，无横向条带 |
+| `app-fixed-680ms.json` | 真实页面采样元数据：chunk 注入次数、帧时间、页码、选择与 stripe 指标 |
+| `probe.html` | 合成 canvas 直接调用 `mountCurl`，并逐帧直接读取 WebGL 画布 |
+| 仓库根目录 `scripts/test-curl-stripes.mjs` | 自动启动临时 HTTP 服务与 Chromium，执行确定性回归 |
 
-## 复现步骤
+## 一键回归
 
-### A. 真实页面（需要 3080 在跑，且本机有 Chromium）
-
-```bash
-# 1. 起一个可被 CDP 驱动的 Chromium（无 GPU 环境用 SwiftShader）
-/usr/bin/chromium --headless=new --no-sandbox --disable-dev-shm-usage \
-  --remote-debugging-port=9222 --remote-allow-origins='*' \
-  --user-data-dir=/tmp/mo/profile --window-size=1440,900 \
-  --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader about:blank
-
-# 2. 打开 http://127.0.0.1:3080/ → 侧栏「墨读」→ 列表 → 打开一本 TXT →
-#    header「排版」→ 翻页效果「卷曲」→ 关抽屉
-# 3. 用 CDP 的 Page.startScreencast 抓帧，点 footer 的「下一页」
-```
-
-录屏脚本是临时的（`/tmp/mo/cdp.mjs` + `final.mjs`），未入库；要点只有两个：先 `Target.activateTarget` 让 3080 页成为活动标签（否则 rAF 被冻结、screencast 只出 1 帧），以及每帧 `Page.screencastFrameAck`。
-
-### B. 隔离探针（不需要 DSH）
+在仓库根目录执行（需 Node 24+ 与 `/usr/bin/chromium`；可用 `CHROMIUM` 覆盖路径）：
 
 ```bash
-cd <repo root>
-python3 -m http.server 8137 --bind 127.0.0.1 --directory .
-# 打开 http://127.0.0.1:8137/docs/evidence/curl-20261105/probe.html?w=900&h=700&d=4000
-# 参数：w/h 合成画布尺寸，d 动画时长（毫秒，默认 4000 便于慢放观察），dir 方向，plain=1 只画纯色
+npm run test:curl
+CURL_DIRECTION=-1 npm run test:curl
+CURL_PROGRESS=time npm run test:curl
 ```
 
-探针只做三件事：画一张合成 canvas（底色 + 色标 + 16 行文字 + 20px 网格）→ `mountCurl(host, { canvas, width, height, duration })` → 记录 `window.__probe`。
+默认使用真实页面几何 **944×605**、时长 **680ms**，并把动画固定在原始进度 **0.65**，消除 rAF 时序抖动。HTTP 服务仅在内存中替换被测模块的计时语句，不改写源文件；源模块 URL 自动加时间戳，避免 ES module 缓存让 A/B 实验误用旧实现。
+
+判定来自 WebGL 画布本身，不经过截图或 DOM：把画布缩到 450×350，计算每行平均亮度和水平差；两行都近似水平均质、相隔两行亮度却跳变超过 15 时记一次跳变，16 行窗口内跳变数即 stripe score，**score ≥ 6 为 FAIL**。
+
+可用变量：`CURL_SRC`、`CURL_DIRECTION`、`CURL_WIDTH`、`CURL_HEIGHT`、`CURL_DURATION`、`CURL_PROGRESS=time`。测试结束会关闭临时浏览器、HTTP 服务并删除临时 profile。
+
+### 修复前后结果
+
+| 用例 | 结果 |
+| --- | --- |
+| 原实现，944×605 / 680ms / 固定 0.65 | FAIL，maxScore = 7 |
+| 修复后，同条件正向 | PASS，maxScore = 0 |
+| 修复后，同条件反向 | PASS，maxScore = 3，低于阈值 6 |
+| 修复后完整计时隔离探针 | 完整跑到 done，11 帧，maxScore = 0 |
+| 完整 `npm test` | 36/36 通过 |
+
+## 真实页面验收
+
+操作路径：侧栏「墨读」→「列表」→ `curl-test.txt` →「排版」→「卷曲」→ 下一页。CDP 驱动真实 3080 页面并录制 680ms 动画，结果：
+
+- 页码：`1 / 8` → `2 / 8`。
+- WebGL canvas：944×605；17 个 overlay 采样帧，`maxStripeScore = 0`。
+- overlay 从 614.7ms 到 1312.1ms，约 697ms，结束后正常移除。
+- 翻完后在 `.mr-paged-chapter` 建立 Range，`getSelection()` 为 `"1段。天"`；命中测试仍落在 `BUTTON.mr-page-btn`。
+
+**验证环境说明**：长期运行的 3080 进程未启用 HMR，旧 `client.three.js?rev=…` 是不可变缓存，磁盘重建后该进程仍提供旧 rev。为验证新代码，CDP `Fetch` 只把真实页面请求 `/plugins/@local/mo-reader/client.three.js` 的响应替换为刚重建的 `/data/reader/client.three.js`（`injectedChunks = 1`），其余页面、DOM、纹理捕获与交互均走真实应用。正常部署/重载插件资源后无需此测试注入。
 
 ## 已排除的方向
 
-| 猜测 | 试验 | 结果 |
-| --- | --- | --- |
-| 截图时序 / 抓帧太慢 | 换 `Page.captureScreenshot`（合成器截图）与 `Page.startScreencast`（真实帧）两条路径 | 两条都出现，且同一现象在合成纹理探针里也能出 → 不是抓帧太慢造成的错觉 |
-| DOM 快照（`capturePageCanvas` 逐字符 fillText）有问题 | 绕开 DOM，用合成 canvas 直接喂 `mountCurl` | 同样出现 → 与快照实现无关 |
-| 纹理尺寸 / NPOT | 探针对比 1024×512（POT）与 872×705（NPOT） | 都出现 → 与纹理尺寸无关 |
-| 只有文字才有内容、看不出所以然 | `plain=1` 纯色纹理 | 条带不可见（纯色没有高频内容可暴露），但折角明暗正常 → 是「采样内容错位」，不是整屏失效 |
+| 猜测 | 试验与结论 |
+| --- | --- |
+| 截图时序 / 抓帧太慢 | 合成器截图、screencast、直接 WebGL 像素采样均出现；真机也复现 |
+| DOM 快照 `capturePageCanvas` | 合成 canvas 直接喂 `mountCurl` 也复现，与 DOM 快照无关 |
+| 纹理尺寸 / NPOT / mip | POT 与 NPOT 都复现；纹理使用 LinearFilter 且禁用 mip，不是主因 |
+| 纯色探针可单独作回归 | 不可：纯色在修复前后都为 0；必须使用含文字/对比内容的纹理 |
+| 把页尾顶点塌缩到折边即可 | 不完整：真实 944×605 / 680ms 下仍可能留下细三角形并出现条带；最终同时移除屏外位移并在片元阶段丢弃页尾 |
 
-## 已知边界（重要）
+## 边界
 
-- 本机**没有 GPU**（无 `/dev/dri`），Chromium 走 `--use-angle=swiftshader`；`chrome-devtools` MCP 自带的 Chrome 因 `at: - /opt/google/chrome/chrome` 缺失且禁止 root 启动，用不了。
-- 因此「条带」目前只能确认「在软件渲染 + headless 采集下可稳定出现」，**不能确认它在用户的真实 GPU 浏览器里是否出现**。若真机复现，那是产品缺陷；若不复现，则是采集/合成器层面的伪影，不应改渲染代码。
-- 代码层面的可疑点（供真机复现后参考，不是结论）：顶点着色器把 `d > 0.30` 的顶点 `p.x = -100.0`（`src/three-entry.js` 的 `mountCurl` vertexShader），这些顶点与其邻点构成跨屏巨三角形，与页面共面（`depthWrite: false`、`DoubleSide`），理论上会与正常页面区域发生 z-fighting 并采到被拉伸的单行纹理。把「传送出屏」改成「塌缩到折边」或「片元 discard」是候选修法；但**在没有真机复现前不应动这段代码**。
+- 自动化图形环境仍为本机 SwiftShader；iPad Safari 的人工结果证明原缺陷真实存在，但修复后的真机回归未再次执行。
+- 本证据验证卷曲动画缺陷，不包含其他 three 动效或视觉 redesign。

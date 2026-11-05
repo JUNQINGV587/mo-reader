@@ -28,4 +28,53 @@ window.__probe = { duration, direction, started: performance.now(), done: false 
 const handle = mountCurl(host, { canvas: src, width: W, height: H, direction, duration,
   onDone: () => { window.__probe.done = true; window.__probe.endedAt = performance.now(); } });
 window.__probe.handle = !!handle;
+
+// 直接读 WebGL 画布：横向近乎均质、相邻行却频繁突跳，即用户看到的横线。
+// 与 DOM 文本/快照路径无关，也不依赖截图编码，供 scripts/test-curl-stripes.mjs 判定。
+const gl = host.querySelector('canvas');
+const sample = document.createElement('canvas');
+sample.width = 450;
+sample.height = 350;
+const sampleContext = sample.getContext('2d', { willReadFrequently: true });
+const probe = window.__probe;
+probe.stripeFrames = 0;
+probe.maxStripeScore = 0;
+function measureStripes() {
+  sampleContext.drawImage(gl, 0, 0, sample.width, sample.height);
+  const pixels = sampleContext.getImageData(0, 0, sample.width, sample.height).data;
+  const means = [];
+  const horizontal = [];
+  for (let y = 0; y < sample.height; y += 1) {
+    let sum = 0;
+    let difference = 0;
+    let count = 0;
+    for (let x = 4; x < sample.width - 6; x += 2) {
+      const index = (y * sample.width + x) * 4;
+      const next = index + 8;
+      const luminance = pixels[index] * 0.2126 + pixels[index + 1] * 0.7152 + pixels[index + 2] * 0.0722;
+      const nextLuminance = pixels[next] * 0.2126 + pixels[next + 1] * 0.7152 + pixels[next + 2] * 0.0722;
+      sum += luminance;
+      difference += Math.abs(luminance - nextLuminance);
+      count += 1;
+    }
+    means.push(sum / count);
+    horizontal.push(difference / count);
+  }
+  const jumps = [];
+  for (let y = 0; y < sample.height - 2; y += 1) {
+    if (horizontal[y] < 5 && horizontal[y + 2] < 5 && Math.abs(means[y] - means[y + 2]) > 15) jumps.push(y);
+  }
+  let start = 0;
+  for (let end = 0; end < jumps.length; end += 1) {
+    while (jumps[start] < jumps[end] - 15) start += 1;
+    const score = end - start + 1;
+    if (score > probe.maxStripeScore) {
+      probe.maxStripeScore = score;
+      probe.worstStripeFrame = Math.round(performance.now() - probe.started);
+    }
+  }
+  probe.stripeFrames += 1;
+  if (!probe.done) requestAnimationFrame(measureStripes);
+}
+measureStripes();
 </script>
