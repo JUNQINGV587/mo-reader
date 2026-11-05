@@ -169,6 +169,92 @@ window.__ModuleLoader__.load({
         h('span', null, (book.name || book.title || '书').slice(0, 1)));
     }
 
+    // S5 "glass" shelf backdrop. One extra WebGL context (the reader keeps its
+    // own); degrades to the CSS gradient when WebGL is unavailable.
+    const GLASS_VERT = 'attribute vec2 a;void main(){gl_Position=vec4(a,0.,1.);}';
+    const GLASS_FRAG = [
+      'precision highp float;uniform vec2 uRes;uniform float uTime;',
+      'float blob(vec2 p,vec2 c,float r){return 1.-smoothstep(0.,r,length(p-c));}',
+      'void main(){vec2 uv=gl_FragCoord.xy/uRes;vec2 p=uv;p.x*=uRes.x/uRes.y;float t=uTime*.06;',
+      'float g=clamp((uv.x+uv.y)*.5,0.,1.);',
+      'vec3 c0=vec3(.910,.925,.961);vec3 c1=vec3(.965,.906,.918);vec3 c2=vec3(.918,.953,.925);',
+      'vec3 base=g<.5?mix(c0,c1,g*2.):mix(c1,c2,(g-.5)*2.);',
+      'float b1=blob(p,vec2(.52+.07*sin(t),.66+.05*cos(t*1.3)),.42);',
+      'float b2=blob(p,vec2(.26+.06*cos(t*1.1),.28+.05*sin(t*.9)),.38);',
+      'float b3=blob(p,vec2(.84+.05*sin(t*.8),.22+.05*cos(t*1.2)),.3);',
+      'vec3 col=base;',
+      'col=mix(col,vec3(1.,.624,.478),b1*.14);',
+      'col=mix(col,vec3(.557,.647,.867),b2*.12);',
+      'col=mix(col,vec3(.855,.808,.957),b3*.1);',
+      'col+=(fract(sin(dot(gl_FragCoord.xy,vec2(12.9898,78.233)))*43758.5453)-.5)*.012;',
+      'gl_FragColor=vec4(col,1.);}',
+    ].join('');
+    function GlassCanvas({ reduced = false }) {
+      const ref = useRef(null);
+      useEffect(() => {
+        const canvas = ref.current;
+        if (!canvas || !supportsWebGL()) return;
+        const gl = canvas.getContext('webgl', { alpha: false, antialias: false, depth: false, powerPreference: 'low-power' });
+        if (!gl) return;
+        const compile = (type, source) => {
+          const shader = gl.createShader(type);
+          gl.shaderSource(shader, source);
+          gl.compileShader(shader);
+          if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) { gl.deleteShader(shader); return null; }
+          return shader;
+        };
+        const vs = compile(gl.VERTEX_SHADER, GLASS_VERT);
+        const fs = compile(gl.FRAGMENT_SHADER, GLASS_FRAG);
+        if (!vs || !fs) return;
+        const program = gl.createProgram();
+        gl.attachShader(program, vs);
+        gl.attachShader(program, fs);
+        gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return;
+        const buffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+        const a = gl.getAttribLocation(program, 'a');
+        gl.enableVertexAttribArray(a);
+        gl.vertexAttribPointer(a, 2, gl.FLOAT, false, 0, 0);
+        const uRes = gl.getUniformLocation(program, 'uRes');
+        const uTime = gl.getUniformLocation(program, 'uTime');
+        gl.useProgram(program);
+        let raf = 0;
+        const start = performance.now();
+        const draw = (now) => {
+          raf = requestAnimationFrame(draw);
+          const dpr = Math.min(window.devicePixelRatio || 1, 2);
+          const w = Math.floor(canvas.clientWidth * dpr);
+          const h = Math.floor(canvas.clientHeight * dpr);
+          if (canvas.width !== w || canvas.height !== h) {
+            canvas.width = w;
+            canvas.height = h;
+            gl.viewport(0, 0, w, h);
+          }
+          gl.uniform2f(uRes, w, h);
+          gl.uniform1f(uTime, reduced ? 0 : (now - start) / 1000);
+          gl.clearColor(0.91, 0.925, 0.961, 1);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+        };
+        raf = requestAnimationFrame(draw);
+        const onLost = (event) => { event.preventDefault(); cancelAnimationFrame(raf); };
+        const onRestored = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(draw); };
+        canvas.addEventListener('webglcontextlost', onLost);
+        canvas.addEventListener('webglcontextrestored', onRestored);
+        return () => {
+          cancelAnimationFrame(raf);
+          canvas.removeEventListener('webglcontextlost', onLost);
+          canvas.removeEventListener('webglcontextrestored', onRestored);
+          gl.deleteBuffer(buffer);
+          gl.deleteProgram(program);
+          gl.getExtension('WEBGL_lose_context')?.loseContext();
+        };
+      }, [reduced]);
+      return h('canvas', { ref, className: 'mr-glass', 'aria-hidden': 'true' });
+    }
+
     const SHELF_MAX_BOOKS = 48;
 
     function shelfLayout(books = []) {
@@ -260,7 +346,10 @@ window.__ModuleLoader__.load({
               h('button', { className: view === 'list' ? 'active' : '', onClick: () => onView('list') }, '列表')),
             h(Button, { icon: 'refresh', onClick: onCheck, disabled: busy }, '补查'))),
         view === 'shelf'
-          ? h(ShelfBoard, { books, reducedMotion, onOpen })
+          ? [
+            h(GlassCanvas, { key: 'glass', reduced: reducedMotion }),
+            h(ShelfBoard, { key: 'shelf', books, reducedMotion, onOpen }),
+          ]
           : h('div', { className: 'mr-book-grid' }, books.map((book) => {
           const id = book.id || book.bookId;
           const name = book.name || book.title || '未命名';
@@ -1363,35 +1452,37 @@ window.__ModuleLoader__.load({
 .mr-view-toggle{display:inline-flex;padding:3px;border:1px solid var(--mr-border);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}
 .mr-view-toggle button{min-height:30px;padding:4px 12px;border:0;border-radius:7px;background:transparent;color:var(--mr-muted);font-size:12px}
 .mr-view-toggle button.active{background:var(--dsw-alias-bg-layer-2);color:var(--mr-text);font-weight:650}
-.mr-shelf{display:flex;flex-direction:column;gap:26px}
-.mr-shelf-hero{display:grid;grid-template-columns:132px 1fr;gap:24px;align-items:center;padding:20px 24px;border:1px solid #e6ddcf;border-radius:18px;background:linear-gradient(180deg,#faf6ee,#f3ebdd);box-shadow:inset 0 1px 0 #fff9,0 18px 36px -30px #5a4028}
-.mr-shelf-hero-cover{width:132px;padding:0;border:0;background:transparent;color:inherit;border-radius:3px;cursor:pointer}
+.mr-glass{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-events:none}
+.mr-content{background:linear-gradient(135deg,#E8ECF5 0%,#F6E7EA 55%,#EAF3EC 100%)}
+.mr-shelf{position:relative;z-index:1;display:flex;flex-direction:column;gap:26px}
+.mr-shelf-hero{display:grid;grid-template-columns:132px 1fr;gap:24px;align-items:center;padding:20px 24px;border:1px solid rgba(255,255,255,.7);border-radius:24px;background:rgba(255,255,255,.62);box-shadow:0 20px 50px rgba(40,50,90,.12);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+.mr-shelf-hero-cover{width:132px;padding:0;border:0;background:transparent;color:inherit;border-radius:10px;cursor:pointer}
 .mr-shelf-hero-info{min-width:0}
-.mr-shelf-eyebrow{margin:0 0 8px;color:#756a5b;font-size:12px;letter-spacing:.14em}
-.mr-shelf-hero-title{margin:0 0 8px;color:#2f2a23;font-size:22px;line-height:1.3;letter-spacing:-.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.mr-shelf-hero-by{margin:0 0 14px;color:#756a5b;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.mr-shelf-progress{height:4px;border-radius:2px;background:#e6ddcf;overflow:hidden;margin:0 0 16px}
-.mr-shelf-progress i{display:block;height:100%;background:#3f6b57;border-radius:2px}
-.mr-shelf-cta{min-height:38px;padding:7px 18px;border:0;border-radius:9px;background:#2f2a23;color:#f8f3e9;font-size:13px;font-weight:600;cursor:pointer}
-.mr-shelf-cta:hover{background:#1f1b16}
+.mr-shelf-eyebrow{margin:0 0 8px;color:#5563D6;font-size:12px;letter-spacing:.14em}
+.mr-shelf-hero-title{margin:0 0 8px;color:#2A2F3A;font-size:24px;line-height:1.3;letter-spacing:-.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mr-shelf-hero-by{margin:0 0 14px;color:#6B7280;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mr-shelf-progress{height:4px;border-radius:2px;background:rgba(255,255,255,.7);overflow:hidden;margin:0 0 16px}
+.mr-shelf-progress i{display:block;height:100%;background:#5563D6;border-radius:2px}
+.mr-shelf-cta{min-height:38px;padding:7px 18px;border:0;border-radius:14px;background:#5563D6;color:#fff;font-size:13px;font-weight:600;cursor:pointer}
+.mr-shelf-cta:hover{background:#4A57C0}
 .mr-shelf-library-head{display:flex;align-items:baseline;justify-content:space-between;margin:0 0 14px}
-.mr-shelf-library-head h3{margin:0;color:#2f2a23;font-size:16px;font-weight:650}
-.mr-shelf-library-head span{color:#756a5b;font-size:12px}
-.mr-shelf-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:30px 24px}
-.mr-shelf-book{display:flex;flex-direction:column;gap:8px;min-width:0;padding:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer;appearance:none;border-radius:3px}
-.mr-shelf-book:focus-visible{outline:2px solid #3f6b57;outline-offset:4px}
+.mr-shelf-library-head h3{margin:0;color:#2A2F3A;font-size:16px;font-weight:650}
+.mr-shelf-library-head span{background:#FF9F7A;color:#2A2F3A;font-size:11px;padding:2px 8px;border-radius:10px}
+.mr-shelf-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:24px 20px}
+.mr-shelf-book{display:flex;flex-direction:column;gap:8px;min-width:0;padding:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer;appearance:none;border-radius:4px}
+.mr-shelf-book:focus-visible{outline:2px solid #5563D6;outline-offset:4px}
 .mr-shelf-book:hover .mr-shelf-cover{transform:translateY(-4px)}
-.mr-shelf-cover{position:relative;display:block;aspect-ratio:2/3;border-radius:2px 3px 3px 2px;overflow:hidden;background:linear-gradient(150deg,hsl(var(--mr-hue,32) 16% 38%),hsl(var(--mr-hue,32) 20% 26%));box-shadow:-1px 0 0 #0000001f inset,2px 0 0 #efe6d5 inset,0 12px 18px -12px #3c2a1a73,0 2px 3px #3c2a1a1f;transition:transform .18s cubic-bezier(.2,.8,.2,1)}
-.mr-shelf-cover::before{content:'';position:absolute;inset:0 auto 0 0;width:6px;background:linear-gradient(90deg,#0000002e,#00000000);z-index:2;pointer-events:none}
-.mr-shelf-cover::after{content:'';position:absolute;inset:0 0 0 auto;width:3px;background:linear-gradient(90deg,#f1e8d8,#e2d7c4);z-index:2;pointer-events:none}
+.mr-shelf-cover{position:relative;display:block;aspect-ratio:2/3;border-radius:4px;overflow:hidden;background:rgba(255,255,255,.55);box-shadow:0 10px 30px rgba(40,50,90,.10);transition:transform .18s cubic-bezier(.2,.8,.2,1)}
+.mr-shelf-cover::before{content:'';position:absolute;inset:0 auto 0 0;width:6px;background:linear-gradient(90deg,rgba(42,47,58,.08),rgba(0,0,0,0));z-index:2;pointer-events:none}
+.mr-shelf-cover::after{content:'';position:absolute;inset:0 0 0 auto;width:3px;background:rgba(255,255,255,.7);z-index:2;pointer-events:none}
 .mr-shelf-cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .mr-shelf-fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:12px 9px 28px}
-.mr-shelf-fallback-title{writing-mode:vertical-rl;font-family:'Songti SC','STSong','Noto Serif SC',serif;font-size:12.5px;line-height:1.5;letter-spacing:.12em;color:#f4ead8;max-height:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-shadow:0 1px 2px #0000004d}
+.mr-shelf-fallback-title{writing-mode:vertical-rl;font-family:'Songti SC','STSong','Noto Serif SC',serif;font-size:12.5px;line-height:1.5;letter-spacing:.12em;color:#2A2F3A;max-height:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mr-shelf-fallback.mr-latin .mr-shelf-fallback-title{writing-mode:horizontal-tb;font-family:'Inter',Georgia,serif;font-size:12px;line-height:1.5;letter-spacing:.02em;max-width:100%;white-space:normal;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;text-align:center}
-.mr-shelf-seal{position:absolute;right:14px;bottom:12px;display:flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:3px;background:#a3412f;color:#f8efe0;font-family:'Songti SC','STSong',serif;font-size:11px;line-height:1;box-shadow:0 1px 0 #ffffff33 inset}
+.mr-shelf-seal{position:absolute;right:14px;bottom:12px;display:flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:4px;background:#FF9F7A;color:#2A2F3A;font-family:'Songti SC','STSong',serif;font-size:11px;line-height:1;box-shadow:0 1px 0 rgba(255,255,255,.4) inset}
 .mr-shelf-meta{display:block;min-width:0}
-.mr-shelf-meta strong{display:block;font-size:12px;line-height:1.45;font-weight:500;color:#2f2a23;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.mr-shelf-meta small{display:block;font-size:11px;color:#756a5b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.mr-shelf-meta strong{display:block;font-size:12px;line-height:1.45;font-weight:500;color:#2A2F3A;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mr-shelf-meta small{display:block;font-size:11px;color:#6B7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
 .mr-shelf.mr-reduced .mr-shelf-cover{transition:none}
 @media (max-width: 720px){.mr-shelf-hero{grid-template-columns:104px 1fr;gap:16px;padding:16px;align-items:start}.mr-shelf-hero-cover{width:104px}.mr-shelf-hero-title{font-size:18px}.mr-shelf-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:22px 14px}}
 .mr-button{min-height:38px;padding:7px 13px;border:1px solid var(--mr-border);border-radius:9px;background:var(--dsw-alias-bg-layer-1);color:var(--mr-text);display:inline-flex;align-items:center;justify-content:center;gap:6px;font-size:13px;white-space:nowrap}.mr-button:hover:not(:disabled){border-color:var(--mr-accent)}.mr-button.primary{background:var(--mr-accent);border-color:var(--mr-accent);color:var(--dsw-alias-bg-base)}.mr-button.soft{background:color-mix(in srgb,var(--mr-accent) 12%,var(--dsw-alias-bg-layer-1));color:var(--mr-accent)}.mr-button.text{border-color:transparent;background:transparent;color:var(--mr-muted);padding-inline:8px}.mr-button.danger{color:var(--dsw-alias-state-error-primary)}.mr-button.icon{width:40px;height:40px;min-height:40px;padding:0;border-color:transparent;background:transparent;color:inherit}
