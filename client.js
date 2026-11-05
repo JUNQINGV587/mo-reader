@@ -30,7 +30,7 @@ window.__ModuleLoader__.load({
       readerTheme: 'paper',
       ttsRate: 1,
       replacements: [],
-      mode: 'paged',
+      mode: 'scroll',
       flipStyle: 'slide',
       animations: true,
       motionQuality: 'auto',
@@ -328,7 +328,7 @@ window.__ModuleLoader__.load({
         h('section', { className: 'mr-panel' }, h('h3', null, '动画'),
           h('p', { className: 'mr-help' }, '无 WebGL 或减少动态时自动瞬时翻页。'),
           h('div', { className: 'mr-setting-row' }, h('span', null, '默认方式'), h('div', { className: 'mr-mode-picker' },
-            h('button', { className: `mr-mode-choice ${(settings.mode || 'paged') === 'paged' ? 'active' : ''}`, onClick: () => onSettings({ mode: 'paged' }) }, '翻页'),
+            h('button', { className: `mr-mode-choice ${(settings.mode || 'scroll') === 'paged' ? 'active' : ''}`, onClick: () => onSettings({ mode: 'paged' }) }, '翻页'),
             h('button', { className: `mr-mode-choice ${settings.mode === 'scroll' ? 'active' : ''}`, onClick: () => onSettings({ mode: 'scroll' }) }, '滚动'))),
           h('div', { className: 'mr-setting-row' }, h('span', null, '默认翻页'), h('div', { className: 'mr-mode-picker' },
             h('button', { className: `mr-mode-choice ${(settings.flipStyle || 'slide') === 'slide' ? 'active' : ''}`, onClick: () => onSettings({ flipStyle: 'slide' }) }, '滑动'),
@@ -424,7 +424,7 @@ window.__ModuleLoader__.load({
       const [retryNonce, setRetryNonce] = useState(0);
       const [failedIndex, setFailedIndex] = useState(-1);
       const bookPrefs = book.readerPrefs || null;
-      const prefMode = bookPrefs?.mode || settings.mode || 'paged';
+      const prefMode = bookPrefs?.mode || settings.mode || 'scroll';
       const prefFlipStyle = bookPrefs?.flipStyle || settings.flipStyle || 'slide';
       const prefAmbience = bookPrefs?.ambience || settings.ambience || 'full';
       // No WebGL or reduced motion means instant page changes; the CSS-based

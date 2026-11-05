@@ -6,9 +6,9 @@ import { createBackup, parseBackup } from '../lib/backup.js'
 import { memoryDb, serviceFixture } from './helpers.js'
 
 test('settings defaults carry mode/flipStyle and validate both enums', () => {
-  assert.equal(DEFAULT_SETTINGS.mode, 'paged')
+  assert.equal(DEFAULT_SETTINGS.mode, 'scroll')
   assert.equal(DEFAULT_SETTINGS.flipStyle, 'slide')
-  assert.equal(normalizeSettings({}).mode, 'paged')
+  assert.equal(normalizeSettings({}).mode, 'scroll')
   assert.equal(normalizeSettings({ mode: 'scroll' }).mode, 'scroll')
   assert.equal(normalizeSettings({ flipStyle: 'curl' }).flipStyle, 'curl')
   assert.throws(() => normalizeSettings({ mode: 'book' }), /mode/)
@@ -69,7 +69,7 @@ test('a global record written before the motion keys parses with defaults', () =
   const legacy = { ...DEFAULT_SETTINGS }
   for (const key of MOTION_KEYS) delete legacy[key]
   const parsed = ReaderDomain.global.schema.parse(legacy)
-  assert.equal(parsed.mode, 'paged')
+  assert.equal(parsed.mode, 'scroll')
   assert.equal(parsed.flipStyle, 'slide')
   assert.equal(parsed.animations, true)
   assert.equal(parsed.motionQuality, 'auto')
@@ -84,7 +84,7 @@ test('Settings.init keeps old rows readable when the new keys are missing', () =
   const legacy = { ...DEFAULT_SETTINGS }
   delete legacy.mode
   delete legacy.flipStyle
-  assert.equal(normalizeSettings({}, legacy).mode, 'paged')
+  assert.equal(normalizeSettings({}, legacy).mode, 'scroll')
   assert.equal(normalizeSettings({}, legacy).flipStyle, 'slide')
   assert.ok(db)
 })
