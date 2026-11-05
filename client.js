@@ -10,7 +10,7 @@ window.__ModuleLoader__.load({
     const REMOTE_METHODS = [
       'state', 'importSource', 'removeSource', 'search', 'discover', 'addBook', 'removeBook',
       'toc', 'chapter', 'saveProgress', 'download', 'cancelJob', 'checkUpdates', 'importLocal',
-      'setSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
+      'setSettings', 'setBookSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
     ];
     const jsonCodec = () => ({ mode: 'strict', typeSymbol: '@local/mo-reader#Json', create: () => z.json() });
     const readerContribution = {
@@ -30,7 +30,52 @@ window.__ModuleLoader__.load({
       readerTheme: 'paper',
       ttsRate: 1,
       replacements: [],
+      mode: 'paged',
+      flipStyle: 'slide',
+      animations: true,
+      motionQuality: 'auto',
+      ambience: 'full',
+      shelfMotion: true,
+      reducedMotion: 'system',
     };
+
+    function prefersReducedMotion() {
+      try { return window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true; }
+      catch { return false; }
+    }
+
+    function supportsWebGL() {
+      try {
+        const canvas = document.createElement('canvas');
+        return Boolean(window.WebGLRenderingContext && (canvas.getContext('webgl2') || canvas.getContext('webgl')));
+      } catch { return false; }
+    }
+
+    // Pure page geometry shared by the paged view and the node tests. Keep
+    // these free of DOM access so a layout change cannot hide a rounding bug.
+    const paginationMath = Object.freeze({
+      totalColumns(scrollWidth, pageWidth, gap) {
+        return Math.max(1, Math.ceil(Number(scrollWidth) / (pageWidth + gap)));
+      },
+      pageCount(totalColumns, columns) {
+        return Math.max(1, columns === 1 ? totalColumns : totalColumns - columns + 1);
+      },
+      pageForPercent(percent, pages) {
+        if (!(pages > 1)) return 0;
+        const value = Math.max(0, Math.min(100, Number(percent) || 0));
+        return Math.max(0, Math.min(pages - 1, Math.round(value / 100 * (pages - 1))));
+      },
+      percentForPage(page, pages) {
+        if (!(pages > 1)) return 0;
+        const value = Math.max(0, Math.min(pages - 1, Number(page) || 0));
+        return Math.round(value / (pages - 1) * 100);
+      },
+      columnForAnchor({ anchorLeft, pageIndex, pageStep, layoutLeft, step, pages }) {
+        const untranslatedLeft = anchorLeft + pageIndex * pageStep;
+        const column = Math.floor((untranslatedLeft - layoutLeft + 1) / step);
+        return Math.max(0, Math.min(pages - 1, column));
+      },
+    });
 
     async function call(ctx, method, args) {
       const result = await ctx.remote.reader[method](args);
@@ -100,7 +145,7 @@ window.__ModuleLoader__.load({
         h('span', null, (book.name || book.title || '书').slice(0, 1)));
     }
 
-    function Shelf3D({ ctx, books, theme, quality, onOpen, onFallback }) {
+    function Shelf3D({ ctx, books, theme, quality, ambience = 'full', reducedMotion = false, onOpen, onFallback }) {
       const hostRef = useRef(null);
       const apiRef = useRef(null);
       const openRef = useRef(onOpen);
@@ -134,6 +179,7 @@ window.__ModuleLoader__.load({
         let cancelled = false;
         (async () => {
           try {
+            if (!supportsWebGL()) { if (active) { setStatus('off'); onFallback?.(); } return; }
             if (typeof require.async !== 'function') throw new Error('当前 DSH 版本不支持按需加载');
             const chunk = await require.async('./client.three.js');
             if (cancelled || !active) return;
@@ -141,6 +187,8 @@ window.__ModuleLoader__.load({
               books,
               theme,
               quality,
+              ambience,
+              reducedMotion,
               onOpen: (book, detail) => shelveOpen(book, detail),
               onError: (cause) => { if (active) { setStatus('error'); setError(cause.message || '3D 书架出错'); } },
               coverLoader: async (book) => {
@@ -173,6 +221,7 @@ window.__ModuleLoader__.load({
       useEffect(() => { apiRef.current?.setBooks(books); }, [books]);
       useEffect(() => { apiRef.current?.setTheme(theme); }, [theme]);
       useEffect(() => { apiRef.current?.setQuality(quality); }, [quality]);
+      useEffect(() => { apiRef.current?.setAmbience(ambience); }, [ambience]);
       return h('div', { className: 'mr-shelf3d' },
         h('div', { ref: hostRef, className: 'mr-shelf3d-host' }),
         status === 'loading' ? h('div', { className: 'mr-shelf3d-status' }, '正在搭书架…') : null,
@@ -182,7 +231,7 @@ window.__ModuleLoader__.load({
         status === 'ready' ? h('div', { className: 'mr-shelf3d-hint' }, '拖动转视角 · 滚轮换层 · 点书翻开') : null);
     }
 
-    function Library({ books, onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality }) {
+    function Library({ books, onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality, ambience, reducedMotion = false, shelfMotion = true }) {
       if (!books.length) return h(Empty, {
         title: '书架还是空的', detail: '去发现搜书，或导入本地书籍。',
       });
@@ -194,8 +243,8 @@ window.__ModuleLoader__.load({
               h('button', { className: view === 'shelf' ? 'active' : '', onClick: () => onView('shelf') }, '书架'),
               h('button', { className: view === 'list' ? 'active' : '', onClick: () => onView('list') }, '列表')),
             h(Button, { icon: 'refresh', onClick: onCheck, disabled: busy }, '补查'))),
-        view === 'shelf'
-          ? h(Shelf3D, { ctx, books, theme, quality, onOpen, onFallback: () => onView('list') })
+        view === 'shelf' && shelfMotion !== false
+          ? h(Shelf3D, { ctx, books, theme, quality, ambience, reducedMotion, onOpen, onFallback: () => onView('list') })
           : h('div', { className: 'mr-book-grid' }, books.map((book) => {
           const id = book.id || book.bookId;
           const name = book.name || book.title || '未命名';
@@ -276,6 +325,34 @@ window.__ModuleLoader__.load({
       };
       return h('div', { className: 'mr-settings' },
         h('div', { className: 'mr-section-head' }, h('div', null, h('h2', null, '阅读设置'), h('p', null, '排版、净化与备份'))),
+        h('section', { className: 'mr-panel' }, h('h3', null, '动画'),
+          h('p', { className: 'mr-help' }, '无 WebGL 或减少动态时自动瞬时翻页。'),
+          h('div', { className: 'mr-setting-row' }, h('span', null, '默认方式'), h('div', { className: 'mr-mode-picker' },
+            h('button', { className: `mr-mode-choice ${(settings.mode || 'paged') === 'paged' ? 'active' : ''}`, onClick: () => onSettings({ mode: 'paged' }) }, '翻页'),
+            h('button', { className: `mr-mode-choice ${settings.mode === 'scroll' ? 'active' : ''}`, onClick: () => onSettings({ mode: 'scroll' }) }, '滚动'))),
+          h('div', { className: 'mr-setting-row' }, h('span', null, '默认翻页'), h('div', { className: 'mr-mode-picker' },
+            h('button', { className: `mr-mode-choice ${(settings.flipStyle || 'slide') === 'slide' ? 'active' : ''}`, onClick: () => onSettings({ flipStyle: 'slide' }) }, '滑动'),
+            h('button', { className: `mr-mode-choice ${settings.flipStyle === 'curl' ? 'active' : ''}`, onClick: () => onSettings({ flipStyle: 'curl' }) }, '卷曲'),
+            h('button', { className: `mr-mode-choice ${settings.flipStyle === 'flip' ? 'active' : ''}`, onClick: () => onSettings({ flipStyle: 'flip' }) }, '翻转'),
+            h('button', { className: `mr-mode-choice ${settings.flipStyle === 'fade' ? 'active' : ''}`, onClick: () => onSettings({ flipStyle: 'fade' }) }, '淡入'))),
+          h('div', { className: 'mr-setting-row' }, h('span', null, '动画开关'), h('div', { className: 'mr-mode-picker' },
+            h('button', { className: `mr-mode-choice ${settings.animations === false ? '' : 'active'}`, onClick: () => onSettings({ animations: true }) }, '开'),
+            h('button', { className: `mr-mode-choice ${settings.animations === false ? 'active' : ''}`, onClick: () => onSettings({ animations: false }) }, '关'))),
+          h('div', { className: 'mr-setting-row' }, h('span', null, '画面质量'), h('div', { className: 'mr-mode-picker' },
+            h('button', { className: `mr-mode-choice ${(settings.motionQuality || 'auto') === 'auto' ? 'active' : ''}`, onClick: () => onSettings({ motionQuality: 'auto' }) }, '自动'),
+            h('button', { className: `mr-mode-choice ${settings.motionQuality === 'high' ? 'active' : ''}`, onClick: () => onSettings({ motionQuality: 'high' }) }, '高'),
+            h('button', { className: `mr-mode-choice ${settings.motionQuality === 'low' ? 'active' : ''}`, onClick: () => onSettings({ motionQuality: 'low' }) }, '低'))),
+          h('div', { className: 'mr-setting-row' }, h('span', null, '氛围'), h('div', { className: 'mr-mode-picker' },
+            h('button', { className: `mr-mode-choice ${(settings.ambience || 'full') === 'full' ? 'active' : ''}`, onClick: () => onSettings({ ambience: 'full' }) }, '完整'),
+            h('button', { className: `mr-mode-choice ${settings.ambience === 'paper' ? 'active' : ''}`, onClick: () => onSettings({ ambience: 'paper' }) }, '仅纸张'),
+            h('button', { className: `mr-mode-choice ${settings.ambience === 'off' ? 'active' : ''}`, onClick: () => onSettings({ ambience: 'off' }) }, '关闭'))),
+          h('div', { className: 'mr-setting-row' }, h('span', null, '书架动效'), h('div', { className: 'mr-mode-picker' },
+            h('button', { className: `mr-mode-choice ${settings.shelfMotion === false ? '' : 'active'}`, onClick: () => onSettings({ shelfMotion: true }) }, '开'),
+            h('button', { className: `mr-mode-choice ${settings.shelfMotion === false ? 'active' : ''}`, onClick: () => onSettings({ shelfMotion: false }) }, '关'))),
+          h('div', { className: 'mr-setting-row' }, h('span', null, '减弱动态'), h('div', { className: 'mr-mode-picker' },
+            h('button', { className: `mr-mode-choice ${(settings.reducedMotion || 'system') === 'system' ? 'active' : ''}`, onClick: () => onSettings({ reducedMotion: 'system' }) }, '跟随系统'),
+            h('button', { className: `mr-mode-choice ${settings.reducedMotion === 'on' ? 'active' : ''}`, onClick: () => onSettings({ reducedMotion: 'on' }) }, '开启'),
+            h('button', { className: `mr-mode-choice ${settings.reducedMotion === 'off' ? 'active' : ''}`, onClick: () => onSettings({ reducedMotion: 'off' }) }, '关闭')))),
         h('section', { className: 'mr-panel' }, h('h3', null, '默认排版'),
           h('div', { className: 'mr-setting-row' }, h('span', null, '字号'), h('div', { className: 'mr-stepper' },
             h(Button, { onClick: () => onSettings({ fontSize: Math.max(14, Number(settings.fontSize || 20) - 1) }) }, '减小'),
@@ -333,7 +410,7 @@ window.__ModuleLoader__.load({
       return canvas;
     }
 
-    function ReaderView({ ctx, book, settings, onSettings, notes, onClose, onSaveNote, onDeleteNote, notify, deferMs = 0 }) {
+    function ReaderView({ ctx, book, settings, onSettings, onBookSettings, notes, onClose, onSaveNote, onDeleteNote, notify, deferMs = 0 }) {
       const [toc, setToc] = useState([]);
       const [chapter, setChapter] = useState(null);
       const [chapterIndex, setChapterIndex] = useState(-1);
@@ -346,10 +423,15 @@ window.__ModuleLoader__.load({
       const [scrollPercent, setScrollPercent] = useState(0);
       const [retryNonce, setRetryNonce] = useState(0);
       const [failedIndex, setFailedIndex] = useState(-1);
-      const [mode, setMode] = useState(() => {
-        try { return window.localStorage.getItem('mo-reader:mode') === 'scroll' ? 'scroll' : 'paged'; }
-        catch { return 'paged'; }
-      });
+      const bookPrefs = book.readerPrefs || null;
+      const prefMode = bookPrefs?.mode || settings.mode || 'paged';
+      const prefFlipStyle = bookPrefs?.flipStyle || settings.flipStyle || 'slide';
+      const prefAmbience = bookPrefs?.ambience || settings.ambience || 'full';
+      // No WebGL or reduced motion means instant page changes; the CSS-based
+      // slide/flip/fade styles stay available when WebGL is missing only if
+      // the user has motion on, so this flag also gates CSS animation.
+      const motionOff = prefersReducedMotion() || settings.reducedMotion === 'on' || settings.animations === false;
+      const [mode, setMode] = useState(prefMode);
       const [columns, setColumns] = useState(1);
       const [pageIndex, setPageIndex] = useState(0);
       const [pageCount, setPageCount] = useState(1);
@@ -358,12 +440,7 @@ window.__ModuleLoader__.load({
       const [dragging, setDragging] = useState(false);
       const [dragOffset, setDragOffset] = useState(0);
       const [chapterVeil, setChapterVeil] = useState('');
-      const [flipStyle, setFlipStyle] = useState(() => {
-        try {
-          const saved = window.localStorage.getItem('mo-reader:flip');
-          return ['slide', 'curl', 'flip', 'fade'].includes(saved) ? saved : 'slide';
-        } catch { return 'slide'; }
-      });
+      const [flipStyle, setFlipStyle] = useState(prefFlipStyle);
       const [curling, setCurling] = useState(false);
       const [turning, setTurning] = useState(false);
       const [fadeIn, setFadeIn] = useState(false);
@@ -381,23 +458,29 @@ window.__ModuleLoader__.load({
       const turnRef = useRef(false);
       const turnTimer = useRef(null);
       const readerThreeRef = useRef(null);
+      const ambienceHostRef = useRef(null);
+      const ambienceRef = useRef(null);
+      const drawerRef = useRef('');
+      drawerRef.current = drawer;
       const veilTimer = useRef(null);
       const measureRef = useRef(null);
       const requestRef = useRef(0);
       const speechGeneration = useRef(0);
       const saveTimer = useRef(null);
-      const progressRef = useRef({ bookId: book.id || book.bookId, chapterId: null, percent: 0 });
+      const webglRef = useRef(true);
+      const pendingOffsetRef = useRef(null);
+      const progressRef = useRef({ bookId: book.id || book.bookId, chapterId: null, percent: 0, offset: 0 });
       const bookId = book.id || book.bookId;
       const theme = settings.readerTheme || 'paper';
       useEffect(() => { pageIndexRef.current = pageIndex; }, [pageIndex]);
-      useEffect(() => {
-        try { window.localStorage.setItem('mo-reader:mode', mode); }
-        catch {}
-      }, [mode]);
-      useEffect(() => {
-        try { window.localStorage.setItem('mo-reader:flip', flipStyle); }
-        catch {}
-      }, [flipStyle]);
+      useEffect(() => { webglRef.current = supportsWebGL(); }, []);
+      useEffect(() => { setMode(prefMode); }, [prefMode]);
+      useEffect(() => { setFlipStyle(prefFlipStyle); }, [prefFlipStyle]);
+      const persistPref = (key, value) => {
+        if (bookPrefs) onBookSettings?.({ [key]: value });
+        else onSettings?.({ [key]: value });
+      };
+      const chooseFlip = (value) => { setFlipStyle(value); persistPref('flipStyle', value); };
       useEffect(() => () => {
         curlingRef.current = false;
         curlRef.current?.dispose?.();
@@ -409,9 +492,126 @@ window.__ModuleLoader__.load({
         turnHostRef.current = null;
         turnRef.current = false;
       }, []);
+      useEffect(() => {
+        const host = ambienceHostRef.current;
+        if (!host) return undefined;
+        if (!webglRef.current || motionOff || prefAmbience === 'off') return undefined;
+        let active = true;
+        let api = null;
+        (async () => {
+          try {
+            const module = readerThreeRef.current || await require.async('./client.three.js');
+            readerThreeRef.current = module;
+            if (!active || !ambienceHostRef.current) return;
+            if (!module || typeof module.mountAmbience !== 'function') return;
+            api = module.mountAmbience(ambienceHostRef.current, {
+              theme: settings.readerTheme || 'paper',
+              quality: settings.motionQuality || 'auto',
+              ambience: prefAmbience,
+              reducedMotion: motionOff,
+            });
+            ambienceRef.current = api;
+            api.setProgress((scrollPercent || 0) / 100);
+            if (drawerRef.current || document.hidden) api.pause();
+          } catch {}
+        })();
+        return () => {
+          active = false;
+          try { api?.dispose?.(); } catch {}
+          if (ambienceRef.current === api) ambienceRef.current = null;
+        };
+      }, [prefAmbience, motionOff]);
+      useEffect(() => { ambienceRef.current?.setTheme(theme); }, [theme]);
+      useEffect(() => { ambienceRef.current?.setQuality(settings.motionQuality || 'auto'); }, [settings.motionQuality]);
+      useEffect(() => { ambienceRef.current?.setAmbience(prefAmbience); }, [prefAmbience]);
+      useEffect(() => {
+        const total = pageCount > 1 ? (pageIndex + Math.min(1, scrollPercent / 100)) / pageCount : (scrollPercent || 0) / 100;
+        ambienceRef.current?.setProgress(total);
+      }, [scrollPercent, pageIndex, pageCount]);
+      useEffect(() => { ambienceRef.current?.setSeam(turning || curling ? 0.45 : 0, 0.5); }, [turning, curling]);
+      useEffect(() => {
+        const api = ambienceRef.current;
+        if (!api) return;
+        if (drawer || document.hidden) api.pause();
+        else api.resume();
+      }, [drawer]);
+      useEffect(() => {
+        let timer = 0;
+        const wake = () => {
+          const api = ambienceRef.current;
+          if (api && !document.hidden && !drawerRef.current) api.resume();
+          window.clearTimeout(timer);
+          timer = window.setTimeout(() => { ambienceRef.current?.pause(); }, 8000);
+        };
+        const events = ['pointerdown', 'pointermove', 'keydown', 'wheel', 'touchstart'];
+        for (const name of events) window.addEventListener(name, wake, { passive: true });
+        timer = window.setTimeout(() => { ambienceRef.current?.pause(); }, 8000);
+        return () => {
+          for (const name of events) window.removeEventListener(name, wake);
+          window.clearTimeout(timer);
+        };
+      }, []);
       const chapterIdAt = (index = chapterIndex) => {
         const item = toc[index];
         return item && (item.id || item.chapterId || item.url || item.chapterUrl || String(index));
+      };
+      const articleTextNodes = () => {
+        const article = articleRef.current;
+        if (!article) return [];
+        const walker = document.createTreeWalker(article, NodeFilter.SHOW_TEXT);
+        const nodes = [];
+        while (walker.nextNode()) {
+          const node = walker.currentNode;
+          if (node.nodeValue && node.nodeValue.length) nodes.push(node);
+        }
+        return nodes;
+      };
+      const offsetOfNode = (node, nodeOffset) => {
+        if (!node || node.nodeType !== 3) return null;
+        const nodes = articleTextNodes();
+        const index = nodes.indexOf(node);
+        if (index < 0) return null;
+        let total = 0;
+        for (let i = 0; i < index; i += 1) total += nodes[i].nodeValue.length;
+        return total + Math.max(0, Math.min(Number(nodeOffset) || 0, node.nodeValue.length));
+      };
+      const nodeAtOffset = (offset) => {
+        const nodes = articleTextNodes();
+        let rest = Math.max(0, Math.floor(Number(offset) || 0));
+        for (const node of nodes) {
+          if (rest <= node.nodeValue.length) return { node, offset: rest };
+          rest -= node.nodeValue.length;
+        }
+        const last = nodes[nodes.length - 1];
+        return last ? { node: last, offset: last.nodeValue.length } : null;
+      };
+      const caretFromPoint = (x, y) => {
+        try {
+          if (document.caretRangeFromPoint) {
+            const range = document.caretRangeFromPoint(x, y);
+            if (range) return { node: range.startContainer, offset: range.startOffset };
+          }
+          if (document.caretPositionFromPoint) {
+            const position = document.caretPositionFromPoint(x, y);
+            if (position) return { node: position.offsetNode, offset: position.offset };
+          }
+        } catch {}
+        return null;
+      };
+      // First character of the page currently in view, as a character offset
+      // into the whole chapter (not the DOM node). Percent cannot survive a
+      // font-size change; an offset can be mapped back to the exact column.
+      const pageStartOffset = () => {
+        const view = pagedRef.current;
+        const rect = view?.getBoundingClientRect();
+        if (!rect) return null;
+        const points = [[rect.left + 28, rect.top + 60], [rect.left + 28, rect.top + 110], [rect.left + 28, rect.bottom - 40]];
+        for (const [x, y] of points) {
+          const point = caretFromPoint(x, y);
+          const offset = point ? offsetOfNode(point.node, point.offset) : null;
+          if (offset != null) return offset;
+        }
+        return null;
       };
       const showChapterVeil = (text) => {
         if (!text) return;
@@ -420,12 +620,12 @@ window.__ModuleLoader__.load({
         veilTimer.current = setTimeout(() => setChapterVeil(''), 1100);
       };
       useEffect(() => () => clearTimeout(veilTimer.current), []);
-      const commitProgress = (percent) => {
+      const commitProgress = (percent, offset = progressRef.current.offset || 0) => {
         setScrollPercent(percent);
         const chapterId = chapterIdAt();
-        progressRef.current = { bookId, chapterId, percent };
+        progressRef.current = { bookId, chapterId, percent, offset };
         clearTimeout(saveTimer.current);
-        saveTimer.current = setTimeout(() => call(ctx, 'saveProgress', { bookId, chapterId, percent }).catch(() => {}), 600);
+        saveTimer.current = setTimeout(() => call(ctx, 'saveProgress', { bookId, chapterId, percent, offset }).catch(() => {}), 600);
       };
       const flushProgress = () => {
         clearTimeout(saveTimer.current);
@@ -454,9 +654,11 @@ window.__ModuleLoader__.load({
           const saved = atPercent != null
             ? Math.max(0, Math.min(100, Number(atPercent) || 0))
             : restore ? Number(book.lastRead?.percent || book.progress?.percent || book.percent || 0) : 0;
+          const savedOffset = atPercent != null ? 0 : restore ? Number(book.lastRead?.offset || book.progress?.offset || 0) : 0;
           showChapterVeil((value && (value.name || value.title)) || item.name || item.title || '正文');
-          progressRef.current = { bookId, chapterId: id, percent: saved };
+          progressRef.current = { bookId, chapterId: id, percent: saved, offset: savedOffset };
           pendingPercentRef.current = saved;
+          pendingOffsetRef.current = savedOffset > 0 ? savedOffset : null;
           setPageIndex(0);
           pageIndexRef.current = 0;
           setScrollPercent(saved);
@@ -488,8 +690,10 @@ window.__ModuleLoader__.load({
               if (!active || requestId !== requestRef.current) return;
               setChapter(value || {}); setChapterIndex(index); setFailedIndex(-1);
               const saved = Number(book.lastRead?.percent || book.progress?.percent || book.percent || 0);
-              progressRef.current = { bookId, chapterId: id, percent: saved };
+              const savedOffset = Number(book.lastRead?.offset || book.progress?.offset || 0);
+              progressRef.current = { bookId, chapterId: id, percent: saved, offset: savedOffset };
               pendingPercentRef.current = saved;
+              pendingOffsetRef.current = savedOffset > 0 ? savedOffset : null;
               setPageIndex(0);
               pageIndexRef.current = 0;
               setScrollPercent(saved);
@@ -539,7 +743,7 @@ window.__ModuleLoader__.load({
         if (!scrollRef.current || chapterIndex < 0) return;
         const el = scrollRef.current;
         const max = Math.max(1, el.scrollHeight - el.clientHeight);
-        commitProgress(Math.round(el.scrollTop / max * 100));
+        commitProgress(Math.round(el.scrollTop / max * 100), 0);
       };
 
       const makeNote = () => {
@@ -557,7 +761,7 @@ window.__ModuleLoader__.load({
         if (next === pageIndexRef.current) return;
         setPageIndex(next);
         pageIndexRef.current = next;
-        commitProgress(pageCount > 1 ? Math.round(next / (pageCount - 1) * 100) : 0);
+        commitProgress(paginationMath.percentForPage(next, pageCount));
       };
       const finishCurl = () => {
         curlingRef.current = false;
@@ -629,10 +833,6 @@ window.__ModuleLoader__.load({
         } catch (cause) {
           finishCurl();
         }
-      };
-      const prefersReducedMotion = () => {
-        try { return window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true; }
-        catch { return false; }
       };
       const buildTurnSheet = () => {
         const view = pagedRef.current;
@@ -742,7 +942,7 @@ window.__ModuleLoader__.load({
         const index = chapterIndex + dir;
         if (!toc[index]) return;
         const percent = dir > 0 ? 0 : 100;
-        if (prefersReducedMotion()) { openChapter(index, false, percent); return; }
+        if (motionOff || !webglRef.current) { openChapter(index, false, percent); return; }
         if (flipStyle === 'curl') { startChapterCurl(dir); return; }
         beginTurn(flipStyle === 'slide' ? 'slide' : flipStyle, dir, null);
         openChapter(index, false, percent);
@@ -758,7 +958,7 @@ window.__ModuleLoader__.load({
           if (chapterIndex + 1 < toc.length) turnChapter(1);
           return;
         }
-        if (prefersReducedMotion()) { goPage(next); return; }
+        if (motionOff || !webglRef.current) { goPage(next); return; }
         if (flipStyle === 'curl') { startCurl(delta); return; }
         if (flipStyle === 'flip' || flipStyle === 'fade') {
           if (beginTurn(flipStyle, delta, next)) return;
@@ -766,7 +966,7 @@ window.__ModuleLoader__.load({
         goPage(next);
       };
 
-      const measureLayout = (restorePercent = null) => {
+      const measureLayout = (restorePercent = null, anchorOffset = null) => {
         const view = pagedRef.current;
         const article = articleRef.current;
         if (!view || !article) return;
@@ -779,34 +979,76 @@ window.__ModuleLoader__.load({
         article.style.columnGap = `${gap}px`;
         article.style.columnCount = 'auto';
         article.style.columnFill = 'auto';
-        const total = Math.max(1, Math.ceil(article.scrollWidth / (nextPageWidth + gap)));
-        const pages = Math.max(1, nextColumns === 1 ? total : total - nextColumns + 1);
+        const totalColumns = paginationMath.totalColumns(article.scrollWidth, nextPageWidth, gap);
+        const pages = paginationMath.pageCount(totalColumns, nextColumns);
         const currentPercent = restorePercent != null
           ? restorePercent
-          : (pageCount > 1 ? pageIndexRef.current / (pageCount - 1) * 100 : 0);
-        const target = pages > 1 ? Math.round(currentPercent / 100 * (pages - 1)) : 0;
+          : paginationMath.percentForPage(pageIndexRef.current, pageCount);
+        // Map an anchor offset to a column. The article is translated by
+        // -pageIndex*pageStep, so add that back before comparing to layoutLeft.
+        const pageForOffset = (offset) => {
+          const anchor = nodeAtOffset(offset);
+          if (!anchor) return null;
+          try {
+            const range = document.createRange();
+            range.setStart(anchor.node, anchor.offset);
+            range.setEnd(anchor.node, Math.min(anchor.node.nodeValue.length, anchor.offset + 1));
+            const rect = range.getBoundingClientRect();
+            if (!rect || (!rect.width && !rect.height)) return null;
+            const viewRect = view.getBoundingClientRect();
+            const layoutLeft = viewRect.left + article.offsetLeft - view.scrollLeft;
+            const step = nextPageWidth + gap;
+            return paginationMath.columnForAnchor({
+              anchorLeft: rect.left,
+              pageIndex: pageIndexRef.current,
+              pageStep: pageStep || step,
+              layoutLeft,
+              step,
+              pages,
+            });
+          } catch { return null; }
+        };
+        const anchor = anchorOffset != null ? Number(anchorOffset) : Number(progressRef.current.offset || 0);
+        const anchored = anchor > 0 ? pageForOffset(anchor) : null;
+        const target = anchored != null ? anchored : paginationMath.pageForPercent(currentPercent, pages);
+        const nextPercent = anchored != null ? paginationMath.percentForPage(target, pages) : currentPercent;
         pendingPercentRef.current = null;
+        pendingOffsetRef.current = null;
         setPageWidth(nextPageWidth);
         setPageStep(nextPageWidth + gap);
         setPageCount(pages);
         pageIndexRef.current = target;
         setPageIndex(target);
-        setScrollPercent(currentPercent);
-        progressRef.current = { bookId, chapterId: chapterIdAt(), percent: currentPercent };
+        setScrollPercent(nextPercent);
+        progressRef.current = { bookId, chapterId: chapterIdAt(), percent: nextPercent, offset: anchor > 0 ? anchor : 0 };
       };
       measureRef.current = measureLayout;
 
       useEffect(() => {
         if (mode !== 'paged' || !chapter) return;
-        const raf = requestAnimationFrame(() => measureRef.current(pendingPercentRef.current));
+        const raf = requestAnimationFrame(() => measureRef.current(pendingPercentRef.current, pendingOffsetRef.current));
         return () => cancelAnimationFrame(raf);
       }, [mode, columns, chapter, settings.fontSize, settings.lineHeight, settings.fontFamily]);
+
+      // Persist the first character of the visible page so a later font-size
+      // or column change can land on the same text instead of the same percent.
+      useEffect(() => {
+        if (mode !== 'paged' || !chapter || loading) return;
+        const raf = requestAnimationFrame(() => {
+          const offset = pageStartOffset();
+          if (offset == null) return;
+          const percent = paginationMath.percentForPage(pageIndex, pageCount);
+          commitProgress(percent, offset);
+        });
+        return () => cancelAnimationFrame(raf);
+      }, [mode, chapter, pageIndex, pageCount, loading]);
 
       useEffect(() => {
         if (mode !== 'paged') return;
         const onResize = () => {
-          const percent = pageCount > 1 ? pageIndexRef.current / (pageCount - 1) * 100 : 0;
-          requestAnimationFrame(() => measureRef.current(percent));
+          const percent = paginationMath.percentForPage(pageIndexRef.current, pageCount);
+          const anchor = progressRef.current.offset || null;
+          requestAnimationFrame(() => measureRef.current(percent, anchor));
         };
         window.addEventListener('resize', onResize);
         const view = pagedRef.current;
@@ -846,6 +1088,7 @@ window.__ModuleLoader__.load({
         if (curlingRef.current || turnRef.current) return;
         if (mode === 'paged') {
           setMode('scroll');
+          persistPref('mode', 'scroll');
           requestAnimationFrame(() => {
             if (!scrollRef.current) return;
             const max = Math.max(1, scrollRef.current.scrollHeight - scrollRef.current.clientHeight);
@@ -854,6 +1097,7 @@ window.__ModuleLoader__.load({
         } else {
           pendingPercentRef.current = scrollPercent;
           setMode('paged');
+          persistPref('mode', 'paged');
         }
       };
 
@@ -936,7 +1180,8 @@ window.__ModuleLoader__.load({
         transform: `translateX(${-(pageIndex * pageStep) + dragOffset}px)`,
       };
 
-      return h('div', { className: `mr-reader theme-${theme} font-${settings.fontFamily || 'serif'}` },
+      return h('div', { className: `mr-reader theme-${theme} font-${settings.fontFamily || 'serif'}${motionOff ? ' mr-reduced' : ''}` },
+        h('div', { className: 'mr-ambience', ref: ambienceHostRef, 'aria-hidden': true }),
         h('header', { className: 'mr-reader-header' },
           h(Button, { kind: 'icon', icon: 'back', onClick: closeReader, title: '返回书架' }),
           h('div', { className: 'mr-reader-heading' }, h('strong', null, book.name || book.title || '本地书籍'), h('small', null, toc.length ? `${chapterIndex + 1}/${toc.length}` : '本地书籍')),
@@ -969,14 +1214,21 @@ window.__ModuleLoader__.load({
           h('div', { className: 'mr-drawer-head' }, h('h2', null, drawer === 'toc' ? '目录' : drawer === 'notes' ? '笔记' : '排版'), h(Button, { kind: 'icon', icon: 'close', onClick: () => setDrawer('') })),
           drawer === 'toc' ? h('div', { className: 'mr-toc' }, toc.map((item, index) => h('button', { key: item.id || item.chapterId || item.url || index, className: index === chapterIndex ? 'active' : '', onClick: () => openChapter(index) }, item.name || item.title || `第 ${index + 1} 章`))) : null,
           drawer === 'settings' ? h('div', { className: 'mr-drawer-body' },
+            h('label', null, '本书动画'), h('div', { className: 'mr-mode-picker' },
+              h('button', { className: `mr-mode-choice ${bookPrefs ? '' : 'active'}`, onClick: () => onBookSettings?.({ clear: true }) }, '跟随全局'),
+              h('button', { className: `mr-mode-choice ${bookPrefs ? 'active' : ''}`, onClick: () => onBookSettings?.({ mode: prefMode, flipStyle: prefFlipStyle, ambience: prefAmbience }) }, '本书单独设定')),
             h('label', null, '阅读方式'), h('div', { className: 'mr-mode-picker' },
-              h('button', { className: `mr-mode-choice ${mode === 'paged' ? 'active' : ''}`, onClick: () => { pendingPercentRef.current = scrollPercent; setMode('paged'); } }, '翻页'),
-              h('button', { className: `mr-mode-choice ${mode === 'scroll' ? 'active' : ''}`, onClick: () => setMode('scroll') }, '滚动')),
+              h('button', { className: `mr-mode-choice ${mode === 'paged' ? 'active' : ''}`, onClick: () => { pendingPercentRef.current = scrollPercent; setMode('paged'); persistPref('mode', 'paged'); } }, '翻页'),
+              h('button', { className: `mr-mode-choice ${mode === 'scroll' ? 'active' : ''}`, onClick: () => { setMode('scroll'); persistPref('mode', 'scroll'); } }, '滚动')),
             h('label', null, '翻页效果'), h('div', { className: 'mr-mode-picker' },
-              h('button', { className: `mr-mode-choice ${flipStyle === 'slide' ? 'active' : ''}`, onClick: () => setFlipStyle('slide') }, '滑动'),
-              h('button', { className: `mr-mode-choice ${flipStyle === 'curl' ? 'active' : ''}`, onClick: () => setFlipStyle('curl') }, '卷曲'),
-              h('button', { className: `mr-mode-choice ${flipStyle === 'flip' ? 'active' : ''}`, onClick: () => setFlipStyle('flip') }, '翻转'),
-              h('button', { className: `mr-mode-choice ${flipStyle === 'fade' ? 'active' : ''}`, onClick: () => setFlipStyle('fade') }, '淡入')),
+              h('button', { className: `mr-mode-choice ${flipStyle === 'slide' ? 'active' : ''}`, onClick: () => chooseFlip('slide') }, '滑动'),
+              h('button', { className: `mr-mode-choice ${flipStyle === 'curl' ? 'active' : ''}`, onClick: () => chooseFlip('curl') }, '卷曲'),
+              h('button', { className: `mr-mode-choice ${flipStyle === 'flip' ? 'active' : ''}`, onClick: () => chooseFlip('flip') }, '翻转'),
+              h('button', { className: `mr-mode-choice ${flipStyle === 'fade' ? 'active' : ''}`, onClick: () => chooseFlip('fade') }, '淡入')),
+            h('label', null, '氛围'), h('div', { className: 'mr-mode-picker' },
+              h('button', { className: `mr-mode-choice ${prefAmbience === 'full' ? 'active' : ''}`, onClick: () => persistPref('ambience', 'full') }, '完整'),
+              h('button', { className: `mr-mode-choice ${prefAmbience === 'paper' ? 'active' : ''}`, onClick: () => persistPref('ambience', 'paper') }, '仅纸张'),
+              h('button', { className: `mr-mode-choice ${prefAmbience === 'off' ? 'active' : ''}`, onClick: () => persistPref('ambience', 'off') }, '关闭')),
             h('label', null, '字号'), h('div', { className: 'mr-stepper' }, h(Button, { onClick: () => onSettings({ fontSize: Math.max(14, settings.fontSize - 1) }) }, '减小'), h('strong', null, settings.fontSize), h(Button, { onClick: () => onSettings({ fontSize: Math.min(36, settings.fontSize + 1) }) }, '增大')),
             h('label', null, '行距'), h('input', { type: 'range', min: 1.4, max: 2.5, step: .1, value: settings.lineHeight, onChange: (e) => onSettings({ lineHeight: Number(e.target.value) }) }),
             h('label', null, '字体'), h('select', { value: settings.fontFamily, onChange: (e) => onSettings({ fontFamily: e.target.value }) }, h('option', { value: 'serif' }, '衬线'), h('option', { value: 'sans' }, '黑体')),
@@ -1053,6 +1305,7 @@ window.__ModuleLoader__.load({
         return job ? { ...book, downloadStatus: job.status, download: job } : book;
       });
       const notes = data.notes || [];
+      const activeBook = reading ? books.find((book) => (book.id || book.bookId) === (reading.id || reading.bookId)) || reading : null;
       const notify = (text, kind = 'info') => setNotice({ text, kind });
 
       const refresh = async (quiet = false) => {
@@ -1098,6 +1351,25 @@ window.__ModuleLoader__.load({
         setData((current) => ({ ...current, settings: { ...current.settings, ...partial } }));
         return call(ctx, 'setSettings', partial).catch((cause) => notify(cause.message || String(cause), 'error'));
       };
+      const updateBookSettings = (bookId, partial) => {
+        setData((current) => ({
+          ...current,
+          books: (current.books || []).map((item) => {
+            if ((item.id || item.bookId) !== bookId) return item;
+            if (partial.clear === true) {
+              const { readerPrefs, ...rest } = item;
+              return rest;
+            }
+            const prefs = { ...(item.readerPrefs || {}) };
+            for (const [key, value] of Object.entries(partial)) {
+              if (value == null) delete prefs[key];
+              else prefs[key] = value;
+            }
+            return { ...item, readerPrefs: Object.keys(prefs).length ? prefs : null };
+          }),
+        }));
+        return call(ctx, 'setBookSettings', { bookId, ...partial }).catch((cause) => notify(cause.message || String(cause), 'error'));
+      };
       const localImport = async (file) => {
         if (file.size > 50 * 1024 * 1024) return notify('单本书不能超过 50MB', 'error');
         const format = file.name.toLowerCase().endsWith('.epub') ? 'epub' : 'txt';
@@ -1131,17 +1403,17 @@ window.__ModuleLoader__.load({
         catch (cause) { notify(cause.message || String(cause), 'error'); }
       };
       const saveNote = (note) => run(() => call(ctx, 'saveNote', note), '笔记已保存');
+      const motionOff = prefersReducedMotion() || settings.reducedMotion === 'on' || settings.animations === false || settings.shelfMotion === false;
       const openBook = (book, detail) => {
-        const reduced = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
-        if (!detail?.rect || !detail?.panel || !detail?.snapshot || reduced) { setOpening(null); setReading(book); return; }
+        if (!detail?.rect || !detail?.panel || !detail?.snapshot || motionOff || !supportsWebGL()) { setOpening(null); setReading(book); return; }
         setOpening({ ...detail, book, theme: settings.readerTheme || 'paper' });
         setReading(book);
       };
       const nav = [
         ['library', '书架', 'shelf'], ['discover', '发现', 'compass'], ['sources', '书源', 'source'], ['settings', '设置', 'settings'],
       ];
-      if (reading) return h(React.Fragment, null, h('style', null, css),
-        h(ReaderView, { ctx, book: reading, settings, notes, deferMs: opening ? 200 : 0, onSettings: updateSettings, onClose: () => { setOpening(null); setReading(null); refresh(true); }, onSaveNote: saveNote, onDeleteNote: (note) => run(() => call(ctx, 'deleteNote', { id: note.id })).catch(() => {}), notify }),
+      if (activeBook) return h(React.Fragment, null, h('style', null, css),
+        h(ReaderView, { ctx, book: activeBook, settings, notes, deferMs: opening ? 200 : 0, onSettings: updateSettings, onBookSettings: (partial) => updateBookSettings(activeBook.id || activeBook.bookId, partial), onClose: () => { setOpening(null); setReading(null); refresh(true); }, onSaveNote: saveNote, onDeleteNote: (note) => run(() => call(ctx, 'deleteNote', { id: note.id })).catch(() => {}), notify }),
         opening ? h(OpenTransition, { key: opening.bookId || 'open', data: opening, onDone: () => setOpening(null) }) : null);
 
       return h(React.Fragment, null, h('style', null, css), h('div', { className: 'mr-root' },
@@ -1152,7 +1424,7 @@ window.__ModuleLoader__.load({
         h('section', { className: 'mr-content' },
           h(Notice, { notice, onClose: () => setNotice(null) }),
           loading ? h('div', { className: 'mr-loading' }, '正在打开墨读…') : null,
-          !loading && tab === 'library' ? h(Library, { books, busy, view: shelfView, onView: setShelfView, ctx, theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}), onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
+          !loading && tab === 'library' ? h(Library, { books, busy, view: shelfView, onView: setShelfView, ctx, theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: prefersReducedMotion() || settings.reducedMotion === 'on', shelfMotion: settings.shelfMotion !== false, onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}), onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, selectedSource, onSource: (sourceId) => { setSelectedSource(sourceId); setResults(null); setResultSource(''); }, onSearch: search, onAdd: addBook, results, busy }) : null,
           !loading && tab === 'sources' ? h(Sources, { sources, busy, onImport: importSource, onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
           !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy }) : null)));
@@ -1186,7 +1458,7 @@ window.__ModuleLoader__.load({
 .mr-setting-row{display:flex;align-items:center;justify-content:space-between;gap:20px;margin:15px 0;font-size:13px}.mr-stepper{display:flex;align-items:center;gap:12px}.mr-stepper strong{min-width:42px;text-align:center}.mr-theme-picker{display:flex;gap:10px}.mr-swatch{width:34px;height:34px;border-radius:50%;border:2px solid transparent;box-shadow:0 0 0 1px var(--mr-border)}.mr-swatch.active{border-color:var(--mr-accent);box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),0 0 0 4px var(--mr-accent)}.mr-swatch.paper{background:#f4ecdc}.mr-swatch.light{background:#fff}.mr-swatch.green{background:#e3eee5}.mr-swatch.dark{background:#202522}.mr-roadmap p{color:var(--mr-muted);font-size:12px;line-height:1.7;margin:0}
 .mr-notice{position:sticky;top:-20px;z-index:20;margin:-12px auto 16px;max-width:760px;padding:11px 13px;border-radius:10px;background:var(--dsw-alias-bg-overlay);border:1px solid var(--mr-border);box-shadow:0 5px 20px #0002;display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px}.mr-notice.error{border-color:var(--dsw-alias-state-error-primary)}.mr-notice.success{border-color:var(--dsw-alias-state-success-primary)}.mr-notice button{border:0;background:transparent;color:inherit;padding:4px;display:flex}.mr-loading{text-align:center;color:var(--mr-muted);font-size:13px;padding:36px}.mr-error-block{text-align:center;padding:50px 20px;color:var(--dsw-alias-state-error-primary)}
 .mr-reader{--reader-bg:#f4ecdc;--reader-text:#342f27;--reader-muted:#857b68;--reader-border:#d9cfbb;height:100%;min-height:0;display:flex;flex-direction:column;position:relative;overflow:hidden;background:var(--reader-bg);color:var(--reader-text)}.mr-reader.theme-light{--reader-bg:#fff;--reader-text:#292d2b;--reader-muted:#7b817e;--reader-border:#e3e6e4}.mr-reader.theme-green{--reader-bg:#e3eee5;--reader-text:#2d3c31;--reader-muted:#708275;--reader-border:#c5d5c9}.mr-reader.theme-dark{--reader-bg:#202522;--reader-text:#d4d9d5;--reader-muted:#87918b;--reader-border:#3b4540}.mr-reader-header{height:58px;flex:0 0 58px;display:flex;align-items:center;gap:3px;padding:0 14px;border-bottom:1px solid var(--reader-border);background:var(--reader-bg);z-index:3}.mr-reader-heading{flex:1;min-width:0;text-align:center}.mr-reader-heading strong,.mr-reader-heading small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mr-reader-heading strong{font-size:14px}.mr-reader-heading small{font-size:10px;color:var(--reader-muted);margin-top:3px}.mr-reading-progress{height:2px;background:var(--mr-accent,var(--dsw-alias-brand-primary));position:absolute;top:57px;left:0;z-index:4;transition:width .2s}
-.mr-chapter-scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain}.mr-paged-view{flex:1;min-height:0;overflow:hidden;position:relative;padding:0 20px;touch-action:pan-y}.mr-paged-chapter{width:100%;height:100%;margin:0 auto;padding:42px 0 34px;box-sizing:border-box;column-fill:auto;will-change:transform;transition:transform .18s ease-out}.mr-paged-chapter.mr-dragging{transition:none;user-select:none;cursor:grabbing}.mr-paged-chapter.mr-curling{transition:none}.mr-paged-chapter.mr-turning{transition:none}.mr-paged-chapter.mr-fade-in{animation:mr-page-fade .24s ease both}@keyframes mr-page-fade{from{opacity:.2}to{opacity:1}}.mr-turn-host{contain:layout paint}.mr-turn-shade{position:absolute;inset:0;pointer-events:none;opacity:0;background:linear-gradient(90deg,rgba(0,0,0,.04),rgba(0,0,0,.22) 60%,rgba(0,0,0,.45))}@media (prefers-reduced-motion:reduce){.mr-chapter-veil{animation-duration:.3s}.mr-paged-chapter{transition:none}}.mr-curl-overlay{position:absolute;inset:0;width:100%;height:100%;z-index:7;pointer-events:none}.mr-chapter.mr-paged-chapter{width:100%}.mr-chapter-veil{position:absolute;left:50%;top:46%;transform:translate(-50%,-50%);z-index:6;pointer-events:none;padding:10px 16px;border-radius:10px;background:color-mix(in srgb,var(--reader-bg) 88%,transparent);color:var(--reader-muted);font-size:13px;letter-spacing:.08em;box-shadow:0 8px 24px #0002;animation:mr-veil-in 1.05s ease both}.mr-chapter-veil.show{opacity:1}@keyframes mr-veil-in{0%{opacity:0;transform:translate(-50%,-42%)}18%,70%{opacity:1;transform:translate(-50%,-50%)}100%{opacity:0;transform:translate(-50%,-54%)}}.mr-chapter{width:min(100% - 40px,720px);margin:0 auto;padding:46px 0 70px;font-family:Georgia,'Noto Serif SC','Songti SC',serif}.font-sans .mr-chapter{font-family:system-ui,'Noto Sans SC',sans-serif}.mr-mode-toggle{border:1px solid var(--reader-border);background:transparent;color:var(--reader-muted);border-radius:7px;padding:5px 8px;font-size:11px;line-height:1;min-height:28px;white-space:nowrap}.mr-mode-toggle:hover{color:var(--reader-text)}.mr-mode-picker{display:flex;gap:8px;margin:0 0 14px}.mr-mode-choice{flex:1;border:1px solid var(--reader-border);background:transparent;color:var(--reader-muted);border-radius:8px;padding:8px;font-size:13px}.mr-mode-choice.active{border-color:var(--reader-accent);color:var(--reader-accent);background:color-mix(in srgb,var(--reader-accent) 10%,transparent)}.mr-page-nav{display:flex;align-items:center;gap:8px}.mr-page-btn{width:34px;height:34px;border:1px solid var(--reader-border);border-radius:8px;background:transparent;color:var(--reader-text);font-size:20px;line-height:1;display:flex;align-items:center;justify-content:center}.mr-page-btn:disabled{opacity:.35}.mr-page-nav span{min-width:52px;text-align:center;font-variant-numeric:tabular-nums}.mr-chapter h1{font-size:1.35em;line-height:1.5;margin:0 0 32px;font-weight:650}.mr-chapter p{margin:0 0 1em;text-align:justify;overflow-wrap:anywhere}.mr-chapter-end{display:flex;justify-content:center;padding:28px 0;color:var(--reader-muted);font-size:12px}.mr-reader-footer{height:50px;flex:0 0 50px;border-top:1px solid var(--reader-border);display:flex;align-items:center;justify-content:space-between;padding:0 18px;color:var(--reader-muted);font-size:11px;background:var(--reader-bg)}
+.mr-chapter-scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain}.mr-paged-view{flex:1;min-height:0;overflow:hidden;position:relative;padding:0 20px;touch-action:pan-y}.mr-paged-chapter{width:100%;height:100%;margin:0 auto;padding:42px 0 34px;box-sizing:border-box;column-fill:auto;will-change:transform;transition:transform .18s ease-out}.mr-paged-chapter.mr-dragging{transition:none;user-select:none;cursor:grabbing}.mr-paged-chapter.mr-curling{transition:none}.mr-paged-chapter.mr-turning{transition:none}.mr-paged-chapter.mr-fade-in{animation:mr-page-fade .24s ease both}@keyframes mr-page-fade{from{opacity:.2}to{opacity:1}}.mr-turn-host{contain:layout paint}.mr-turn-shade{position:absolute;inset:0;pointer-events:none;opacity:0;background:linear-gradient(90deg,rgba(0,0,0,.04),rgba(0,0,0,.22) 60%,rgba(0,0,0,.45))}@media (prefers-reduced-motion:reduce){.mr-chapter-veil{animation-duration:.3s}.mr-paged-chapter{transition:none}}.mr-reader.mr-reduced .mr-paged-chapter{transition:none}.mr-reader.mr-reduced .mr-chapter-veil{animation-duration:.3s}.mr-reader.mr-reduced .mr-paged-chapter.mr-fade-in{animation:none}.mr-curl-overlay{position:absolute;inset:0;width:100%;height:100%;z-index:7;pointer-events:none}.mr-chapter.mr-paged-chapter{width:100%}.mr-chapter-veil{position:absolute;left:50%;top:46%;transform:translate(-50%,-50%);z-index:6;pointer-events:none;padding:10px 16px;border-radius:10px;background:color-mix(in srgb,var(--reader-bg) 88%,transparent);color:var(--reader-muted);font-size:13px;letter-spacing:.08em;box-shadow:0 8px 24px #0002;animation:mr-veil-in 1.05s ease both}.mr-chapter-veil.show{opacity:1}@keyframes mr-veil-in{0%{opacity:0;transform:translate(-50%,-42%)}18%,70%{opacity:1;transform:translate(-50%,-50%)}100%{opacity:0;transform:translate(-50%,-54%)}}.mr-chapter{width:min(100% - 40px,720px);margin:0 auto;padding:46px 0 70px;font-family:Georgia,'Noto Serif SC','Songti SC',serif}.font-sans .mr-chapter{font-family:system-ui,'Noto Sans SC',sans-serif}.mr-mode-toggle{border:1px solid var(--reader-border);background:transparent;color:var(--reader-muted);border-radius:7px;padding:5px 8px;font-size:11px;line-height:1;min-height:28px;white-space:nowrap}.mr-mode-toggle:hover{color:var(--reader-text)}.mr-mode-picker{display:flex;gap:8px;margin:0 0 14px}.mr-mode-choice{flex:1;border:1px solid var(--reader-border);background:transparent;color:var(--reader-muted);border-radius:8px;padding:8px;font-size:13px}.mr-mode-choice.active{border-color:var(--reader-accent);color:var(--reader-accent);background:color-mix(in srgb,var(--reader-accent) 10%,transparent)}.mr-page-nav{display:flex;align-items:center;gap:8px}.mr-page-btn{width:34px;height:34px;border:1px solid var(--reader-border);border-radius:8px;background:transparent;color:var(--reader-text);font-size:20px;line-height:1;display:flex;align-items:center;justify-content:center}.mr-page-btn:disabled{opacity:.35}.mr-page-nav span{min-width:52px;text-align:center;font-variant-numeric:tabular-nums}.mr-chapter h1{font-size:1.35em;line-height:1.5;margin:0 0 32px;font-weight:650}.mr-chapter p{margin:0 0 1em;text-align:justify;overflow-wrap:anywhere}.mr-chapter-end{display:flex;justify-content:center;padding:28px 0;color:var(--reader-muted);font-size:12px}.mr-reader-footer{height:50px;flex:0 0 50px;border-top:1px solid var(--reader-border);display:flex;align-items:center;justify-content:space-between;padding:0 18px;color:var(--reader-muted);font-size:11px;background:var(--reader-bg)}
 .mr-drawer-backdrop{position:absolute;inset:0;background:#0004;z-index:8}.mr-drawer{position:absolute;top:0;right:0;bottom:0;width:min(390px,88%);z-index:9;background:var(--reader-bg);border-left:1px solid var(--reader-border);box-shadow:-12px 0 30px #0002;display:flex;flex-direction:column}.mr-drawer-head{height:58px;flex:0 0 58px;padding:0 14px 0 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--reader-border)}.mr-drawer-head h2{font-size:16px}.mr-toc{overflow-y:auto;padding:8px}.mr-toc button{display:block;width:100%;min-height:42px;text-align:left;padding:10px 12px;border:0;border-radius:7px;background:transparent;color:var(--reader-text);font-size:13px;line-height:1.5}.mr-toc button:hover,.mr-toc button.active{background:color-mix(in srgb,var(--reader-text) 8%,transparent)}.mr-toc button.active{color:var(--mr-accent,var(--dsw-alias-brand-primary));font-weight:600}.mr-drawer-body{padding:20px;overflow-y:auto}.mr-drawer-body>label{display:block;font-size:12px;color:var(--reader-muted);margin:20px 0 9px}.mr-drawer-body>label:first-child{margin-top:0}.mr-drawer-body input[type=range],.mr-drawer-body select{width:100%}.mr-note-editor textarea{width:100%;resize:vertical;background:transparent;color:var(--reader-text);border-color:var(--reader-border)}.mr-note-editor .mr-button{margin-top:8px}.mr-notes{margin-top:20px}.mr-notes article{border-top:1px solid var(--reader-border);padding:14px 0;font-size:13px}.mr-notes blockquote,.mr-drawer-body>blockquote{margin:0 0 12px;padding:9px 12px;border-left:3px solid var(--reader-muted);color:var(--reader-muted);font-size:12px;line-height:1.6;overflow-wrap:anywhere}.mr-notes p{line-height:1.6;white-space:pre-wrap}
 .mr-open-shift{position:fixed;z-index:80;overflow:hidden;pointer-events:none;contain:layout paint}
 .mr-open-veil{position:absolute;inset:0;opacity:.96;animation:mr-open-veil .46s ease-out both}
@@ -1197,11 +1469,13 @@ window.__ModuleLoader__.load({
 .mr-open-cover img{display:block;width:100%;height:100%;object-fit:cover}
 .mr-open-cover span{display:flex;align-items:center;justify-content:center;width:100%;height:100%;font-family:Georgia,'Noto Serif SC',serif;font-size:24px;color:#4a3d2c;background:linear-gradient(150deg,#dfcfae,#bfa986)}
 .mr-open-spine{position:absolute;left:0;top:0;bottom:0;width:5px;background:linear-gradient(90deg,rgba(0,0,0,.28),rgba(255,255,255,.12) 62%,transparent)}
+.mr-ambience{position:absolute;inset:0;z-index:0;overflow:hidden;pointer-events:none;contain:strict}.mr-ambience canvas{display:block;width:100%;height:100%}.mr-reader-header,.mr-reader-footer{position:relative;z-index:3}.mr-chapter-scroll,.mr-paged-view{position:relative;z-index:2}.mr-loading,.mr-error-block{position:relative;z-index:2}
 @media(max-width:720px){.mr-root{flex-direction:column;padding-left:88px}.mr-section-actions{width:100%;justify-content:space-between}.mr-shelf3d{height:58vh;min-height:340px}.mr-shelf3d-hint{left:12px;bottom:10px;font-size:10px}.mr-reader{padding-left:88px}.mr-paged-view{padding:0 14px}.mr-mode-toggle{display:none}.mr-reader-heading small{display:none}.mr-reader-heading strong{max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-content{order:1;padding:20px 14px}.mr-section-head{flex-wrap:wrap;margin-bottom:18px}.mr-section-head h2{font-size:22px;white-space:nowrap}.mr-book-grid{grid-template-columns:1fr;gap:10px}.mr-book-open{padding:13px}.mr-book-actions{position:relative}.mr-searchbar{flex-wrap:wrap}.mr-searchbar select{max-width:none;width:100%}.mr-searchbar input{flex:1}.mr-result{align-items:flex-start;padding:12px;gap:10px}.mr-result .mr-button{align-self:center;padding-inline:9px}.mr-result-info .mr-intro{-webkit-line-clamp:1}.mr-source-row{flex-wrap:wrap}.mr-source-row .mr-tag{display:none}.mr-panel{padding:16px}.mr-notice{top:-12px}.mr-reader-header{padding:0 5px}.mr-reader-heading strong{font-size:12px}.mr-chapter{width:calc(100% - 34px);padding-top:30px}.mr-chapter h1{margin-bottom:24px}.mr-drawer{left:88px;right:0;width:auto}}
 `;
 
     return {
       inject: ['slots', 'layout', 'remote'],
+      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath } } : {}),
       async apply(ctx) {
         const unmount = await ctx.remote.$mount(readerContribution);
         const ui = ctx.inject(['remote.reader'], (inner) => {

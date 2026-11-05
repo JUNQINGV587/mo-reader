@@ -6,15 +6,17 @@ import { fetchRemote } from './lib/http.js'
 import { importEpub, importedSource, importTxt } from './lib/importers.js'
 import { ACTIVE_JOBS, createJob, jobView, transitionJob } from './lib/jobs.js'
 import { applyReplacements } from './lib/replacements.js'
-import { assertSettingKeys, normalizeSettings } from './lib/settings.js'
+import { assertSettingKeys, normalizeReaderPrefs, normalizeSettings } from './lib/settings.js'
 import { normalizeSource } from './lib/rules.js'
 import { SourceEngine } from './lib/source-engine.js'
 import { DEFAULT_SETTINGS, entries, openReaderStorage } from './lib/storage.js'
 import { base64ToBuffer, clone, id, MAX_ARCHIVE_BYTES, MAX_TEXT_BYTES, now, pageNumber, requiredString, stableId, textToBuffer } from './lib/utils.js'
 
+const COVER_MAX_BYTES = 2 * 1024 * 1024
+
 export const REMOTE_METHODS = Object.freeze([
   'state', 'importSource', 'removeSource', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
-  'saveProgress', 'download', 'cancelJob', 'checkUpdates', 'importLocal', 'setSettings', 'saveNote', 'deleteNote',
+  'saveProgress', 'download', 'cancelJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
   'exportBackup', 'importBackup', 'fetchCover',
 ])
 
@@ -28,6 +30,7 @@ export class ReaderService extends TypertRemoteService {
   constructor(ctx, options = {}) {
     super(ctx, 'reader')
     this.engine = options.engine ?? new SourceEngine(options)
+    this.fetchRemote = options.fetchRemote ?? fetchRemote
     this.runningJobs = new Map()
     this.coverCache = new Map()
     this.disposed = false
@@ -112,6 +115,7 @@ export class ReaderService extends TypertRemoteService {
       ...clone(book),
       unread: Math.max(0, readIndex < 0 ? chapters.length : chapters.length - readIndex - 1),
       lastRead: clone(book.progress ?? null),
+      readerPrefs: book.readerPrefs && Object.keys(book.readerPrefs).length ? clone(book.readerPrefs) : null,
       download: { status, total: chapters.length, done: downloaded, jobId: book.download?.jobId, auto: book.download?.auto === true },
     }
   }
@@ -398,9 +402,10 @@ export class ReaderService extends TypertRemoteService {
       this.coverCache.set(url, cached)
       return { dataUrl: cached, cached: true }
     }
-    const response = await fetchRemote(url, { maxBytes: 2 * 1024 * 1024 })
+    const response = await this.fetchRemote(url, { maxBytes: COVER_MAX_BYTES })
     const contentType = String(response.headers['content-type'] || '').split(';')[0].trim().toLowerCase()
     if (!contentType.startsWith('image/')) throw new ReaderError('reader/parse-error', '封面地址返回的不是图片。')
+    if (response.buffer.length > COVER_MAX_BYTES) throw new ReaderError('reader/too-large', `封面超过 ${COVER_MAX_BYTES} 字节。`)
     const dataUrl = `data:${contentType};base64,${response.buffer.toString('base64')}`
     this.coverCache.set(url, dataUrl)
     while (this.coverCache.size > 24) this.coverCache.delete(this.coverCache.keys().next().value)
@@ -416,6 +421,33 @@ export class ReaderService extends TypertRemoteService {
     if (typeof settings.autoDownloadNewChapters !== 'boolean') throw new ReaderError('reader/invalid-settings', 'autoDownloadNewChapters must be boolean.')
     await this.db.settings.set(settings)
     return clone(settings)
+  }
+
+  // Per-book overrides only carry mode/flipStyle/ambience. Passing clear:true
+  // (or null for a single key) drops the override so the book follows global
+  // settings again. Everything else stays device-wide.
+  async setBookSettings(args) {
+    args ??= {}
+    this.assertReady()
+    assertObject(args)
+    const book = this.book(args.bookId)
+    const partial = {}
+    for (const [key, value] of Object.entries(args)) {
+      if (key === 'bookId' || key === 'clear') continue
+      if (value === null) continue
+      Object.assign(partial, normalizeReaderPrefs({ [key]: value }))
+    }
+    const prefs = args.clear === true ? {} : { ...(book.readerPrefs ?? {}), ...partial }
+    if (args.clear !== true) {
+      for (const [key, value] of Object.entries(args)) {
+        if (value === null && key !== 'bookId' && key !== 'clear') delete prefs[key]
+      }
+    }
+    const next = { ...book, updatedAt: now() }
+    if (Object.keys(prefs).length) next.readerPrefs = prefs
+    else delete next.readerPrefs
+    await this.db.books.put(book.id, next)
+    return clone({ bookId: book.id, readerPrefs: next.readerPrefs ?? null })
   }
 
   async saveNote(args) {

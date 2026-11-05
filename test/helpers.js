@@ -38,9 +38,9 @@ export function memoryDb() {
   }
 }
 
-export async function serviceFixture(engine = {}) {
+export async function serviceFixture(engine = {}, options = {}) {
   const ctx = new Context()
-  const service = new ReaderService(ctx, { engine })
+  const service = new ReaderService(ctx, { engine, ...options })
   service.db = memoryDb()
   return { ctx, service, db: service.db }
 }

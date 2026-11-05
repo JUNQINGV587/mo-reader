@@ -20,7 +20,7 @@ test('all contracted methods are discovered by the Stage-3 Remote markers', asyn
   const { service } = await serviceFixture()
   const discovered = remoteMethods(service).map(marker => marker.exportName ?? marker.method)
   assert.deepEqual(discovered, [...REMOTE_METHODS])
-  assert.equal(new Set(discovered).size, 20)
+  assert.equal(new Set(discovered).size, 21)
 })
 
 test('real gateway SRC descriptor accepts every Remote signature', async () => {
@@ -101,6 +101,11 @@ test('local TXT/EPUB API and settings validation need no network', async () => {
   assert.equal(JSON.parse(backup).settings.readerTheme, 'dark')
   await service.importBackup({ data: backup })
   assert.equal(service.db.settings.get().fontSize, 22)
+  const motion = { animations: false, motionQuality: 'low', ambience: 'paper', shelfMotion: false, reducedMotion: 'on' }
+  assert.deepEqual(await service.setSettings(motion), { ...service.db.settings.get(), ...motion })
+  assert.equal(service.db.settings.get().ambience, 'paper')
+  await assert.rejects(() => service.setSettings({ ambience: 'dim' }), /ambience/)
+  await assert.rejects(() => service.setSettings({ motionQuality: 'ultra' }), /motionQuality/)
   await assert.rejects(() => service.setSettings({ fontSize: 8 }), /fontSize/)
   await assert.rejects(() => service.setSettings({ ttsRate: 9 }), /ttsRate/)
   await assert.rejects(() => service.setSettings({ cookie: 'x' }), /仅支持/)

@@ -1,9 +1,9 @@
 /* global window, document, ResizeObserver, Image */
 import {
   AmbientLight, BoxGeometry, BufferAttribute, BufferGeometry, CanvasTexture, Color,
-  DirectionalLight, DoubleSide, Fog, Group, HemisphereLight, MathUtils, Mesh, MeshStandardMaterial,
+  DirectionalLight, DoubleSide, Fog, Group, HemisphereLight, MathUtils, Mesh, MeshBasicMaterial, MeshStandardMaterial,
   OrthographicCamera, PCFSoftShadowMap, PerspectiveCamera, PlaneGeometry, PointLight, Points, PointsMaterial, AdditiveBlending,
-  LinearFilter, Raycaster, Scene, ShaderMaterial, SRGBColorSpace, Texture, Vector2, Vector3, WebGLRenderer,
+  LinearFilter, Raycaster, RepeatWrapping, Scene, ShaderMaterial, SRGBColorSpace, Texture, Vector2, Vector3, WebGLRenderer,
 } from 'three'
 
 const PALETTES = {
@@ -178,6 +178,7 @@ export function mountShelf(host, options = {}) {
     books: Array.isArray(options.books) ? options.books.slice() : [],
     theme: options.theme || 'paper',
     quality: options.quality || 'auto',
+    ambience: options.ambience || 'full',
     selected: null,
     hovered: null,
     disposed: false,
@@ -365,8 +366,8 @@ export function mountShelf(host, options = {}) {
       dustMaterial?.dispose()
       dust = null
     }
-    if (reduced) return
-    const count = state.quality === 'low' ? 36 : 110
+    if (reduced || state.ambience !== 'full') return
+    const count = state.quality === 'low' ? 24 : 60
     const positions = new Float32Array(count * 3)
     for (let index = 0; index < count; index += 1) {
       positions[index * 3] = (Math.random() - 0.5) * shelfWidth * 1.2
@@ -715,7 +716,21 @@ export function mountShelf(host, options = {}) {
     renderer.setPixelRatio(clamp(window.devicePixelRatio || 1, 1, state.quality === 'low' ? 1.25 : 2))
     renderer.shadowMap.enabled = !reduced && state.quality !== 'low'
     resize()
-    if (dust) dust.visible = state.quality !== 'low'
+    if (dust) dust.visible = state.ambience === 'full' && state.quality !== 'low'
+  }
+
+  function setAmbience(mode) {
+    state.ambience = ['full', 'paper', 'off'].includes(mode) ? mode : 'full'
+    if (state.ambience === 'full') {
+      if (!dust) addDust()
+      if (dust) dust.visible = state.quality !== 'low'
+      return
+    }
+    if (!dust) return
+    shelf.remove(dust)
+    dustGeometry?.dispose()
+    dustMaterial?.dispose()
+    dust = null
   }
 
   function focusBook(bookId) {
@@ -744,10 +759,19 @@ export function mountShelf(host, options = {}) {
     }
   }
 
+  const shelfStats = () => ({
+    dust: dust && dust.geometry?.attributes?.position ? dust.geometry.attributes.position.count : 0,
+    ambience: state.ambience,
+    quality: state.quality,
+    books: bookMeshes.length,
+  })
+  host.__mrShelf = { stats: shelfStats }
+
   return {
     setBooks,
     setTheme,
     setQuality,
+    setAmbience,
     focusBook,
     resize,
     snapshot,
@@ -770,6 +794,7 @@ export function mountShelf(host, options = {}) {
       dustMaterial?.dispose()
       renderer.dispose()
       renderer.domElement.remove()
+      if (host.__mrShelf && host.__mrShelf.stats === shelfStats) delete host.__mrShelf
     },
   }
 
@@ -792,6 +817,404 @@ export function mountShelf(host, options = {}) {
       dustMaterial?.dispose()
       dust = null
     }
+  }
+}
+
+const AMBIENCE_PALETTES = {
+  paper: { ink: 0x453a2b, light: 0xfff1d3, dust: 0xd8c6a2 },
+  light: { ink: 0x333834, light: 0xffffff, dust: 0xd8dad4 },
+  green: { ink: 0x2f4436, light: 0xeaf6e3, dust: 0xc2dcc4 },
+  dark: { ink: 0xdfe5e0, light: 0x93ab9c, dust: 0xa7bcae },
+}
+
+const AMBIENCE_VERTEX = [
+  'varying vec2 vUv;',
+  'void main() {',
+  '  vUv = uv;',
+  '  gl_Position = vec4(position.xy, 0.0, 1.0);',
+  '}',
+].join('\n')
+
+const AMBIENCE_LIGHT_FRAGMENT = [
+  'precision mediump float;',
+  'varying vec2 vUv;',
+  'uniform float uProgress;',
+  'uniform vec3 uColor;',
+  'uniform float uOpacity;',
+  'void main() {',
+  '  float band = smoothstep(0.46, 0.0, abs(vUv.y - uProgress));',
+  '  float edge = smoothstep(0.0, 0.24, min(vUv.y, 1.0 - vUv.y));',
+  '  gl_FragColor = vec4(uColor, band * uOpacity * edge);',
+  '}',
+].join('\n')
+
+const AMBIENCE_SEAM_FRAGMENT = [
+  'precision mediump float;',
+  'varying vec2 vUv;',
+  'uniform float uSeam;',
+  'uniform float uSeamX;',
+  'uniform vec3 uColor;',
+  'void main() {',
+  '  float band = smoothstep(0.18, 0.0, abs(vUv.x - uSeamX));',
+  '  gl_FragColor = vec4(uColor, band * uSeam * 0.38);',
+  '}',
+].join('\n')
+
+function ambiencePaperCanvas(document) {
+  const size = 512
+  const canvas = document.createElement('canvas')
+  canvas.width = size
+  canvas.height = size
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return null
+  for (let index = 0; index < 900; index += 1) {
+    const x = Math.random() * size
+    const y = Math.random() * size
+    const length = 8 + Math.random() * 26
+    const angle = Math.random() * Math.PI
+    ctx.strokeStyle = 'rgba(255,255,255,' + (0.03 + Math.random() * 0.05).toFixed(3) + ')'
+    ctx.lineWidth = 0.6 + Math.random() * 0.8
+    ctx.beginPath()
+    ctx.moveTo(x, y)
+    ctx.lineTo(x + Math.cos(angle) * length, y + Math.sin(angle) * length)
+    ctx.stroke()
+  }
+  for (let index = 0; index < 1400; index += 1) {
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.02 + Math.random() * 0.06).toFixed(3) + ')'
+    ctx.fillRect(Math.random() * size, Math.random() * size, 1, 1)
+  }
+  for (let index = 0; index < 18; index += 1) {
+    const x = Math.random() * size
+    const y = Math.random() * size
+    const radius = 40 + Math.random() * 90
+    const gradient = ctx.createRadialGradient(x, y, 0, x, y, radius)
+    gradient.addColorStop(0, 'rgba(255,255,255,0.035)')
+    gradient.addColorStop(1, 'rgba(255,255,255,0)')
+    ctx.fillStyle = gradient
+    ctx.beginPath()
+    ctx.arc(x, y, radius, 0, Math.PI * 2)
+    ctx.fill()
+  }
+  return canvas
+}
+
+function ambienceDustSprite(document) {
+  const canvas = document.createElement('canvas')
+  canvas.width = 32
+  canvas.height = 32
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return null
+  const gradient = ctx.createRadialGradient(16, 16, 0, 16, 16, 16)
+  gradient.addColorStop(0, 'rgba(255,255,255,0.9)')
+  gradient.addColorStop(0.45, 'rgba(255,255,255,0.35)')
+  gradient.addColorStop(1, 'rgba(255,255,255,0)')
+  ctx.fillStyle = gradient
+  ctx.fillRect(0, 0, 32, 32)
+  return canvas
+}
+
+function dustCountFor(quality) {
+  return quality === 'low' ? 48 : quality === 'high' ? 120 : 88
+}
+
+export function mountAmbience(host, options = {}) {
+  if (!host || typeof host.appendChild !== 'function') throw new Error('mountAmbience requires a DOM host')
+  const document = host.ownerDocument
+  const window = document.defaultView
+  const clampValue = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value))
+  const dampValue = (current, target, lambda, dt) => current + (target - current) * (1 - Math.exp(-lambda * dt / 1000))
+  const state = {
+    theme: options.theme || 'paper',
+    quality: options.quality || 'auto',
+    ambience: options.ambience || 'full',
+    still: Boolean(options.reducedMotion),
+    paused: false,
+    disposed: false,
+    frames: 0,
+    ema: 0,
+  }
+  let palette = AMBIENCE_PALETTES[state.theme] || AMBIENCE_PALETTES.paper
+
+  const renderer = new WebGLRenderer({ antialias: false, alpha: true, powerPreference: 'low-power' })
+  renderer.setClearAlpha(0)
+  renderer.setPixelRatio(clampValue(window.devicePixelRatio || 1, 1, state.quality === 'low' ? 1.25 : 2))
+  renderer.domElement.className = 'mr-ambience-canvas'
+  renderer.domElement.setAttribute('aria-hidden', 'true')
+  host.appendChild(renderer.domElement)
+
+  const scene = new Scene()
+  const camera = new OrthographicCamera(-1, 1, 1, -1, 0.1, 10)
+  camera.position.z = 1
+
+  const paperTexture = ambiencePaperCanvas(document)
+  const paperMaterial = new MeshBasicMaterial({
+    color: new Color(palette.ink),
+    map: paperTexture ? new CanvasTexture(paperTexture) : null,
+    transparent: true,
+    opacity: 0.5,
+    depthWrite: false,
+  })
+  if (paperMaterial.map) {
+    paperMaterial.map.wrapS = paperMaterial.map.wrapT = RepeatWrapping
+    paperMaterial.map.repeat.set(2, 3)
+  }
+  const paper = new Mesh(new PlaneGeometry(2, 2), paperMaterial)
+  scene.add(paper)
+
+  const lightMaterial = new ShaderMaterial({
+    uniforms: {
+      uProgress: { value: 0.5 },
+      uColor: { value: new Color(palette.light) },
+      uOpacity: { value: 0.16 },
+    },
+    vertexShader: AMBIENCE_VERTEX,
+    fragmentShader: AMBIENCE_LIGHT_FRAGMENT,
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+  })
+  const light = new Mesh(new PlaneGeometry(2, 2), lightMaterial)
+  light.position.z = 0.01
+  scene.add(light)
+
+  const seamMaterial = new ShaderMaterial({
+    uniforms: {
+      uSeam: { value: 0 },
+      uSeamX: { value: 0.5 },
+      uColor: { value: new Color(palette.ink) },
+    },
+    vertexShader: AMBIENCE_VERTEX,
+    fragmentShader: AMBIENCE_SEAM_FRAGMENT,
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+  })
+  const seam = new Mesh(new PlaneGeometry(2, 2), seamMaterial)
+  seam.position.z = 0.02
+  scene.add(seam)
+
+  const dustSprite = ambienceDustSprite(document)
+  const dustMaterial = new PointsMaterial({
+    color: new Color(palette.dust),
+    size: 2.2,
+    sizeAttenuation: false,
+    transparent: true,
+    opacity: 0.42,
+    depthWrite: false,
+    map: dustSprite ? new CanvasTexture(dustSprite) : null,
+  })
+  let dustGeometry = null
+  let dustPositions = null
+  let dustSpeeds = null
+  let dust = null
+
+  function rebuildDust(count) {
+    if (dust) {
+      scene.remove(dust)
+      dustGeometry?.dispose()
+      dust = null
+    }
+    dustGeometry = null
+    dustPositions = null
+    dustSpeeds = null
+    if (state.still || state.ambience !== 'full' || count <= 0) return
+    dustPositions = new Float32Array(count * 3)
+    dustSpeeds = new Float32Array(count)
+    for (let index = 0; index < count; index += 1) {
+      dustPositions[index * 3] = Math.random() * 2 - 1
+      dustPositions[index * 3 + 1] = Math.random() * 2 - 1
+      dustPositions[index * 3 + 2] = 0
+      dustSpeeds[index] = 0.00004 + Math.random() * 0.00008
+    }
+    dustGeometry = new BufferGeometry()
+    dustGeometry.setAttribute('position', new BufferAttribute(dustPositions, 3))
+    dust = new Points(dustGeometry, dustMaterial)
+    scene.add(dust)
+  }
+
+  const stats = { frames: 0, ema: 0, paused: false, mode: state.ambience, quality: state.quality }
+  host.__mrAmbience = stats
+
+  let frameHandle = 0
+  let lastTime = 0
+  let targetProgress = 0.5
+  let progress = 0.5
+  let targetSeam = 0
+  let seamStrength = 0
+
+  function size() {
+    const width = Math.max(1, host.clientWidth || 1)
+    const height = Math.max(1, host.clientHeight || 1)
+    renderer.setSize(width, height, false)
+  }
+
+  function renderOnce() {
+    renderer.render(scene, camera)
+  }
+
+  function degrade() {
+    state.quality = 'low'
+    stats.quality = 'low'
+    renderer.setPixelRatio(clampValue(window.devicePixelRatio || 1, 1, 1.25))
+    size()
+    rebuildDust(dustCountFor('low'))
+    renderOnce()
+  }
+
+  function tick(now) {
+    if (state.disposed || state.paused) return
+    const dt = lastTime ? Math.min(64, now - lastTime) : 16
+    lastTime = now
+    progress = dampValue(progress, targetProgress, 6, dt)
+    seamStrength = dampValue(seamStrength, targetSeam, 7, dt)
+    lightMaterial.uniforms.uProgress.value = progress
+    seamMaterial.uniforms.uSeam.value = seamStrength
+    if (dust && dustPositions && dustSpeeds) {
+      for (let index = 0; index < dustSpeeds.length; index += 1) {
+        const offset = index * 3
+        dustPositions[offset + 1] -= dustSpeeds[index] * dt
+        dustPositions[offset] += Math.sin((now * 0.00012) + index) * 0.000012 * dt
+        if (dustPositions[offset + 1] < -1) {
+          dustPositions[offset + 1] = 1
+          dustPositions[offset] = Math.random() * 2 - 1
+        }
+      }
+      dust.geometry.attributes.position.needsUpdate = true
+      dust.rotation.z = Math.sin(now * 0.00005) * 0.004
+    }
+    renderer.render(scene, camera)
+    state.frames += 1
+    stats.frames = state.frames
+    state.ema = state.ema ? state.ema * 0.92 + dt * 0.08 : dt
+    stats.ema = Math.round(state.ema * 100) / 100
+    if (state.quality === 'auto' && state.frames === 90 && state.ema > 20) degrade()
+    frameHandle = window.requestAnimationFrame(tick)
+  }
+
+  function start() {
+    if (state.disposed || state.paused || state.still || state.ambience === 'off') return
+    if (frameHandle) return
+    lastTime = 0
+    frameHandle = window.requestAnimationFrame(tick)
+  }
+
+  function stop() {
+    if (frameHandle) window.cancelAnimationFrame(frameHandle)
+    frameHandle = 0
+  }
+
+  function applyAmbience() {
+    const mode = state.ambience
+    paper.visible = mode !== 'off'
+    light.visible = mode === 'full'
+    seam.visible = mode !== 'off'
+    stats.mode = mode
+    if (mode === 'full') {
+      if (!dust) rebuildDust(dustCountFor(state.quality))
+    } else {
+      rebuildDust(0)
+    }
+    renderOnce()
+  }
+
+  function setAmbience(mode) {
+    state.ambience = ['full', 'paper', 'off'].includes(mode) ? mode : 'full'
+    if (state.ambience === 'off') {
+      state.paused = true
+      stats.paused = true
+      stop()
+    }
+    applyAmbience()
+    if (state.ambience !== 'off' && !state.paused && !state.still) start()
+  }
+
+  function setTheme(theme) {
+    if (!AMBIENCE_PALETTES[theme] || theme === state.theme) return
+    state.theme = theme
+    palette = AMBIENCE_PALETTES[theme]
+    paperMaterial.color = new Color(palette.ink)
+    lightMaterial.uniforms.uColor.value = new Color(palette.light)
+    seamMaterial.uniforms.uColor.value = new Color(palette.ink)
+    dustMaterial.color = new Color(palette.dust)
+    renderOnce()
+  }
+
+  function setQuality(quality) {
+    state.quality = ['auto', 'high', 'low'].includes(quality) ? quality : 'auto'
+    stats.quality = state.quality
+    renderer.setPixelRatio(clampValue(window.devicePixelRatio || 1, 1, state.quality === 'low' ? 1.25 : 2))
+    size()
+    rebuildDust(dustCountFor(state.quality))
+    renderOnce()
+  }
+
+  const onLost = (event) => {
+    event.preventDefault()
+    host.dataset.ambienceError = 'lost'
+  }
+  renderer.domElement.addEventListener('webglcontextlost', onLost)
+  const onVisibility = () => {
+    if (document.hidden) {
+      state.paused = true
+      stats.paused = true
+      stop()
+    } else if (!state.still && state.ambience !== 'off') {
+      state.paused = false
+      stats.paused = false
+      start()
+    }
+  }
+  document.addEventListener('visibilitychange', onVisibility)
+  const observer = new ResizeObserver(() => { size(); renderOnce() })
+  observer.observe(host)
+
+  size()
+  rebuildDust(dustCountFor(state.quality))
+  applyAmbience()
+  renderOnce()
+  start()
+
+  return {
+    setTheme,
+    setQuality,
+    setAmbience,
+    setProgress(value) {
+      targetProgress = clampValue(Number(value) || 0, 0, 1)
+    },
+    setSeam(value, seamX = 0.5) {
+      targetSeam = clampValue(Number(value) || 0, 0, 1)
+      seamMaterial.uniforms.uSeamX.value = clampValue(seamX, 0, 1)
+    },
+    pause() {
+      if (state.paused) return
+      state.paused = true
+      stats.paused = true
+      stop()
+    },
+    resume() {
+      if (!state.paused) return
+      if (state.disposed || state.still || state.ambience === 'off') return
+      state.paused = false
+      stats.paused = false
+      start()
+    },
+    dispose() {
+      if (state.disposed) return
+      state.disposed = true
+      stop()
+      observer.disconnect()
+      document.removeEventListener('visibilitychange', onVisibility)
+      renderer.domElement.removeEventListener('webglcontextlost', onLost)
+      rebuildDust(0)
+      paperTexture?.dispose?.()
+      paperMaterial.dispose()
+      lightMaterial.dispose()
+      seamMaterial.dispose()
+      dustMaterial.dispose()
+      renderer.dispose()
+      renderer.domElement.remove()
+      if (host.__mrAmbience === stats) delete host.__mrAmbience
+    },
   }
 }
 
