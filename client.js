@@ -32,6 +32,7 @@ window.__ModuleLoader__.load({
       replacements: [],
       mode: 'scroll',
       flipStyle: 'slide',
+      measureWidth: 800,
       animations: true,
       motionQuality: 'auto',
       ambience: 'full',
@@ -131,6 +132,10 @@ window.__ModuleLoader__.load({
         close: 'M6 6l12 12M18 6L6 18',
         upload: 'M12 16V4m-5 5 5-5 5 5M5 20h14',
         check: 'M5 12l4 4L19 6',
+        type: 'M5 6V4h14v2M12 4v16M9 20h6',
+        sun: 'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM12 3v1.6M12 19.4V21M3 12h1.6M19.4 12H21M5.6 5.6l1.1 1.1M17.3 17.3l1.1 1.1M18.4 5.6l-1.1 1.1M6.7 17.3l-1.1 1.1',
+        up: 'M12 19V6m-6 6 6-6 6 6',
+        moon: 'M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z',
       };
       return h('svg', {
         className: 'mr-glyph', width: size, height: size, viewBox: '0 0 24 24',
@@ -526,6 +531,7 @@ window.__ModuleLoader__.load({
       const scrollMotionRef = useRef({ target: 0, current: 0, velocity: 0, settle: 0 });
       const drawerRef = useRef('');
       drawerRef.current = drawer;
+      const tocActiveRef = useRef(null);
       const veilTimer = useRef(null);
       const measureRef = useRef(null);
       const requestRef = useRef(0);
@@ -588,6 +594,14 @@ window.__ModuleLoader__.load({
         ambienceRef.current?.setProgress(total);
       }, [scrollPercent, pageIndex, pageCount]);
       useEffect(() => { ambienceRef.current?.setSeam(turning ? 0.45 : 0, 0.5); }, [turning]);
+      useEffect(() => {
+        if (drawer !== 'toc') return undefined;
+        const frame = requestAnimationFrame(() => {
+          const node = tocActiveRef.current;
+          if (node && typeof node.scrollIntoView === 'function') node.scrollIntoView({ block: 'center' });
+        });
+        return () => cancelAnimationFrame(frame);
+      }, [drawer]);
       useEffect(() => {
         const api = ambienceRef.current;
         if (!api) return;
@@ -990,15 +1004,36 @@ window.__ModuleLoader__.load({
         const view = pagedRef.current;
         const article = articleRef.current;
         if (!view || !article) return;
-        const gap = 30;
+        const nextColumns = 1;
+        const gap = 0;
         const width = article.clientWidth || view.clientWidth;
-        const nextColumns = width >= 860 ? 2 : 1;
         if (nextColumns !== columns) { setColumns(nextColumns); return; }
         const nextPageWidth = nextColumns === 1 ? width : (width - gap) / nextColumns;
         article.style.columnWidth = `${nextPageWidth}px`;
         article.style.columnGap = `${gap}px`;
         article.style.columnCount = 'auto';
         article.style.columnFill = 'auto';
+        // Multicol clips at the column box instead of pushing a half line to the
+        // next column, so snap both the box and the chapter head to whole lines.
+        const box = getComputedStyle(article);
+        const lineHeight = parseFloat(box.lineHeight) || 0;
+        const padTop = parseFloat(box.paddingTop) || 0;
+        const padBottom = parseFloat(box.paddingBottom) || 0;
+        if (lineHeight > 0) {
+          const head = article.querySelector('.mr-chapter-open');
+          if (head) {
+            const headPad = parseFloat(getComputedStyle(head).paddingBottom) || 0;
+            const content = Math.max(0, head.getBoundingClientRect().height - headPad);
+            const snappedPad = Math.max(0, Math.ceil(content / lineHeight) * lineHeight - content);
+            if (Math.abs(headPad - snappedPad) > 0.5) head.style.paddingBottom = `${snappedPad}px`;
+          }
+          const available = view.clientHeight - padTop - padBottom;
+          if (available > lineHeight) {
+            const snapped = Math.floor(available / lineHeight) * lineHeight;
+            const target = `${snapped + padTop + padBottom}px`;
+            if (article.style.height !== target) article.style.height = target;
+          }
+        }
         const totalColumns = paginationMath.totalColumns(article.scrollWidth, nextPageWidth, gap);
         const pages = paginationMath.pageCount(totalColumns, nextColumns);
         const currentPercent = restorePercent != null
@@ -1015,9 +1050,8 @@ window.__ModuleLoader__.load({
             range.setEnd(anchor.node, Math.min(anchor.node.nodeValue.length, anchor.offset + 1));
             const rect = range.getBoundingClientRect();
             if (!rect || (!rect.width && !rect.height)) return null;
-            const viewRect = view.getBoundingClientRect();
-            const layoutLeft = viewRect.left + article.offsetLeft - view.scrollLeft;
             const step = nextPageWidth + gap;
+            const layoutLeft = article.getBoundingClientRect().left + pageIndexRef.current * step;
             return paginationMath.columnForAnchor({
               anchorLeft: rect.left,
               pageIndex: pageIndexRef.current,
@@ -1048,7 +1082,7 @@ window.__ModuleLoader__.load({
         if (mode !== 'paged' || !chapter) return;
         const raf = requestAnimationFrame(() => measureRef.current(pendingPercentRef.current, pendingOffsetRef.current));
         return () => cancelAnimationFrame(raf);
-      }, [mode, columns, chapter, settings.fontSize, settings.lineHeight, settings.fontFamily]);
+      }, [mode, columns, chapter, settings.fontSize, settings.lineHeight, settings.fontFamily, settings.measureWidth]);
 
       // Persist the first character of the visible page so a later font-size
       // or column change can land on the same text instead of the same percent.
@@ -1183,8 +1217,18 @@ window.__ModuleLoader__.load({
         turnPage(event.clientX < rect.left + rect.width / 2 ? -1 : 1);
       };
 
+      const rawTitle = String(name || '').trim();
+      const titleMatch = rawTitle.match(/^(第[〇零一二三四五六七八九十百千万两\d]+[章节回卷])[\s　]*([\s\S]*)$/);
+      const chapterNo = titleMatch ? titleMatch[1] : '';
+      const chapterTitle = titleMatch ? titleMatch[2].trim() : rawTitle;
+      const chapterChars = paragraphs.reduce((sum, line) => sum + line.replace(/\s/g, '').length, 0);
+      const bookLabel = String(book.title || book.name || '').trim().replace(/\.(txt|epub|md)$/i, '');
+      const chapterMeta = [bookLabel, chapterChars ? `${chapterChars} 字` : ''].filter(Boolean).join(' · ');
       const chapterNodes = [
-        h('h1', { key: 'title' }, name),
+        h('header', { key: 'title', className: 'mr-chapter-open' },
+          chapterNo ? h('div', { className: 'mr-chapter-no' }, chapterNo) : null,
+          chapterTitle ? h('h1', { className: 'mr-chapter-title' }, chapterTitle) : null,
+          chapterMeta ? h('div', { className: 'mr-chapter-meta' }, h('i', { 'aria-hidden': true }), h('span', null, chapterMeta)) : null),
         ...paragraphs.map((line, index) => h('p', { key: index }, line)),
         !paragraphs.length ? h(Empty, { key: 'empty', title: '本章无正文', detail: '可尝试刷新目录。' }) : null,
         h('div', { key: 'end', className: 'mr-chapter-end' }, chapterIndex + 1 < toc.length ? h(Button, { kind: 'primary soft', onClick: () => openChapter(chapterIndex + 1) }, '下一章') : h('span', null, '已是最后一章')),
@@ -1193,70 +1237,129 @@ window.__ModuleLoader__.load({
         fontSize: `${settings.fontSize || 20}px`,
         lineHeight: settings.lineHeight || 1.9,
         columnWidth: pageWidth ? `${pageWidth}px` : 'auto',
-        columnGap: '30px',
+        columnGap: '0px',
         columnCount: 'auto',
         columnFill: 'auto',
         height: '100%',
         transform: `translateX(${-(pageIndex * pageStep) + dragOffset}px)`,
       };
 
-      return h('div', { className: `mr-reader theme-${theme} font-${settings.fontFamily || 'serif'}${motionOff ? ' mr-reduced' : ''}` },
+      const toolButton = (icon, label, onClick, extra = {}) => h('button', {
+        type: 'button', className: 'mr-tool-btn', title: label, 'aria-label': label, onClick, ...extra,
+      }, h(Glyph, { name: icon, size: 19 }), h('span', null, label));
+      const tabButton = (icon, label, onClick, extra = {}) => h('button', {
+        type: 'button', className: 'mr-tab-btn', title: label, 'aria-label': label, onClick, ...extra,
+      }, h(Glyph, { name: icon, size: 20 }), h('span', null, label));
+      const segment = (items) => h('div', { className: 'mr-seg' }, items.map(([text, active, handle]) => h('button', {
+        key: text, type: 'button', className: `mr-seg-btn${active ? ' active' : ''}`, onClick: handle,
+      }, text)));
+      const settingRow = (label, control) => h('div', { key: label, className: 'mr-set-row' },
+        h('span', { className: 'mr-set-label' }, label), h('div', { className: 'mr-set-control' }, control));
+      const rangeRow = (label, value, suffix, control) => settingRow(label, h('div', { className: 'mr-range' },
+        control, h('span', { className: 'mr-range-val' }, `${value}${suffix}`)));
+      const chapterPercent = chapterIndex >= 0 ? `${Math.round((chapterIndex + 1) / Math.max(1, toc.length) * 100)}%` : '';
+      const pageFraction = mode === 'paged' ? Math.min(1, (pageIndex + 1) / Math.max(1, pageCount)) : scrollPercent / 100;
+      const bookPercent = chapterIndex >= 0 && toc.length
+        ? Math.max(0, Math.min(100, (chapterIndex + pageFraction) / toc.length * 100))
+        : 0;
+
+      return h('div', {
+        className: `mr-reader theme-${theme} font-${settings.fontFamily === 'sans' ? 'sans' : 'serif'}${motionOff ? ' mr-reduced' : ''}`,
+        style: { '--mr-text': `${Math.max(360, (settings.measureWidth || 800) - 128)}px` },
+      },
         h('div', { className: 'mr-ambience', ref: ambienceHostRef, 'aria-hidden': true }),
-        h('header', { className: 'mr-reader-header' },
-          h(Button, { kind: 'icon', icon: 'back', onClick: closeReader, title: '返回书架' }),
-          h('div', { className: 'mr-reader-heading' }, h('strong', null, book.name || book.title || '本地书籍'), h('small', null, toc.length ? `${chapterIndex + 1}/${toc.length}` : '本地书籍')),
-          h('button', { className: 'mr-mode-toggle', onClick: toggleMode, title: `切换为${mode === 'paged' ? '滚动' : '翻页'}阅读` }, mode === 'paged' ? '滚动' : '翻页'),
-          h(Button, { kind: 'icon', icon: speaking ? 'stop' : 'play', onClick: speak, title: speaking ? '停止' : '听书' }),
-          h(Button, { kind: 'icon', icon: 'note', onPointerDown: (event) => event.preventDefault(), onClick: makeNote, title: '笔记' }),
-          h(Button, { kind: 'icon', icon: 'settings', onClick: () => setDrawer(drawer === 'settings' ? '' : 'settings'), title: '排版' }),
-          h(Button, { kind: 'icon', icon: 'list', onClick: () => setDrawer(drawer === 'toc' ? '' : 'toc'), title: '目录' })),
-        h('div', { className: 'mr-reading-progress', style: { width: `${scrollPercent}%` } }),
+        h('div', { className: 'mr-rail', 'aria-hidden': true }, h('i', { style: { width: `${bookPercent}%` } })),
         h('main', mode === 'paged'
           ? { className: 'mr-paged-view', ref: pagedRef, onClick: onPagedClick, onPointerDown: onPagedPointerDown, onPointerMove: onPagedPointerMove, onPointerUp: onPagedPointerUp, onPointerCancel: onPagedPointerCancel }
           : { className: 'mr-chapter-scroll', ref: scrollRef, onScroll },
           loading ? h('div', { className: 'mr-loading' }, '正在打开章节…') : error ? h('div', { className: 'mr-error-block' }, h('p', null, error), h(Button, { onClick: () => { if (toc.length && failedIndex >= 0) openChapter(failedIndex); else { setLoading(true); setError(''); setRetryNonce((value) => value + 1); } } }, '重试')) :
-            h('article', mode === 'paged'
-              ? { className: `mr-chapter mr-paged-chapter${dragging ? ' mr-dragging' : ''}${turning ? ' mr-turning' : ''}${fadeIn ? ' mr-fade-in' : ''}`, ref: articleRef, style: pagedArticleStyle }
-              : { className: 'mr-chapter', style: { fontSize: `${settings.fontSize || 20}px`, lineHeight: settings.lineHeight || 1.9 } },
-            chapterNodes),
+            mode === 'paged'
+              ? h('div', { className: 'mr-page-window' },
+                h('article', { className: `mr-chapter mr-paged-chapter${dragging ? ' mr-dragging' : ''}${turning ? ' mr-turning' : ''}${fadeIn ? ' mr-fade-in' : ''}`, ref: articleRef, style: pagedArticleStyle }, chapterNodes))
+              : h('article', { className: 'mr-chapter', style: { fontSize: `${settings.fontSize || 20}px`, lineHeight: settings.lineHeight || 1.9 } }, chapterNodes),
           chapterVeil ? h('div', { className: `mr-chapter-veil${chapterVeil ? ' show' : ''}`, key: chapterVeil }, chapterVeil) : null),
-        h('footer', { className: 'mr-reader-footer' },
-          h(Button, { kind: 'text', icon: 'back', disabled: chapterIndex <= 0 || loading, onClick: () => openChapter(chapterIndex - 1) }, '上一章'),
-          mode === 'paged'
-            ? h('div', { className: 'mr-page-nav' },
-              h('button', { className: 'mr-page-btn', disabled: turning || (pageIndex <= 0 && chapterIndex <= 0), onClick: () => turnPage(-1), 'aria-label': '上一页' }, '‹'),
-              h('span', null, `${Math.min(pageCount, pageIndex + 1)} / ${pageCount}`),
-              h('button', { className: 'mr-page-btn', disabled: turning || (pageIndex >= pageCount - 1 && chapterIndex + 1 >= toc.length), onClick: () => turnPage(1), 'aria-label': '下一页' }, '›'))
-            : h('span', null, chapterIndex >= 0 ? `${Math.round((chapterIndex + 1) / Math.max(1, toc.length) * 100)}%` : ''),
-          h(Button, { kind: 'text', icon: 'next', disabled: chapterIndex + 1 >= toc.length || loading, onClick: () => openChapter(chapterIndex + 1) }, '下一章')),
-        drawer ? h('div', { className: 'mr-drawer-backdrop', onClick: () => setDrawer('') }) : null,
-        drawer ? h('aside', { className: 'mr-drawer', role: 'dialog', 'aria-modal': true, 'aria-label': drawer === 'toc' ? '目录' : drawer === 'notes' ? '笔记' : '排版' },
-          h('div', { className: 'mr-drawer-head' }, h('h2', null, drawer === 'toc' ? '目录' : drawer === 'notes' ? '笔记' : '排版'), h(Button, { kind: 'icon', icon: 'close', onClick: () => setDrawer('') })),
-          drawer === 'toc' ? h('div', { className: 'mr-toc' }, toc.map((item, index) => h('button', { key: item.id || item.chapterId || item.url || index, className: index === chapterIndex ? 'active' : '', onClick: () => openChapter(index) }, item.name || item.title || `第 ${index + 1} 章`))) : null,
-          drawer === 'settings' ? h('div', { className: 'mr-drawer-body' },
-            h('label', null, '本书动画'), h('div', { className: 'mr-mode-picker' },
-              h('button', { className: `mr-mode-choice ${bookPrefs ? '' : 'active'}`, onClick: () => onBookSettings?.({ clear: true }) }, '跟随全局'),
-              h('button', { className: `mr-mode-choice ${bookPrefs ? 'active' : ''}`, onClick: () => onBookSettings?.({ mode: prefMode, flipStyle: prefFlipStyle, ambience: prefAmbience }) }, '本书单独设定')),
-            h('label', null, '阅读方式'), h('div', { className: 'mr-mode-picker' },
-              h('button', { className: `mr-mode-choice ${mode === 'paged' ? 'active' : ''}`, onClick: () => { pendingPercentRef.current = scrollPercent; setMode('paged'); persistPref('mode', 'paged'); } }, '翻页'),
-              h('button', { className: `mr-mode-choice ${mode === 'scroll' ? 'active' : ''}`, onClick: () => { setMode('scroll'); persistPref('mode', 'scroll'); } }, '滚动')),
-            h('label', null, '翻页效果'), h('div', { className: 'mr-mode-picker' },
-              h('button', { className: `mr-mode-choice ${flipStyle === 'slide' ? 'active' : ''}`, onClick: () => chooseFlip('slide') }, '滑动'),
-              h('button', { className: `mr-mode-choice ${flipStyle === 'flip' ? 'active' : ''}`, onClick: () => chooseFlip('flip') }, '翻转'),
-              h('button', { className: `mr-mode-choice ${flipStyle === 'fade' ? 'active' : ''}`, onClick: () => chooseFlip('fade') }, '淡入')),
-            h('label', null, '氛围'), h('div', { className: 'mr-mode-picker' },
-              h('button', { className: `mr-mode-choice ${prefAmbience === 'full' ? 'active' : ''}`, onClick: () => persistPref('ambience', 'full') }, '完整'),
-              h('button', { className: `mr-mode-choice ${prefAmbience === 'paper' ? 'active' : ''}`, onClick: () => persistPref('ambience', 'paper') }, '仅纸张'),
-              h('button', { className: `mr-mode-choice ${prefAmbience === 'off' ? 'active' : ''}`, onClick: () => persistPref('ambience', 'off') }, '关闭')),
-            h('label', null, '字号'), h('div', { className: 'mr-stepper' }, h(Button, { onClick: () => onSettings({ fontSize: Math.max(14, settings.fontSize - 1) }) }, '减小'), h('strong', null, settings.fontSize), h(Button, { onClick: () => onSettings({ fontSize: Math.min(36, settings.fontSize + 1) }) }, '增大')),
-            h('label', null, '行距'), h('input', { type: 'range', min: 1.4, max: 2.5, step: .1, value: settings.lineHeight, onChange: (e) => onSettings({ lineHeight: Number(e.target.value) }) }),
-            h('label', null, '字体'), h('select', { value: settings.fontFamily, onChange: (e) => onSettings({ fontFamily: e.target.value }) }, h('option', { value: 'serif' }, '衬线'), h('option', { value: 'sans' }, '黑体')),
-            h('label', null, '纸张'), h('div', { className: 'mr-theme-picker' }, ['paper', 'light', 'green', 'dark'].map((item) => h('button', { key: item, className: `mr-swatch ${item} ${theme === item ? 'active' : ''}`, 'aria-label': ({ paper: '米黄', light: '白色', green: '浅绿', dark: '深色' })[item], onClick: () => onSettings({ readerTheme: item }) }))),
-            h('label', null, '语速'), h('input', { type: 'range', min: .5, max: 2, step: .1, value: settings.ttsRate || 1, onChange: (e) => onSettings({ ttsRate: Number(e.target.value) }) })) : null,
-          drawer === 'notes' ? h('div', { className: 'mr-drawer-body' },
+        mode === 'paged' && !loading && !error ? h('div', { className: 'mr-folio', 'aria-hidden': true },
+          `${Math.min(pageCount, pageIndex + 1)} / ${pageCount}`) : null,
+        h('nav', { className: 'mr-tools', 'aria-label': '阅读工具' },
+          toolButton('back', '返回', closeReader),
+          toolButton('list', '目录', () => setDrawer(drawer === 'toc' ? '' : 'toc')),
+          toolButton('type', '排版', () => setDrawer(drawer === 'settings' ? '' : 'settings')),
+          h('hr', { 'aria-hidden': true }),
+          toolButton(speaking ? 'stop' : 'play', speaking ? '停止' : '听书', speak),
+          toolButton('note', '笔记', makeNote, { onPointerDown: (event) => event.preventDefault() }),
+          h('hr', { 'aria-hidden': true }),
+          toolButton(theme === 'dark' ? 'sun' : 'moon', '夜间', () => onSettings({ readerTheme: theme === 'dark' ? 'paper' : 'dark' })),
+          mode === 'scroll' ? toolButton('up', '回顶', () => scrollRef.current?.scrollTo({ top: 0, behavior: motionOff ? 'auto' : 'smooth' })) : null),
+        h('nav', { className: 'mr-tabbar', 'aria-label': '阅读工具' },
+          tabButton('back', '返回', closeReader),
+          tabButton('list', '目录', () => setDrawer(drawer === 'toc' ? '' : 'toc')),
+          tabButton('type', '排版', () => setDrawer(drawer === 'settings' ? '' : 'settings')),
+          tabButton(speaking ? 'stop' : 'play', speaking ? '停止' : '听书', speak),
+          tabButton('note', '笔记', makeNote, { onPointerDown: (event) => event.preventDefault() })),
+        drawer ? h('div', { className: `mr-drawer-backdrop${drawer === 'toc' ? ' mr-backdrop-soft' : ''}`, onClick: () => setDrawer('') }) : null,
+        drawer === 'settings' ? h('div', { className: 'mr-modal-backdrop', onClick: () => setDrawer('') },
+          h('div', { className: 'mr-modal', role: 'dialog', 'aria-modal': true, 'aria-label': '排版', onClick: (event) => event.stopPropagation() },
+            h('div', { className: 'mr-modal-head' },
+              h('h2', null, '排版'),
+              h('button', { type: 'button', className: 'mr-modal-close', 'aria-label': '关闭', onClick: () => setDrawer('') }, h(Glyph, { name: 'close', size: 15 }))),
+            h('div', { className: 'mr-modal-body' },
+              settingRow('本书', segment([
+                ['跟随全局', !bookPrefs, () => onBookSettings?.({ clear: true })],
+                ['本书单独设定', !!bookPrefs, () => onBookSettings?.({ mode: prefMode, flipStyle: prefFlipStyle, ambience: prefAmbience })],
+              ])),
+              settingRow('纸张', h('div', { className: 'mr-swatches' }, ['paper', 'light', 'green', 'dark'].map((item) => h('button', {
+                key: item, type: 'button', className: `mr-swatch ${item}${theme === item ? ' active' : ''}`,
+                'aria-label': ({ paper: '米黄', light: '白色', green: '浅绿', dark: '深色' })[item],
+                onClick: () => onSettings({ readerTheme: item }),
+              })))),
+              settingRow('字体', segment([
+                ['衬线', settings.fontFamily !== 'sans', () => onSettings({ fontFamily: 'serif' })],
+                ['黑体', settings.fontFamily === 'sans', () => onSettings({ fontFamily: 'sans' })],
+              ])),
+              settingRow('字号', h('div', { className: 'mr-stepper' },
+                h('button', { type: 'button', className: 'mr-step-btn', onClick: () => onSettings({ fontSize: Math.max(14, (settings.fontSize || 19) - 1) }) }, '减小'),
+                h('strong', null, settings.fontSize || 19),
+                h('button', { type: 'button', className: 'mr-step-btn', onClick: () => onSettings({ fontSize: Math.min(36, (settings.fontSize || 19) + 1) }) }, '增大'))),
+              settingRow('版心', segment([
+                ['640', (settings.measureWidth || 800) === 640, () => onSettings({ measureWidth: 640 })],
+                ['800', (settings.measureWidth || 800) === 800, () => onSettings({ measureWidth: 800 })],
+                ['960', (settings.measureWidth || 800) === 960, () => onSettings({ measureWidth: 960 })],
+              ])),
+              settingRow('阅读方式', segment([
+                ['翻页', mode === 'paged', () => { pendingPercentRef.current = scrollPercent; setMode('paged'); persistPref('mode', 'paged'); }],
+                ['滚动', mode === 'scroll', () => { setMode('scroll'); persistPref('mode', 'scroll'); }],
+              ])),
+              settingRow('翻页效果', segment([
+                ['滑动', flipStyle === 'slide', () => chooseFlip('slide')],
+                ['翻转', flipStyle === 'flip', () => chooseFlip('flip')],
+                ['淡入', flipStyle === 'fade', () => chooseFlip('fade')],
+              ])),
+              settingRow('氛围', segment([
+                ['完整', prefAmbience === 'full', () => persistPref('ambience', 'full')],
+                ['仅纸张', prefAmbience === 'paper', () => persistPref('ambience', 'paper')],
+                ['关闭', prefAmbience === 'off', () => persistPref('ambience', 'off')],
+              ])),
+              rangeRow('行距', (settings.lineHeight || 1.9).toFixed(1), '', h('input', { type: 'range', min: 1.4, max: 2.5, step: .1, value: settings.lineHeight || 1.9, onChange: (e) => onSettings({ lineHeight: Number(e.target.value) }) })),
+              rangeRow('语速', (settings.ttsRate || 1).toFixed(1), '×', h('input', { type: 'range', min: .5, max: 2, step: .1, value: settings.ttsRate || 1, onChange: (e) => onSettings({ ttsRate: Number(e.target.value) }) }))))) : null,
+        drawer === 'toc' ? h('aside', { className: 'mr-drawer mr-drawer-left', role: 'dialog', 'aria-modal': true, 'aria-label': '目录' },
+          h('div', { className: 'mr-drawer-head' },
+            h('h2', null, '目录'),
+            h('span', { className: 'mr-drawer-count' }, `${toc.length} 章`),
+            h(Button, { kind: 'icon', icon: 'close', onClick: () => setDrawer('') })),
+          h('div', { className: 'mr-toc' }, toc.map((item, index) => h('button', {
+            key: item.id || item.chapterId || item.url || index,
+            ref: index === chapterIndex ? tocActiveRef : null,
+            className: index === chapterIndex ? 'active' : '',
+            onClick: () => openChapter(index),
+          }, item.name || item.title || `第 ${index + 1} 章`)))) : null,
+        drawer === 'notes' ? h('aside', { className: 'mr-drawer', role: 'dialog', 'aria-modal': true, 'aria-label': '笔记' },
+          h('div', { className: 'mr-drawer-head' },
+            h('h2', null, '笔记'),
+            h(Button, { kind: 'icon', icon: 'close', onClick: () => setDrawer('') })),
+          h('div', { className: 'mr-drawer-body' },
             quote ? h('blockquote', null, quote) : null,
             h('div', { className: 'mr-note-editor' }, h('textarea', { rows: 4, value: noteText, onChange: (e) => setNoteText(e.target.value), placeholder: '写下想法…' }), h(Button, { kind: 'primary', disabled: !noteText.trim(), onClick: async () => { try { await onSaveNote({ bookId, chapterId: progressRef.current.chapterId, text: noteText, quote }); setNoteText(''); setQuote(''); } catch {} } }, '保存')),
-            h('div', { className: 'mr-notes' }, chapterNotes.map((note) => h('article', { key: note.id }, note.quote ? h('blockquote', null, note.quote) : null, h('p', null, note.text), h(Button, { kind: 'text danger', icon: 'trash', onClick: () => onDeleteNote(note) }, '删除'))))) : null) : null);
+            h('div', { className: 'mr-notes' }, chapterNotes.map((note) => h('article', { key: note.id }, note.quote ? h('blockquote', null, note.quote) : null, h('p', null, note.text), h(Button, { kind: 'text danger', icon: 'trash', onClick: () => onDeleteNote(note) }, '删除')))))) : null);
     }
 
     const OPEN_BACKDROPS = { paper: '#f4ecdc', light: '#ffffff', green: '#e3eee5', dark: '#202522' };
@@ -1532,9 +1635,97 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-panel{border:1px solid var(--mr-border);border-radius:12px;background:var(--mr-card);box-shadow:var(--mr-shadow);padding:20px;margin-bottom:16px}.mr-panel h3{font:400 18px/1.35 var(--mr-serif);margin:0 0 14px}.mr-panel textarea{width:100%;resize:vertical;line-height:1.6}.mr-help{font-size:12px;color:var(--mr-muted);line-height:1.6}.mr-check{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mr-muted);margin-top:12px}.mr-check input{width:16px;height:16px;padding:0}.mr-inline-actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}.mr-source-list{display:flex;flex-direction:column;gap:9px}.mr-source-row{display:flex;align-items:center;gap:12px;padding:13px 15px;border:1px solid var(--mr-border);border-radius:11px;background:var(--mr-card)}.mr-source-row>div:nth-child(2){flex:1;min-width:0}.mr-source-row h3{font:400 15px/1.4 var(--mr-serif);margin:0 0 4px}.mr-source-row p{font-size:11px;color:var(--mr-muted);margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mr-source-mark{color:var(--mr-accent)}.mr-tag{font-size:10px;border:1px solid var(--mr-border);padding:3px 7px;border-radius:10px;color:var(--mr-muted);white-space:nowrap}
 .mr-setting-row{display:flex;align-items:center;justify-content:space-between;gap:20px;margin:15px 0;font-size:13px}.mr-stepper{display:flex;align-items:center;gap:12px}.mr-stepper strong{min-width:42px;text-align:center}.mr-setting-row input[type=range],.mr-drawer input[type=range]{accent-color:var(--mr-accent,var(--reader-accent));height:20px}.mr-mode-picker{display:inline-flex;gap:2px;padding:2px;border:1px solid var(--mr-border);border-radius:8px;background:var(--mr-sunken)}.mr-mode-choice{min-height:32px;padding:0 12px;border:0;border-radius:6px;background:transparent;color:var(--mr-muted);font-size:12px;white-space:nowrap}.mr-mode-choice:hover{color:var(--mr-text)}.mr-mode-choice.active{background:var(--mr-card);color:var(--mr-text);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.08)}.mr-theme-picker{display:flex;gap:10px}.mr-swatch{width:34px;height:34px;border-radius:50%;border:2px solid transparent;box-shadow:0 0 0 1px var(--mr-border)}.mr-swatch.active{border-color:var(--mr-accent);box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),0 0 0 4px var(--mr-accent)}.mr-swatch.paper{background:#f4ecdc}.mr-swatch.light{background:#fff}.mr-swatch.green{background:#e3eee5}.mr-swatch.dark{background:#202522}.mr-roadmap p{color:var(--mr-muted);font-size:12px;line-height:1.7;margin:0}
 .mr-notice{position:sticky;top:-20px;z-index:20;margin:-12px auto 16px;max-width:760px;padding:11px 13px;border-radius:10px;background:var(--mr-card);border:1px solid var(--mr-border);box-shadow:var(--mr-shadow);display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px}.mr-notice.error{border-color:var(--dsw-alias-state-error-primary)}.mr-notice.success{border-color:var(--dsw-alias-state-success-primary)}.mr-notice button{border:0;background:transparent;color:inherit;padding:4px;display:flex}.mr-loading{text-align:center;color:var(--mr-muted);font-size:13px;padding:36px}.mr-error-block{text-align:center;padding:50px 20px;color:var(--dsw-alias-state-error-primary)}
-.mr-reader{--reader-bg:#f4ecdc;--reader-text:#342f27;--reader-muted:#857b68;--reader-border:#d9cfbb;--mr-card:var(--reader-bg);--mr-sunken:color-mix(in srgb,var(--reader-text) 6%,var(--reader-bg));--mr-border:var(--reader-border);--mr-text:var(--reader-text);--mr-muted:var(--reader-muted);--mr-on-accent:var(--reader-bg);--mr-accent:var(--dsw-alias-brand-primary);height:100%;min-height:0;display:flex;flex-direction:column;position:relative;overflow:hidden;background:var(--reader-bg);color:var(--reader-text)}.mr-reader.theme-light{--reader-bg:#fff;--reader-text:#292d2b;--reader-muted:#7b817e;--reader-border:#e3e6e4}.mr-reader.theme-green{--reader-bg:#e3eee5;--reader-text:#2d3c31;--reader-muted:#708275;--reader-border:#c5d5c9}.mr-reader.theme-dark{--reader-bg:#202522;--reader-text:#d4d9d5;--reader-muted:#87918b;--reader-border:#3b4540}.mr-reader-header{height:58px;flex:0 0 58px;display:flex;align-items:center;gap:3px;padding:0 14px;border-bottom:1px solid var(--reader-border);background:var(--reader-bg);z-index:3}.mr-reader-heading{flex:1;min-width:0;text-align:center}.mr-reader-heading strong,.mr-reader-heading small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mr-reader-heading strong{font-size:14px}.mr-reader-heading small{font-size:10px;color:var(--reader-muted);margin-top:3px}.mr-reading-progress{height:2px;background:var(--mr-accent,var(--dsw-alias-brand-primary));position:absolute;top:57px;left:0;z-index:4;transition:width .2s}
-.mr-chapter-scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;mask-image:linear-gradient(to bottom,transparent 0,#000 1.6em,#000 calc(100% - 1.6em),transparent 100%);-webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 1.6em,#000 calc(100% - 1.6em),transparent 100%)}.mr-paged-view{flex:1;min-height:0;overflow:hidden;position:relative;padding:0 20px;touch-action:pan-y}.mr-paged-chapter{width:100%;height:100%;margin:0 auto;padding:42px 0 34px;box-sizing:border-box;column-fill:auto;will-change:transform;transition:transform .18s ease-out}.mr-paged-chapter.mr-dragging{transition:none;user-select:none;cursor:grabbing}.mr-paged-chapter.mr-turning{transition:none}.mr-paged-chapter.mr-fade-in{animation:mr-page-fade .24s ease both}@keyframes mr-page-fade{from{opacity:.2}to{opacity:1}}.mr-turn-host{contain:layout paint}.mr-turn-shade{position:absolute;inset:0;pointer-events:none;opacity:0;background:linear-gradient(90deg,rgba(0,0,0,.04),rgba(0,0,0,.22) 60%,rgba(0,0,0,.45))}@media (prefers-reduced-motion:reduce){.mr-chapter-veil{animation-duration:.3s}.mr-paged-chapter{transition:none}}.mr-reader.mr-reduced .mr-paged-chapter{transition:none}.mr-reader.mr-reduced .mr-chapter-veil{animation-duration:.3s}.mr-reader.mr-reduced .mr-paged-chapter.mr-fade-in{animation:none}.mr-chapter.mr-paged-chapter{width:100%}.mr-chapter-veil{position:absolute;left:50%;top:46%;transform:translate(-50%,-50%);z-index:6;pointer-events:none;padding:10px 16px;border-radius:10px;background:color-mix(in srgb,var(--reader-bg) 88%,transparent);color:var(--reader-muted);font-size:13px;letter-spacing:.08em;box-shadow:0 8px 24px #0002;animation:mr-veil-in 1.05s ease both}.mr-chapter-veil.show{opacity:1}@keyframes mr-veil-in{0%{opacity:0;transform:translate(-50%,-42%)}18%,70%{opacity:1;transform:translate(-50%,-50%)}100%{opacity:0;transform:translate(-50%,-54%)}}.mr-chapter{width:min(100% - 40px,720px);margin:0 auto;padding:46px 0 70px;font-family:Georgia,'Noto Serif SC','Songti SC',serif}.font-sans .mr-chapter{font-family:system-ui,'Noto Sans SC',sans-serif}.mr-mode-toggle{border:1px solid var(--reader-border);background:transparent;color:var(--reader-muted);border-radius:7px;padding:5px 8px;font-size:11px;line-height:1;min-height:28px;white-space:nowrap}.mr-mode-toggle:hover{color:var(--reader-text)}.mr-drawer .mr-mode-picker{display:flex;gap:8px;margin:0 0 14px}.mr-drawer .mr-mode-choice{flex:1;border:1px solid var(--reader-border);background:transparent;color:var(--reader-muted);border-radius:8px;padding:8px;font-size:13px;white-space:nowrap}.mr-drawer .mr-mode-choice.active{border-color:var(--reader-accent);color:var(--reader-accent);background:color-mix(in srgb,var(--reader-accent) 10%,transparent)}.mr-page-nav{display:flex;align-items:center;gap:8px}.mr-page-btn{width:34px;height:34px;border:1px solid var(--reader-border);border-radius:8px;background:transparent;color:var(--reader-text);font-size:20px;line-height:1;display:flex;align-items:center;justify-content:center}.mr-page-btn:disabled{opacity:.35}.mr-page-nav span{min-width:52px;text-align:center;font-variant-numeric:tabular-nums}.mr-chapter h1{font-size:1.35em;line-height:1.5;margin:0 0 32px;font-weight:650}.mr-chapter p{margin:0 0 1em;text-align:justify;overflow-wrap:anywhere}.mr-chapter-end{display:flex;justify-content:center;padding:28px 0;color:var(--reader-muted);font-size:12px}.mr-reader-footer{height:50px;flex:0 0 50px;border-top:1px solid var(--reader-border);display:flex;align-items:center;justify-content:space-between;padding:0 18px;color:var(--reader-muted);font-size:11px;background:var(--reader-bg)}
-.mr-drawer-backdrop{position:absolute;inset:0;background:#0004;z-index:8}.mr-drawer{position:absolute;top:0;right:0;bottom:0;width:min(390px,88%);z-index:9;background:var(--reader-bg);border-left:1px solid var(--reader-border);box-shadow:-12px 0 30px #0002;display:flex;flex-direction:column}.mr-drawer-head{height:58px;flex:0 0 58px;padding:0 14px 0 20px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--reader-border)}.mr-drawer-head h2{font-size:16px}.mr-toc{overflow-y:auto;padding:8px}.mr-toc button{display:block;width:100%;min-height:42px;text-align:left;padding:10px 12px;border:0;border-radius:7px;background:transparent;color:var(--reader-text);font-size:13px;line-height:1.5}.mr-toc button:hover,.mr-toc button.active{background:color-mix(in srgb,var(--reader-text) 8%,transparent)}.mr-toc button.active{color:var(--mr-accent,var(--dsw-alias-brand-primary));font-weight:600}.mr-drawer-body{padding:20px;overflow-y:auto}.mr-drawer-body>label{display:block;font-size:12px;color:var(--reader-muted);margin:20px 0 9px}.mr-drawer-body>label:first-child{margin-top:0}.mr-drawer-body input[type=range],.mr-drawer-body select{width:100%}.mr-note-editor textarea{width:100%;resize:vertical;background:transparent;color:var(--reader-text);border-color:var(--reader-border)}.mr-note-editor .mr-button{margin-top:8px}.mr-notes{margin-top:20px}.mr-notes article{border-top:1px solid var(--reader-border);padding:14px 0;font-size:13px}.mr-notes blockquote,.mr-drawer-body>blockquote{margin:0 0 12px;padding:9px 12px;border-left:3px solid var(--reader-muted);color:var(--reader-muted);font-size:12px;line-height:1.6;overflow-wrap:anywhere}.mr-notes p{line-height:1.6;white-space:pre-wrap}
+.mr-reader{--reader-bg:#f6f1e6;--reader-text:#2b261e;--reader-muted:#867b68;--reader-border:#e2d8c4;--reader-accent:#9a3b2b;--reader-card:#fbf7ee;--mr-card:var(--reader-bg);--mr-sunken:color-mix(in srgb,var(--reader-text) 6%,var(--reader-bg));--mr-border:var(--reader-border);--mr-text:var(--reader-text);--mr-muted:var(--reader-muted);--mr-accent:var(--reader-accent);--mr-accent-hover:color-mix(in srgb,var(--reader-accent) 84%,#000);--mr-on-accent:var(--reader-bg);height:100%;min-height:0;display:flex;flex-direction:column;position:relative;overflow:hidden;background:var(--reader-bg);color:var(--reader-text)}
+.mr-reader.theme-light{--reader-bg:#fdfcf9;--reader-text:#24282a;--reader-muted:#7b817e;--reader-border:#e5e4de;--reader-card:#ffffff}
+.mr-reader.theme-green{--reader-bg:#e9f0e9;--reader-text:#2c3a30;--reader-muted:#6f8174;--reader-border:#cfdcce;--reader-accent:#4d6350;--reader-card:#f6faf5}
+.mr-reader.theme-dark{--reader-bg:#1d2220;--reader-text:#d7dcd8;--reader-muted:#8a938d;--reader-border:#39433c;--reader-accent:#c98169;--reader-card:#242b27}
+.mr-rail{position:absolute;left:0;right:0;top:0;height:2px;z-index:6;pointer-events:none;background:color-mix(in srgb,var(--reader-text) 7%,transparent)}
+.mr-rail i{display:block;height:100%;background:var(--reader-accent);opacity:.7;transition:width .28s ease}
+.mr-tools{position:absolute;right:14px;top:50%;transform:translateY(-50%);z-index:7;display:flex;flex-direction:column;gap:2px}
+.mr-tool-btn{display:flex;flex-direction:column;align-items:center;gap:4px;width:54px;padding:8px 0 7px;border:1px solid transparent;border-radius:10px;background:none;color:var(--reader-muted);font:400 11px/1 'Noto Serif CJK SC',Georgia,serif;letter-spacing:.04em;transition:background .15s ease,color .15s ease,border-color .15s ease}
+.mr-tool-btn:hover:not(:disabled){background:color-mix(in srgb,var(--reader-text) 5%,transparent);border-color:color-mix(in srgb,var(--reader-text) 10%,transparent);color:var(--reader-text)}
+.mr-tool-btn svg{display:block}
+.mr-tools hr{width:22px;height:1px;margin:5px auto;border:0;background:color-mix(in srgb,var(--reader-text) 12%,transparent)}
+.mr-folio{position:absolute;left:50%;bottom:24px;transform:translateX(-50%);z-index:3;font:400 11px/1 'Noto Serif CJK SC',Georgia,serif;letter-spacing:.24em;color:var(--reader-muted);pointer-events:none;font-variant-numeric:tabular-nums}
+.mr-tabbar{display:none}
+.mr-chapter-scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;position:relative;z-index:2}
+.mr-paged-view{flex:1;min-height:0;overflow:hidden;position:relative;z-index:2;touch-action:pan-y}
+.mr-page-window{position:relative;width:min(var(--mr-text,672px),calc(100% - 56px));height:100%;margin:0 auto;overflow:hidden}
+.mr-chapter{width:min(var(--mr-text,672px),calc(100% - 56px));margin:0 auto;padding:76px 0 96px;font-family:'Noto Serif CJK SC',Georgia,'Noto Serif SC','Songti SC',SimSun,serif}
+.font-sans .mr-chapter{font-family:system-ui,'Noto Sans SC','PingFang SC',sans-serif}
+.mr-chapter.mr-paged-chapter{width:100%;height:100%;margin:0;padding:68px 0 74px;box-sizing:border-box;column-fill:auto;will-change:transform;transition:transform .18s ease-out}
+.mr-paged-chapter.mr-dragging{transition:none;user-select:none;cursor:grabbing}
+.mr-paged-chapter.mr-turning{transition:none}
+.mr-paged-chapter.mr-fade-in{animation:mr-page-fade .24s ease both}
+@keyframes mr-page-fade{from{opacity:.2}to{opacity:1}}
+.mr-turn-host{contain:layout paint}
+.mr-turn-shade{position:absolute;inset:0;pointer-events:none;opacity:0;background:linear-gradient(90deg,rgba(0,0,0,.04),rgba(0,0,0,.22) 60%,rgba(0,0,0,.45))}
+@media (prefers-reduced-motion:reduce){.mr-chapter-veil{animation-duration:.3s}.mr-paged-chapter{transition:none}}
+.mr-reader.mr-reduced .mr-paged-chapter{transition:none}
+.mr-reader.mr-reduced .mr-chapter-veil{animation-duration:.3s}
+.mr-reader.mr-reduced .mr-paged-chapter.mr-fade-in{animation:none}
+.mr-chapter-open{padding:0 0 8px;break-inside:avoid}
+.mr-chapter-no{font-size:12px;line-height:1.6;letter-spacing:.52em;text-indent:.52em;color:var(--reader-accent);opacity:.92}
+.mr-chapter-title{font-size:30px;line-height:1.45;font-weight:600;margin:16px 0 0;letter-spacing:.01em}
+.mr-chapter-meta{display:flex;align-items:center;gap:12px;margin:22px 0 34px;font-size:12px;letter-spacing:.08em;color:var(--reader-muted)}
+.mr-chapter-meta i{display:block;width:28px;height:1px;background:var(--reader-accent);opacity:.5}
+.mr-chapter p{margin:0 0 .82em;text-align:justify;text-justify:inter-ideograph;overflow-wrap:anywhere;letter-spacing:.012em}
+.mr-chapter-end{display:flex;align-items:center;justify-content:center;gap:14px;padding:34px 0 6px;color:var(--reader-muted);font-size:12px}
+.mr-chapter-end .mr-button{min-height:0;padding:0;border:0;background:none;color:var(--reader-accent);font-size:12px;letter-spacing:.14em;box-shadow:none}
+.mr-chapter-end .mr-button:hover:not(:disabled){background:none;color:var(--reader-accent);text-decoration:underline;text-underline-offset:4px}
+.mr-chapter-veil{position:absolute;left:50%;top:46%;transform:translate(-50%,-50%);z-index:6;pointer-events:none;padding:9px 16px;border-radius:999px;background:color-mix(in srgb,var(--reader-bg) 86%,transparent);color:var(--reader-muted);font-size:13px;letter-spacing:.08em;box-shadow:0 10px 26px color-mix(in srgb,var(--reader-text) 12%,transparent);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);animation:mr-veil-in 1.05s ease both}
+.mr-chapter-veil.show{opacity:1}
+@keyframes mr-veil-in{0%{opacity:0;transform:translate(-50%,-42%)}18%,70%{opacity:1;transform:translate(-50%,-50%)}100%{opacity:0;transform:translate(-50%,-54%)}}
+.mr-drawer-backdrop{position:absolute;inset:0;z-index:8;background:color-mix(in srgb,var(--reader-text) 14%,transparent)}
+.mr-drawer{position:absolute;top:0;right:0;bottom:0;width:min(368px,90%);z-index:9;display:flex;flex-direction:column;background:var(--reader-bg);border-left:1px solid color-mix(in srgb,var(--reader-text) 12%,transparent);box-shadow:-20px 0 44px color-mix(in srgb,var(--reader-text) 12%,transparent)}
+.mr-drawer-head{height:52px;flex:0 0 52px;padding:0 8px 0 22px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid color-mix(in srgb,var(--reader-text) 10%,transparent)}
+.mr-drawer-head h2{font-size:14px;font-weight:600;letter-spacing:.22em;text-indent:.22em;color:var(--reader-text)}
+.mr-toc{overflow-y:auto;overscroll-behavior:contain;padding:6px 0 24px}
+.mr-toc button{position:relative;display:block;width:100%;min-height:44px;padding:11px 22px;border:0;border-radius:0;background:transparent;color:var(--reader-text);font-size:13px;line-height:1.55;text-align:left;opacity:.74;transition:background .15s ease,opacity .15s ease}
+.mr-toc button:hover{background:color-mix(in srgb,var(--reader-text) 5%,transparent);opacity:1}
+.mr-toc button.active{color:var(--reader-accent);font-weight:600;opacity:1}
+.mr-toc button.active::before{content:"";position:absolute;left:0;top:12px;bottom:12px;width:2px;background:var(--reader-accent)}
+.mr-drawer-body{padding:6px 22px 28px;overflow-y:auto;overscroll-behavior:contain}
+.mr-drawer-body>label{display:block;font-size:12px;letter-spacing:.13em;color:var(--reader-muted);margin:24px 0 10px}
+.mr-drawer-body>label:first-child{margin-top:8px}
+.mr-drawer-left{left:0;right:auto;border-left:0;border-right:1px solid color-mix(in srgb,var(--reader-text) 12%,transparent);box-shadow:20px 0 44px color-mix(in srgb,var(--reader-text) 12%,transparent)}
+.mr-drawer-count{margin-left:auto;margin-right:10px;font-size:12px;letter-spacing:.06em;color:var(--reader-muted)}
+.mr-backdrop-soft{background:color-mix(in srgb,var(--reader-text) 16%,transparent);-webkit-backdrop-filter:none;backdrop-filter:none}
+.mr-modal-backdrop{position:absolute;inset:0;z-index:9;display:flex;align-items:center;justify-content:center;padding:24px;background:color-mix(in srgb,var(--reader-text) 30%,transparent);-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px)}
+.mr-modal{width:min(480px,100%);max-height:100%;display:flex;flex-direction:column;background:var(--reader-card);border:1px solid color-mix(in srgb,var(--reader-text) 10%,transparent);border-radius:14px;box-shadow:0 30px 80px color-mix(in srgb,var(--reader-text) 26%,transparent);overflow:hidden}
+.mr-modal-head{display:flex;align-items:center;justify-content:space-between;padding:18px 22px 6px}
+.mr-modal-head h2{margin:0;font-size:14px;font-weight:600;letter-spacing:.2em;text-indent:.2em;color:var(--reader-text)}
+.mr-modal-close{width:30px;height:30px;display:grid;place-items:center;border:0;border-radius:8px;background:none;color:var(--reader-muted)}
+.mr-modal-close:hover{background:color-mix(in srgb,var(--reader-text) 7%,transparent);color:var(--reader-text)}
+.mr-modal-body{padding:4px 22px 22px;overflow-y:auto;overscroll-behavior:contain}
+.mr-set-row{display:flex;align-items:center;gap:14px;padding:9px 0}
+.mr-set-label{flex:none;width:64px;font-size:12px;letter-spacing:.08em;color:var(--reader-muted)}
+.mr-set-control{flex:1;min-width:0;display:flex;align-items:center;gap:10px}
+.mr-seg{display:flex;flex-wrap:wrap;gap:8px}
+.mr-seg-btn{min-height:30px;padding:0 14px;border:1px solid color-mix(in srgb,var(--reader-text) 14%,transparent);border-radius:8px;background:none;color:var(--reader-text);font-size:13px;line-height:1}
+.mr-seg-btn:hover{border-color:color-mix(in srgb,var(--reader-text) 30%,transparent)}
+.mr-seg-btn.active{border-color:var(--reader-accent);color:var(--reader-accent);background:color-mix(in srgb,var(--reader-accent) 6%,transparent)}
+.mr-stepper{display:flex;align-items:center;border:1px solid color-mix(in srgb,var(--reader-text) 14%,transparent);border-radius:8px;overflow:hidden}
+.mr-step-btn{min-height:30px;padding:0 14px;border:0;background:none;color:var(--reader-text);font-size:13px}
+.mr-step-btn:hover{background:color-mix(in srgb,var(--reader-text) 6%,transparent)}
+.mr-stepper strong{min-width:52px;text-align:center;font-size:14px;font-weight:600}
+.mr-swatches{display:flex;gap:10px}
+.mr-swatches .mr-swatch{width:26px;height:26px;border:1px solid color-mix(in srgb,var(--reader-text) 16%,transparent);border-radius:50%;box-shadow:none}
+.mr-swatches .mr-swatch.active{outline:1px solid var(--reader-accent);outline-offset:3px;border-color:transparent}
+.mr-range{display:flex;align-items:center;gap:12px;flex:1}
+.mr-range input[type=range]{-webkit-appearance:none;appearance:none;flex:1;height:22px;margin:0;background:transparent;accent-color:var(--reader-accent)}
+.mr-range input[type=range]::-webkit-slider-runnable-track{height:2px;border-radius:2px;background:color-mix(in srgb,var(--reader-text) 16%,transparent)}
+.mr-range input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:12px;height:12px;margin-top:-5px;border:0;border-radius:50%;background:var(--reader-accent)}
+.mr-range input[type=range]::-moz-range-track{height:2px;border-radius:2px;background:color-mix(in srgb,var(--reader-text) 16%,transparent)}
+.mr-range input[type=range]::-moz-range-thumb{width:12px;height:12px;border:0;border-radius:50%;background:var(--reader-accent)}
+.mr-range-val{min-width:36px;text-align:right;font-size:12px;color:var(--reader-muted);font-variant-numeric:tabular-nums}
+.mr-note-editor textarea{width:100%;min-height:96px;padding:6px 0;border:0;border-bottom:1px solid color-mix(in srgb,var(--reader-text) 14%,transparent);border-radius:0;background:transparent;color:var(--reader-text);font-size:14px;line-height:1.8;resize:vertical}
+.mr-drawer .mr-note-editor .mr-button{min-height:30px;margin-top:14px;padding:0 2px;border:0;background:none;box-shadow:none;color:var(--reader-accent);font-size:13px;letter-spacing:.12em}.mr-drawer .mr-note-editor .mr-button:hover:not(:disabled){background:none;color:var(--reader-accent);text-decoration:underline;text-underline-offset:4px}.mr-drawer .mr-note-editor .mr-button:disabled{background:none;border-color:transparent;color:var(--reader-muted);box-shadow:none;opacity:.55}.mr-drawer .mr-note-editor textarea:focus{outline:none;box-shadow:none;border-bottom-color:var(--reader-accent)}
+.mr-drawer .mr-button.primary{background:var(--reader-accent);border-color:var(--reader-accent);color:var(--reader-bg)}
+.mr-notes{margin-top:24px}
+.mr-notes article{border-top:1px solid color-mix(in srgb,var(--reader-text) 12%,transparent);padding:14px 0;font-size:13px}
+.mr-notes blockquote,.mr-drawer-body>blockquote{margin:0 0 12px;padding:8px 12px;border-left:2px solid color-mix(in srgb,var(--reader-accent) 55%,transparent);color:var(--reader-muted);font-size:12px;line-height:1.7;overflow-wrap:anywhere}
+.mr-notes p{line-height:1.7;white-space:pre-wrap}
 .mr-open-shift{position:fixed;z-index:80;overflow:hidden;pointer-events:none;contain:layout paint}
 .mr-open-veil{position:absolute;inset:0;opacity:.96;animation:mr-open-veil .46s ease-out both}
 @keyframes mr-open-veil{0%{opacity:.96}40%{opacity:1}100%{opacity:0}}
@@ -1542,8 +1733,10 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-open-cover img{display:block;width:100%;height:100%;object-fit:cover}
 .mr-open-cover span{display:flex;align-items:center;justify-content:center;width:100%;height:100%;font-family:Georgia,'Noto Serif SC',serif;font-size:24px;color:#4a3d2c;background:linear-gradient(150deg,#dfcfae,#bfa986)}
 .mr-open-spine{position:absolute;left:0;top:0;bottom:0;width:5px;background:linear-gradient(90deg,rgba(0,0,0,.28),rgba(255,255,255,.12) 62%,transparent)}
-.mr-ambience{position:absolute;inset:0;z-index:0;overflow:hidden;pointer-events:none;contain:strict}.mr-ambience canvas{display:block;width:100%;height:100%}.mr-reader-header,.mr-reader-footer{position:relative;z-index:3}.mr-chapter-scroll,.mr-paged-view{position:relative;z-index:2}.mr-loading,.mr-error-block{position:relative;z-index:2}
-@media(max-width:720px){.mr-shelf-search .kbd{display:none}.mr-root{flex-direction:column;padding-left:0}.mr-section-actions{width:100%;justify-content:space-between}.mr-reader{padding-left:0}.mr-paged-view{padding:0 14px}.mr-mode-toggle{display:none}.mr-reader-heading small{display:none}.mr-reader-heading strong{max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-content{order:1;padding:20px 14px}.mr-section-head{flex-wrap:wrap;margin-bottom:18px}.mr-section-head h2{font-size:22px;white-space:nowrap}.mr-book-grid{grid-template-columns:1fr;gap:10px}.mr-book-open{padding:13px}.mr-book-actions{position:relative}.mr-searchbar{flex-wrap:wrap}.mr-searchbar select{max-width:none;width:100%}.mr-searchbar input{flex:1}.mr-result{align-items:flex-start;padding:12px;gap:10px}.mr-result .mr-button{align-self:center;padding-inline:9px}.mr-result-info .mr-intro{-webkit-line-clamp:1}.mr-source-row{flex-wrap:wrap}.mr-source-row .mr-tag{display:none}.mr-panel{padding:16px}.mr-notice{top:-12px}.mr-reader-header{padding:0 5px}.mr-reader-heading strong{font-size:12px}.mr-chapter{width:calc(100% - 34px);padding-top:30px}.mr-chapter h1{margin-bottom:24px}.mr-drawer{left:0;right:0;width:auto}}
+.mr-ambience{position:absolute;inset:0;z-index:0;overflow:hidden;pointer-events:none;contain:strict}.mr-ambience canvas{display:block;width:100%;height:100%}.mr-chapter-scroll,.mr-paged-view{position:relative;z-index:2}.mr-loading,.mr-error-block{position:relative;z-index:2}
+@media(max-width:880px){.mr-tools{display:none}.mr-tabbar{position:absolute;left:0;right:0;bottom:0;z-index:7;display:flex;align-items:center;justify-content:space-around;height:54px;background:var(--reader-bg);border-top:1px solid color-mix(in srgb,var(--reader-text) 10%,transparent)}.mr-tab-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;flex:1;height:100%;padding:0;border:0;background:none;color:var(--reader-muted);font:400 11px/1 'Noto Serif CJK SC',Georgia,serif;letter-spacing:.04em}.mr-tab-btn:hover:not(:disabled){color:var(--reader-text)}.mr-paged-view{padding-bottom:54px}.mr-folio{bottom:70px}.mr-page-window{width:min(var(--mr-text,672px),calc(100% - 40px))}}
+@media(min-width:881px){.mr-page-window,.mr-chapter{width:min(var(--mr-text,672px),calc(100% - 200px))}}
+@media(max-width:720px){.mr-shelf-search .kbd{display:none}.mr-root{flex-direction:column;padding-left:0}.mr-section-actions{width:100%;justify-content:space-between}.mr-reader{padding-left:0}.mr-page-window{width:calc(100% - 32px)}.mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-content{order:1;padding:20px 14px}.mr-section-head{flex-wrap:wrap;margin-bottom:18px}.mr-section-head h2{font-size:22px;white-space:nowrap}.mr-book-grid{grid-template-columns:1fr;gap:10px}.mr-book-open{padding:13px}.mr-book-actions{position:relative}.mr-searchbar{flex-wrap:wrap}.mr-searchbar select{max-width:none;width:100%}.mr-searchbar input{flex:1}.mr-result{align-items:flex-start;padding:12px;gap:10px}.mr-result .mr-button{align-self:center;padding-inline:9px}.mr-result-info .mr-intro{-webkit-line-clamp:1}.mr-source-row{flex-wrap:wrap}.mr-source-row .mr-tag{display:none}.mr-panel{padding:16px}.mr-notice{top:-12px}.mr-chapter{width:calc(100% - 40px);padding:64px 0 84px}.mr-chapter-title{font-size:25px}.mr-chapter-no{letter-spacing:.42em;text-indent:.42em}.mr-drawer{left:0;right:0;width:auto}.mr-chapter-meta{letter-spacing:.04em}.mr-modal{padding:0}.mr-set-label{width:56px}}
 `;
 
     return {

@@ -1,5 +1,17 @@
 /* global window, document, ResizeObserver */
 
+// DSH loads package-local dynamic chunks as classic scripts that must register
+// a factory with the client module loader. This file is the lazy ambience
+// chunk, so it ships pre-wrapped (no build step) and keeps mountAmbience as its
+// single export.
+window.__ModuleLoader__.load({
+	id: '@local/mo-reader',
+	chunk: 'client.gl.js',
+	factory: (require) => {
+		var module = { exports: {} };
+		var exports = module.exports;
+		Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
+
 // Raw WebGL1 ambience for the reading page: paper tint, light, seam and dust.
 // No three.js, no build step; the module is loaded lazily by client.js.
 
@@ -185,7 +197,7 @@ function dustCountFor(quality) {
   return 140
 }
 
-export function mountAmbience(host, options = {}) {
+function mountAmbience(host, options = {}) {
   if (!host || typeof host.appendChild !== 'function') throw new Error('mountAmbience requires a DOM host')
   const document = host.ownerDocument
   const window = document.defaultView
@@ -321,7 +333,7 @@ export function mountAmbience(host, options = {}) {
     gl.bindTexture(gl.TEXTURE_2D, paperTexture)
     gl.uniform1i(gl.getUniformLocation(axisProgram, 'uMap'), 0)
     gl.uniform3fv(gl.getUniformLocation(axisProgram, 'uColor'), palette.ink)
-    gl.uniform1f(gl.getUniformLocation(axisProgram, 'uOpacity'), 0.9)
+    gl.uniform1f(gl.getUniformLocation(axisProgram, 'uOpacity'), 0.5)
     gl.uniform1f(gl.getUniformLocation(axisProgram, 'uAxis'), axis)
     gl.uniform1f(gl.getUniformLocation(axisProgram, 'uVelocity'), state.velocity)
     gl.drawArrays(gl.TRIANGLES, 0, 6)
@@ -343,7 +355,7 @@ export function mountAmbience(host, options = {}) {
     gl.bindTexture(gl.TEXTURE_2D, paperTexture)
     gl.uniform1i(gl.getUniformLocation(paperProgram, 'uMap'), 0)
     gl.uniform3fv(gl.getUniformLocation(paperProgram, 'uColor'), palette.ink)
-    gl.uniform1f(gl.getUniformLocation(paperProgram, 'uOpacity'), 0.5)
+    gl.uniform1f(gl.getUniformLocation(paperProgram, 'uOpacity'), 0.14)
     gl.drawArrays(gl.TRIANGLES, 0, 6)
 
     if (state.axesVisible && state.axisTop > 0) drawAxis([0, 1 - state.axisTop * 2, 1, state.axisTop * 2], 0)
@@ -354,7 +366,7 @@ export function mountAmbience(host, options = {}) {
       setupQuad(lightProgram)
       gl.uniform1f(gl.getUniformLocation(lightProgram, 'uProgress'), state.progress)
       gl.uniform3fv(gl.getUniformLocation(lightProgram, 'uColor'), palette.light)
-      gl.uniform1f(gl.getUniformLocation(lightProgram, 'uOpacity'), 0.16 * (1 + Math.min(0.5, Math.abs(state.velocity) * 0.1)))
+      gl.uniform1f(gl.getUniformLocation(lightProgram, 'uOpacity'), 0.13 * (1 + Math.min(0.5, Math.abs(state.velocity) * 0.1)))
       gl.drawArrays(gl.TRIANGLES, 0, 6)
     }
 
@@ -373,7 +385,7 @@ export function mountAmbience(host, options = {}) {
       gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0)
       gl.uniform1f(gl.getUniformLocation(dustProgram, 'uRotation'), state.dustRotation || 0)
       gl.uniform1f(gl.getUniformLocation(dustProgram, 'uDpr'), state.dpr)
-      gl.uniform1f(gl.getUniformLocation(dustProgram, 'uOpacity'), 0.42 * (1 + Math.min(0.4, Math.abs(state.velocity) * 0.08)))
+      gl.uniform1f(gl.getUniformLocation(dustProgram, 'uOpacity'), 0.2 * (1 + Math.min(0.4, Math.abs(state.velocity) * 0.08)))
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, dustTexture)
       gl.uniform1i(gl.getUniformLocation(dustProgram, 'uMap'), 0)
@@ -551,3 +563,8 @@ export function mountAmbience(host, options = {}) {
     },
   }
 }
+
+		exports.mountAmbience = mountAmbience;
+		return module.exports;
+	},
+});
