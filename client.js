@@ -360,7 +360,7 @@ window.__ModuleLoader__.load({
               h('p', null, '去发现搜书，或导入本地书籍。'))
           : h('div', { className: 'mr-shelf-gallery' },
               lastRead ? h('section', { className: 'mr-shelf-hero', 'aria-label': '继续阅读' },
-                h('button', { className: 'mr-shelf-hero-cover', type: 'button', 'aria-label': `继续阅读 ${heroTitle}`, onClick: (event) => open(lastRead, event) }, coverNode(lastRead, heroTitle, 1), h(DownloadBadge, { book: lastRead, onToggle: onToggleDownload })),
+                h('button', { className: 'mr-shelf-hero-cover', type: 'button', 'aria-label': `继续阅读 ${heroTitle}`, onClick: (event) => open(lastRead, event) }, coverNode(lastRead, heroTitle, 1), h(DownloadBadge, { book: lastRead, onToggle: onToggleDownload }), Number(lastRead.unread || lastRead.unreadCount || 0) > 0 ? h('span', { className: 'mr-new-badge' }, `+${Number(lastRead.unread || lastRead.unreadCount)} 章`) : null),
                 h('div', { className: 'mr-shelf-hero-info' },
                   h('p', { className: 'mr-shelf-eyebrow' }, '01 · 继续阅读'),
                   h('h3', { className: 'mr-shelf-hero-title' }, heroTitle),
@@ -389,6 +389,7 @@ window.__ModuleLoader__.load({
                           },
                           coverNode(book, name, variant),
                           h(DownloadBadge, { book, onToggle: onToggleDownload }),
+                          Number(book.unread || book.unreadCount || 0) > 0 ? h('span', { className: 'mr-new-badge' }, `+${Number(book.unread || book.unreadCount)} 章`) : null,
                           h('span', { className: 'mr-shelf-cap' },
                             h('strong', null, name.replace(/\.(?:txt|epub|md|pdf)$/i, '')),
                             book.author ? h('small', null, book.author) : null));
@@ -2049,6 +2050,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-shelf-head-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .mr-shelf-gallery{display:grid;grid-template-columns:320px 1fr;gap:28px;align-items:stretch}
 .mr-tag.failed{background:color-mix(in srgb, #a8422f 18%, transparent);color:#a8422f;border-color:color-mix(in srgb, #a8422f 35%, transparent)}
+.mr-new-badge{position:absolute;left:8px;top:8px;z-index:3;display:inline-flex;align-items:center;height:20px;padding:0 7px;border-radius:999px;font:500 11px/1 var(--mr-sans);letter-spacing:.02em;color:#fff;background:#a8422f;box-shadow:0 1px 3px rgba(0,0,0,.18)}
 .mr-dl-badge{position:absolute;right:8px;top:8px;z-index:3;display:inline-flex;align-items:center;justify-content:center;min-width:38px;height:20px;padding:0 7px;border-radius:999px;font:500 11px/1 var(--mr-sans);letter-spacing:.02em;color:var(--mr-on-accent);background:color-mix(in srgb,var(--mr-ink) 72%,transparent);backdrop-filter:blur(6px);cursor:pointer;user-select:none}
 .mr-dl-badge:hover{background:color-mix(in srgb,var(--mr-ink) 84%,transparent)}
 .mr-dl-badge.queued{background:color-mix(in srgb,var(--mr-ink) 45%,transparent)}
