@@ -239,11 +239,11 @@ window.__ModuleLoader__.load({
       const done = Number(job?.done || 0);
       const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((done / total) * 100))) : 0;
       const label = status === 'queued' ? '排队'
-        : status === 'paused' ? '已暂停'
+        : status === 'paused' || status === 'cancelled' ? '已暂停'
         : status === 'failed' ? '失败'
         : status === 'completed' ? '已下载'
         : `${pct}%`;
-      const kind = status === 'completed' ? 'done' : status === 'failed' ? 'failed' : status === 'paused' ? 'paused' : status === 'queued' ? 'queued' : 'running';
+      const kind = status === 'completed' ? 'done' : status === 'failed' ? 'failed' : status === 'paused' || status === 'cancelled' ? 'paused' : status === 'queued' ? 'queued' : 'running';
       return { label, kind, status };
     }
 
@@ -2001,8 +2001,12 @@ window.__ModuleLoader__.load({
               const status = book.downloadStatus || book.download?.status;
               const bookId = book.id || book.bookId;
               if (status === 'failed' || status === 'completed') return run(() => call(ctx, 'download', { bookId }), status === 'failed' ? '重新下载' : '重新检查').catch(() => {});
-              const paused = status === 'paused';
-              return run(() => call(ctx, paused ? 'resumeJob' : 'pauseJob', { bookId }), paused ? '继续下载' : '已暂停').catch(() => {});
+              const paused = status === 'paused' || status === 'cancelled';
+              const canPause = typeof ctx?.remote?.reader?.pauseJob === 'function';
+              if (paused) return run(() => call(ctx, 'download', { bookId }), '继续下载').catch(() => {});
+              if (canPause) return run(() => call(ctx, 'pauseJob', { bookId }), '已暂停').catch(() => {});
+              const jobId = book.download?.id || book.download?.jobId || book.downloadJobId;
+              return run(() => call(ctx, 'cancelJob', { jobId }), '已暂停').catch(() => {});
             }, onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
           !loading && tab === 'sources' ? h(Sources, { sources, busy, onImport: importSource, onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
