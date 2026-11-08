@@ -5,7 +5,7 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const { z } = require('zod');
     const h = React.createElement;
-    const { useEffect, useMemo, useRef, useState } = React;
+    const { useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
     const PANEL_ID = 'reader';
     const REMOTE_METHODS = [
       'state', 'importSource', 'removeSource', 'search', 'discover', 'addBook', 'removeBook',
@@ -482,7 +482,7 @@ window.__ModuleLoader__.load({
         h('section', { className: 'mr-panel mr-roadmap' }, h('h3', null, '分期说明'), h('p', null, '当前为文字核心版。高兼容脚本、AI 与多媒体将在后续阶段提供。')));
     }
 
-    function ReaderView({ ctx, book, settings, onSettings, onBookSettings, notes, onClose, onSaveNote, onDeleteNote, notify, deferMs = 0 }) {
+    function ReaderView({ ctx, book, settings, onSettings, onBookSettings, notes, onClose, onSaveNote, onDeleteNote, notify, notice, onDismissNotice, deferMs = 0 }) {
       const [toc, setToc] = useState([]);
       const [chapter, setChapter] = useState(null);
       const [chapterIndex, setChapterIndex] = useState(-1);
@@ -504,9 +504,13 @@ window.__ModuleLoader__.load({
       // the user has motion on, so this flag also gates CSS animation.
       const motionOff = prefersReducedMotion() || settings.reducedMotion === 'on' || settings.animations === false;
       const [mode, setMode] = useState(prefMode);
+      const modeRef = useRef(prefMode);
       const [columns, setColumns] = useState(1);
       const [pageIndex, setPageIndex] = useState(0);
       const [pageCount, setPageCount] = useState(1);
+      // 页数是按章量的：换章后到 measureLayout 跑完之前，pageCount 还是上一章的值，
+      // 这段时间里宁可先不显示页码，也别闪一个错的。
+      const [measuredFor, setMeasuredFor] = useState('');
       const [pageStep, setPageStep] = useState(0);
       const [pageWidth, setPageWidth] = useState(0);
       const [dragging, setDragging] = useState(false);
@@ -540,11 +544,62 @@ window.__ModuleLoader__.load({
       const webglRef = useRef(true);
       const pendingOffsetRef = useRef(null);
       const progressRef = useRef({ bookId: book.id || book.bookId, chapterId: null, percent: 0, offset: 0 });
+      const [scrollChapters, setScrollChapters] = useState([]);
+      const [scrollError, setScrollError] = useState(null);
+      const scrollChaptersRef = useRef([]);
+      const chapterIndexRef = useRef(-1);
+      const chapterNodesRef = useRef(new Map());
+      const pageForOffsetRef = useRef(null);
+      const textIndexRef = useRef(null);
+      const scrollAppendRef = useRef(false);
+      const trimTimerRef = useRef(0);
+      const pendingScrollRestoreRef = useRef(null);
+      const suppressScrollUntilRef = useRef(0);
+      const modeReadyRef = useRef(false);
+      const pendingPagePercentRef = useRef(null);
+      const lastPercentRef = useRef(0);
       const bookId = book.id || book.bookId;
       const theme = settings.readerTheme || 'paper';
       useEffect(() => { pageIndexRef.current = pageIndex; }, [pageIndex]);
+      useEffect(() => { chapterIndexRef.current = chapterIndex; }, [chapterIndex]);
+      useEffect(() => { scrollChaptersRef.current = scrollChapters; }, [scrollChapters]);
+      const restorePendingScroll = () => {
+        const pending = pendingScrollRestoreRef.current;
+        if (!pending || modeRef.current !== 'scroll') return;
+        const node = chapterNodesRef.current.get(pending.index);
+        const el = scrollRef.current;
+        if (!node || !el || !node.isConnected) return;
+        pendingScrollRestoreRef.current = null;
+        suppressScrollUntilRef.current = performance.now() + 120;
+        const offset = pending.offset != null
+          ? pending.offset
+          : (pending.percent || 0) / 100 * Math.max(1, node.offsetHeight);
+        el.scrollTop = Math.max(0, nodeTop(node) + offset);
+      };
+      // 窗口裁章会一次性移除视口上方几千像素，必须在这一帧 paint 之前把 scrollTop 摆回去，
+      // 否则用户会看到「闪一下又归位」（真机上就是跳页）。
+      useLayoutEffect(() => { restorePendingScroll(); }, [scrollChapters, mode]);
+      useEffect(() => {
+        if (!modeReadyRef.current) { modeReadyRef.current = true; return; }
+        const index = chapterIndexRef.current;
+        if (index < 0) return;
+        if (mode !== 'scroll') {
+          pendingPagePercentRef.current = lastPercentRef.current;
+          return;
+        }
+        const percent = lastPercentRef.current || 0;
+        if (scrollChaptersRef.current.some((entry) => entry.index === index)) {
+          requestAnimationFrame(() => {
+            pendingScrollRestoreRef.current = { index, percent };
+            restorePendingScroll();
+          });
+        } else {
+          loadScrollWindow(index, toc, { restore: { index, percent } });
+        }
+      }, [mode]);
       useEffect(() => { webglRef.current = supportsWebGL(); }, []);
       useEffect(() => { setMode(prefMode); }, [prefMode]);
+      useEffect(() => { modeRef.current = mode; }, [mode]);
       useEffect(() => { setFlipStyle(prefFlipStyle); }, [prefFlipStyle]);
       const persistPref = (key, value) => {
         if (bookPrefs) onBookSettings?.({ [key]: value });
@@ -721,10 +776,10 @@ window.__ModuleLoader__.load({
         clearTimeout(veilTimer.current);
         veilTimer.current = setTimeout(() => setChapterVeil(''), 1100);
       };
-      useEffect(() => () => clearTimeout(veilTimer.current), []);
-      const commitProgress = (percent, offset = progressRef.current.offset || 0) => {
+      useEffect(() => () => { clearTimeout(veilTimer.current); clearTimeout(trimTimerRef.current); }, []);
+      const commitProgress = (percent, offset = progressRef.current.offset || 0, index = chapterIndex) => {
         setScrollPercent(percent);
-        const chapterId = chapterIdAt();
+        const chapterId = chapterIdAt(index);
         progressRef.current = { bookId, chapterId, percent, offset };
         clearTimeout(saveTimer.current);
         saveTimer.current = setTimeout(() => call(ctx, 'saveProgress', { bookId, chapterId, percent, offset }).catch(() => {}), 600);
@@ -739,25 +794,121 @@ window.__ModuleLoader__.load({
         onClose();
       };
 
+      const chapterSourceId = (index, list = toc) => {
+        const item = list[index];
+        return item && (item.id || item.chapterId || item.url || item.chapterUrl || String(index));
+      };
+      const fetchChapterEntry = async (index, list = toc) => {
+        const id = chapterSourceId(index, list);
+        if (!id) return null;
+        const value = await call(ctx, 'chapter', { bookId, chapterId: id });
+        return { index, chapter: value || {} };
+      };
+      const nodeTop = (node) => {
+        const el = scrollRef.current;
+        if (!node || !el) return 0;
+        return node.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop;
+      };
+      const loadScrollWindow = async (center, list0 = toc, options = {}) => {
+        const wanted = [center - 1, center, center + 1].filter((index) => index >= 0 && index < list0.length);
+        const entries = await Promise.all(wanted.map((index) => fetchChapterEntry(index, list0).catch(() => null)));
+        const list = entries.filter(Boolean).sort((a, b) => a.index - b.index);
+        if (options.restore) pendingScrollRestoreRef.current = options.restore;
+        setScrollChapters(list);
+        scrollChaptersRef.current = list;
+        const current = list.find((entry) => entry.index === center) || list[0] || null;
+        if (current) { setChapter(current.chapter); setChapterIndex(current.index); chapterIndexRef.current = current.index; }
+        return list;
+      };
+      const anchorAtScroll = (wanted) => {
+        const el = scrollRef.current;
+        if (!el) return null;
+        const list = scrollChaptersRef.current;
+        let current = list[0];
+        for (const entry of list) {
+          const node = chapterNodesRef.current.get(entry.index);
+          if (node && nodeTop(node) <= el.scrollTop + 12) current = entry;
+        }
+        if (!current) return null;
+        const kept = wanted.filter((index) => index >= current.index);
+        if (!kept.length) return null;
+        if (kept[0] !== current.index) return { index: kept[0], offset: 0 };
+        const node = chapterNodesRef.current.get(current.index);
+        if (!node) return null;
+        const offset = el.scrollTop - nodeTop(node);
+        return { index: current.index, offset: Math.max(0, Math.min(Math.max(0, node.offsetHeight - 1), offset)) };
+      };
+      const normalizeWindow = async (center) => {
+        const wanted = [center - 1, center, center + 1].filter((index) => index >= 0 && index < toc.length);
+        const list = scrollChaptersRef.current;
+        const have = new Map(list.map((entry) => [entry.index, entry]));
+        if (wanted.length === list.length && wanted.every((index) => have.has(index))) return;
+        const missing = wanted.filter((index) => !have.has(index));
+        const fetched = await Promise.all(missing.map((index) => fetchChapterEntry(index).catch(() => null)));
+        const seen = new Set();
+        const next = wanted
+          .map((index) => have.get(index) || fetched.find((entry) => entry && entry.index === index))
+          .filter((entry) => entry && !seen.has(entry.index) && seen.add(entry.index));
+        if (!next.length) return;
+        // 以「此刻视口里的那一段」为锚，避免等 fetch 期间用户又滚了几百像素造成回跳。
+        pendingScrollRestoreRef.current = anchorAtScroll(wanted) || { index: center, percent: 0 };
+        suppressScrollUntilRef.current = performance.now() + 400;
+        setScrollChapters(next);
+        scrollChaptersRef.current = next;
+      };
+
+      const appendScrollChapter = async (index) => {
+        if (scrollAppendRef.current) return;
+        if (index < 0 || index >= toc.length) return;
+        if (scrollChaptersRef.current.some((entry) => entry.index === index)) return;
+        scrollAppendRef.current = true;
+        try {
+          const entry = await fetchChapterEntry(index);
+          if (!entry) return;
+          if (scrollChaptersRef.current.some((item) => item.index === index)) return;
+          const list = [...scrollChaptersRef.current, entry].sort((a, b) => a.index - b.index);
+          setScrollChapters(list);
+          scrollChaptersRef.current = list;
+          setScrollError(null);
+        } catch {
+          setScrollError(index);
+        } finally {
+          scrollAppendRef.current = false;
+        }
+      };
       const openChapter = async (index, restore = false, atPercent = null) => {
         if (!toc[index]) return;
         const requestId = ++requestRef.current;
         flushProgress();
-        setLoading(true); setError(''); setDrawer(''); setFailedIndex(index);
+        setLoading(true); setError(''); setDrawer(''); setFailedIndex(index); setScrollError(null);
         stopSpeech();
+        const item = toc[index];
+        const id = chapterSourceId(index);
+        const saved = atPercent != null
+          ? Math.max(0, Math.min(100, Number(atPercent) || 0))
+          : restore ? Number(book.lastRead?.percent || book.progress?.percent || book.percent || 0) : 0;
+        const savedOffset = atPercent != null ? 0 : restore ? Number(book.lastRead?.offset || book.progress?.offset || 0) : 0;
         try {
-          const item = toc[index];
-          const id = item.id || item.chapterId || item.url || item.chapterUrl || String(index);
+          if (mode === 'scroll') {
+            const list = await loadScrollWindow(index, toc, { restore: { index, percent: saved } });
+            if (requestId !== requestRef.current) return;
+            if (!list.some((entry) => entry.index === index)) throw new Error('章节未加载');
+            progressRef.current = { bookId, chapterId: id, percent: saved, offset: savedOffset };
+            pendingPercentRef.current = saved;
+            pendingOffsetRef.current = savedOffset > 0 ? savedOffset : null;
+            lastPercentRef.current = saved;
+            setPageIndex(0);
+            pageIndexRef.current = 0;
+            setScrollPercent(saved);
+            setFailedIndex(-1);
+            return;
+          }
           const value = await call(ctx, 'chapter', { bookId, chapterId: id });
           if (requestId !== requestRef.current) return;
           setChapter(value || {});
           setChapterIndex(index);
           setFailedIndex(-1);
-          const saved = atPercent != null
-            ? Math.max(0, Math.min(100, Number(atPercent) || 0))
-            : restore ? Number(book.lastRead?.percent || book.progress?.percent || book.percent || 0) : 0;
-          const savedOffset = atPercent != null ? 0 : restore ? Number(book.lastRead?.offset || book.progress?.offset || 0) : 0;
-          showChapterVeil((value && (value.name || value.title)) || item.name || item.title || '正文');
+          if (mode !== 'scroll') showChapterVeil((value && (value.name || value.title)) || item.name || item.title || '正文');
           progressRef.current = { bookId, chapterId: id, percent: saved, offset: savedOffset };
           pendingPercentRef.current = saved;
           pendingOffsetRef.current = savedOffset > 0 ? savedOffset : null;
@@ -788,9 +939,6 @@ window.__ModuleLoader__.load({
               setFailedIndex(index);
               const item = list[index];
               const id = item.id || item.chapterId || item.url || item.chapterUrl || String(index);
-              const value = await call(ctx, 'chapter', { bookId, chapterId: id });
-              if (!active || requestId !== requestRef.current) return;
-              setChapter(value || {}); setChapterIndex(index); setFailedIndex(-1);
               const saved = Number(book.lastRead?.percent || book.progress?.percent || book.percent || 0);
               const savedOffset = Number(book.lastRead?.offset || book.progress?.offset || 0);
               progressRef.current = { bookId, chapterId: id, percent: saved, offset: savedOffset };
@@ -799,10 +947,19 @@ window.__ModuleLoader__.load({
               setPageIndex(0);
               pageIndexRef.current = 0;
               setScrollPercent(saved);
-              requestAnimationFrame(() => {
-                if (!scrollRef.current) return;
-                scrollRef.current.scrollTop = saved > 0 ? saved / 100 * (scrollRef.current.scrollHeight - scrollRef.current.clientHeight) : 0;
-              });
+              if (modeRef.current === 'scroll') {
+                await loadScrollWindow(index, list, { restore: { index, percent: saved } });
+                if (!active || requestId !== requestRef.current) return;
+                setFailedIndex(-1);
+              } else {
+                const value = await call(ctx, 'chapter', { bookId, chapterId: id });
+                if (!active || requestId !== requestRef.current) return;
+                setChapter(value || {}); setChapterIndex(index); setFailedIndex(-1);
+                requestAnimationFrame(() => {
+                  if (!scrollRef.current) return;
+                  scrollRef.current.scrollTop = saved > 0 ? saved / 100 * (scrollRef.current.scrollHeight - scrollRef.current.clientHeight) : 0;
+                });
+              }
             }
           } catch (cause) { if (active && requestId === requestRef.current) setError(cause.message || String(cause)); }
           finally { if (active && requestId === requestRef.current) setLoading(false); }
@@ -813,40 +970,203 @@ window.__ModuleLoader__.load({
       }, [bookId, retryNonce, deferMs]);
 
       useEffect(() => {
+        if (mode !== 'paged' || !pageCount) return undefined;
+        const pending = pendingPagePercentRef.current;
+        if (pending == null) return undefined;
+        const timer = setTimeout(() => {
+          pendingPagePercentRef.current = null;
+          goPage(paginationMath.pageForPercent(pending, pageCount));
+        }, 160);
+        return () => clearTimeout(timer);
+      }, [mode, pageCount]);
+      useEffect(() => {
+        if (mode !== 'scroll' || !toc.length || chapterIndex < 0) return undefined;
+        if (scrollChaptersRef.current.some((entry) => entry.index === chapterIndex)) return undefined;
+        let active = true;
+        loadScrollWindow(chapterIndex, toc, { restore: { index: chapterIndex, percent: scrollPercent } }).catch(() => {});
+        return () => { active = false; };
+      }, [mode, toc.length]);
+
+
+      useEffect(() => {
         if (!drawer) return;
         const onKeyDown = (event) => { if (event.key === 'Escape') setDrawer(''); };
         document.addEventListener('keydown', onKeyDown);
         return () => document.removeEventListener('keydown', onKeyDown);
       }, [drawer]);
 
+      // 朗读跟页：翻页模式下把正在读的那句映射回页码，自动翻过去。
+      // 正文段落没有换行符，朗读切句却可能带着，所以比对时先去掉空白，
+      // 再靠 map 把「无空白串」的下标换回原文偏移。
+      const articleIndex = () => {
+        const article = articleRef.current;
+        if (!article) return null;
+        const full = article.textContent || '';
+        const key = `${chapterIdAt()}|${full.length}|${modeRef.current}`;
+        const cached = textIndexRef.current;
+        if (cached && cached.key === key) return cached;
+        let stripped = '';
+        const map = [];
+        for (let i = 0; i < full.length; i += 1) {
+          const ch = full[i];
+          if (!/\s/.test(ch)) { stripped += ch; map.push(i); }
+        }
+        textIndexRef.current = { key, stripped, map, cursor: 0 };
+        return textIndexRef.current;
+      };
+      const followPageForSpeech = (chunk) => {
+        if (modeRef.current !== 'paged' || !pageForOffsetRef.current) return;
+        const index = articleIndex();
+        if (!index || !index.stripped) return;
+        const probe = String(chunk || '').replace(/\s+/g, '').slice(0, 16);
+        if (!probe) return;
+        const at = index.stripped.indexOf(probe, index.cursor || 0);
+        const hit = at >= 0 ? at : index.stripped.indexOf(probe);
+        if (hit < 0) return;
+        index.cursor = hit;
+        const target = pageForOffsetRef.current(index.map[hit]);
+        if (target == null) return;
+        const next = Math.max(0, Math.min(pageCount - 1, target));
+        if (next === pageIndexRef.current) return;
+        setPageIndex(next);
+        pageIndexRef.current = next;
+        lastPercentRef.current = paginationMath.percentForPage(next, pageCount);
+        commitProgress(lastPercentRef.current);
+      };
+
       const stopSpeech = () => { speechGeneration.current += 1; window.speechSynthesis?.cancel(); setSpeaking(false); };
-      const speak = () => {
-        if (!('speechSynthesis' in window)) return notify('当前环境不支持系统语音', 'error');
-        if (speaking) return stopSpeech();
-        const text = String(chapter?.content || chapter?.text || '').trim();
-        if (!text) return;
-        const generation = ++speechGeneration.current;
-        setSpeaking(true);
-        const chunks = text.match(/[^。！？!?\n]{1,140}[。！？!?\n]?/g) || [text];
-        let index = 0;
+      const advancePagedForSpeech = async (index, generation) => {
+        const id = chapterSourceId(index);
+        try {
+          const value = await call(ctx, 'chapter', { bookId, chapterId: id });
+          if (generation !== speechGeneration.current) return;
+          setChapter(value || {});
+          setChapterIndex(index);
+          chapterIndexRef.current = index;
+          setPageIndex(0); pageIndexRef.current = 0;
+          progressRef.current = { bookId, chapterId: id, percent: 0, offset: 0 };
+          pendingPercentRef.current = 0; pendingOffsetRef.current = null; lastPercentRef.current = 0;
+          setScrollPercent(0);
+          speakChapter(index, generation, value && (value.content || value.text));
+        } catch {
+          if (generation === speechGeneration.current) setSpeaking(false);
+        }
+      };
+
+      const speakChapter = (index, generation, textOverride) => {
+        if (generation !== speechGeneration.current) return;
+        const source = textOverride != null ? { text: textOverride } : (index === chapterIndex ? chapter : scrollChaptersRef.current.find((entry) => entry.index === index)?.chapter);
+        const text = String(source?.content || source?.text || '').trim();
+        const chunks = text ? (text.match(/[^。！？!?\n]{1,140}[。！？!?\n]?/g) || [text]) : [];
+        let cursor = 0;
         const next = () => {
           if (generation !== speechGeneration.current) return;
-          if (index >= chunks.length) return setSpeaking(false);
-          const utterance = new SpeechSynthesisUtterance(chunks[index++]);
+          if (cursor >= chunks.length) {
+            const following = index + 1;
+            // 朗读中途可能切过阅读方式，这里必须读当前值，否则翻页模式会走滚动的跨章分支，
+            // 页码不归零、正文和声音各走各的。
+            if (modeRef.current === 'scroll' && following < toc.length) {
+              const jump = () => {
+                if (generation !== speechGeneration.current) return;
+                const node = chapterNodesRef.current.get(following);
+                const el = scrollRef.current;
+                if (node && el) el.scrollTop = nodeTop(node);
+                const entry = scrollChaptersRef.current.find((item) => item.index === following);
+                if (entry) { setChapter(entry.chapter); setChapterIndex(following); chapterIndexRef.current = following; }
+                // 语音自动跨章时视口是程序化跳的，那次 scroll 事件会被恢复抑制吃掉，
+                // 这里显式收敛窗口，否则一路听下去章节只增不减。
+                if (modeRef.current === 'scroll') normalizeWindow(following);
+                speakChapter(following, generation);
+              };
+              if (scrollChaptersRef.current.some((entry) => entry.index === following)) jump();
+              else appendScrollChapter(following).then(jump).catch(() => setSpeaking(false));
+              return;
+            }
+            if (following < toc.length) { advancePagedForSpeech(following, generation); return; }
+            setSpeaking(false);
+            return;
+          }
+          const spoken = chunks[cursor];
+          cursor += 1;
+          followPageForSpeech(spoken);
+          const utterance = new SpeechSynthesisUtterance(spoken);
           utterance.rate = Number(settings.ttsRate || 1);
-          utterance.onend = next;
-          utterance.onerror = () => { if (generation === speechGeneration.current) setSpeaking(false); };
+          let started = false;
+          // 有些环境（没有装语音包、系统合成失败）speak() 之后既不 start 也不 end，
+          // 状态会永远停在「停止」。这里给每句一个启动看门狗。
+          const watchdog = window.setTimeout(() => {
+            if (started || generation !== speechGeneration.current) return;
+            stopSpeech();
+            notify('当前环境没有可用的语音', 'error');
+          }, 2000);
+          utterance.onstart = () => { started = true; window.clearTimeout(watchdog); };
+          utterance.onend = () => { window.clearTimeout(watchdog); next(); };
+          utterance.onerror = () => {
+            window.clearTimeout(watchdog);
+            if (generation === speechGeneration.current) setSpeaking(false);
+          };
           window.speechSynthesis.speak(utterance);
         };
         next();
       };
+      const speak = () => {
+        if (!('speechSynthesis' in window)) return notify('当前环境不支持系统语音', 'error');
+        if (speaking) return stopSpeech();
+        const windowChapter = scrollChaptersRef.current.find((entry) => entry.index === chapterIndex)?.chapter;
+        const text = String(chapter?.content || chapter?.text || windowChapter?.content || windowChapter?.text || '').trim();
+        if (!text) return;
+        const generation = ++speechGeneration.current;
+        setSpeaking(true);
+        speakChapter(chapterIndex, generation);
+      };
 
+      const armTrim = () => {
+        window.clearTimeout(trimTimerRef.current);
+        trimTimerRef.current = window.setTimeout(() => {
+          trimTimerRef.current = 0;
+          normalizeWindow(chapterIndexRef.current);
+        }, 180);
+      };
       const onScroll = () => {
-        if (!scrollRef.current || chapterIndex < 0) return;
         const el = scrollRef.current;
+        if (!el || chapterIndexRef.current < 0) return;
+        if (performance.now() < suppressScrollUntilRef.current) return;
+        // 手势没停就别裁章：倒计时跟着每次滚动事件往后推。
+        if (trimTimerRef.current) armTrim();
         const max = Math.max(1, el.scrollHeight - el.clientHeight);
         scrollMotionRef.current.target = scrollMotion.progress(el.scrollTop / max);
-        commitProgress(Math.round(el.scrollTop / max * 100), 0);
+        const list = scrollChaptersRef.current;
+        if (list.length) {
+          const probe = el.scrollTop + 12;
+          let current = list[0];
+          for (const entry of list) {
+            const node = chapterNodesRef.current.get(entry.index);
+            if (node && nodeTop(node) <= probe) current = entry;
+          }
+          const node = chapterNodesRef.current.get(current.index);
+          const start = node ? nodeTop(node) : 0;
+          const height = node ? Math.max(1, node.offsetHeight) : 1;
+          const within = Math.max(0, Math.min(1, (el.scrollTop - start) / height));
+          if (current.index !== chapterIndexRef.current) {
+            chapterIndexRef.current = current.index;
+            setChapterIndex(current.index);
+            setChapter(current.chapter);
+            progressRef.current = { ...progressRef.current, chapterId: chapterSourceId(current.index) };
+            // 裁章会移除视口上方的几千像素，手势进行中改 DOM 会被当成「跳页」；
+            // 等滚动停稳（180ms 无新事件）再一次性收窗口。
+            armTrim();
+          }
+          lastPercentRef.current = Math.round(within * 100);
+          commitProgress(lastPercentRef.current, 0, current.index);
+          const last = list[list.length - 1];
+          const lastNode = chapterNodesRef.current.get(last.index);
+          if (lastNode) {
+            const remaining = nodeTop(lastNode) + lastNode.offsetHeight - (el.scrollTop + el.clientHeight);
+            if (remaining < el.clientHeight) appendScrollChapter(last.index + 1);
+          }
+        } else {
+          commitProgress(Math.round(el.scrollTop / max * 100), 0);
+        }
         window.clearTimeout(scrollMotionRef.current.settle);
         scrollMotionRef.current.settle = window.setTimeout(() => {
           scrollMotionRef.current.target = scrollMotion.progress(el.scrollTop / max);
@@ -868,7 +1188,8 @@ window.__ModuleLoader__.load({
         if (next === pageIndexRef.current) return;
         setPageIndex(next);
         pageIndexRef.current = next;
-        commitProgress(paginationMath.percentForPage(next, pageCount));
+        lastPercentRef.current = paginationMath.percentForPage(next, pageCount);
+        commitProgress(lastPercentRef.current);
       };
       const buildTurnSheet = () => {
         const view = pagedRef.current;
@@ -1062,6 +1383,7 @@ window.__ModuleLoader__.load({
             });
           } catch { return null; }
         };
+        pageForOffsetRef.current = pageForOffset;
         const anchor = anchorOffset != null ? Number(anchorOffset) : Number(progressRef.current.offset || 0);
         const anchored = anchor > 0 ? pageForOffset(anchor) : null;
         const target = anchored != null ? anchored : paginationMath.pageForPercent(currentPercent, pages);
@@ -1071,6 +1393,7 @@ window.__ModuleLoader__.load({
         setPageWidth(nextPageWidth);
         setPageStep(nextPageWidth + gap);
         setPageCount(pages);
+        setMeasuredFor(String(chapterIdAt()));
         pageIndexRef.current = target;
         setPageIndex(target);
         setScrollPercent(nextPercent);
@@ -1115,16 +1438,6 @@ window.__ModuleLoader__.load({
       }, [mode, pageCount, columns]);
 
       useEffect(() => {
-        if (mode !== 'scroll' || !chapter) return;
-        const raf = requestAnimationFrame(() => {
-          if (!scrollRef.current) return;
-          const max = Math.max(1, scrollRef.current.scrollHeight - scrollRef.current.clientHeight);
-          scrollRef.current.scrollTop = scrollPercent / 100 * max;
-        });
-        return () => cancelAnimationFrame(raf);
-      }, [mode, chapter]);
-
-      useEffect(() => {
         if (mode !== 'paged' || drawer) return;
         const onKeyDown = (event) => {
           if (event.altKey || event.ctrlKey || event.metaKey) return;
@@ -1143,11 +1456,6 @@ window.__ModuleLoader__.load({
         if (mode === 'paged') {
           setMode('scroll');
           persistPref('mode', 'scroll');
-          requestAnimationFrame(() => {
-            if (!scrollRef.current) return;
-            const max = Math.max(1, scrollRef.current.scrollHeight - scrollRef.current.clientHeight);
-            scrollRef.current.scrollTop = scrollPercent / 100 * max;
-          });
         } else {
           pendingPercentRef.current = scrollPercent;
           setMode('paged');
@@ -1217,22 +1525,34 @@ window.__ModuleLoader__.load({
         turnPage(event.clientX < rect.left + rect.width / 2 ? -1 : 1);
       };
 
-      const rawTitle = String(name || '').trim();
-      const titleMatch = rawTitle.match(/^(第[〇零一二三四五六七八九十百千万两\d]+[章节回卷])[\s　]*([\s\S]*)$/);
-      const chapterNo = titleMatch ? titleMatch[1] : '';
-      const chapterTitle = titleMatch ? titleMatch[2].trim() : rawTitle;
-      const chapterChars = paragraphs.reduce((sum, line) => sum + line.replace(/\s/g, '').length, 0);
       const bookLabel = String(book.title || book.name || '').trim().replace(/\.(txt|epub|md)$/i, '');
-      const chapterMeta = [bookLabel, chapterChars ? `${chapterChars} 字` : ''].filter(Boolean).join(' · ');
-      const chapterNodes = [
-        h('header', { key: 'title', className: 'mr-chapter-open' },
-          chapterNo ? h('div', { className: 'mr-chapter-no' }, chapterNo) : null,
-          chapterTitle ? h('h1', { className: 'mr-chapter-title' }, chapterTitle) : null,
-          chapterMeta ? h('div', { className: 'mr-chapter-meta' }, h('i', { 'aria-hidden': true }), h('span', null, chapterMeta)) : null),
-        ...paragraphs.map((line, index) => h('p', { key: index }, line)),
-        !paragraphs.length ? h(Empty, { key: 'empty', title: '本章无正文', detail: '可尝试刷新目录。' }) : null,
-        h('div', { key: 'end', className: 'mr-chapter-end' }, chapterIndex + 1 < toc.length ? h(Button, { kind: 'primary soft', onClick: () => openChapter(chapterIndex + 1) }, '下一章') : h('span', null, '已是最后一章')),
-      ];
+      const chapterNodesFor = (entry, options = {}) => {
+        const index = entry.index;
+        const source = entry.chapter || {};
+        const lines = String(source.content || source.text || '').split(/\n+/).map((line) => line.trim()).filter(Boolean);
+        const heading = source.name || source.title || toc[index]?.name || toc[index]?.title || '正文';
+        const rawTitle = String(heading || '').trim();
+        const titleMatch = rawTitle.match(/^(第[〇零一二三四五六七八九十百千万两\d]+[章节回卷])[\s　]*([\s\S]*)$/);
+        const chapterNo = titleMatch ? titleMatch[1] : '';
+        const chapterTitle = titleMatch ? titleMatch[2].trim() : rawTitle;
+        const chars = lines.reduce((sum, line) => sum + line.replace(/\s/g, '').length, 0);
+        const meta = [bookLabel, chars ? `${chars} 字` : ''].filter(Boolean).join(' · ');
+        const showEnd = options.withEnd === true;
+        return [
+          h('header', { key: 'title', className: 'mr-chapter-open' },
+            chapterNo ? h('div', { className: 'mr-chapter-no' }, chapterNo) : null,
+            chapterTitle ? h('h1', { className: 'mr-chapter-title' }, chapterTitle) : null,
+            meta ? h('div', { className: 'mr-chapter-meta' }, h('i', { 'aria-hidden': true }), h('span', null, meta)) : null),
+          ...lines.map((line, key) => h('p', { key }, line)),
+          !lines.length ? h(Empty, { key: 'empty', title: '本章无正文', detail: '可尝试刷新目录。' }) : null,
+          showEnd
+            ? h('div', { key: 'end', className: 'mr-chapter-end' }, index + 1 < toc.length
+              ? h(Button, { kind: 'primary soft', onClick: () => openChapter(index + 1) }, '下一章')
+              : h('span', null, '已是最后一章'))
+            : null,
+        ];
+      };
+      const chapterNodes = chapterNodesFor({ index: chapterIndex, chapter });
       const pagedArticleStyle = {
         fontSize: `${settings.fontSize || 20}px`,
         lineHeight: settings.lineHeight || 1.9,
@@ -1267,6 +1587,7 @@ window.__ModuleLoader__.load({
         className: `mr-reader theme-${theme} font-${settings.fontFamily === 'sans' ? 'sans' : 'serif'}${motionOff ? ' mr-reduced' : ''}`,
         style: { '--mr-text': `${Math.max(360, (settings.measureWidth || 800) - 128)}px` },
       },
+        notice ? h(Notice, { notice, onClose: onDismissNotice }) : null,
         h('div', { className: 'mr-ambience', ref: ambienceHostRef, 'aria-hidden': true }),
         h('div', { className: 'mr-rail', 'aria-hidden': true }, h('i', { style: { width: `${bookPercent}%` } })),
         h('main', mode === 'paged'
@@ -1276,10 +1597,27 @@ window.__ModuleLoader__.load({
             mode === 'paged'
               ? h('div', { className: 'mr-page-window' },
                 h('article', { className: `mr-chapter mr-paged-chapter${dragging ? ' mr-dragging' : ''}${turning ? ' mr-turning' : ''}${fadeIn ? ' mr-fade-in' : ''}`, ref: articleRef, style: pagedArticleStyle }, chapterNodes))
-              : h('article', { className: 'mr-chapter', style: { fontSize: `${settings.fontSize || 20}px`, lineHeight: settings.lineHeight || 1.9 } }, chapterNodes),
+              : [
+                scrollChapters.map((entry) => h('article', {
+                  key: entry.index,
+                  className: 'mr-chapter',
+                  'data-chapter-index': entry.index,
+                  ref: (node) => {
+                    if (node) chapterNodesRef.current.set(entry.index, node);
+                    else chapterNodesRef.current.delete(entry.index);
+                  },
+                  style: { fontSize: `${settings.fontSize || 20}px`, lineHeight: settings.lineHeight || 1.9 },
+                }, chapterNodesFor(entry, { withEnd: entry.index === toc.length - 1 }))),
+                scrollError != null
+                  ? h('div', { key: 'retry', className: 'mr-scroll-retry' },
+                    h('p', null, '本章未加载'),
+                    h(Button, { onClick: () => { const next = scrollError; setScrollError(null); appendScrollChapter(next); } }, '重试'))
+                  : null,
+              ],
           chapterVeil ? h('div', { className: `mr-chapter-veil${chapterVeil ? ' show' : ''}`, key: chapterVeil }, chapterVeil) : null),
-        mode === 'paged' && !loading && !error ? h('div', { className: 'mr-folio', 'aria-hidden': true },
-          `${Math.min(pageCount, pageIndex + 1)} / ${pageCount}`) : null,
+        mode === 'paged' && !loading && !error && measuredFor && measuredFor === String(chapterIdAt())
+          ? h('div', { className: 'mr-folio', 'aria-hidden': true }, `${Math.min(pageCount, pageIndex + 1)} / ${pageCount}`)
+          : null,
         h('nav', { className: 'mr-tools', 'aria-label': '阅读工具' },
           toolButton('back', '返回', closeReader),
           toolButton('list', '目录', () => setDrawer(drawer === 'toc' ? '' : 'toc')),
@@ -1527,7 +1865,7 @@ window.__ModuleLoader__.load({
         ['library', '书架', 'shelf'], ['discover', '发现', 'compass'], ['sources', '书源', 'source'], ['settings', '设置', 'settings'],
       ];
       if (activeBook) return h(React.Fragment, null, h('style', null, css),
-        h(ReaderView, { ctx, book: activeBook, settings, notes, deferMs: opening ? 200 : 0, onSettings: updateSettings, onBookSettings: (partial) => updateBookSettings(activeBook.id || activeBook.bookId, partial), onClose: () => { setOpening(null); setReading(null); refresh(true); }, onSaveNote: saveNote, onDeleteNote: (note) => run(() => call(ctx, 'deleteNote', { id: note.id })).catch(() => {}), notify }),
+        h(ReaderView, { ctx, book: activeBook, settings, notes, notice, onDismissNotice: () => setNotice(null), deferMs: opening ? 200 : 0, onSettings: updateSettings, onBookSettings: (partial) => updateBookSettings(activeBook.id || activeBook.bookId, partial), onClose: () => { setOpening(null); setReading(null); refresh(true); }, onSaveNote: saveNote, onDeleteNote: (note) => run(() => call(ctx, 'deleteNote', { id: note.id })).catch(() => {}), notify }),
         opening ? h(OpenTransition, { key: opening.bookId || 'open', data: opening, onDone: () => setOpening(null) }) : null);
 
       return h(React.Fragment, null, h('style', null, css), h('div', { className: 'mr-root' },
@@ -1635,6 +1973,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-panel{border:1px solid var(--mr-border);border-radius:12px;background:var(--mr-card);box-shadow:var(--mr-shadow);padding:20px;margin-bottom:16px}.mr-panel h3{font:400 18px/1.35 var(--mr-serif);margin:0 0 14px}.mr-panel textarea{width:100%;resize:vertical;line-height:1.6}.mr-help{font-size:12px;color:var(--mr-muted);line-height:1.6}.mr-check{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mr-muted);margin-top:12px}.mr-check input{width:16px;height:16px;padding:0}.mr-inline-actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}.mr-source-list{display:flex;flex-direction:column;gap:9px}.mr-source-row{display:flex;align-items:center;gap:12px;padding:13px 15px;border:1px solid var(--mr-border);border-radius:11px;background:var(--mr-card)}.mr-source-row>div:nth-child(2){flex:1;min-width:0}.mr-source-row h3{font:400 15px/1.4 var(--mr-serif);margin:0 0 4px}.mr-source-row p{font-size:11px;color:var(--mr-muted);margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mr-source-mark{color:var(--mr-accent)}.mr-tag{font-size:10px;border:1px solid var(--mr-border);padding:3px 7px;border-radius:10px;color:var(--mr-muted);white-space:nowrap}
 .mr-setting-row{display:flex;align-items:center;justify-content:space-between;gap:20px;margin:15px 0;font-size:13px}.mr-stepper{display:flex;align-items:center;gap:12px}.mr-stepper strong{min-width:42px;text-align:center}.mr-setting-row input[type=range],.mr-drawer input[type=range]{accent-color:var(--mr-accent,var(--reader-accent));height:20px}.mr-mode-picker{display:inline-flex;gap:2px;padding:2px;border:1px solid var(--mr-border);border-radius:8px;background:var(--mr-sunken)}.mr-mode-choice{min-height:32px;padding:0 12px;border:0;border-radius:6px;background:transparent;color:var(--mr-muted);font-size:12px;white-space:nowrap}.mr-mode-choice:hover{color:var(--mr-text)}.mr-mode-choice.active{background:var(--mr-card);color:var(--mr-text);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.08)}.mr-theme-picker{display:flex;gap:10px}.mr-swatch{width:34px;height:34px;border-radius:50%;border:2px solid transparent;box-shadow:0 0 0 1px var(--mr-border)}.mr-swatch.active{border-color:var(--mr-accent);box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),0 0 0 4px var(--mr-accent)}.mr-swatch.paper{background:#f4ecdc}.mr-swatch.light{background:#fff}.mr-swatch.green{background:#e3eee5}.mr-swatch.dark{background:#202522}.mr-roadmap p{color:var(--mr-muted);font-size:12px;line-height:1.7;margin:0}
 .mr-notice{position:sticky;top:-20px;z-index:20;margin:-12px auto 16px;max-width:760px;padding:11px 13px;border-radius:10px;background:var(--mr-card);border:1px solid var(--mr-border);box-shadow:var(--mr-shadow);display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px}.mr-notice.error{border-color:var(--dsw-alias-state-error-primary)}.mr-notice.success{border-color:var(--dsw-alias-state-success-primary)}.mr-notice button{border:0;background:transparent;color:inherit;padding:4px;display:flex}.mr-loading{text-align:center;color:var(--mr-muted);font-size:13px;padding:36px}.mr-error-block{text-align:center;padding:50px 20px;color:var(--dsw-alias-state-error-primary)}
+.mr-reader>.mr-notice{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:60;margin:0;max-width:min(560px,calc(100% - 32px));width:max-content}
 .mr-reader{--reader-bg:#f6f1e6;--reader-text:#2b261e;--reader-muted:#867b68;--reader-border:#e2d8c4;--reader-accent:#9a3b2b;--reader-card:#fbf7ee;--mr-card:var(--reader-bg);--mr-sunken:color-mix(in srgb,var(--reader-text) 6%,var(--reader-bg));--mr-border:var(--reader-border);--mr-text:var(--reader-text);--mr-muted:var(--reader-muted);--mr-accent:var(--reader-accent);--mr-accent-hover:color-mix(in srgb,var(--reader-accent) 84%,#000);--mr-on-accent:var(--reader-bg);height:100%;min-height:0;display:flex;flex-direction:column;position:relative;overflow:hidden;background:var(--reader-bg);color:var(--reader-text)}
 .mr-reader.theme-light{--reader-bg:#fdfcf9;--reader-text:#24282a;--reader-muted:#7b817e;--reader-border:#e5e4de;--reader-card:#ffffff}
 .mr-reader.theme-green{--reader-bg:#e9f0e9;--reader-text:#2c3a30;--reader-muted:#6f8174;--reader-border:#cfdcce;--reader-accent:#4d6350;--reader-card:#f6faf5}
@@ -1648,7 +1987,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-tools hr{width:22px;height:1px;margin:5px auto;border:0;background:color-mix(in srgb,var(--reader-text) 12%,transparent)}
 .mr-folio{position:absolute;left:50%;bottom:24px;transform:translateX(-50%);z-index:3;font:400 11px/1 'Noto Serif CJK SC',Georgia,serif;letter-spacing:.24em;color:var(--reader-muted);pointer-events:none;font-variant-numeric:tabular-nums}
 .mr-tabbar{display:none}
-.mr-chapter-scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;position:relative;z-index:2}
+.mr-chapter-scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;position:relative;z-index:2;overflow-anchor:none}
 .mr-paged-view{flex:1;min-height:0;overflow:hidden;position:relative;z-index:2;touch-action:pan-y}
 .mr-page-window{position:relative;width:min(var(--mr-text,672px),calc(100% - 56px));height:100%;margin:0 auto;overflow:hidden}
 .mr-chapter{width:min(var(--mr-text,672px),calc(100% - 56px));margin:0 auto;padding:76px 0 96px;font-family:'Noto Serif CJK SC',Georgia,'Noto Serif SC','Songti SC',SimSun,serif}
@@ -1671,6 +2010,12 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-chapter-meta i{display:block;width:28px;height:1px;background:var(--reader-accent);opacity:.5}
 .mr-chapter p{margin:0 0 .82em;text-align:justify;text-justify:inter-ideograph;overflow-wrap:anywhere;letter-spacing:.012em}
 .mr-chapter-end{display:flex;align-items:center;justify-content:center;gap:14px;padding:34px 0 6px;color:var(--reader-muted);font-size:12px}
+.mr-chapter-scroll .mr-chapter{padding:36px 0 28px}
+.mr-chapter-scroll .mr-chapter + .mr-chapter{margin-top:24px}
+.mr-scroll-retry{display:flex;flex-direction:column;align-items:center;gap:12px;padding:40px 0 80px;color:var(--reader-muted);font-size:13px}
+.mr-scroll-retry p{margin:0}
+.mr-scroll-retry .mr-button{min-height:0;padding:4px 0;border:0;background:none;color:var(--reader-accent);font-size:13px;letter-spacing:.12em}
+.mr-scroll-retry .mr-button:hover:not(:disabled){background:none;text-decoration:underline;text-underline-offset:4px}
 .mr-chapter-end .mr-button{min-height:0;padding:0;border:0;background:none;color:var(--reader-accent);font-size:12px;letter-spacing:.14em;box-shadow:none}
 .mr-chapter-end .mr-button:hover:not(:disabled){background:none;color:var(--reader-accent);text-decoration:underline;text-underline-offset:4px}
 .mr-chapter-veil{position:absolute;left:50%;top:46%;transform:translate(-50%,-50%);z-index:6;pointer-events:none;padding:9px 16px;border-radius:999px;background:color-mix(in srgb,var(--reader-bg) 86%,transparent);color:var(--reader-muted);font-size:13px;letter-spacing:.08em;box-shadow:0 10px 26px color-mix(in srgb,var(--reader-text) 12%,transparent);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);animation:mr-veil-in 1.05s ease both}
