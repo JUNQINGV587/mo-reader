@@ -163,9 +163,23 @@ export class ReaderService extends TypertRemoteService {
     } catch (error) {
       throw new ReaderError('reader/invalid-source', '书源不是有效 JSON。', undefined, { cause: error })
     }
+    if (Array.isArray(raw)) {
+      const imported = []
+      const skipped = []
+      raw.forEach((item, index) => {
+        try {
+          imported.push(normalizeSource(item, { allowHttp: args.allowHttp === true }))
+        } catch (error) {
+          skipped.push({ index, reason: error?.message || String(error) })
+        }
+      })
+      if (!imported.length) throw new ReaderError('reader/invalid-source', '这批书源都不符合规则，一个也没有导入。', undefined, { cause: skipped.length ? new Error(skipped[0].reason) : undefined })
+      for (const source of imported) await this.db.sources.put(source.id, source)
+      return { imported: imported.length, skipped, total: raw.length, names: imported.map(item => item.name) }
+    }
     const source = normalizeSource(raw, { allowHttp: args.allowHttp === true })
     await this.db.sources.put(source.id, source)
-    return clone(source)
+    return { imported: 1, skipped: [], total: 1, names: [source.name], ...clone(source) }
   }
 
   async removeSource(args) {

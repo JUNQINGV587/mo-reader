@@ -452,10 +452,28 @@ window.__ModuleLoader__.load({
         })));
     }
 
-    function Sources({ sources, onImport, onRemove, busy }) {
+    function importSummary(result) {
+      if (!result || typeof result !== 'object') return '书源已导入';
+      const imported = Number(result.imported || 0);
+      const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
+      if (!imported) return '这批书源都不符合规则，一个也没有导入';
+      return skipped ? `已导入 ${imported} 个书源，跳过 ${skipped} 个` : `已导入 ${imported} 个书源`;
+    }
+    const SOURCE_LIBRARY_KEY = 'mo-reader:source-library';
+    function readSourceLibrary() {
+      try { return JSON.parse(window.localStorage.getItem(SOURCE_LIBRARY_KEY) || 'null') || { url: '', at: '' }; }
+      catch { return { url: '', at: '' }; }
+    }
+    function writeSourceLibrary(value) {
+      try { window.localStorage.setItem(SOURCE_LIBRARY_KEY, JSON.stringify(value)); } catch {}
+    }
+    function Sources({ sources, onImport, onRemove, busy, onPullLibrary }) {
       const [draft, setDraft] = useState('');
       const [allowHttp, setAllowHttp] = useState(false);
+      const [library, setLibrary] = useState(readSourceLibrary);
+      const [libraryText, setLibraryText] = useState(library.url || '');
       const fileRef = useRef(null);
+      const pulling = busy;
       return h('div', { className: 'mr-sources' },
         h('div', { className: 'mr-section-head' }, h('div', null, h('h2', null, '书源管理'), h('p', null, '基础规则 · 本机校验'))),
         h('section', { className: 'mr-panel' },
@@ -467,6 +485,18 @@ window.__ModuleLoader__.load({
             h(Button, { kind: 'primary', icon: 'plus', disabled: busy || !draft.trim(), onClick: () => onImport(draft, allowHttp).then(() => setDraft('')) }, '导入'),
             h(Button, { icon: 'upload', onClick: () => fileRef.current?.click(), disabled: busy }, '选文件'),
             h('input', { ref: fileRef, type: 'file', accept: '.json,application/json', hidden: true, onChange: async (e) => { const file = e.target.files?.[0]; if (file) setDraft(await file.text()); e.target.value = ''; } }))),
+        h('section', { className: 'mr-panel' },
+          h('h3', null, '在线源库'),
+          h('p', { className: 'mr-help' }, '填一个公开源库地址（返回书源 JSON 数组），拉取后导入全部可用书源。'),
+          h('div', { className: 'mr-inline-actions' },
+            h('input', { className: 'mr-input', value: libraryText, onChange: (e) => setLibraryText(e.target.value), placeholder: 'https://…/sources.json', style: { flex: '1 1 320px' } }),
+            h(Button, { kind: 'primary', icon: 'download', disabled: pulling || !libraryText.trim(), onClick: async () => {
+              const next = { url: libraryText.trim(), at: new Date().toISOString() };
+              await onPullLibrary(next);
+              setLibrary(next);
+              writeSourceLibrary(next);
+            } }, '拉取'),
+            library.at ? h('span', { className: 'mr-help' }, `上次拉取 ${new Date(library.at).toLocaleString('zh-CN', { hour12: false })}`) : null)),
         h('section', { className: 'mr-source-list' }, sources.length ? sources.map((source) => {
           const id = source.id || source.bookSourceUrl;
           return h('article', { className: 'mr-source-row', key: id },
@@ -1889,9 +1919,11 @@ window.__ModuleLoader__.load({
         catch (cause) { notify(cause.message || String(cause), 'error'); throw cause; }
         finally { setBusy(false); }
       };
-      const importSource = (draft, allowHttp) => run(() => {
+      const importSource = (draft, allowHttp) => run(async () => {
         const value = draft.trim();
-        return call(ctx, 'importSource', /^https?:\/\//i.test(value) ? { url: value, allowHttp } : { text: value, allowHttp });
+        const result = await call(ctx, 'importSource', /^https?:\/\//i.test(value) ? { url: value, allowHttp } : { text: value, allowHttp });
+        setNotice({ kind: 'info', text: importSummary(result) });
+        return result;
       }, '书源已导入');
       const search = async (query) => {
         const keyword = String(query || '').trim();
@@ -2009,7 +2041,13 @@ window.__ModuleLoader__.load({
               return run(() => call(ctx, 'cancelJob', { jobId }), '已暂停').catch(() => {});
             }, onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
-          !loading && tab === 'sources' ? h(Sources, { sources, busy, onImport: importSource, onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
+          !loading && tab === 'sources' ? h(Sources, { sources, busy, onImport: importSource,
+              onPullLibrary: (next) => run(async () => {
+                const result = await call(ctx, 'importSource', { url: next.url, allowHttp: false });
+                setNotice({ kind: 'info', text: importSummary(result) });
+                return result;
+              }, '拉取完成').catch(() => {}),
+              onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
           !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy }) : null)));
     }
 
