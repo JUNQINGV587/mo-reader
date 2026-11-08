@@ -161,6 +161,19 @@ window.__ModuleLoader__.load({
         h('h3', null, title), detail ? h('p', null, detail) : null, action || null);
     }
 
+    // 进度的崩溃兜底：localStorage 是同步写，标签页被杀/刷新也还在。
+    // 启动时用它和书里的进度比 updatedAt，谁新听谁的。
+    const PROGRESS_MIRROR_KEY = 'mo-reader:progress';
+    function readProgressMirror() {
+      try {
+        const raw = globalThis.localStorage?.getItem(PROGRESS_MIRROR_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch { return null; }
+    }
+    function writeProgressMirror(value) {
+      try { globalThis.localStorage?.setItem(PROGRESS_MIRROR_KEY, JSON.stringify(value)); } catch { /* 隐私模式等 */ }
+    }
+
     function Notice({ notice, onClose }) {
       if (!notice) return null;
       return h('div', { className: `mr-notice ${notice.kind || 'info'}`, role: 'status' },
@@ -544,6 +557,8 @@ window.__ModuleLoader__.load({
       const webglRef = useRef(true);
       const pendingOffsetRef = useRef(null);
       const progressRef = useRef({ bookId: book.id || book.bookId, chapterId: null, percent: 0, offset: 0 });
+      const lastSaveAtRef = useRef(0);
+      const mirrorAtRef = useRef({ at: 0, chapterId: '' });
       const [scrollChapters, setScrollChapters] = useState([]);
       const [scrollError, setScrollError] = useState(null);
       const scrollChaptersRef = useRef([]);
@@ -781,13 +796,29 @@ window.__ModuleLoader__.load({
         setScrollPercent(percent);
         const chapterId = chapterIdAt(index);
         progressRef.current = { bookId, chapterId, percent, offset };
+        // 1. 同步写一份到 localStorage：崩溃/刷新时最多丢 350ms 的滚动。
+        const stamp = Date.now();
+        if (chapterId !== mirrorAtRef.current.chapterId || stamp - mirrorAtRef.current.at > 350) {
+          mirrorAtRef.current = { at: stamp, chapterId };
+          writeProgressMirror({ bookId, chapterId, percent, offset, savedAt: new Date(stamp).toISOString() });
+        }
+        // 2. 服务端存盘：滚动中一直有事件的话，600ms 的尾随定时器会被不断推后，
+        //    所以再加一个 1.2s 的节流，保证持续阅读时也在定期落盘。
+        const save = () => {
+          lastSaveAtRef.current = Date.now();
+          call(ctx, 'saveProgress', { bookId, chapterId, percent, offset }).catch(() => {});
+        };
         clearTimeout(saveTimer.current);
-        saveTimer.current = setTimeout(() => call(ctx, 'saveProgress', { bookId, chapterId, percent, offset }).catch(() => {}), 600);
+        if (stamp - lastSaveAtRef.current >= 1200) save();
+        else saveTimer.current = setTimeout(save, 600);
       };
       const flushProgress = () => {
         clearTimeout(saveTimer.current);
         const payload = { ...progressRef.current };
-        return payload.chapterId ? call(ctx, 'saveProgress', payload).catch(() => {}) : Promise.resolve();
+        if (!payload.chapterId) return Promise.resolve();
+        writeProgressMirror({ ...payload, savedAt: new Date().toISOString() });
+        lastSaveAtRef.current = Date.now();
+        return call(ctx, 'saveProgress', payload).catch(() => {});
       };
       const closeReader = async () => {
         await flushProgress();
@@ -924,6 +955,17 @@ window.__ModuleLoader__.load({
       };
 
       useEffect(() => {
+        const onPageHide = () => { flushProgress(); };
+        const onVisibility = () => { if (document.visibilityState === 'hidden') flushProgress(); };
+        window.addEventListener('pagehide', onPageHide);
+        document.addEventListener('visibilitychange', onVisibility);
+        return () => {
+          window.removeEventListener('pagehide', onPageHide);
+          document.removeEventListener('visibilitychange', onVisibility);
+        };
+      }, []);
+
+      useEffect(() => {
         let active = true;
         let timer = 0;
         const requestId = ++requestRef.current;
@@ -933,14 +975,24 @@ window.__ModuleLoader__.load({
             const list = Array.isArray(result) ? result : result?.chapters || result?.items || [];
             if (!active || requestId !== requestRef.current) return;
             setToc(list);
-            const savedId = book.lastRead?.chapterId || book.progress?.chapterId || book.chapterId;
-            const index = Math.max(0, list.findIndex((item, i) => (item.id || item.chapterId || item.url || item.chapterUrl || String(i)) === savedId));
+            let savedId = book.lastRead?.chapterId || book.progress?.chapterId || book.chapterId;
+            let index = Math.max(0, list.findIndex((item, i) => (item.id || item.chapterId || item.url || item.chapterUrl || String(i)) === savedId));
+            // 上次是被刷新/杀掉的话，书里的进度可能落后几十毫秒到几百毫秒，
+            // localStorage 里那份「刚滚到的位置」更新就用它。
+            const mirror = readProgressMirror();
+            const mirrorIndex = mirror && mirror.bookId === bookId
+              ? list.findIndex((item, i) => (item.id || item.chapterId || item.url || item.chapterUrl || String(i)) === mirror.chapterId)
+              : -1;
+            const mirrorAt = Date.parse(mirror?.savedAt || 0) || 0;
+            const storedAt = Date.parse(book.progress?.updatedAt || book.lastRead?.updatedAt || 0) || 0;
+            const useMirror = mirrorIndex >= 0 && mirrorAt > storedAt;
+            if (useMirror) { savedId = mirror.chapterId; index = mirrorIndex; }
             if (list.length) {
               setFailedIndex(index);
               const item = list[index];
               const id = item.id || item.chapterId || item.url || item.chapterUrl || String(index);
-              const saved = Number(book.lastRead?.percent || book.progress?.percent || book.percent || 0);
-              const savedOffset = Number(book.lastRead?.offset || book.progress?.offset || 0);
+              const saved = useMirror ? Math.max(0, Math.min(100, Number(mirror.percent) || 0)) : Number(book.lastRead?.percent || book.progress?.percent || book.percent || 0);
+              const savedOffset = useMirror ? Number(mirror.offset) || 0 : Number(book.lastRead?.offset || book.progress?.offset || 0);
               progressRef.current = { bookId, chapterId: id, percent: saved, offset: savedOffset };
               pendingPercentRef.current = saved;
               pendingOffsetRef.current = savedOffset > 0 ? savedOffset : null;
