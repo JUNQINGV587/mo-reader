@@ -360,8 +360,7 @@ window.__ModuleLoader__.load({
               h('p', null, '去发现搜书，或导入本地书籍。'))
           : h('div', { className: 'mr-shelf-gallery' },
               lastRead ? h('section', { className: 'mr-shelf-hero', 'aria-label': '继续阅读' },
-                h('button', { className: 'mr-shelf-hero-cover', type: 'button', 'aria-label': `继续阅读 ${heroTitle}`, onClick: (event) => open(lastRead, event) }, coverNode(lastRead, heroTitle, 1)),
-                h(DownloadBadge, { book: lastRead, onToggle: onToggleDownload }),
+                h('button', { className: 'mr-shelf-hero-cover', type: 'button', 'aria-label': `继续阅读 ${heroTitle}`, onClick: (event) => open(lastRead, event) }, coverNode(lastRead, heroTitle, 1), h(DownloadBadge, { book: lastRead, onToggle: onToggleDownload })),
                 h('div', { className: 'mr-shelf-hero-info' },
                   h('p', { className: 'mr-shelf-eyebrow' }, '01 · 继续阅读'),
                   h('h3', { className: 'mr-shelf-hero-title' }, heroTitle),
