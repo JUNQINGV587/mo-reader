@@ -457,7 +457,9 @@ window.__ModuleLoader__.load({
       const imported = Number(result.imported || 0);
       const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
       if (!imported) return '这批书源都不符合规则，一个也没有导入';
-      return skipped ? `已导入 ${imported} 个书源，跳过 ${skipped} 个` : `已导入 ${imported} 个书源`;
+      const first = Array.isArray(result.skipped) && result.skipped[0]?.reason ? String(result.skipped[0].reason).replace(/^source\./, '') : '';
+      const skippedText = skipped ? `跳过 ${skipped} 个${first ? `（${first.slice(0, 40)}）` : ''}` : '';
+      return skippedText ? `已导入 ${imported} 个书源，${skippedText}` : `已导入 ${imported} 个书源`;
     }
     const SOURCE_LIBRARY_KEY = 'mo-reader:source-library';
     function readSourceLibrary() {
