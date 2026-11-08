@@ -102,6 +102,13 @@ window.__ModuleLoader__.load({
       },
     });
 
+    function withTimeout(promise, ms) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`请求超过 ${Math.round(ms / 1000)} 秒，已跳过`)), ms);
+        Promise.resolve(promise).then((value) => { clearTimeout(timer); resolve(value); }, (error) => { clearTimeout(timer); reject(error); });
+      });
+    }
+
     async function call(ctx, method, args) {
       const result = await ctx.remote.reader[method](args);
       if (result && result.ok === false) {
@@ -388,23 +395,22 @@ window.__ModuleLoader__.load({
         })));
     }
 
-    function Discover({ sources, selectedSource, onSource, onSearch, onAdd, results, busy }) {
+    function Discover({ sources, onSearch, onAdd, results, busy, failed }) {
       const [query, setQuery] = useState('');
       if (!sources.length) return h(Empty, { icon: 'source', title: '先导入书源', detail: '支持 URL、文件或粘贴 JSON。' });
       return h('div', { className: 'mr-discover' },
-        h('div', { className: 'mr-section-head' }, h('div', null, h('h2', null, '发现好书'), h('p', null, '搜索当前书源'))),
+        h('div', { className: 'mr-section-head' }, h('div', null, h('h2', null, '发现好书'), h('p', null, `搜索全部 ${sources.length} 个书源`))),
         h('form', { className: 'mr-searchbar', onSubmit: (event) => { event.preventDefault(); onSearch(query); } },
-          h('select', { value: selectedSource, onChange: (e) => onSource(e.target.value), 'aria-label': '书源' },
-            sources.map((source) => h('option', { key: source.id || source.bookSourceUrl, value: source.id || source.bookSourceUrl }, source.bookSourceName || source.name || source.bookSourceUrl))),
           h('input', { value: query, onChange: (e) => setQuery(e.target.value), placeholder: '书名或作者', 'aria-label': '搜索' }),
           h(Button, { kind: 'primary', icon: 'search', type: 'submit', disabled: busy }, '搜索')),
         busy ? h('div', { className: 'mr-loading' }, '正在查找…') : null,
+        !busy && failed ? h('p', { className: 'mr-help' }, `${failed} 个书源没响应，已跳过。`) : null,
         !busy && results && results.length === 0 ? h(Empty, { icon: 'search', title: '没有找到', detail: '换个关键词或书源试试。' }) : null,
         h('div', { className: 'mr-results' }, (results || []).map((book, index) => {
           const name = book.name || book.title || '未命名';
           return h('article', { className: 'mr-result', key: `${book.bookUrl || book.url || name}-${index}` },
             h(BookCover, { book, small: true }),
-            h('div', { className: 'mr-result-info' }, h('h3', null, name), h('p', null, [book.author, book.kind].filter(Boolean).join(' · ') || '书籍'), book.intro ? h('p', { className: 'mr-intro' }, book.intro) : null),
+            h('div', { className: 'mr-result-info' }, h('h3', null, name), h('p', null, [book.author, book.kind, book.sourceName].filter(Boolean).join(' · ') || '书籍'), book.intro ? h('p', { className: 'mr-intro' }, book.intro) : null),
             h(Button, { kind: 'primary soft', icon: 'plus', onClick: () => onAdd(book), disabled: busy }, '加书架'));
         })));
     }
@@ -1798,6 +1804,7 @@ window.__ModuleLoader__.load({
       const [selectedSource, setSelectedSource] = useState('');
       const [results, setResults] = useState(null);
       const [resultSource, setResultSource] = useState('');
+      const [searchFailed, setSearchFailed] = useState(0);
       const [reading, setReading] = useState(null);
       const [opening, setOpening] = useState(null);
       const [shelfView, setShelfView] = useState('shelf');
@@ -1843,14 +1850,32 @@ window.__ModuleLoader__.load({
         const value = draft.trim();
         return call(ctx, 'importSource', /^https?:\/\//i.test(value) ? { url: value, allowHttp } : { text: value, allowHttp });
       }, '书源已导入');
-      const search = (query) => {
-        const sourceId = selectedSource;
-        return run(() => call(ctx, query.trim() ? 'search' : 'discover', { sourceId, query, page: 1 }).then((value) => {
-          setResults(Array.isArray(value) ? value : value?.items || value?.books || []);
-          setResultSource(sourceId);
-        })).catch(() => {});
+      const search = async (query) => {
+        const keyword = String(query || '').trim();
+        if (!keyword) return;
+        setBusy(true); setResults(null); setSearchFailed(0);
+        const targets = sources.filter((source) => source.enabled !== false);
+        const settled = await Promise.allSettled(targets.map((source) => {
+          const sourceId = source.id || source.bookSourceUrl;
+          return withTimeout(call(ctx, 'search', { sourceId, query: keyword, page: 1 }), 15_000)
+            .then((value) => ({ source, sourceId, items: Array.isArray(value) ? value : value?.items || value?.books || [] }));
+        }));
+        const shelfUrls = new Set(books.map((book) => book.bookUrl || book.url).filter(Boolean));
+        const merged = [];
+        let failed = 0;
+        for (const outcome of settled) {
+          if (outcome.status === 'rejected') { failed += 1; continue; }
+          const { source, sourceId, items } = outcome.value;
+          const label = source.bookSourceName || source.name || source.bookSourceUrl;
+          for (const item of items) merged.push({ ...item, sourceId, sourceName: label });
+        }
+        merged.sort((a, b) => Number(shelfUrls.has(b.bookUrl || b.url)) - Number(shelfUrls.has(a.bookUrl || a.url)));
+        setResults(merged);
+        setSearchFailed(failed);
+        setResultSource('');
+        setBusy(false);
       };
-      const addBook = (book) => run(() => call(ctx, 'addBook', { sourceId: resultSource || selectedSource, bookUrl: book.bookUrl || book.url, download: true }), '已加入书架，开始下载').catch(() => {});
+      const addBook = (book) => run(() => call(ctx, 'addBook', { sourceId: book.sourceId || resultSource || book.bookSourceUrl || selectedSource, bookUrl: book.bookUrl || book.url, download: true }), '已加入书架，开始下载').catch(() => {});
       const updateSettings = (partial) => {
         setData((current) => ({ ...current, settings: { ...current.settings, ...partial } }));
         return call(ctx, 'setSettings', partial).catch((cause) => notify(cause.message || String(cause), 'error'));
@@ -1929,7 +1954,7 @@ window.__ModuleLoader__.load({
           h(Notice, { notice, onClose: () => setNotice(null) }),
           loading ? h('div', { className: 'mr-loading' }, '正在打开墨读…') : null,
           !loading && tab === 'library' ? h(Library, { books, busy, view: shelfView, onView: setShelfView, ctx, theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: prefersReducedMotion() || settings.reducedMotion === 'on', onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}), onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
-          !loading && tab === 'discover' ? h(Discover, { sources, selectedSource, onSource: (sourceId) => { setSelectedSource(sourceId); setResults(null); setResultSource(''); }, onSearch: search, onAdd: addBook, results, busy }) : null,
+          !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
           !loading && tab === 'sources' ? h(Sources, { sources, busy, onImport: importSource, onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
           !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy }) : null)));
     }
