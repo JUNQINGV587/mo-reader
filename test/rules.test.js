@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { isPrivateAddress, parseRemoteUrl } from '../lib/http.js'
 import { applyReplacements, normalizeReplacements } from '../lib/replacements.js'
-import { mapList, normalizeSource, renderTemplate, responseDocument } from '../lib/rules.js'
+import { extractOne, mapList, normalizeSource, renderTemplate, responseDocument } from '../lib/rules.js'
 
 test('URL templates encode key, page and book values', () => {
   assert.equal(
@@ -98,4 +98,14 @@ test('field templates render from extracted fields without URL encoding', () => 
     mapList(document, 'li', { name: 'a@title', bookUrl: 'https://zh.wikisource.org/wiki/{{name}}' }),
     [{ name: '三國演義', bookUrl: 'https://zh.wikisource.org/wiki/三國演義' }],
   )
+})
+
+test('Legado index and html actions pick the right node', () => {
+  const document = responseDocument(
+    '<div id="article"><p>第一段</p><p>第二段</p><p>第三段</p></div>',
+    'text/html',
+  )
+  assert.equal(extractOne(document, '#article p!0@text'), '第一段')
+  assert.equal(extractOne(document, '#article p!-1@text'), '第三段')
+  assert.equal(extractOne(document, '#article p!-1@html'), '<p>第三段</p>'.replace(/^<p>|<\/p>$/g, '') || '第三段')
 })
