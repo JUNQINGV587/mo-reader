@@ -429,8 +429,8 @@ window.__ModuleLoader__.load({
           return h('article', { className: 'mr-source-row', key: id },
             h('div', { className: 'mr-source-mark' }, h(Glyph, { name: 'source' })),
             h('div', null, h('h3', null, source.bookSourceName || source.name || '书源'), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl)),
-            h('span', { className: 'mr-tag' }, source.compatibility || '基础规则'),
-            h(Button, { kind: 'text danger', icon: 'trash', onClick: () => onRemove(source), disabled: busy }, '移除'));
+            h('span', { className: 'mr-tag' }, source.builtin ? '内置' : (source.compatibility || '基础规则')),
+            source.builtin ? null : h(Button, { kind: 'text danger', icon: 'trash', onClick: () => onRemove(source), disabled: busy }, '移除'));
         }) : h(Empty, { icon: 'source', title: '暂无书源', detail: '导入后即可搜索和追更。' })));
     }
 

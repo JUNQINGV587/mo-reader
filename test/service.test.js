@@ -170,3 +170,11 @@ test('addBook accepts search-result data when a source has no bookInfo rule', as
   assert.equal(book.name, '公版书')
   assert.equal(book.author, '作者甲')
 })
+
+test('built-in sources cannot be removed', async () => {
+  const { service, db } = await serviceFixture()
+  await service.seedBuiltinSources()
+  const [builtin] = [...db.sources.entries()].map(([, value]) => value)
+  await assert.rejects(() => service.removeSource({ id: builtin.id }), /内置书源不能删除/)
+  assert.equal(db.sources.get(builtin.id)?.builtin, true)
+})

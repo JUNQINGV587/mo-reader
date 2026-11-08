@@ -168,6 +168,7 @@ export class ReaderService extends TypertRemoteService {
     args ??= {}
     this.assertReady()
     const source = this.source(args.id)
+    if (source.builtin) throw new ReaderError('reader/unsupported-source', '内置书源不能删除，可以关闭。')
     if (entries(this.db.books).some(book => book.sourceId === source.id)) throw new ReaderError('reader/source-in-use', '请先从书架移除该书源的书籍。')
     await this.db.sources.delete(source.id)
     return { removed: true, id: source.id }
