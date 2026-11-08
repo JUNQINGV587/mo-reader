@@ -20,7 +20,17 @@ test('all contracted methods are discovered by the Stage-3 Remote markers', asyn
   const { service } = await serviceFixture()
   const discovered = remoteMethods(service).map(marker => marker.exportName ?? marker.method)
   assert.deepEqual(discovered, [...REMOTE_METHODS])
-  assert.equal(new Set(discovered).size, 21)
+  assert.equal(new Set(discovered).size, REMOTE_METHODS.length)
+})
+
+test('download jobs can be paused and resumed', () => {
+  const job = createJob({ bookId: 'b1', total: 10 })
+  const running = transitionJob(job, 'start')
+  const paused = transitionJob(running, 'pause')
+  assert.equal(paused.status, 'paused')
+  const resumed = transitionJob(paused, 'resume')
+  assert.equal(resumed.status, 'queued')
+  assert.throws(() => transitionJob(job, 'resume'))
 })
 
 test('real gateway SRC descriptor accepts every Remote signature', async () => {

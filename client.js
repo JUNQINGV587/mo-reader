@@ -231,7 +231,37 @@ window.__ModuleLoader__.load({
       return hash % 360;
     }
 
-    function ShelfBoard({ books, reducedMotion = false, onOpen, headActions }) {
+    function downloadBadge(book) {
+      const job = book && typeof book.download === 'object' ? book.download : null;
+      const status = book?.downloadStatus || (typeof book?.download === 'string' ? book.download : job?.status);
+      if (!status) return null;
+      const total = Number(job?.total || 0);
+      const done = Number(job?.done || 0);
+      const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((done / total) * 100))) : 0;
+      const label = status === 'queued' ? '排队'
+        : status === 'paused' ? '已暂停'
+        : status === 'failed' ? '失败'
+        : status === 'completed' ? '已下载'
+        : `${pct}%`;
+      const kind = status === 'completed' ? 'done' : status === 'failed' ? 'failed' : status === 'paused' ? 'paused' : status === 'queued' ? 'queued' : 'running';
+      return { label, kind, status };
+    }
+
+    function DownloadBadge({ book, onToggle }) {
+      const badge = downloadBadge(book);
+      if (!badge) return null;
+      const toggle = (event) => { event.preventDefault(); event.stopPropagation(); onToggle?.(book); };
+      return h('span', {
+        className: `mr-dl-badge ${badge.kind}`,
+        role: 'button',
+        tabIndex: 0,
+        title: badge.kind === 'paused' ? '点击继续下载' : badge.kind === 'running' || badge.kind === 'queued' ? '点击暂停下载' : '下载状态',
+        onClick: toggle,
+        onKeyDown: (event) => { if (event.key === 'Enter' || event.key === ' ') toggle(event); },
+      }, badge.label);
+    }
+
+    function ShelfBoard({ books, reducedMotion = false, onOpen, headActions, onToggleDownload }) {
       const [query, setQuery] = useState('');
       const searchRef = useRef(null);
       useEffect(() => {
@@ -331,6 +361,7 @@ window.__ModuleLoader__.load({
           : h('div', { className: 'mr-shelf-gallery' },
               lastRead ? h('section', { className: 'mr-shelf-hero', 'aria-label': '继续阅读' },
                 h('button', { className: 'mr-shelf-hero-cover', type: 'button', 'aria-label': `继续阅读 ${heroTitle}`, onClick: (event) => open(lastRead, event) }, coverNode(lastRead, heroTitle, 1)),
+                h(DownloadBadge, { book: lastRead, onToggle: onToggleDownload }),
                 h('div', { className: 'mr-shelf-hero-info' },
                   h('p', { className: 'mr-shelf-eyebrow' }, '01 · 继续阅读'),
                   h('h3', { className: 'mr-shelf-hero-title' }, heroTitle),
@@ -358,6 +389,7 @@ window.__ModuleLoader__.load({
                             onClick: (event) => open(book, event),
                           },
                           coverNode(book, name, variant),
+                          h(DownloadBadge, { book, onToggle: onToggleDownload }),
                           h('span', { className: 'mr-shelf-cap' },
                             h('strong', null, name.replace(/\.(?:txt|epub|md|pdf)$/i, '')),
                             book.author ? h('small', null, book.author) : null));
@@ -367,7 +399,7 @@ window.__ModuleLoader__.load({
           h('span', { className: 'wall' }, normalizedQuery ? `${String(matches.length).padStart(2, '0')} 本 · 匹配` : `${String(layout.count).padStart(2, '0')} 本 · 都在墙上`)));
     }
 
-    function Library({ books, onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality, ambience, reducedMotion = false }) {
+    function Library({ books, onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality, ambience, reducedMotion = false, onToggleDownload }) {
       if (!books.length) return h(Empty, {
         title: '书架还是空的', detail: '去发现搜书，或导入本地书籍。',
       });
@@ -376,7 +408,7 @@ window.__ModuleLoader__.load({
         h('button', { className: view === 'list' ? 'active' : '', onClick: () => onView('list') }, '列表'));
       const checkButton = h(Button, { icon: 'refresh', onClick: onCheck, disabled: busy }, '补查');
       const actions = h(React.Fragment, null, viewToggle, checkButton);
-      if (view === 'shelf') return h(ShelfBoard, { key: 'shelf', books, reducedMotion, onOpen, headActions: actions });
+      if (view === 'shelf') return h(ShelfBoard, { key: 'shelf', books, reducedMotion, onOpen, headActions: actions, onToggleDownload });
       return h(React.Fragment, null,
         h('div', { className: 'mr-section-head' },
           h('div', null, h('h2', null, '我的书架'), h('p', null, `${books.length} 本 · 本机保存`)),
@@ -389,6 +421,7 @@ window.__ModuleLoader__.load({
           return h('article', { className: 'mr-book-card', key: id },
             h('button', { className: 'mr-book-open', onClick: () => onOpen(book) },
               h(BookCover, { book }),
+              h(DownloadBadge, { book, onToggle: onToggleDownload }),
               h('div', { className: 'mr-book-info' },
                 h('div', { className: 'mr-book-title-row' }, h('h3', { title: name }, name), unread > 0 ? h('span', { className: 'mr-badge' }, `${unread} 章`) : null),
                 h('p', null, book.author || (book.sourceType === 'local' ? '本地书籍' : '未知作者')),
@@ -1957,7 +1990,8 @@ window.__ModuleLoader__.load({
         h('section', { className: 'mr-content' },
           h(Notice, { notice, onClose: () => setNotice(null) }),
           loading ? h('div', { className: 'mr-loading' }, '正在打开墨读…') : null,
-          !loading && tab === 'library' ? h(Library, { books, busy, view: shelfView, onView: setShelfView, ctx, theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: prefersReducedMotion() || settings.reducedMotion === 'on', onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}), onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
+          !loading && tab === 'library' ? h(Library, { books, busy, view: shelfView, onView: setShelfView, ctx, theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: prefersReducedMotion() || settings.reducedMotion === 'on', onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}),
+            onToggleDownload: (book) => { const paused = (book.downloadStatus || book.download?.status) === 'paused'; return run(() => call(ctx, paused ? 'resumeJob' : 'pauseJob', { bookId: book.id || book.bookId }), paused ? '继续下载' : '已暂停').catch(() => {}); }, onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
           !loading && tab === 'sources' ? h(Sources, { sources, busy, onImport: importSource, onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
           !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy }) : null)));
@@ -2003,7 +2037,13 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-shelf-head h1{font:400 32px/1.2 var(--mr-serif);margin:0;color:var(--mr-text);letter-spacing:-.4px}
 .mr-shelf-head-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .mr-shelf-gallery{display:grid;grid-template-columns:320px 1fr;gap:28px;align-items:stretch}
-.mr-shelf-piece{display:flex;flex-direction:column;gap:10px;min-width:0;padding:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer;appearance:none;border-radius:4px;opacity:0;animation:mr-fade-in .2s ease forwards}
+.mr-dl-badge{position:absolute;right:8px;bottom:8px;z-index:3;display:inline-flex;align-items:center;justify-content:center;min-width:38px;height:20px;padding:0 7px;border-radius:999px;font:500 11px/1 var(--mr-sans);letter-spacing:.02em;color:var(--mr-on-accent);background:color-mix(in srgb,var(--mr-ink) 72%,transparent);backdrop-filter:blur(6px);cursor:pointer;user-select:none}
+.mr-dl-badge:hover{background:color-mix(in srgb,var(--mr-ink) 84%,transparent)}
+.mr-dl-badge.queued{background:color-mix(in srgb,var(--mr-ink) 45%,transparent)}
+.mr-dl-badge.paused{background:color-mix(in srgb,var(--mr-ink) 55%,transparent)}
+.mr-dl-badge.failed{background:#a8422f}
+.mr-dl-badge.done{background:color-mix(in srgb,var(--mr-accent) 78%,#000 6%)}
+.mr-shelf-piece{position:relative;display:flex;flex-direction:column;gap:10px;min-width:0;padding:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer;appearance:none;border-radius:4px;opacity:0;animation:mr-fade-in .2s ease forwards}
 .mr-shelf-piece:focus-visible{outline:2px solid var(--mr-accent);outline-offset:4px}
 .mr-shelf-piece:hover .mr-shelf-cover{transform:translateY(-4px)}
 .mr-shelf-piece:active .mr-shelf-cover{transform:translateY(-2px)}
@@ -2047,7 +2087,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 @container (max-width:760px){.mr-shelf-gallery{grid-template-columns:260px 1fr}.mr-shelf-hero-cover{width:260px}}
 @container (max-width:640px){.mr-shelf-gallery{grid-template-columns:1fr;gap:20px}.mr-shelf-hero{flex-direction:row;align-items:flex-start;gap:16px}.mr-shelf-hero-cover{width:120px}.mr-shelf-hero-cover .mr-shelf-fallback-title{font-size:15px;white-space:normal;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;max-width:100%}.mr-shelf-hero-title{font-size:20px}.mr-shelf-hero-by{font-size:11px}.mr-shelf-cta{height:36px;min-height:36px;font-size:13px;padding:0 14px}.mr-shelf-progress{margin-top:10px}.mr-shelf-progress-label{font-size:10px}.mr-shelf-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 12px;align-content:start}}
 .mr-button{min-height:40px;padding:0 16px;border:1px solid var(--mr-border);border-radius:8px;background:var(--mr-card);color:var(--mr-text);display:inline-flex;align-items:center;justify-content:center;gap:6px;font-size:13px;font-weight:500;white-space:nowrap;box-shadow:0 1px 2px rgba(0,0,0,.04);transition:background .15s,border-color .15s,transform .15s}.mr-button:hover:not(:disabled){border-color:color-mix(in srgb,var(--mr-text) 22%,var(--mr-border));background:var(--mr-sunken)}.mr-button.primary{background:var(--mr-accent);border-color:var(--mr-accent);color:var(--mr-on-accent);box-shadow:0 1px 2px rgba(0,0,0,.12)}.mr-button.primary:hover:not(:disabled){background:var(--mr-accent-hover);border-color:var(--mr-accent-hover)}.mr-button.soft{background:color-mix(in srgb,var(--mr-accent) 10%,var(--mr-card));border-color:color-mix(in srgb,var(--mr-accent) 30%,var(--mr-border));color:var(--mr-accent)}.mr-button.soft:hover:not(:disabled){background:color-mix(in srgb,var(--mr-accent) 16%,var(--mr-card))}.mr-button.text{min-height:32px;border-color:transparent;background:transparent;color:var(--mr-muted);padding-inline:8px;box-shadow:none}.mr-button.text:hover:not(:disabled){background:var(--mr-sunken);color:var(--mr-text);border-color:transparent}.mr-button.danger{color:var(--dsw-alias-state-error-primary)}.mr-button.icon{width:40px;height:40px;min-height:40px;padding:0;border-color:transparent;background:transparent;color:inherit;box-shadow:none}.mr-button.icon:hover:not(:disabled){background:var(--mr-sunken)}.mr-button:focus-visible{outline:2px solid var(--mr-accent);outline-offset:2px}.mr-button:active:not(:disabled){transform:translateY(1px)}
-.mr-book-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(225px,1fr));gap:16px}.mr-book-card{border:1px solid var(--mr-border);background:var(--mr-card);border-radius:12px;overflow:hidden;box-shadow:var(--mr-shadow);transition:border-color .15s,transform .15s}.mr-book-card:hover{border-color:color-mix(in srgb,var(--mr-accent) 45%,var(--mr-border));transform:translateY(-1px)}.mr-book-open{border:0;background:transparent;color:inherit;width:100%;padding:18px 16px 12px;display:flex;gap:14px;text-align:left;min-width:0}.mr-book-info{min-width:0;flex:1}.mr-book-title-row{display:flex;gap:6px;align-items:flex-start}.mr-book-info h3{font:400 15px/1.45 var(--mr-serif);margin:1px 0 8px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.mr-book-info p,.mr-book-info small{margin:0;color:var(--mr-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}.mr-book-info p{font-size:12px}.mr-book-info small{font-size:11px;margin-top:12px}.mr-badge{flex:0 0 auto;background:var(--mr-accent);color:var(--mr-on-accent);font-size:10px;padding:2px 6px;border-radius:10px}.mr-book-actions{display:flex;justify-content:space-between;border-top:1px solid var(--mr-border);padding:3px 8px}
+.mr-book-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(225px,1fr));gap:16px}.mr-book-card{position:relative;border:1px solid var(--mr-border);background:var(--mr-card);border-radius:12px;overflow:hidden;box-shadow:var(--mr-shadow);transition:border-color .15s,transform .15s}.mr-book-card:hover{border-color:color-mix(in srgb,var(--mr-accent) 45%,var(--mr-border));transform:translateY(-1px)}.mr-book-open{border:0;background:transparent;color:inherit;width:100%;padding:18px 16px 12px;display:flex;gap:14px;text-align:left;min-width:0}.mr-book-info{min-width:0;flex:1}.mr-book-title-row{display:flex;gap:6px;align-items:flex-start}.mr-book-info h3{font:400 15px/1.45 var(--mr-serif);margin:1px 0 8px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}.mr-book-info p,.mr-book-info small{margin:0;color:var(--mr-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}.mr-book-info p{font-size:12px}.mr-book-info small{font-size:11px;margin-top:12px}.mr-badge{flex:0 0 auto;background:var(--mr-accent);color:var(--mr-on-accent);font-size:10px;padding:2px 6px;border-radius:10px}.mr-book-actions{display:flex;justify-content:space-between;border-top:1px solid var(--mr-border);padding:3px 8px}
 .mr-cover{position:relative;flex:0 0 66px;width:66px;height:94px;border-radius:6px;background:linear-gradient(145deg,color-mix(in srgb,var(--mr-accent) 35%,var(--dsw-alias-bg-layer-2)),var(--dsw-alias-bg-layer-2));box-shadow:0 4px 12px #0002;overflow:hidden;display:flex;align-items:center;justify-content:center}.mr-cover.small{width:52px;height:74px;flex-basis:52px}.mr-cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1}.mr-cover>span{font-family:serif;font-size:28px;color:var(--mr-accent);opacity:.65}
 .mr-empty{text-align:center;padding:70px 20px;color:var(--mr-muted)}.mr-empty-icon{width:58px;height:58px;border-radius:18px;background:var(--mr-sunken);display:flex;align-items:center;justify-content:center;margin:0 auto 16px;color:var(--mr-accent)}.mr-empty h3{color:var(--mr-text);font:400 18px/1.3 var(--mr-serif);margin:0 0 8px}.mr-empty p{font-size:13px;margin:0;line-height:1.7}
 .mr-searchbar{display:flex;gap:10px;margin-bottom:22px}.mr-searchbar select{max-width:190px}.mr-root input,.mr-root textarea,.mr-root select,.mr-reader input,.mr-reader textarea,.mr-reader select{border:1px solid var(--mr-border);border-radius:8px;background:var(--dsw-specific-input-major,var(--mr-sunken));color:var(--mr-text);padding:9px 12px;outline:none}.mr-root input:focus,.mr-root textarea:focus,.mr-root select:focus,.mr-reader textarea:focus{border-color:var(--mr-accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--mr-accent) 18%,transparent)}.mr-reader input,.mr-reader textarea,.mr-reader select{background:var(--mr-sunken)}.mr-root input[type=range]{padding:0;min-height:24px}.mr-searchbar input{flex:1;min-width:0}.mr-searchbar select{min-width:130px}.mr-results{display:flex;flex-direction:column;gap:10px}.mr-result{display:flex;align-items:center;gap:15px;padding:14px;border:1px solid var(--mr-border);border-radius:12px;background:var(--mr-card);box-shadow:var(--mr-shadow)}.mr-result-info{flex:1;min-width:0}.mr-result-info h3{font:400 15px/1.45 var(--mr-serif);margin:0 0 5px}.mr-result-info p{font-size:12px;color:var(--mr-muted);margin:0}.mr-result-info .mr-intro{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-top:7px;line-height:1.5}

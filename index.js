@@ -21,7 +21,7 @@ const COVER_MAX_BYTES = 2 * 1024 * 1024
 
 export const REMOTE_METHODS = Object.freeze([
   'state', 'importSource', 'removeSource', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
-  'saveProgress', 'download', 'cancelJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
+  'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
   'exportBackup', 'importBackup', 'fetchCover',
 ])
 
@@ -290,6 +290,35 @@ export class ReaderService extends TypertRemoteService {
     const progress = { chapterId: chapter.id, offset, percent, updatedAt: now() }
     await this.db.books.put(book.id, { ...book, progress, updatedAt: now() })
     return clone(progress)
+  }
+
+  activeJobFor(bookId) {
+    return entries(this.db.jobs).find(job => job.bookId === bookId && job.type === 'download' && ['queued', 'running', 'paused'].includes(job.status))
+  }
+
+  async pauseJob(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const job = this.activeJobFor(book.id)
+    if (!job) throw new ReaderError('reader/not-found', 'No active download for this book.')
+    const paused = transitionJob(job, 'pause')
+    await this.db.jobs.put(paused.id, paused)
+    await this.db.books.put(book.id, { ...this.book(book.id), download: { status: 'paused', jobId: paused.id, auto: true }, updatedAt: now() })
+    return jobView(paused)
+  }
+
+  async resumeJob(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const job = this.activeJobFor(book.id)
+    if (!job || job.status !== 'paused') throw new ReaderError('reader/not-found', 'No paused download for this book.')
+    const resumed = transitionJob(job, 'resume')
+    await this.db.jobs.put(resumed.id, resumed)
+    await this.db.books.put(book.id, { ...this.book(book.id), download: { status: 'queued', jobId: resumed.id, auto: true }, updatedAt: now() })
+    this.scheduleJob(resumed.id)
+    return jobView(resumed)
   }
 
   async download(args) {
