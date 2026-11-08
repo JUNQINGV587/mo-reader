@@ -472,6 +472,7 @@ window.__ModuleLoader__.load({
       const [allowHttp, setAllowHttp] = useState(false);
       const [library, setLibrary] = useState(readSourceLibrary);
       const [libraryText, setLibraryText] = useState(library.url || '');
+      const [libraryHttp, setLibraryHttp] = useState(false);
       const fileRef = useRef(null);
       const pulling = busy;
       return h('div', { className: 'mr-sources' },
@@ -488,11 +489,13 @@ window.__ModuleLoader__.load({
         h('section', { className: 'mr-panel' },
           h('h3', null, '在线源库'),
           h('p', { className: 'mr-help' }, '填一个公开源库地址（返回书源 JSON 数组），拉取后导入全部可用书源。'),
+          h('label', { className: 'mr-check' }, h('input', { type: 'checkbox', checked: libraryHttp, onChange: (e) => setLibraryHttp(e.target.checked) }), '允许明文 HTTP'),
           h('div', { className: 'mr-inline-actions' },
             h('input', { className: 'mr-input', value: libraryText, onChange: (e) => setLibraryText(e.target.value), placeholder: 'https://…/sources.json', style: { flex: '1 1 320px' } }),
             h(Button, { kind: 'primary', icon: 'download', disabled: pulling || !libraryText.trim(), onClick: async () => {
+              const ok = await onPullLibrary({ url: libraryText.trim(), allowHttp: libraryHttp });
+              if (ok === false) return;
               const next = { url: libraryText.trim(), at: new Date().toISOString() };
-              await onPullLibrary(next);
               setLibrary(next);
               writeSourceLibrary(next);
             } }, '拉取'),
@@ -2043,10 +2046,10 @@ window.__ModuleLoader__.load({
           !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
           !loading && tab === 'sources' ? h(Sources, { sources, busy, onImport: importSource,
               onPullLibrary: (next) => run(async () => {
-                const result = await call(ctx, 'importSource', { url: next.url, allowHttp: false });
+                const result = await call(ctx, 'importSource', { url: next.url, allowHttp: next.allowHttp === true });
                 setNotice({ kind: 'info', text: importSummary(result) });
                 return result;
-              }, '拉取完成').catch(() => {}),
+              }, '拉取完成').then(() => true).catch(() => false),
               onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
           !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy }) : null)));
     }
