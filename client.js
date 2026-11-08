@@ -255,7 +255,7 @@ window.__ModuleLoader__.load({
         className: `mr-dl-badge ${badge.kind}`,
         role: 'button',
         tabIndex: 0,
-        title: badge.kind === 'paused' ? '点击继续下载' : badge.kind === 'running' || badge.kind === 'queued' ? '点击暂停下载' : '下载状态',
+        title: badge.kind === 'paused' ? '点击继续下载' : badge.kind === 'running' || badge.kind === 'queued' ? '点击暂停下载' : badge.kind === 'failed' ? '点击重新下载' : '已下载，点击重新拉取新章',
         onClick: toggle,
         onKeyDown: (event) => { if (event.key === 'Enter' || event.key === ' ') toggle(event); },
       }, badge.label);
@@ -1990,7 +1990,13 @@ window.__ModuleLoader__.load({
           h(Notice, { notice, onClose: () => setNotice(null) }),
           loading ? h('div', { className: 'mr-loading' }, '正在打开墨读…') : null,
           !loading && tab === 'library' ? h(Library, { books, busy, view: shelfView, onView: setShelfView, ctx, theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: prefersReducedMotion() || settings.reducedMotion === 'on', onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}),
-            onToggleDownload: (book) => { const paused = (book.downloadStatus || book.download?.status) === 'paused'; return run(() => call(ctx, paused ? 'resumeJob' : 'pauseJob', { bookId: book.id || book.bookId }), paused ? '继续下载' : '已暂停').catch(() => {}); }, onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
+            onToggleDownload: (book) => {
+              const status = book.downloadStatus || book.download?.status;
+              const bookId = book.id || book.bookId;
+              if (status === 'failed' || status === 'completed') return run(() => call(ctx, 'download', { bookId }), status === 'failed' ? '重新下载' : '重新检查').catch(() => {});
+              const paused = status === 'paused';
+              return run(() => call(ctx, paused ? 'resumeJob' : 'pauseJob', { bookId }), paused ? '继续下载' : '已暂停').catch(() => {});
+            }, onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
           !loading && tab === 'sources' ? h(Sources, { sources, busy, onImport: importSource, onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
           !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy }) : null)));
