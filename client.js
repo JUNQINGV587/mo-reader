@@ -1625,7 +1625,9 @@ window.__ModuleLoader__.load({
         const source = entry.chapter || {};
         const lines = String(source.content || source.text || '').split(/\n+/).map((line) => line.trim()).filter(Boolean);
         const heading = source.name || source.title || toc[index]?.name || toc[index]?.title || '正文';
-        const rawTitle = String(heading || '').trim();
+        const rawHeading = String(heading || '').trim();
+        const prefixed = bookLabel && (rawHeading === bookLabel || rawHeading.startsWith(`${bookLabel}/`) || rawHeading.startsWith(`${bookLabel}·`));
+        const rawTitle = prefixed ? (rawHeading === bookLabel ? bookLabel : rawHeading.slice(bookLabel.length + 1).trim()) : rawHeading;
         const titleMatch = rawTitle.match(/^(第[〇零一二三四五六七八九十百千万两\d]+[章节回卷])[\s　]*([\s\S]*)$/);
         const chapterNo = titleMatch ? titleMatch[1] : '';
         const chapterTitle = titleMatch ? titleMatch[2].trim() : rawTitle;
