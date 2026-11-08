@@ -59,3 +59,43 @@ test('global text and regex replacements apply only to returned content', () => 
   assert.equal(applyReplacements('垃圾正文 广告 12 disabled', rules), '正文 [removed] disabled')
   assert.throws(() => normalizeReplacements([{ type: 'regex', pattern: '[' }]), /合法正则/)
 })
+
+test('URL templates keep `{{!name}}` verbatim for whole-URL variables', () => {
+  assert.equal(
+    renderTemplate('{{!bookUrl}}', { bookUrl: 'https://example.com/book/1.html' }),
+    'https://example.com/book/1.html',
+  )
+  assert.equal(
+    renderTemplate('https://example.com/a?u={{bookUrl}}', { bookUrl: 'https://b/1' }),
+    'https://example.com/a?u=https%3A%2F%2Fb%2F1',
+  )
+})
+
+test('field rules reshape text with ##pattern and ###replacement', () => {
+  const document = responseDocument('<ul><li><a href="//www.example.com/book/123.html">示例</a></li></ul>')
+  const listRule = '@css:li'
+  assert.deepEqual(
+    mapList(document, listRule, { bookUrl: 'a@href##/book/(\\d+)\\.html###/list/$1.html' }),
+    [{ bookUrl: '//www.example.com/list/123.html' }],
+  )
+  assert.deepEqual(
+    mapList(document, listRule, { id: 'a@href##(\\d+)' }),
+    [{ id: '123' }],
+  )
+})
+
+test('chapter list items can read their own attributes with @text/@href', () => {
+  const document = responseDocument('<dl class="Volume"><dd><a href="/c/1">第一章</a></dd><dd><a href="/c/2">第二章</a></dd></dl>')
+  assert.deepEqual(
+    mapList(document, 'dl.Volume dd a', { title: '@text', url: '@href' }),
+    [{ title: '第一章', url: '/c/1' }, { title: '第二章', url: '/c/2' }],
+  )
+})
+
+test('field templates render from extracted fields without URL encoding', () => {
+  const document = responseDocument('<ul><li><a title="三國演義" href="/wiki/三國演義">三國演義</a></li></ul>')
+  assert.deepEqual(
+    mapList(document, 'li', { name: 'a@title', bookUrl: 'https://zh.wikisource.org/wiki/{{name}}' }),
+    [{ name: '三國演義', bookUrl: 'https://zh.wikisource.org/wiki/三國演義' }],
+  )
+})

@@ -8,6 +8,7 @@ import { ACTIVE_JOBS, createJob, jobView, transitionJob } from './lib/jobs.js'
 import { applyReplacements } from './lib/replacements.js'
 import { assertSettingKeys, normalizeReaderPrefs, normalizeSettings } from './lib/settings.js'
 import { normalizeSource } from './lib/rules.js'
+import { BUILTIN_SOURCES } from './lib/builtin-sources.js'
 import { SourceEngine } from './lib/source-engine.js'
 import { DEFAULT_SETTINGS, entries, openReaderStorage } from './lib/storage.js'
 import { base64ToBuffer, clone, id, MAX_ARCHIVE_BYTES, MAX_TEXT_BYTES, now, pageNumber, requiredString, stableId, textToBuffer } from './lib/utils.js'
@@ -47,6 +48,7 @@ export class ReaderService extends TypertRemoteService {
 
   async [Service.init]() {
     this.db = await openReaderStorage(this.ctx)
+    await this.seedBuiltinSources()
     this.ctx.effect(() => async () => {
       this.disposed = true
       for (const job of entries(this.db.jobs)) {
@@ -67,6 +69,16 @@ export class ReaderService extends TypertRemoteService {
       this.log('warn', 'Startup update check failed', error)
     }
     for (const job of entries(this.db.jobs)) if (job.status === 'queued') this.scheduleJob(job.id)
+  }
+
+  async seedBuiltinSources() {
+    const settings = this.db.settings.get()
+    if (settings.builtinSourcesAt) return
+    for (const raw of BUILTIN_SOURCES) {
+      const source = normalizeSource(raw)
+      if (!this.db.sources.get(source.id)) await this.db.sources.put(source.id, { ...source, builtin: true })
+    }
+    await this.db.settings.set({ ...settings, builtinSourcesAt: now() })
   }
 
   log(level, message, error) {
@@ -178,8 +190,9 @@ export class ReaderService extends TypertRemoteService {
     this.assertReady()
     const source = this.source(args.sourceId)
     const bookUrl = requiredString(args.bookUrl, 'bookUrl', 4096)
-    const info = await this.engine.bookInfo(source, bookUrl)
-    if (!info.name) throw new ReaderError('reader/parse-error', '书籍详情缺少 name；请完善 bookInfo 规则。')
+    const hint = args.book && typeof args.book === 'object' ? args.book : {}
+    const info = { ...hint, ...(await this.engine.bookInfo(source, bookUrl)) }
+    if (!info.name) throw new ReaderError('reader/parse-error', '书籍详情缺少 name；请在搜索结果的书籍信息里补上书名。')
     const timestamp = now()
     const bookId = stableId('book', source.id, bookUrl)
     const previous = this.db.books.get(bookId)

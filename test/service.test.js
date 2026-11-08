@@ -149,3 +149,24 @@ test('Service.init opens storage, recovers persisted jobs and registers hourly u
   assert.equal(service.disposed, true)
   assert.equal(stopIntervalCalled, false, 'ctx.interval owns its own disposer')
 })
+
+test('builtin sources are seeded once and can be turned off without re-adding', async () => {
+  const { service, db } = await serviceFixture()
+  await service.seedBuiltinSources()
+  const seeded = [...db.sources.entries()].map(([, value]) => value)
+  assert.deepEqual(seeded.map(item => item.name).sort(), ['17K 小说', '维基文库'])
+  assert.equal(seeded.every(item => item.builtin === true), true)
+  // Second call is a no-op even after the user deletes one.
+  await db.sources.delete(seeded[0].id)
+  await service.seedBuiltinSources()
+  assert.equal(db.sources.size, 1)
+})
+
+test('addBook accepts search-result data when a source has no bookInfo rule', async () => {
+  const { service } = await serviceFixture({ async bookInfo() { return {} } })
+  const { source: builtin } = { source }
+  await service.db.sources.put(builtin.id, builtin)
+  const book = await service.addBook({ sourceId: builtin.id, bookUrl: 'https://example.com/book/1', book: { name: '公版书', author: '作者甲' } })
+  assert.equal(book.name, '公版书')
+  assert.equal(book.author, '作者甲')
+})
