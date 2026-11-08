@@ -389,7 +389,8 @@ export class ReaderService extends TypertRemoteService {
             catch (error) {
               lastError = error
               if (this.disposed) return
-              if (attempt < MAX_CHAPTER_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, 400 * attempt))
+              const status = error && error.details && error.details.status
+              if (attempt < MAX_CHAPTER_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, (status === 429 ? 1500 : 400) * attempt))
             }
           }
           job = this.db.jobs.get(jobId)
@@ -403,6 +404,7 @@ export class ReaderService extends TypertRemoteService {
         }
         job = transitionJob(this.db.jobs.get(jobId), 'chapter')
         await this.db.jobs.put(job.id, job)
+        if (!book.local) await new Promise(resolve => setTimeout(resolve, 200))
       }
       job = this.db.jobs.get(jobId)
       if (!job || job.status !== 'running') return
