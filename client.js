@@ -2036,7 +2036,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-shelf-head h1{font:400 32px/1.2 var(--mr-serif);margin:0;color:var(--mr-text);letter-spacing:-.4px}
 .mr-shelf-head-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .mr-shelf-gallery{display:grid;grid-template-columns:320px 1fr;gap:28px;align-items:stretch}
-.mr-dl-badge{position:absolute;right:8px;bottom:8px;z-index:3;display:inline-flex;align-items:center;justify-content:center;min-width:38px;height:20px;padding:0 7px;border-radius:999px;font:500 11px/1 var(--mr-sans);letter-spacing:.02em;color:var(--mr-on-accent);background:color-mix(in srgb,var(--mr-ink) 72%,transparent);backdrop-filter:blur(6px);cursor:pointer;user-select:none}
+.mr-dl-badge{position:absolute;right:8px;top:8px;z-index:3;display:inline-flex;align-items:center;justify-content:center;min-width:38px;height:20px;padding:0 7px;border-radius:999px;font:500 11px/1 var(--mr-sans);letter-spacing:.02em;color:var(--mr-on-accent);background:color-mix(in srgb,var(--mr-ink) 72%,transparent);backdrop-filter:blur(6px);cursor:pointer;user-select:none}
 .mr-dl-badge:hover{background:color-mix(in srgb,var(--mr-ink) 84%,transparent)}
 .mr-dl-badge.queued{background:color-mix(in srgb,var(--mr-ink) 45%,transparent)}
 .mr-dl-badge.paused{background:color-mix(in srgb,var(--mr-ink) 55%,transparent)}
