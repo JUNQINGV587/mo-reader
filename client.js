@@ -102,6 +102,10 @@ window.__ModuleLoader__.load({
       },
     });
 
+    function plainText(value) {
+      return String(value == null ? '' : value).replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+    }
+
     function withTimeout(promise, ms) {
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error(`请求超过 ${Math.round(ms / 1000)} 秒，已跳过`)), ms);
@@ -410,7 +414,7 @@ window.__ModuleLoader__.load({
           const name = book.name || book.title || '未命名';
           return h('article', { className: 'mr-result', key: `${book.bookUrl || book.url || name}-${index}` },
             h(BookCover, { book, small: true }),
-            h('div', { className: 'mr-result-info' }, h('h3', null, name), h('p', null, [book.author, book.kind, book.sourceName].filter(Boolean).join(' · ') || '书籍'), book.intro ? h('p', { className: 'mr-intro' }, book.intro) : null),
+            h('div', { className: 'mr-result-info' }, h('h3', null, name), h('p', null, [book.author, book.kind, book.sourceName].filter(Boolean).map(plainText).join(' · ') || '书籍'), book.intro ? h('p', { className: 'mr-intro' }, book.intro) : null),
             h(Button, { kind: 'primary soft', icon: 'plus', onClick: () => onAdd(book), disabled: busy }, '加书架'));
         })));
     }
@@ -1875,7 +1879,7 @@ window.__ModuleLoader__.load({
         setResultSource('');
         setBusy(false);
       };
-      const addBook = (book) => run(() => call(ctx, 'addBook', { sourceId: book.sourceId || resultSource || book.bookSourceUrl || selectedSource, bookUrl: book.bookUrl || book.url, download: true }), '已加入书架，开始下载').catch(() => {});
+      const addBook = (book) => run(() => call(ctx, 'addBook', { sourceId: book.sourceId || resultSource || book.bookSourceUrl || selectedSource, bookUrl: book.bookUrl || book.url, download: true, book }), '已加入书架，开始下载').catch(() => {});
       const updateSettings = (partial) => {
         setData((current) => ({ ...current, settings: { ...current.settings, ...partial } }));
         return call(ctx, 'setSettings', partial).catch((cause) => notify(cause.message || String(cause), 'error'));

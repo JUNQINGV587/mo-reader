@@ -5,6 +5,10 @@ import { ReaderError } from './lib/errors.js'
 import { fetchRemote } from './lib/http.js'
 import { importEpub, importedSource, importTxt } from './lib/importers.js'
 import { ACTIVE_JOBS, createJob, jobView, transitionJob } from './lib/jobs.js'
+
+const MAX_PARALLEL_JOBS = 4
+const MAX_PER_SOURCE_JOBS = 2
+const MAX_CHAPTER_ATTEMPTS = 2
 import { applyReplacements } from './lib/replacements.js'
 import { assertSettingKeys, normalizeReaderPrefs, normalizeSettings } from './lib/settings.js'
 import { normalizeSource } from './lib/rules.js'
@@ -302,11 +306,32 @@ export class ReaderService extends TypertRemoteService {
     return jobView(job)
   }
 
+  canStartJob(job) {
+    if (this.runningJobs.size >= MAX_PARALLEL_JOBS) return false
+    const book = this.db.books.get(job.bookId)
+    if (!book) return true
+    let sameSource = 0
+    for (const id of this.runningJobs.keys()) {
+      const other = this.db.jobs.get(id)
+      const otherBook = other && this.db.books.get(other.bookId)
+      if (other && otherBook && otherBook.sourceId === book.sourceId) sameSource += 1
+    }
+    return sameSource < MAX_PER_SOURCE_JOBS
+  }
+
   scheduleJob(jobId) {
     if (this.disposed || this.runningJobs.has(jobId)) return
+    const pending = this.db.jobs.get(jobId)
+    if (!pending || pending.status !== 'queued') return
+    if (!this.canStartJob(pending)) return
     const promise = this.runJob(jobId)
       .catch(error => this.log('error', `Job ${jobId} could not update persisted state`, error))
-      .finally(() => this.runningJobs.delete(jobId))
+      .finally(() => {
+        this.runningJobs.delete(jobId)
+        for (const next of entries(this.db.jobs)) {
+          if (next.status === 'queued' && !this.runningJobs.has(next.id)) { this.scheduleJob(next.id); break }
+        }
+      })
     this.runningJobs.set(jobId, promise)
     return promise
   }
@@ -328,10 +353,24 @@ export class ReaderService extends TypertRemoteService {
         job = this.db.jobs.get(jobId)
         if (!job || job.status !== 'running' || this.disposed) return
         if (typeof chapter.text !== 'string') {
-          const content = await this.engine.content(this.source(book.sourceId), book, chapter)
+          let content = null
+          let lastError = null
+          for (let attempt = 1; attempt <= MAX_CHAPTER_ATTEMPTS; attempt += 1) {
+            try { content = await this.engine.content(this.source(book.sourceId), book, chapter); lastError = null; break }
+            catch (error) {
+              lastError = error
+              if (this.disposed) return
+              if (attempt < MAX_CHAPTER_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, 400 * attempt))
+            }
+          }
           job = this.db.jobs.get(jobId)
           if (!job || job.status !== 'running' || this.disposed) return
-          await this.db.chapters.put(chapter.id, { ...chapter, ...content, downloadedAt: now() })
+          if (content) await this.db.chapters.put(chapter.id, { ...chapter, ...content, downloadedAt: now() })
+          else {
+            this.log('warn', `Chapter ${chapter.id} skipped`, lastError)
+            job = { ...job, failedChapters: [...(job.failedChapters || []), chapter.id] }
+            await this.db.jobs.put(job.id, job)
+          }
         }
         job = transitionJob(this.db.jobs.get(jobId), 'chapter')
         await this.db.jobs.put(job.id, job)
