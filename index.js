@@ -178,10 +178,31 @@ export class ReaderService extends TypertRemoteService {
     return { removed: true, id: source.id }
   }
 
+  async markSourceStatus(sourceId, error) {
+    const source = this.db.sources.get(sourceId)
+    if (!source) return
+    const failed = !!error
+    if (!failed && !source.lastError) return
+    await this.db.sources.put(source.id, {
+      ...source,
+      lastError: failed ? String(error.message || error).slice(0, 200) : undefined,
+      lastErrorAt: failed ? now() : source.lastErrorAt,
+      updatedAt: now(),
+    })
+  }
+
   async search(args) {
     args ??= {}
     this.assertReady()
-    return this.engine.search(this.source(args.sourceId), { query: requiredString(args.query, 'query', 500), page: pageNumber(args.page) })
+    const source = this.source(args.sourceId)
+    try {
+      const list = await this.engine.search(source, { query: requiredString(args.query, 'query', 500), page: pageNumber(args.page) })
+      await this.markSourceStatus(source.id, null)
+      return list
+    } catch (error) {
+      await this.markSourceStatus(source.id, error)
+      throw error
+    }
   }
 
   async discover(args) {

@@ -424,7 +424,7 @@ window.__ModuleLoader__.load({
               h('div', { className: 'mr-book-info' },
                 h('div', { className: 'mr-book-title-row' }, h('h3', { title: name }, name), unread > 0 ? h('span', { className: 'mr-badge' }, `${unread} 章`) : null),
                 h('p', null, book.author || (book.sourceType === 'local' ? '本地书籍' : '未知作者')),
-                h('small', null, book.latestChapter || book.lastChapter || (job === 'running' ? '下载中' : '尚未读')))),
+                h('small', null, book.sourceFailed ? '源失效' : (book.latestChapter || book.lastChapter || (job === 'running' ? '下载中' : '尚未读'))))),
             h('div', { className: 'mr-book-actions' },
               h(Button, { kind: 'text', icon: 'download', title: '整本下载', onClick: () => onDownload(book), disabled: busy || job === 'running' || job === 'queued' }, job === 'completed' ? '已下载' : job === 'queued' ? '排队' : '下载'),
               h(Button, { kind: 'text danger', icon: 'trash', title: '移出书架', onClick: () => onRemove(book), disabled: busy }, '移除')));
@@ -471,7 +471,7 @@ window.__ModuleLoader__.load({
           return h('article', { className: 'mr-source-row', key: id },
             h('div', { className: 'mr-source-mark' }, h(Glyph, { name: 'source' })),
             h('div', null, h('h3', null, source.bookSourceName || source.name || '书源'), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl)),
-            h('span', { className: 'mr-tag' }, source.builtin ? '内置' : (source.compatibility || '基础规则')),
+            h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || '' }, source.lastError ? '解析失败' : source.builtin ? '内置' : (source.compatibility || '基础规则')),
             source.builtin ? null : h(Button, { kind: 'text danger', icon: 'trash', onClick: () => onRemove(source), disabled: busy }, '移除'));
         }) : h(Empty, { icon: 'source', title: '暂无书源', detail: '导入后即可搜索和追更。' })));
     }
@@ -1854,7 +1854,8 @@ window.__ModuleLoader__.load({
         const job = (data.jobs || [])
           .filter((item) => item.bookId === bookId)
           .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0];
-        return job ? { ...book, downloadStatus: job.status, download: job } : book;
+        const sourceFailed = (data.sources || []).some((item) => (item.id || item.bookSourceUrl) === book.sourceId && item.lastError);
+        return job ? { ...book, sourceFailed, downloadStatus: job.status, download: job } : { ...book, sourceFailed };
       });
       const notes = data.notes || [];
       const activeBook = reading ? books.find((book) => (book.id || book.bookId) === (reading.id || reading.bookId)) || reading : null;
@@ -2047,6 +2048,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-shelf-head h1{font:400 32px/1.2 var(--mr-serif);margin:0;color:var(--mr-text);letter-spacing:-.4px}
 .mr-shelf-head-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .mr-shelf-gallery{display:grid;grid-template-columns:320px 1fr;gap:28px;align-items:stretch}
+.mr-tag.failed{background:color-mix(in srgb, #a8422f 18%, transparent);color:#a8422f;border-color:color-mix(in srgb, #a8422f 35%, transparent)}
 .mr-dl-badge{position:absolute;right:8px;top:8px;z-index:3;display:inline-flex;align-items:center;justify-content:center;min-width:38px;height:20px;padding:0 7px;border-radius:999px;font:500 11px/1 var(--mr-sans);letter-spacing:.02em;color:var(--mr-on-accent);background:color-mix(in srgb,var(--mr-ink) 72%,transparent);backdrop-filter:blur(6px);cursor:pointer;user-select:none}
 .mr-dl-badge:hover{background:color-mix(in srgb,var(--mr-ink) 84%,transparent)}
 .mr-dl-badge.queued{background:color-mix(in srgb,var(--mr-ink) 45%,transparent)}
