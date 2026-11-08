@@ -1848,7 +1848,10 @@ window.__ModuleLoader__.load({
       const settings = { ...DEFAULT_SETTINGS, ...(data.settings || {}) };
       const sources = (data.sources || []).filter((source) => (source.id || source.bookSourceUrl) !== 'local' && source.bookSourceUrl !== 'local:');
       const books = (data.books || []).map((book) => {
-        const job = (data.jobs || []).find((item) => item.bookId === (book.id || book.bookId));
+        const bookId = book.id || book.bookId;
+        const job = (data.jobs || [])
+          .filter((item) => item.bookId === bookId)
+          .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))[0];
         return job ? { ...book, downloadStatus: job.status, download: job } : book;
       });
       const notes = data.notes || [];
@@ -1872,7 +1875,7 @@ window.__ModuleLoader__.load({
       };
       useEffect(() => {
         mounted.current = true; refresh();
-        const timer = setInterval(() => { refresh(true); }, 5000);
+        const timer = setInterval(() => { refresh(true); }, 2000);
         return () => { mounted.current = false; clearInterval(timer); };
       }, []);
 
