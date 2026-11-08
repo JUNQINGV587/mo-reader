@@ -23,6 +23,20 @@ test('all contracted methods are discovered by the Stage-3 Remote markers', asyn
   assert.equal(new Set(discovered).size, REMOTE_METHODS.length)
 })
 
+test('pauseJob and resumeJob move a download between paused and queued', async () => {
+  const { service, db } = await serviceFixture()
+  const book = { id: 'book-1', bookId: 'book-1', name: '书', sourceId: source.id, sourceType: 'remote', download: { status: 'running', jobId: 'job-1' } }
+  await db.books.put(book.id, book)
+  await db.jobs.put('job-1', { id: 'job-1', type: 'download', bookId: book.id, status: 'running', total: 10, done: 3, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+  service.scheduleJob = () => Promise.resolve()
+  const paused = await service.pauseJob({ bookId: book.id })
+  assert.equal(paused.status, 'paused')
+  assert.equal(db.books.get(book.id).download.status, 'paused')
+  const resumed = await service.resumeJob({ bookId: book.id })
+  assert.equal(resumed.status, 'queued')
+  assert.equal(db.books.get(book.id).download.status, 'queued')
+})
+
 test('download jobs can be paused and resumed', () => {
   const job = createJob({ bookId: 'b1', total: 10 })
   const running = transitionJob(job, 'start')
