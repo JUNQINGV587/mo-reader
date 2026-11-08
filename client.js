@@ -1922,12 +1922,12 @@ window.__ModuleLoader__.load({
         catch (cause) { notify(cause.message || String(cause), 'error'); throw cause; }
         finally { setBusy(false); }
       };
-      const importSource = (draft, allowHttp) => run(async () => {
+      const importSource = (draft, allowHttp) => {
         const value = draft.trim();
-        const result = await call(ctx, 'importSource', /^https?:\/\//i.test(value) ? { url: value, allowHttp } : { text: value, allowHttp });
-        setNotice({ kind: 'info', text: importSummary(result) });
-        return result;
-      }, '书源已导入');
+        const pending = run(() => call(ctx, 'importSource', /^https?:\/\//i.test(value) ? { url: value, allowHttp } : { text: value, allowHttp }), '书源已导入');
+        pending.then((result) => { if (result) setNotice({ kind: 'info', text: importSummary(result) }); }, () => {});
+        return pending;
+      };
       const search = async (query) => {
         const keyword = String(query || '').trim();
         if (!keyword) return;
@@ -2037,19 +2037,23 @@ window.__ModuleLoader__.load({
               const bookId = book.id || book.bookId;
               if (status === 'failed' || status === 'completed') return run(() => call(ctx, 'download', { bookId }), status === 'failed' ? '重新下载' : '重新检查').catch(() => {});
               const paused = status === 'paused' || status === 'cancelled';
-              const canPause = typeof ctx?.remote?.reader?.pauseJob === 'function';
-              if (paused) return run(() => call(ctx, 'download', { bookId }), '继续下载').catch(() => {});
-              if (canPause) return run(() => call(ctx, 'pauseJob', { bookId }), '已暂停').catch(() => {});
-              const jobId = book.download?.id || book.download?.jobId || book.downloadJobId;
-              return run(() => call(ctx, 'cancelJob', { jobId }), '已暂停').catch(() => {});
+              if (paused) {
+                const pending = call(ctx, 'resumeJob', { bookId }).catch(() => call(ctx, 'download', { bookId }));
+                return run(() => pending, '继续下载').catch(() => {});
+              }
+              const pending = call(ctx, 'pauseJob', { bookId }).catch(() => {
+                const jobId = book.download?.id || book.download?.jobId || book.downloadJobId;
+                return call(ctx, 'cancelJob', { jobId });
+              });
+              return run(() => pending, '已暂停').catch(() => {});
             }, onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
           !loading && tab === 'sources' ? h(Sources, { sources, busy, onImport: importSource,
-              onPullLibrary: (next) => run(async () => {
-                const result = await call(ctx, 'importSource', { url: next.url, allowHttp: next.allowHttp === true });
-                setNotice({ kind: 'info', text: importSummary(result) });
-                return result;
-              }, '拉取完成').then(() => true).catch(() => false),
+              onPullLibrary: (next) => {
+                const pending = run(() => call(ctx, 'importSource', { url: next.url, allowHttp: next.allowHttp === true }), '拉取完成');
+                pending.then((result) => { if (result) setNotice({ kind: 'info', text: importSummary(result) }); }, () => {});
+                return pending.then(() => true, () => false);
+              },
               onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
           !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy }) : null)));
     }
