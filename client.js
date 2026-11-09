@@ -763,9 +763,31 @@ window.__ModuleLoader__.load({
         h('section', { className: 'mr-panel mr-roadmap' }, h('h3', null, '分期说明'), h('p', null, '当前为文字核心版。高兼容脚本、AI 与多媒体将在后续阶段提供。')),
         h('section', { className: 'mr-panel' }, h('h3', null, '阅读统计'),
           h('div', { className: 'mr-stats-grid' },
-            h('div', { className: 'mr-stat-card' }, h('strong', null, '0'), h('span', null, '今日阅读（分钟）')),
-            h('div', { className: 'mr-stat-card' }, h('strong', null, '0'), h('span', null, '本周阅读（页）')),
-            h('div', { className: 'mr-stat-card' }, h('strong', null, '0'), h('span', null, '连续阅读（天）')))),
+            h('div', { className: 'mr-stat-card' }, h('strong', null, (() => {
+              const today = new Date().toISOString().slice(0, 10);
+              const stats = JSON.parse(localStorage.getItem(`mo-reader:stats:${today}`) || '{"minutes":0}');
+              return stats.minutes;
+            })()), h('span', null, '今日阅读（分钟）')),
+            h('div', { className: 'mr-stat-card' }, h('strong', null, (() => {
+              let total = 0;
+              for (let i = 0; i < 7; i++) {
+                const d = new Date(); d.setDate(d.getDate() - i);
+                const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                const s = JSON.parse(localStorage.getItem(key) || '{"pages":0}');
+                total += s.pages || 0;
+              }
+              return total;
+            })()), h('span', null, '本周阅读（页）')),
+            h('div', { className: 'mr-stat-card' }, h('strong', null, (() => {
+              let streak = 0;
+              for (let i = 0; i < 365; i++) {
+                const d = new Date(); d.setDate(d.getDate() - i);
+                const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                if (s.minutes > 0) streak++; else break;
+              }
+              return streak;
+            })()), h('span', null, '连续阅读（天）')))),
         h('section', { className: 'mr-panel' }, h('h3', null, '笔记导出'),
           h('p', { className: 'mr-help' }, '把划线和笔记导出为 Markdown。'),
           h(Button, { icon: 'download', onClick: () => onExportNotes?.(), disabled: busy }, '导出笔记')),
@@ -1089,6 +1111,22 @@ window.__ModuleLoader__.load({
         setScrollPercent(percent);
         const chapterId = chapterIdAt(index);
         progressRef.current = { bookId, chapterId, percent, offset };
+        // 阅读时长统计：每次进度变化记一次活跃
+        const today = new Date().toISOString().slice(0, 10);
+        const statsKey = `mo-reader:stats:${today}`;
+        const stats = JSON.parse(localStorage.getItem(statsKey) || '{"minutes":0,"pages":0,"lastActive":0}');
+        const nowTs = Date.now();
+        if (nowTs - stats.lastActive > 60000) stats.minutes += 1; // 超过 1 分钟算新会话
+        stats.lastActive = nowTs;
+        localStorage.setItem(statsKey, JSON.stringify(stats));
+        // 阅读目标检查
+        if (settings.dailyGoal > 0 && stats.minutes >= settings.dailyGoal) {
+          const goalKey = `mo-reader:goal-notified:${today}`;
+          if (!localStorage.getItem(goalKey)) {
+            localStorage.setItem(goalKey, '1');
+            notify?.('今日阅读目标已完成！', 'success');
+          }
+        }
         // 1. 同步写一份到 localStorage：崩溃/刷新时最多丢 350ms 的滚动。
         const stamp = Date.now();
         if (chapterId !== mirrorAtRef.current.chapterId || stamp - mirrorAtRef.current.at > 350) {
