@@ -1908,7 +1908,7 @@ window.__ModuleLoader__.load({
         : state.error
           ? h('p', { className: 'mr-meta-status' }, '补全信息暂时不可用，可以跳过。')
           : candidates.length === 0
-            ? h('p', { className: 'mr-meta-status' }, state.debug ? `没搜到合适的，可以跳过。（${state.debug}）` : '没搜到合适的，可以跳过。')
+            ? h('p', { className: 'mr-meta-status' }, '没搜到合适的，可以跳过。')
           : h('div', { className: 'mr-meta-list' }, candidates.map((item, index) => h('button', {
             key: `${item.sourceId}-${index}`,
             type: 'button',
@@ -2077,7 +2077,8 @@ window.__ModuleLoader__.load({
           const sources = (data.sources || []).filter((item) => item.id || item.bookSourceUrl);
           const perSource = await Promise.allSettled(sources.map(async (source) => {
             const list = await withTimeout(call(ctx, 'search', { sourceId: source.id, query }), 15000);
-            return (list || []).slice(0, 2).map((item) => ({
+            const items = Array.isArray(list) ? list : (list?.items || list?.results || []);
+            return items.slice(0, 2).map((item) => ({
               sourceId: source.id,
               sourceName: source.name,
               name: String(item.name || '').trim(),
@@ -2088,8 +2089,7 @@ window.__ModuleLoader__.load({
             }));
           }));
           const candidates = perSource.flatMap((outcome) => (outcome.status === 'fulfilled' ? outcome.value : [])).slice(0, 8);
-          const failed = perSource.filter((outcome) => outcome.status === 'rejected').map((outcome) => String(outcome.reason?.message || outcome.reason).slice(0, 40));
-          setMetaSheet({ book, bookId, candidates, busy: false, debug: `${sources.map((x) => x.id).join(',')} | ${failed.join(' / ')}` });
+          setMetaSheet({ book, bookId, candidates, busy: false });
         } catch (cause) {
           const message = cause.message || String(cause);
           setMetaSheet({ book, bookId, candidates: [], busy: false, error: message });

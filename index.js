@@ -601,12 +601,24 @@ export class ReaderService extends TypertRemoteService {
     this.assertReady()
     const book = this.book(args.bookId)
     const meta = args.meta && typeof args.meta === 'object' ? args.meta : {}
+    let enriched = { ...meta }
+    if (meta.sourceId && meta.bookUrl) {
+      const source = this.db.sources.get(meta.sourceId)
+      if (source) {
+        try {
+          const info = await this.engine.bookInfo(source, meta.bookUrl)
+          for (const key of ['author', 'intro', 'coverUrl']) if (!enriched[key] && info[key]) enriched[key] = info[key]
+        } catch (error) {
+          this.log('warn', 'book info failed', error)
+        }
+      }
+    }
     const next = {
       ...book,
-      author: String(meta.author ?? book.author ?? '').trim(),
-      intro: String(meta.intro ?? book.intro ?? '').trim(),
-      coverUrl: String(meta.coverUrl ?? book.coverUrl ?? '').trim(),
-      coverLocal: String(meta.coverUrl ?? '') === String(book.coverUrl ?? '') ? book.coverLocal : '',
+      author: String(enriched.author ?? book.author ?? '').trim(),
+      intro: String(enriched.intro ?? book.intro ?? '').trim(),
+      coverUrl: String(enriched.coverUrl ?? book.coverUrl ?? '').trim(),
+      coverLocal: String(enriched.coverUrl ?? '') === String(book.coverUrl ?? '') ? book.coverLocal : '',
       updatedAt: now(),
     }
     await this.db.books.put(next.id, next)
