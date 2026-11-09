@@ -3,7 +3,7 @@ import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { createBackup, parseBackup } from './lib/backup.js'
 import { ReaderError } from './lib/errors.js'
 import { fetchRemote } from './lib/http.js'
-import { importEpub, importedSource, importTxt } from './lib/importers.js'
+import { importEpub, importedSource, importTxt, exportEpub } from './lib/importers.js'
 import { ACTIVE_JOBS, createJob, jobView, transitionJob } from './lib/jobs.js'
 
 const MAX_PARALLEL_JOBS = 4
@@ -820,7 +820,11 @@ export class ReaderService extends TypertRemoteService {
       }
       return { name: book.name, format, text: lines.join('') }
     }
-    throw new ReaderError('reader/invalid-input', `不支持的导出格式 ${format}，目前只支持 txt 和 md。`)
+    if (format === 'epub') {
+      const buffer = await exportEpub(book, chapters)
+      return { name: book.name, format, base64: buffer.toString('base64') }
+    }
+    throw new ReaderError('reader/invalid-input', `不支持的导出格式 ${format}，目前只支持 txt、md 和 epub。`)
   }
 
   async markBookRead(args) {
