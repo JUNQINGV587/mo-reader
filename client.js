@@ -1463,6 +1463,15 @@ window.__ModuleLoader__.load({
         const generation = ++speechGeneration.current;
         setSpeaking(true);
         speakChapter(chapterIndex, generation);
+        // 听书定时：N 分钟后自动停止
+        if (settings.ttsTimer > 0) {
+          setTimeout(() => {
+            if (speechGeneration.current === generation) {
+              stopSpeech();
+              notify?.('定时停止', 'info');
+            }
+          }, settings.ttsTimer * 60 * 1000);
+        }
       };
 
       const armTrim = () => {
@@ -2173,6 +2182,25 @@ window.__ModuleLoader__.load({
         const timer = setInterval(() => { refresh(true); }, 2000);
         return () => { mounted.current = false; clearInterval(timer); };
       }, []);
+
+      // 夜间定时：到点自动切换主题
+      useEffect(() => {
+        if (!settings.nightAuto) return;
+        const check = () => {
+          const now = new Date();
+          const current = now.getHours() * 60 + now.getMinutes();
+          const [sh, sm] = (settings.nightStart || '22:00').split(':').map(Number);
+          const [eh, em] = (settings.nightEnd || '06:00').split(':').map(Number);
+          const start = sh * 60 + sm;
+          const end = eh * 60 + em;
+          const inNight = start <= end ? (current >= start && current < end) : (current >= start || current < end);
+          const targetTheme = inNight ? 'dark' : 'paper';
+          if (settings.readerTheme !== targetTheme) updateSettings({ readerTheme: targetTheme });
+        };
+        check();
+        const timer = setInterval(check, 60000);
+        return () => clearInterval(timer);
+      }, [settings.nightAuto, settings.nightStart, settings.nightEnd, settings.readerTheme]);
 
       const run = async (operation, success) => {
         setBusy(true);
