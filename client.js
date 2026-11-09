@@ -261,7 +261,7 @@ window.__ModuleLoader__.load({
       }, badge.label);
     }
 
-    function ShelfBoard({ books, reducedMotion = false, onOpen, headActions, onToggleDownload }) {
+    function ShelfBoard({ books, reducedMotion = false, onOpen, headActions, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline }) {
       const [query, setQuery] = useState('');
       const searchRef = useRef(null);
       useEffect(() => {
@@ -278,11 +278,23 @@ window.__ModuleLoader__.load({
       }, []);
       const layout = shelfLayout(books);
       const lastRead = layout.lastRead;
+      const debounceRef = useRef(null);
+      useEffect(() => {
+        if (!onSearchOnline) return undefined;
+        const keyword = query.trim();
+        clearTimeout(debounceRef.current);
+        if (keyword.length < 1) { onSearchOnline(''); return undefined; }
+        debounceRef.current = setTimeout(() => onSearchOnline(keyword), 500);
+        return () => clearTimeout(debounceRef.current);
+      }, [query, onSearchOnline]);
+      const onlineItems = Array.isArray(online) ? online : [];
+      const shelfUrls = new Set(layout.books.map((book) => book.bookUrl || book.url).filter(Boolean));
       const normalizedQuery = query.trim().toLowerCase();
       const matches = normalizedQuery
         ? layout.books.filter((book) => `${book.name || book.title || ''} ${book.author || ''}`.toLowerCase().includes(normalizedQuery))
         : layout.books;
-      const gridBooks = matches.filter((book) => book !== lastRead);
+      const heroBook = normalizedQuery ? null : lastRead;
+      const gridBooks = matches.filter((book) => book !== heroBook);
       const open = (book, event) => {
         const scope = event.currentTarget.closest?.('.mr-shelf-hero, .mr-shelf-book') || event.currentTarget;
         const cover = scope.querySelector?.('.mr-shelf-cover') || event.currentTarget.querySelector?.('.mr-shelf-cover');
@@ -311,12 +323,12 @@ window.__ModuleLoader__.load({
             variant === 1 ? h('span', { className: 'mr-shelf-mtn', 'aria-hidden': 'true' }) : null),
           cover ? h('img', { src: cover, alt: '', loading: 'lazy', onError: (event) => { event.currentTarget.style.visibility = 'hidden'; } }) : null);
       };
-      const progress = lastRead ? (lastRead.lastRead || lastRead.progress || {}) : {};
+      const progress = heroBook ? (heroBook.lastRead || heroBook.progress || {}) : {};
       const rawPercent = Number(progress.percent);
       const percent = Number.isFinite(rawPercent) ? Math.max(0, Math.min(100, Math.round(rawPercent))) : 0;
       const chapter = progress.chapterTitle || (Number.isInteger(progress.chapterIndex) ? `第 ${progress.chapterIndex + 1} 章` : '');
-      const heroTitle = lastRead ? String(lastRead.name || lastRead.title || '未命名').replace(/\.(?:txt|epub|md|pdf)$/i, '') : '';
-      const byline = lastRead ? [lastRead.author, chapter, percent > 0 ? `已读 ${percent}%` : ''].filter(Boolean).join(' · ') : '';
+      const heroTitle = heroBook ? String(heroBook.name || heroBook.title || '未命名').replace(/\.(?:txt|epub|md|pdf)$/i, '') : '';
+      const byline = heroBook ? [heroBook.author, chapter, percent > 0 ? `已读 ${percent}%` : ''].filter(Boolean).join(' · ') : '';
       return h('div', { className: `mr-shelf${reducedMotion ? ' mr-reduced' : ''}` },
         h('div', { className: 'mr-shelf-topbar' },
           h('div', { className: 'mr-shelf-search', role: 'search' },
@@ -359,14 +371,14 @@ window.__ModuleLoader__.load({
               h('h3', null, '墙上还空着'),
               h('p', null, '去发现搜书，或导入本地书籍。'))
           : h('div', { className: 'mr-shelf-gallery' },
-              lastRead ? h('section', { className: 'mr-shelf-hero', 'aria-label': '继续阅读' },
-                h('button', { className: 'mr-shelf-hero-cover', type: 'button', 'aria-label': `继续阅读 ${heroTitle}`, onClick: (event) => open(lastRead, event) }, coverNode(lastRead, heroTitle, 1), h(DownloadBadge, { book: lastRead, onToggle: onToggleDownload }), Number(lastRead.unread || lastRead.unreadCount || 0) > 0 ? h('span', { className: 'mr-new-badge' }, `+${Number(lastRead.unread || lastRead.unreadCount)} 章`) : null),
+              heroBook ? h('section', { className: 'mr-shelf-hero', 'aria-label': '继续阅读' },
+                h('button', { className: 'mr-shelf-hero-cover', type: 'button', 'aria-label': `继续阅读 ${heroTitle}`, onClick: (event) => open(heroBook, event) }, coverNode(heroBook, heroTitle, 1), h(DownloadBadge, { book: heroBook, onToggle: onToggleDownload }), Number(heroBook.unread || heroBook.unreadCount || 0) > 0 ? h('span', { className: 'mr-new-badge' }, `+${Number(lastRead.unread || lastRead.unreadCount)} 章`) : null),
                 h('div', { className: 'mr-shelf-hero-info' },
                   h('p', { className: 'mr-shelf-eyebrow' }, '01 · 继续阅读'),
                   h('h3', { className: 'mr-shelf-hero-title' }, heroTitle),
                   byline ? h('p', { className: 'mr-shelf-hero-by' }, byline) : null,
                   h('div', { className: 'mr-shelf-progress', 'aria-hidden': 'true' }, h('i', { style: { width: `${percent}%` } })),
-                  h('button', { className: 'mr-shelf-cta', type: 'button', onClick: (event) => open(lastRead, event) }, '继续阅读 →'))) : null,
+                  h('button', { className: 'mr-shelf-cta', type: 'button', onClick: (event) => open(heroBook, event) }, '继续阅读 →'))) : null,
               normalizedQuery && matches.length === 0
                 ? h('div', { className: 'mr-shelf-search-empty' },
                     h('p', null, `没有找到「${query.trim()}」`),
@@ -394,12 +406,28 @@ window.__ModuleLoader__.load({
                             h('strong', null, name.replace(/\.(?:txt|epub|md|pdf)$/i, '')),
                             book.author ? h('small', null, book.author) : null));
                         }))),
+        normalizedQuery ? h('section', { className: 'mr-shelf-online', 'aria-label': '在线搜索结果' },
+          h('div', { className: 'mr-shelf-online-head' },
+            h('h2', null, '在线'),
+            h('span', { className: 'mr-shelf-online-meta' }, onlineItems.length ? `${onlineItems.length} 个结果${onlineBusy ? ' · 还在搜' : ''}` : onlineBusy ? '正在搜全部书源…' : onlineFailed ? `${onlineFailed} 个书源没响应` : '没有匹配')),
+          onlineItems.length ? h('div', { className: 'mr-shelf-online-list' }, onlineItems.map((item, index) => {
+            const key = `online-${item.sourceId || index}-${item.bookUrl || item.url || index}`;
+            const added = shelfUrls.has(item.bookUrl || item.url);
+            return h('article', { className: 'mr-shelf-online-row', key },
+              h('div', { className: 'mr-shelf-online-cover' },
+                item.coverUrl ? h('img', { src: item.coverUrl, alt: '', loading: 'lazy', onError: (event) => { event.currentTarget.style.visibility = 'hidden'; } }) : h('span', null, String(item.name || '书').slice(0, 1))),
+              h('div', { className: 'mr-shelf-online-info' },
+                h('strong', null, String(item.name || '未命名')),
+                h('small', null, [item.author, item.sourceName].filter(Boolean).join(' · ')),
+                item.intro ? h('p', null, String(item.intro).slice(0, 90)) : null),
+              h(Button, { kind: added ? 'soft' : 'primary', disabled: added || !onAddOnline, onClick: () => onAddOnline?.(item) }, added ? '已在书架' : '加书架'));
+          })) : null) : null,
         h('div', { className: 'mr-shelf-foot' },
           h('span', null, `共 ${layout.count} 本 · 本机保存 · 不上传`),
           h('span', { className: 'wall' }, normalizedQuery ? `${String(matches.length).padStart(2, '0')} 本 · 匹配` : `${String(layout.count).padStart(2, '0')} 本 · 都在墙上`)));
     }
 
-    function Library({ books, onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality, ambience, reducedMotion = false, onToggleDownload }) {
+    function Library({ books, onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality, ambience, reducedMotion = false, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline }) {
       if (!books.length) return h(Empty, {
         title: '书架还是空的', detail: '去发现搜书，或导入本地书籍。',
       });
@@ -408,7 +436,7 @@ window.__ModuleLoader__.load({
         h('button', { className: view === 'list' ? 'active' : '', onClick: () => onView('list') }, '列表'));
       const checkButton = h(Button, { icon: 'refresh', onClick: onCheck, disabled: busy }, '补查');
       const actions = h(React.Fragment, null, viewToggle, checkButton);
-      if (view === 'shelf') return h(ShelfBoard, { key: 'shelf', books, reducedMotion, onOpen, headActions: actions, onToggleDownload });
+      if (view === 'shelf') return h(ShelfBoard, { key: 'shelf', books, reducedMotion, onOpen, headActions: actions, onToggleDownload, online, onlineBusy, onlineFailed, onSearchOnline, onAddOnline });
       return h(React.Fragment, null,
         h('div', { className: 'mr-section-head' },
           h('div', null, h('h2', null, '我的书架'), h('p', null, `${books.length} 本 · 本机保存`)),
@@ -1876,7 +1904,11 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false);
       const [notice, setNotice] = useState(null);
       const [selectedSource, setSelectedSource] = useState('');
-      const [results, setResults] = useState(null);
+      const [results, setResults] = useState(null)
+      const [shelfOnline, setShelfOnline] = useState(null)
+      const [shelfOnlineBusy, setShelfOnlineBusy] = useState(false)
+      const [shelfOnlineFailed, setShelfOnlineFailed] = useState(0)
+      const shelfSearchTicket = useRef(0);
       const [resultSource, setResultSource] = useState('');
       const [searchFailed, setSearchFailed] = useState(0);
       const [reading, setReading] = useState(null);
@@ -1955,6 +1987,30 @@ window.__ModuleLoader__.load({
         setResultSource('');
         setBusy(false);
       };
+      const searchShelfOnline = async (keyword) => {
+        const text = String(keyword || '').trim()
+        if (!text) { setShelfOnline(null); setShelfOnlineFailed(0); setShelfOnlineBusy(false); return }
+        const ticket = ++shelfSearchTicket.current
+        setShelfOnlineBusy(true)
+        const targets = sources.filter((source) => source.enabled !== false)
+        const settled = await Promise.allSettled(targets.map((source) => {
+          const sourceId = source.id || source.bookSourceUrl
+          return withTimeout(call(ctx, 'search', { sourceId, query: text, page: 1 }), 15_000)
+            .then((value) => ({ source, items: Array.isArray(value) ? value : value?.items || value?.books || [] }))
+        }))
+        if (ticket !== shelfSearchTicket.current) return
+        const items = []
+        let failed = 0
+        for (const outcome of settled) {
+          if (outcome.status === 'rejected') { failed += 1; continue }
+          const label = outcome.value.source.bookSourceName || outcome.value.source.name || outcome.value.source.bookSourceUrl
+          const sourceId = outcome.value.source.id || outcome.value.source.bookSourceUrl
+          for (const item of outcome.value.items) items.push({ ...item, sourceId, sourceName: label })
+        }
+        setShelfOnline(items)
+        setShelfOnlineFailed(failed)
+        setShelfOnlineBusy(false)
+      }
       const addBook = (book) => run(() => call(ctx, 'addBook', { sourceId: book.sourceId || resultSource || book.bookSourceUrl || selectedSource, bookUrl: book.bookUrl || book.url, download: true, book }), '已加入书架，开始下载').catch(() => {});
       const updateSettings = (partial) => {
         setData((current) => ({ ...current, settings: { ...current.settings, ...partial } }));
@@ -2033,7 +2089,7 @@ window.__ModuleLoader__.load({
         h('section', { className: 'mr-content' },
           h(Notice, { notice, onClose: () => setNotice(null) }),
           loading ? h('div', { className: 'mr-loading' }, '正在打开墨读…') : null,
-          !loading && tab === 'library' ? h(Library, { books, busy, view: shelfView, onView: setShelfView, ctx, theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: prefersReducedMotion() || settings.reducedMotion === 'on', onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}),
+          !loading && tab === 'library' ? h(Library, { books, busy, view: shelfView, onView: setShelfView, ctx, online: shelfOnline, onlineBusy: shelfOnlineBusy, onlineFailed: shelfOnlineFailed, onSearchOnline: searchShelfOnline, onAddOnline: (item) => addBook(item), theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: prefersReducedMotion() || settings.reducedMotion === 'on', onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}),
             onToggleDownload: (book) => {
               const status = book.downloadStatus || book.download?.status;
               const bookId = book.id || book.bookId;
@@ -2078,6 +2134,19 @@ body[data-ds-dark-theme] .mr-shelf-cover{box-shadow:0 0 0 1px rgba(242,232,213,.
 body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba(0,0,0,.4)}
 .mr-shelf{position:relative;z-index:1;display:flex;flex-direction:column;gap:0;min-height:100%}
 .mr-shelf-topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 0 16px;margin-bottom:20px}
+.mr-shelf-online{margin:26px 0 8px;padding-top:18px;border-top:1px solid var(--mr-line)}
+.mr-shelf-online-head{display:flex;align-items:baseline;gap:12px;margin-bottom:12px}
+.mr-shelf-online-head h2{margin:0;font-size:15px;font-weight:600}
+.mr-shelf-online-meta{color:var(--mr-muted);font-size:12px}
+.mr-shelf-online-list{display:flex;flex-direction:column;gap:2px}
+.mr-shelf-online-row{display:flex;align-items:center;gap:14px;padding:12px 4px;border-bottom:1px solid var(--mr-line)}
+.mr-shelf-online-row:last-child{border-bottom:0}
+.mr-shelf-online-cover{flex:none;width:42px;height:56px;border-radius:4px;overflow:hidden;background:var(--mr-sunken);display:flex;align-items:center;justify-content:center;font-size:16px;color:var(--mr-muted)}
+.mr-shelf-online-cover img{width:100%;height:100%;object-fit:cover}
+.mr-shelf-online-info{min-width:0;flex:1}
+.mr-shelf-online-info strong{display:block;font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mr-shelf-online-info small{display:block;margin-top:2px;color:var(--mr-muted);font-size:12px}
+.mr-shelf-online-info p{margin:4px 0 0;color:var(--mr-muted);font-size:12px;line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .mr-shelf-search{display:flex;align-items:center;gap:8px;height:40px;padding:0 12px;border:1px solid var(--mr-border);border-radius:8px;background:var(--dsw-specific-input-major,var(--mr-card));font-size:13px;color:var(--mr-muted)}
 .mr-shelf-search:focus-within{border-color:var(--mr-accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--mr-accent) 12%,transparent)}
 .mr-shelf-search input{border:0!important;background:transparent;outline:none;width:200px;padding:0;font-size:13px;color:var(--mr-text)}.mr-shelf-search input:focus,.mr-shelf-search input:focus-visible{outline:0!important;box-shadow:none!important}.mr-shelf-search input::placeholder{color:var(--mr-muted);opacity:1}
