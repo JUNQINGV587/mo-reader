@@ -1942,8 +1942,11 @@ window.__ModuleLoader__.load({
             chapterNo ? h('div', { className: 'mr-chapter-no' }, chapterNo) : null,
             chapterTitle ? h('h1', { className: 'mr-chapter-title' }, chapterTitle) : null,
             meta ? h('div', { className: 'mr-chapter-meta' }, h('i', { 'aria-hidden': true }), h('span', null, meta)) : null),
-          ...lines.map((line, key) => h('p', { key }, line)),
-          !lines.length ? h(Empty, { key: 'empty', title: '本章无正文', detail: '可尝试刷新目录。' }) : null,
+          ...(book.contentType === 'comic' ? renderComic(lines) :
+              book.contentType === 'audio' ? [renderAudio(source)] :
+              book.contentType === 'video' ? [renderVideo(source)] :
+              lines.map((line, key) => h('p', { key }, line))),
+          !lines.length && book.contentType !== 'audio' && book.contentType !== 'video' ? h(Empty, { key: 'empty', title: '本章无正文', detail: '可尝试刷新目录。' }) : null,
           showEnd
             ? h('div', { key: 'end', className: 'mr-chapter-end' }, index + 1 < toc.length
               ? h(Button, { kind: 'primary soft', onClick: () => openChapter(index + 1) }, '下一章')
@@ -1952,6 +1955,55 @@ window.__ModuleLoader__.load({
         ];
       };
       const chapterNodes = chapterNodesFor({ index: chapterIndex, chapter });
+
+      // 多媒体渲染器
+      function renderComic(lines) {
+        return lines.map((line, key) => {
+          const trimmed = line.trim();
+          if (/^https?:\/\/.*\.(?:jpg|jpeg|png|gif|webp|avif|svg)(?:\?|$)/i.test(trimmed)) {
+            return h('div', { key, className: 'mr-comic-page' },
+              h('img', { src: trimmed, alt: `第 ${key + 1} 页`, loading: 'lazy' }));
+          }
+          if (trimmed.startsWith('![') || trimmed.startsWith('http')) {
+            const match = trimmed.match(/!\[([^\]]*)\]\(([^)]+)\)/) || trimmed.match(/^(https?:\/\/\S+)/);
+            if (match) {
+              const url = match[2] || match[1];
+              const alt = match[1] || `第 ${key + 1} 页`;
+              return h('div', { key, className: 'mr-comic-page' },
+                h('img', { src: url, alt, loading: 'lazy' }));
+            }
+          }
+          return h('p', { key }, line);
+        });
+      }
+
+      function renderAudio(source) {
+        const url = source.audioUrl || source.url || source.src || '';
+        if (!url) return h('p', null, '本章无音频');
+        return h('div', { className: 'mr-audio-player' },
+          h('audio', { controls: true, preload: 'metadata', src: url },
+            '你的浏览器不支持音频播放。'),
+          h('p', { className: 'mr-audio-title' }, source.title || source.name || '音频'));
+      }
+
+      function renderVideo(source) {
+        const url = source.videoUrl || source.url || source.src || '';
+        if (!url) return h('p', null, '本章无视频');
+        // 嵌入 B站/YouTube 等
+        if (/bilibili\.com\/video\/(\w+)/.test(url)) {
+          const bv = url.match(/bilibili\.com\/video\/(\w+)/)?.[1];
+          return h('div', { className: 'mr-video-embed' },
+            h('iframe', { src: `https://player.bilibili.com/player.html?bvid=${bv}&autoplay=0`, allowFullScreen: true, frameBorder: 0 }));
+        }
+        if (/youtube\.com\/watch\?v=(\w+)/.test(url) || /youtu\.be\/(\w+)/.test(url)) {
+          const vid = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)(\w+)/)?.[1];
+          return h('div', { className: 'mr-video-embed' },
+            h('iframe', { src: `https://www.youtube.com/embed/${vid}`, allowFullScreen: true, frameBorder: 0 }));
+        }
+        return h('div', { className: 'mr-video-player' },
+          h('video', { controls: true, preload: 'metadata', src: url },
+            '你的浏览器不支持视频播放。'));
+      }
       const pagedArticleStyle = {
         fontSize: `${settings.fontSize || 20}px`,
         lineHeight: settings.lineHeight || 1.9,
@@ -2724,6 +2776,45 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 @media(max-width:880px){.mr-tools{display:none}.mr-tabbar{position:absolute;left:0;right:0;bottom:0;z-index:7;display:flex;align-items:center;justify-content:space-around;height:54px;background:var(--reader-bg);border-top:1px solid color-mix(in srgb,var(--reader-text) 10%,transparent)}.mr-tab-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;flex:1;height:100%;padding:0;border:0;background:none;color:var(--reader-muted);font:400 11px/1 'Noto Serif CJK SC',Georgia,serif;letter-spacing:.04em}.mr-tab-btn:hover:not(:disabled){color:var(--reader-text)}.mr-paged-view{padding-bottom:54px}.mr-folio{bottom:70px}.mr-page-window{width:min(var(--mr-text,672px),calc(100% - 40px))}}
 @media(min-width:881px){.mr-page-window,.mr-chapter{width:min(var(--mr-text,672px),calc(100% - 200px))}}
 @media(max-width:720px){.mr-shelf-search .kbd{display:none}.mr-root{flex-direction:column;padding-left:0}.mr-section-actions{width:100%;justify-content:space-between}.mr-reader{padding-left:0}.mr-page-window{width:calc(100% - 32px)}.mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-content{order:1;padding:20px 14px}.mr-section-head{flex-wrap:wrap;margin-bottom:18px}.mr-section-head h2{font-size:22px;white-space:nowrap}.mr-book-grid{grid-template-columns:1fr;gap:10px}.mr-book-open{padding:13px}.mr-book-actions{position:relative}.mr-searchbar{flex-wrap:wrap}.mr-searchbar select{max-width:none;width:100%}.mr-searchbar input{flex:1}.mr-result{align-items:flex-start;padding:12px;gap:10px}.mr-result .mr-button{align-self:center;padding-inline:9px}.mr-result-info .mr-intro{-webkit-line-clamp:1}.mr-source-row{flex-wrap:wrap}.mr-source-row .mr-tag{display:none}.mr-panel{padding:16px}.mr-notice{top:-12px}.mr-chapter{width:calc(100% - 40px);padding:64px 0 84px}.mr-chapter-title{font-size:25px}.mr-chapter-no{letter-spacing:.42em;text-indent:.42em}.mr-drawer{left:0;right:0;width:auto}.mr-chapter-meta{letter-spacing:.04em}.mr-modal{padding:0}.mr-set-label{width:56px}}
+/* 阅读页精修：动效与细节 */
+.mr-chapter p{transition:opacity .2s ease}
+.mr-chapter p:first-of-type::first-letter{font-size:2.1em;line-height:1;float:left;margin:0.08em 0.1em 0 0;font-weight:500;color:var(--reader-accent)}
+.mr-chapter p:hover{opacity:.95}
+.mr-folio{transition:opacity .3s ease,transform .3s ease}
+.mr-folio:hover{opacity:.7;transform:translateX(-50%) scale(1.05)}
+.mr-tool-btn{transition:all .2s cubic-bezier(.4,0,.2,1)}
+.mr-tool-btn:active{transform:scale(.92)}
+.mr-tool-btn svg{transition:transform .2s ease}
+.mr-tool-btn:hover svg{transform:translateY(-1px)}
+.mr-chapter-title{transition:letter-spacing .3s ease}
+.mr-chapter:hover .mr-chapter-title{letter-spacing:.02em}
+.mr-chapter-meta{transition:opacity .3s ease}
+.mr-chapter:hover .mr-chapter-meta{opacity:.8}
+.mr-chapter-end .mr-button{transition:all .2s ease}
+.mr-chapter-end .mr-button:hover{letter-spacing:.18em}
+.mr-chapter-scroll{scroll-behavior:smooth}
+.mr-reader.mr-reduced .mr-chapter-scroll{scroll-behavior:auto}
+.mr-chapter p::selection{background:color-mix(in srgb,var(--reader-accent) 20%,transparent);color:var(--reader-text)}
+.mr-chapter-title::selection{background:color-mix(in srgb,var(--reader-accent) 30%,transparent)}
+.mr-tab-btn{transition:all .2s ease}
+.mr-tab-btn:active{transform:scale(.9)}
+.mr-page-window{transition:transform .2s ease-out}
+.mr-paged-chapter{transition:transform .18s cubic-bezier(.4,0,.2,1)}
+.mr-chapter-veil{animation:mr-veil-in 1.05s cubic-bezier(.4,0,.2,1) both}
+@keyframes mr-fade-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.mr-chapter{animation:mr-fade-in .4s ease-out}
+.mr-reader.mr-reduced .mr-chapter{animation:none}
+@media (prefers-reduced-motion:reduce){.mr-chapter p,.mr-folio,.mr-tool-btn,.mr-chapter-title,.mr-chapter-meta,.mr-chapter-end .mr-button,.mr-tab-btn{transition:none}.mr-chapter{animation:none}}
+/* 多媒体内容 */
+.mr-comic-page{margin:0 auto 16px;text-align:center;max-width:100%}
+.mr-comic-page img{max-width:100%;height:auto;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.08)}
+.mr-audio-player{padding:24px;background:var(--reader-card);border-radius:12px;border:1px solid var(--reader-border);margin:16px 0}
+.mr-audio-player audio{width:100%;margin-bottom:12px}
+.mr-audio-title{font-size:14px;color:var(--reader-muted);text-align:center;margin:0}
+.mr-video-embed{position:relative;padding-bottom:56.25%;height:0;overflow:hidden;border-radius:12px;margin:16px 0;background:#000}
+.mr-video-embed iframe{position:absolute;top:0;left:0;width:100%;height:100%;border:0}
+.mr-video-player{margin:16px 0;border-radius:12px;overflow:hidden}
+.mr-video-player video{width:100%;display:block}
 `;
 
     return {
