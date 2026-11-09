@@ -269,6 +269,7 @@ window.__ModuleLoader__.load({
       const [selected, setSelected] = useState(new Set());
       const [folderFilter, setFolderFilter] = useState(null);
       const [folderSheet, setFolderSheet] = useState(false);
+      const [sortBy, setSortBy] = useState('recent');
       const searchRef = useRef(null);
       useEffect(() => {
         const onKey = (event) => {
@@ -310,8 +311,16 @@ window.__ModuleLoader__.load({
       const matches = normalizedQuery
         ? layout.books.filter((book) => `${book.name || book.title || ''} ${book.author || ''}`.toLowerCase().includes(normalizedQuery))
         : visibleBooks;
+      const sortedMatches = useMemo(() => {
+        const arr = [...matches];
+        if (sortBy === 'recent') arr.sort((a, b) => (b.lastReadAt || b.updatedAt || 0) - (a.lastReadAt || a.updatedAt || 0));
+        else if (sortBy === 'added') arr.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        else if (sortBy === 'name') arr.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+        else if (sortBy === 'progress') arr.sort((a, b) => (b.lastRead?.percent || 0) - (a.lastRead?.percent || 0));
+        return arr;
+      }, [matches, sortBy]);
       const heroBook = normalizedQuery || folderFilter || selectMode ? null : lastRead;
-      const gridBooks = matches.filter((book) => book !== heroBook);
+      const gridBooks = sortedMatches.filter((book) => book !== heroBook);
       const toggleSelect = (book) => {
         const id = book.id || book.bookId;
         setSelected(prev => {
@@ -392,10 +401,15 @@ window.__ModuleLoader__.load({
         h('div', { className: 'mr-shelf-head' },
           h('div', { className: 'mr-shelf-head-copy' },
             h('div', { className: 'kicker' },
-              h('span', null, normalizedQuery ? `找到 ${matches.length} 本` : folderFilter ? (folderMap.get(folderFilter)?.name || '文件夹') : `本机书库 · ${layout.count} 本`),
+              h('span', null, normalizedQuery ? `找到 ${sortedMatches.length} 本` : folderFilter ? (folderMap.get(folderFilter)?.name || '文件夹') : `本机书库 · ${layout.count} 本`),
               h('span', { className: 'tag' }, '画廊')),
             h('h1', null, '书架')),
           h('div', { className: 'mr-shelf-head-actions' },
+            h('select', { className: 'mr-sort-select', value: sortBy, onChange: (e) => setSortBy(e.target.value) },
+              h('option', { value: 'recent' }, '最近阅读'),
+              h('option', { value: 'added' }, '添加时间'),
+              h('option', { value: 'name' }, '书名'),
+              h('option', { value: 'progress' }, '进度')),
             headActions,
             h(Button, { kind: selectMode ? 'primary' : 'secondary', onClick: () => { setSelectMode(!selectMode); setSelected(new Set()); } }, selectMode ? '退出多选' : '多选'))),
         folders.length > 0 || selectMode ? h('div', { className: 'mr-shelf-folder-bar' },
@@ -417,6 +431,12 @@ window.__ModuleLoader__.load({
             h(Button, { kind: 'secondary', disabled: !selected.size, onClick: () => onMarkRead?.(Array.from(selected)) }, '标已读'),
             h(Button, { kind: 'danger', disabled: !selected.size, onClick: () => { if (window.confirm(`删除 ${selected.size} 本书？`)) onBatchDelete?.(Array.from(selected)); } }, '删除'),
             h(Button, { kind: 'text', onClick: exitSelect }, '取消'))) : null,
+        normalizedQuery && sortedMatches.length === 0
+          ? h('div', { className: 'mr-shelf-search-empty' },
+              h('p', null, `没有找到「${query.trim()}」`),
+              h('p', { className: 'hint' }, '换个书名或作者，或清空搜索。'),
+              h(Button, { kind: 'secondary', onClick: () => { setQuery(''); searchRef.current?.focus(); } }, '清空搜索'))
+          : null,
         folderSheet ? h('div', { className: 'mr-folder-sheet-backdrop', onClick: () => setFolderSheet(false) },
           h('div', { className: 'mr-folder-sheet', onClick: (e) => e.stopPropagation() },
             h('h3', null, `移动 ${selected.size} 本书到…`),
@@ -606,10 +626,11 @@ window.__ModuleLoader__.load({
         }) : h(Empty, { icon: 'source', title: '暂无书源', detail: '导入后即可搜索和追更。' })));
     }
 
-    function Settings({ settings, onSettings, onLocal, onExport, onImport, busy }) {
+    function Settings({ settings, onSettings, onLocal, onExport, onImport, busy, onExportNotes, onUploadFont }) {
       const [replacementText, setReplacementText] = useState(() => (settings.replacements || []).map((rule) => `${rule.pattern || rule.from || ''}=>${rule.replacement || rule.to || ''}`).join('\n'));
       const localRef = useRef(null);
       const backupRef = useRef(null);
+      const fontRef = useRef(null);
       useEffect(() => {
         setReplacementText((settings.replacements || []).map((rule) => `${rule.pattern || rule.from || ''}=>${rule.replacement || rule.to || ''}`).join('\n'));
       }, [settings.replacements]);
@@ -664,7 +685,32 @@ window.__ModuleLoader__.load({
             h(Button, { icon: 'download', onClick: onExport, disabled: busy }, '导出'),
             h(Button, { icon: 'upload', onClick: () => backupRef.current?.click(), disabled: busy }, '恢复'),
             h('input', { ref: backupRef, type: 'file', accept: '.json,application/json', hidden: true, onChange: async (e) => { const file = e.target.files?.[0]; if (file) onImport(file); e.target.value = ''; } }))),
-        h('section', { className: 'mr-panel mr-roadmap' }, h('h3', null, '分期说明'), h('p', null, '当前为文字核心版。高兼容脚本、AI 与多媒体将在后续阶段提供。')));
+        h('section', { className: 'mr-panel mr-roadmap' }, h('h3', null, '分期说明'), h('p', null, '当前为文字核心版。高兼容脚本、AI 与多媒体将在后续阶段提供。')),
+        h('section', { className: 'mr-panel' }, h('h3', null, '阅读统计'),
+          h('div', { className: 'mr-stats-grid' },
+            h('div', { className: 'mr-stat-card' }, h('strong', null, '0'), h('span', null, '今日阅读（分钟）')),
+            h('div', { className: 'mr-stat-card' }, h('strong', null, '0'), h('span', null, '本周阅读（页）')),
+            h('div', { className: 'mr-stat-card' }, h('strong', null, '0'), h('span', null, '连续阅读（天）')))),
+        h('section', { className: 'mr-panel' }, h('h3', null, '笔记导出'),
+          h('p', { className: 'mr-help' }, '把划线和笔记导出为 Markdown。'),
+          h(Button, { icon: 'download', onClick: () => onExportNotes?.(), disabled: busy }, '导出笔记')),
+        h('section', { className: 'mr-panel' }, h('h3', null, '夜间定时'),
+          h('div', { className: 'mr-setting-row' }, h('span', null, '自动夜间'), h('div', { className: 'mr-mode-picker' },
+            h('button', { className: `mr-mode-choice ${!settings.nightAuto ? 'active' : ''}`, onClick: () => onSettings({ nightAuto: false }) }, '关'),
+            h('button', { className: `mr-mode-choice ${settings.nightAuto ? 'active' : ''}`, onClick: () => onSettings({ nightAuto: true }) }, '开'))),
+          settings.nightAuto ? h('div', { className: 'mr-setting-row' }, h('span', null, '开始时间'), h('input', { type: 'time', value: settings.nightStart || '22:00', onChange: (e) => onSettings({ nightStart: e.target.value }) })) : null,
+          settings.nightAuto ? h('div', { className: 'mr-setting-row' }, h('span', null, '结束时间'), h('input', { type: 'time', value: settings.nightEnd || '06:00', onChange: (e) => onSettings({ nightEnd: e.target.value }) })) : null),
+        h('section', { className: 'mr-panel' }, h('h3', null, '听书定时'),
+          h('div', { className: 'mr-setting-row' }, h('span', null, '定时停止'), h('div', { className: 'mr-mode-picker' },
+            h('button', { className: `mr-mode-choice ${!settings.ttsTimer ? 'active' : ''}`, onClick: () => onSettings({ ttsTimer: 0 }) }, '关'),
+            [15, 30, 60].map(min => h('button', { key: min, className: `mr-mode-choice ${settings.ttsTimer === min ? 'active' : ''}`, onClick: () => onSettings({ ttsTimer: min }) }, `${min}分钟`))))),
+        h('section', { className: 'mr-panel' }, h('h3', null, '阅读目标'),
+          h('div', { className: 'mr-setting-row' }, h('span', null, '每日目标（分钟）'), h('input', { type: 'number', min: 0, max: 480, step: 5, value: settings.dailyGoal || 0, onChange: (e) => onSettings({ dailyGoal: Number(e.target.value) }) })),
+          h('p', { className: 'mr-help' }, '设为 0 关闭目标提醒。')),
+        h('section', { className: 'mr-panel' }, h('h3', null, '自定义字体'),
+          h('p', { className: 'mr-help' }, '上传 TTF/OTF 字体文件。'),
+          h(Button, { icon: 'upload', onClick: () => fontRef.current?.click(), disabled: busy }, '上传字体'),
+          h('input', { ref: fontRef, type: 'file', accept: '.ttf,.otf,.woff,.woff2', hidden: true, onChange: (e) => { const file = e.target.files?.[0]; if (file) onUploadFont?.(file); e.target.value = ''; } })));
     }
 
     function ReaderView({ ctx, book, settings, onSettings, onBookSettings, notes, onClose, onSaveNote, onDeleteNote, notify, notice, onDismissNotice, deferMs = 0 }) {
@@ -2389,6 +2435,11 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-folder-sheet-list{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
 .mr-folder-sheet-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--mr-border);border-radius:8px;background:var(--mr-paper);color:var(--mr-text);font-size:14px;text-align:left;cursor:pointer;transition:background .15s}
 .mr-folder-sheet-item:hover{background:var(--mr-sunken)}
+.mr-sort-select{min-height:32px;padding:0 8px;border:1px solid var(--mr-border);border-radius:6px;background:var(--mr-card);color:var(--mr-text);font-size:12px}
+.mr-stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.mr-stat-card{display:flex;flex-direction:column;align-items:center;padding:16px;border:1px solid var(--mr-border);border-radius:10px;background:var(--mr-sunken)}
+.mr-stat-card strong{font-size:28px;font-weight:600;color:var(--mr-accent)}
+.mr-stat-card span{font-size:12px;color:var(--mr-muted);margin-top:4px}
 .mr-shelf-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px;border:1px dashed var(--mr-border);border-radius:8px;background:color-mix(in srgb,var(--mr-card) 55%,transparent)}
 .mr-shelf-empty-icon{width:48px;height:48px;border-radius:50%;background:var(--mr-sunken);display:flex;align-items:center;justify-content:center;margin-bottom:12px;color:var(--mr-accent)}
 .mr-shelf-empty h3{color:var(--mr-text);font:400 18px/1.3 var(--mr-serif);margin:0 0 6px}
