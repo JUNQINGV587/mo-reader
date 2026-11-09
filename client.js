@@ -13,6 +13,7 @@ window.__ModuleLoader__.load({
       'setSettings', 'setBookSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
       'cacheBookCover', 'bookCandidates', 'applyBookMeta',
       'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead', 'exportNotes',
+      'aiSummarize', 'aiTranslate', 'aiAsk',
     ];
     const jsonCodec = () => ({ mode: 'strict', typeSymbol: '@local/mo-reader#Json', create: () => z.json() });
     const readerContribution = {
@@ -819,6 +820,8 @@ window.__ModuleLoader__.load({
       const [drawer, setDrawer] = useState('');
       const [speaking, setSpeaking] = useState(false);
       const [noteText, setNoteText] = useState('');
+      const [aiQuestion, setAiQuestion] = useState('');
+      const [aiResult, setAiResult] = useState(null);
       const [quote, setQuote] = useState('');
       const [scrollPercent, setScrollPercent] = useState(0);
       const [retryNonce, setRetryNonce] = useState(0);
@@ -1163,8 +1166,38 @@ window.__ModuleLoader__.load({
       const fetchChapterEntry = async (index, list = toc) => {
         const id = chapterSourceId(index, list);
         if (!id) return null;
+        // 离线缓存：先查 localStorage，没有再请求
+        const cacheKey = `mo-reader:chapter:${bookId}:${id}`;
+        try {
+          const cached = localStorage.getItem(cacheKey);
+          if (cached) {
+            const { text, timestamp } = JSON.parse(cached);
+            // 缓存 7 天有效
+            if (Date.now() - timestamp < 7 * 24 * 3600 * 1000) {
+              return { index, chapter: { text, cached: true } };
+            }
+          }
+        } catch {}
         const value = await call(ctx, 'chapter', { bookId, chapterId: id });
+        // 写入缓存
+        if (value?.text) {
+          try { localStorage.setItem(cacheKey, JSON.stringify({ text: value.text, timestamp: Date.now() })); } catch {}
+        }
         return { index, chapter: value || {} };
+      };
+      // 预加载：当前章加载后，后台预取下一章
+      const prefetchNextChapter = (currentIndex) => {
+        const next = currentIndex + 1;
+        if (next >= toc.length) return;
+        const id = chapterSourceId(next, toc);
+        if (!id) return;
+        const cacheKey = `mo-reader:chapter:${bookId}:${id}`;
+        try { if (localStorage.getItem(cacheKey)) return; } catch {}
+        call(ctx, 'chapter', { bookId, chapterId: id }).then(value => {
+          if (value?.text) {
+            try { localStorage.setItem(cacheKey, JSON.stringify({ text: value.text, timestamp: Date.now() })); } catch {}
+          }
+        }).catch(() => {});
       };
       const nodeTop = (node) => {
         const el = scrollRef.current;
@@ -1179,7 +1212,7 @@ window.__ModuleLoader__.load({
         setScrollChapters(list);
         scrollChaptersRef.current = list;
         const current = list.find((entry) => entry.index === center) || list[0] || null;
-        if (current) { setChapter(current.chapter); setChapterIndex(current.index); chapterIndexRef.current = current.index; }
+        if (current) { setChapter(current.chapter); setChapterIndex(current.index); chapterIndexRef.current = current.index; prefetchNextChapter(current.index); }
         return list;
       };
       const anchorAtScroll = (wanted) => {
@@ -1962,7 +1995,7 @@ window.__ModuleLoader__.load({
           const trimmed = line.trim();
           if (/^https?:\/\/.*\.(?:jpg|jpeg|png|gif|webp|avif|svg)(?:\?|$)/i.test(trimmed)) {
             return h('div', { key, className: 'mr-comic-page' },
-              h('img', { src: trimmed, alt: `第 ${key + 1} 页`, loading: 'lazy' }));
+              h('img', { src: trimmed, alt: `第 ${key + 1} 页`, loading: 'lazy', decoding: 'async' }));
           }
           if (trimmed.startsWith('![') || trimmed.startsWith('http')) {
             const match = trimmed.match(/!\[([^\]]*)\]\(([^)]+)\)/) || trimmed.match(/^(https?:\/\/\S+)/);
@@ -1970,7 +2003,7 @@ window.__ModuleLoader__.load({
               const url = match[2] || match[1];
               const alt = match[1] || `第 ${key + 1} 页`;
               return h('div', { key, className: 'mr-comic-page' },
-                h('img', { src: url, alt, loading: 'lazy' }));
+                h('img', { src: url, alt, loading: 'lazy', decoding: 'async' }));
             }
           }
           return h('p', { key }, line);
@@ -2077,6 +2110,7 @@ window.__ModuleLoader__.load({
           toolButton(speaking ? 'stop' : 'play', speaking ? '停止' : '听书', speak),
           toolButton('note', '笔记', makeNote, { onPointerDown: (event) => event.preventDefault() }),
           h('hr', { 'aria-hidden': true }),
+          toolButton('sparkles', 'AI', () => setDrawer(drawer === 'ai' ? '' : 'ai')),
           toolButton(theme === 'dark' ? 'sun' : 'moon', '夜间', () => onSettings({ readerTheme: theme === 'dark' ? 'paper' : 'dark' })),
           mode === 'scroll' ? toolButton('up', '回顶', () => scrollRef.current?.scrollTo({ top: 0, behavior: motionOff ? 'auto' : 'smooth' })) : null),
         h('nav', { className: 'mr-tabbar', 'aria-label': '阅读工具' },
@@ -2148,7 +2182,21 @@ window.__ModuleLoader__.load({
           h('div', { className: 'mr-drawer-body' },
             quote ? h('blockquote', null, quote) : null,
             h('div', { className: 'mr-note-editor' }, h('textarea', { rows: 4, value: noteText, onChange: (e) => setNoteText(e.target.value), placeholder: '写下想法…' }), h(Button, { kind: 'primary', disabled: !noteText.trim(), onClick: async () => { try { await onSaveNote({ bookId, chapterId: progressRef.current.chapterId, text: noteText, quote }); setNoteText(''); setQuote(''); } catch {} } }, '保存')),
-            h('div', { className: 'mr-notes' }, chapterNotes.map((note) => h('article', { key: note.id }, note.quote ? h('blockquote', null, note.quote) : null, h('p', null, note.text), h(Button, { kind: 'text danger', icon: 'trash', onClick: () => onDeleteNote(note) }, '删除')))))) : null);
+            h('div', { className: 'mr-notes' }, chapterNotes.map((note) => h('article', { key: note.id }, note.quote ? h('blockquote', null, note.quote) : null, h('p', null, note.text), h(Button, { kind: 'text danger', icon: 'trash', onClick: () => onDeleteNote(note) }, '删除')))))) : null,
+        drawer === 'ai' ? h('aside', { className: 'mr-drawer', role: 'dialog', 'aria-modal': true, 'aria-label': 'AI 助手' },
+          h('div', { className: 'mr-drawer-head' },
+            h('h2', null, 'AI 助手'),
+            h(Button, { kind: 'icon', icon: 'close', onClick: () => setDrawer('') })),
+          h('div', { className: 'mr-drawer-body' },
+            h('div', { className: 'mr-ai-actions' },
+              h(Button, { icon: 'file', onClick: () => { run(() => call(ctx, 'aiSummarize', { bookId }), '摘要生成中…').then(r => { if (r?.summary) setAiResult({ type: 'summary', text: r.summary }); }, () => {}); } }, '章节摘要'),
+              h(Button, { icon: 'translate', onClick: () => { const text = window.getSelection()?.toString() || ''; if (!text) { notify('请先选中要翻译的文字'); return; } run(() => call(ctx, 'aiTranslate', { text, target: 'zh' }), '翻译中…').then(r => { if (r?.translated) setAiResult({ type: 'translate', text: r.translated }); }, () => {}); } }, '划词翻译')),
+            h('div', { className: 'mr-ai-ask' },
+              h('textarea', { rows: 3, value: aiQuestion, onChange: (e) => setAiQuestion(e.target.value), placeholder: '问 AI 关于这本书的问题…' }),
+              h(Button, { kind: 'primary', disabled: !aiQuestion.trim(), onClick: () => { run(() => call(ctx, 'aiAsk', { bookId, question: aiQuestion }), '思考中…').then(r => { if (r?.answer) setAiResult({ type: 'answer', text: r.answer }); setAiQuestion(''); }, () => {}); } }, '提问')),
+            aiResult ? h('div', { className: 'mr-ai-result' },
+              h('div', { className: 'mr-ai-result-head' }, h('span', null, aiResult.type === 'summary' ? '摘要' : aiResult.type === 'translate' ? '翻译' : '回答'), h(Button, { kind: 'icon', icon: 'close', onClick: () => setAiResult(null) })),
+              h('p', null, aiResult.text)) : null)) : null);
     }
 
     const OPEN_BACKDROPS = { paper: '#f4ecdc', light: '#ffffff', green: '#e3eee5', dark: '#202522' };
@@ -2815,6 +2863,14 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-video-embed iframe{position:absolute;top:0;left:0;width:100%;height:100%;border:0}
 .mr-video-player{margin:16px 0;border-radius:12px;overflow:hidden}
 .mr-video-player video{width:100%;display:block}
+/* AI 助手 */
+.mr-ai-actions{display:flex;gap:10px;margin-bottom:20px}
+.mr-ai-actions .mr-button{flex:1}
+.mr-ai-ask{display:flex;flex-direction:column;gap:10px;margin-bottom:20px}
+.mr-ai-ask textarea{resize:vertical;min-height:80px}
+.mr-ai-result{background:var(--reader-card);border:1px solid var(--reader-border);border-radius:10px;padding:14px;animation:mr-fade-in .3s ease}
+.mr-ai-result-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;font-size:12px;color:var(--reader-muted);letter-spacing:.1em}
+.mr-ai-result p{margin:0;font-size:14px;line-height:1.8;white-space:pre-wrap}
 `;
 
     return {

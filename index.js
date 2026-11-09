@@ -24,6 +24,7 @@ export const REMOTE_METHODS = Object.freeze([
   'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
   'exportBackup', 'importBackup', 'fetchCover', 'cacheBookCover', 'bookCandidates', 'applyBookMeta',
   'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead', 'exportNotes',
+  'aiSummarize', 'aiTranslate', 'aiAsk',
 ])
 
 function assertObject(value, label = 'arguments') {
@@ -862,6 +863,54 @@ export class ReaderService extends TypertRemoteService {
     for (const note of backup.notes) await this.db.notes.put(note.id, note)
     await this.db.settings.set({ ...DEFAULT_SETTINGS, ...backup.settings })
     return this.state()
+  }
+
+  // AI 助手：摘要、翻译、问答
+  async aiSummarize(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const chapters = this.chapters(book.id)
+    const text = chapters.map(c => c.text || c.content || '').filter(Boolean).join('\n\n').slice(0, 8000)
+    if (!text) throw new ReaderError('reader/invalid-input', '这本书还没有内容。')
+    const result = await this.callLlm(`请用中文总结以下书籍内容，100字以内：\n\n${text}`)
+    return { summary: result }
+  }
+
+  async aiTranslate(args) {
+    args ??= {}
+    this.assertReady()
+    const text = String(args.text || '').slice(0, 4000)
+    const target = args.target || 'zh'
+    if (!text) throw new ReaderError('reader/invalid-input', '没有要翻译的内容。')
+    const lang = target === 'zh' ? '中文' : target === 'en' ? '英文' : target
+    const result = await this.callLlm(`请将以下内容翻译成${lang}，保持原意：\n\n${text}`)
+    return { translated: result }
+  }
+
+  async aiAsk(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const question = String(args.question || '').trim()
+    if (!question) throw new ReaderError('reader/invalid-input', '请输入问题。')
+    const chapters = this.chapters(book.id)
+    const context = chapters.slice(0, 3).map(c => c.text || c.content || '').filter(Boolean).join('\n\n').slice(0, 6000)
+    const result = await this.callLlm(`基于以下书籍内容回答问题：\n\n${context}\n\n问题：${question}\n\n请用中文回答：`)
+    return { answer: result }
+  }
+
+  async callLlm(prompt) {
+    if (!this.ctx.llm) throw new ReaderError('reader/ai-unavailable', 'AI 服务不可用。')
+    try {
+      const chunks = []
+      for await (const chunk of this.ctx.llm.stream({ messages: [{ role: 'user', content: prompt }] })) {
+        if (chunk.type === 'text') chunks.push(chunk.text)
+      }
+      return chunks.join('').trim()
+    } catch (error) {
+      throw new ReaderError('reader/ai-error', `AI 调用失败：${error.message}`)
+    }
   }
 }
 
