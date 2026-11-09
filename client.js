@@ -808,7 +808,18 @@ window.__ModuleLoader__.load({
         h('section', { className: 'mr-panel' }, h('h3', null, '自定义字体'),
           h('p', { className: 'mr-help' }, '上传 TTF/OTF 字体文件。'),
           h(Button, { icon: 'upload', onClick: () => fontRef.current?.click(), disabled: busy }, '上传字体'),
-          h('input', { ref: fontRef, type: 'file', accept: '.ttf,.otf,.woff,.woff2', hidden: true, onChange: (e) => { const file = e.target.files?.[0]; if (file) onUploadFont?.(file); e.target.value = ''; } })));
+          h('input', { ref: fontRef, type: 'file', accept: '.ttf,.otf,.woff,.woff2', hidden: true, onChange: (e) => { const file = e.target.files?.[0]; if (file) onUploadFont?.(file); e.target.value = ''; } })),
+        h('section', { className: 'mr-panel' }, h('h3', null, '快捷键'),
+          h('div', { className: 'mr-shortcuts' },
+            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '上一页'), h('kbd', null, '←')),
+            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '下一页'), h('kbd', null, '→ / 空格')),
+            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '目录'), h('kbd', null, 'D')),
+            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '排版'), h('kbd', null, 'S')),
+            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '笔记'), h('kbd', null, 'N')),
+            h('div', { className: 'mr-shortcuts-row' }, h('span', null, 'AI 助手'), h('kbd', null, 'A')),
+            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '听书'), h('kbd', null, 'T')),
+            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '切换模式'), h('kbd', null, 'M')),
+            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '关闭面板'), h('kbd', null, 'Esc')))));
     }
 
     function ReaderView({ ctx, book, settings, onSettings, onBookSettings, notes, onClose, onSaveNote, onDeleteNote, notify, notice, onDismissNotice, deferMs = 0 }) {
@@ -1876,6 +1887,14 @@ window.__ModuleLoader__.load({
           if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ' || event.code === 'Space') { event.preventDefault(); turnPage(1); }
           if (event.key === 'Home') { event.preventDefault(); goPage(0); }
           if (event.key === 'End') { event.preventDefault(); goPage(pageCount - 1); }
+          // 快捷键：D=目录 S=设置 N=笔记 A=AI T=听书 M=模式
+          if (event.key === 'd' || event.key === 'D') { event.preventDefault(); setDrawer(drawer === 'toc' ? '' : 'toc'); }
+          if (event.key === 's' || event.key === 'S') { event.preventDefault(); setDrawer(drawer === 'settings' ? '' : 'settings'); }
+          if (event.key === 'n' || event.key === 'N') { event.preventDefault(); setDrawer(drawer === 'notes' ? '' : 'notes'); }
+          if (event.key === 'a' || event.key === 'A') { event.preventDefault(); setDrawer(drawer === 'ai' ? '' : 'ai'); }
+          if (event.key === 't' || event.key === 'T') { event.preventDefault(); speak(); }
+          if (event.key === 'm' || event.key === 'M') { event.preventDefault(); toggleMode(); }
+          if (event.key === 'Escape') { event.preventDefault(); setDrawer(''); }
         };
         document.addEventListener('keydown', onKeyDown);
         return () => document.removeEventListener('keydown', onKeyDown);
@@ -2824,8 +2843,59 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 @media(max-width:880px){.mr-tools{display:none}.mr-tabbar{position:absolute;left:0;right:0;bottom:0;z-index:7;display:flex;align-items:center;justify-content:space-around;height:54px;background:var(--reader-bg);border-top:1px solid color-mix(in srgb,var(--reader-text) 10%,transparent)}.mr-tab-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;flex:1;height:100%;padding:0;border:0;background:none;color:var(--reader-muted);font:400 11px/1 'Noto Serif CJK SC',Georgia,serif;letter-spacing:.04em}.mr-tab-btn:hover:not(:disabled){color:var(--reader-text)}.mr-paged-view{padding-bottom:54px}.mr-folio{bottom:70px}.mr-page-window{width:min(var(--mr-text,672px),calc(100% - 40px))}}
 @media(min-width:881px){.mr-page-window,.mr-chapter{width:min(var(--mr-text,672px),calc(100% - 200px))}}
 @media(max-width:720px){.mr-shelf-search .kbd{display:none}.mr-root{flex-direction:column;padding-left:0}.mr-section-actions{width:100%;justify-content:space-between}.mr-reader{padding-left:0}.mr-page-window{width:calc(100% - 32px)}.mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-content{order:1;padding:20px 14px}.mr-section-head{flex-wrap:wrap;margin-bottom:18px}.mr-section-head h2{font-size:22px;white-space:nowrap}.mr-book-grid{grid-template-columns:1fr;gap:10px}.mr-book-open{padding:13px}.mr-book-actions{position:relative}.mr-searchbar{flex-wrap:wrap}.mr-searchbar select{max-width:none;width:100%}.mr-searchbar input{flex:1}.mr-result{align-items:flex-start;padding:12px;gap:10px}.mr-result .mr-button{align-self:center;padding-inline:9px}.mr-result-info .mr-intro{-webkit-line-clamp:1}.mr-source-row{flex-wrap:wrap}.mr-source-row .mr-tag{display:none}.mr-panel{padding:16px}.mr-notice{top:-12px}.mr-chapter{width:calc(100% - 40px);padding:64px 0 84px}.mr-chapter-title{font-size:25px}.mr-chapter-no{letter-spacing:.42em;text-indent:.42em}.mr-drawer{left:0;right:0;width:auto}.mr-chapter-meta{letter-spacing:.04em}.mr-modal{padding:0}.mr-set-label{width:56px}}
-/* 阅读页精修：动效与细节 */
-.mr-chapter p{transition:opacity .2s ease}
+/* 平板适配（721-1024px） */
+@media(min-width:721px) and (max-width:1024px){
+  .mr-nav{width:140px;flex:0 0 140px;padding:20px 10px 14px}
+  .mr-content{padding:20px 24px}
+  .mr-content>div:not(.mr-notice){max-width:900px}
+  .mr-chapter{width:min(var(--mr-text,672px),calc(100% - 160px))}
+  .mr-tools{right:8px}
+  .mr-tool-btn{width:48px;padding:6px 0}
+  .mr-shelf-gallery{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .mr-book-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .mr-drawer{width:320px}
+}
+/* 桌面端（1025px+） */
+@media(min-width:1025px){
+  .mr-nav{width:200px;flex:0 0 200px;padding:28px 18px 20px}
+  .mr-content{padding:28px clamp(24px,4vw,56px)}
+  .mr-content>div:not(.mr-notice){max-width:1280px}
+  .mr-chapter{width:min(var(--mr-text,672px),calc(100% - 240px))}
+  .mr-tools{right:20px}
+  .mr-tool-btn{width:56px;padding:10px 0}
+  .mr-shelf-gallery{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .mr-book-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .mr-drawer{width:400px}
+}
+/* 横屏模式（高度<500px 且宽度>高度） */
+@media(orientation:landscape) and (max-height:500px){
+  .mr-root{flex-direction:row}
+  .mr-nav{width:64px;flex:0 0 64px;padding:12px 8px;order:0}
+  .mr-nav-items{flex-direction:column;gap:8px}
+  .mr-nav-items button{min-height:44px;flex-direction:row;gap:6px;padding:8px;font-size:11px}
+  .mr-brand,.mr-local{display:none}
+  .mr-content{order:1;padding:16px 20px}
+  .mr-reader{padding-left:0}
+  .mr-tools{position:absolute;right:8px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:4px}
+  .mr-tool-btn{width:40px;padding:6px 0;font-size:10px}
+  .mr-tool-btn span{display:none}
+  .mr-tabbar{display:none}
+  .mr-chapter{padding:40px 0 60px;width:min(var(--mr-text,672px),calc(100% - 100px))}
+  .mr-chapter-title{font-size:22px;margin-top:12px}
+  .mr-chapter-no{font-size:11px;letter-spacing:.4em}
+  .mr-chapter-meta{margin:16px 0 24px;font-size:11px}
+  .mr-folio{bottom:12px;font-size:10px}
+  .mr-paged-view{padding-bottom:0}
+  .mr-page-window{width:calc(100% - 80px)}
+  .mr-drawer{width:300px}
+  .mr-modal{max-height:90vh}
+}
+/* 快捷键提示 */
+.mr-shortcuts{display:flex;flex-direction:column;gap:8px;padding:16px;background:var(--reader-card);border:1px solid var(--reader-border);border-radius:10px;font-size:12px}
+.mr-shortcuts kbd{display:inline-block;padding:2px 6px;background:var(--reader-bg);border:1px solid var(--reader-border);border-radius:4px;font-family:monospace;font-size:11px}
+.mr-shortcuts-row{display:flex;justify-content:space-between;align-items:center}
+.mr-shortcuts-row span{color:var(--reader-muted)}
+/* 阅读页精修：动效与细节 */.mr-chapter p{transition:opacity .2s ease}
 .mr-chapter p:first-of-type::first-letter{font-size:2.1em;line-height:1;float:left;margin:0.08em 0.1em 0 0;font-weight:500;color:var(--reader-accent)}
 .mr-chapter p:hover{opacity:.95}
 .mr-folio{transition:opacity .3s ease,transform .3s ease}
