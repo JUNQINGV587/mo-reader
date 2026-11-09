@@ -12,7 +12,7 @@ window.__ModuleLoader__.load({
       'toc', 'chapter', 'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal',
       'setSettings', 'setBookSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
       'cacheBookCover', 'bookCandidates', 'applyBookMeta',
-      'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead',
+      'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead', 'exportNotes',
     ];
     const jsonCodec = () => ({ mode: 'strict', typeSymbol: '@local/mo-reader#Json', create: () => z.json() });
     const readerContribution = {
@@ -1582,6 +1582,11 @@ window.__ModuleLoader__.load({
         }
         if (next >= pageCount) {
           if (chapterIndex + 1 < toc.length) turnChapter(1);
+          else if (chapterIndex === toc.length - 1) {
+            // 读完最后一章，自动标记已读
+            call(ctx, 'markBookRead', { bookId: book.id || book.bookId }).catch(() => {});
+            notify?.('已读完全书', 'success');
+          }
           return;
         }
         if (motionOff || !webglRef.current) { goPage(next); return; }
@@ -2304,7 +2309,10 @@ window.__ModuleLoader__.load({
                 return pending.then(() => true, () => false);
               },
               onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
-          !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy }) : null)));
+          !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy,
+            onExportNotes: () => run(() => call(ctx, 'exportNotes'), '导出完成').then(r => { if (r?.text) { const blob = new Blob([r.text], { type: 'text/markdown;charset=utf-8' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = '墨读笔记.md'; a.click(); URL.revokeObjectURL(a.href); } }, () => {}),
+            onUploadFont: (file) => { const reader = new FileReader(); reader.onload = (e) => { const fontFamily = `custom-${Date.now()}`; const style = document.createElement('style'); style.textContent = `@font-face{font-family:'${fontFamily}';src:url('${e.target.result}')}`; document.head.appendChild(style); updateSettings({ fontFamily }); setNotice({ kind: 'success', text: '字体已应用' }); }; reader.readAsDataURL(file); },
+          }) : null)));
     }
 
     const css = String.raw`

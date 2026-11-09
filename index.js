@@ -23,7 +23,7 @@ export const REMOTE_METHODS = Object.freeze([
   'state', 'importSource', 'restoreBuiltinSources', 'removeSource', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
   'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
   'exportBackup', 'importBackup', 'fetchCover', 'cacheBookCover', 'bookCandidates', 'applyBookMeta',
-  'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead',
+  'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead', 'exportNotes',
 ])
 
 function assertObject(value, label = 'arguments') {
@@ -707,6 +707,23 @@ export class ReaderService extends TypertRemoteService {
     if (!this.db.notes.get(noteId)) throw new ReaderError('reader/not-found', 'Note not found.')
     await this.db.notes.delete(noteId)
     return { removed: true, id: noteId }
+  }
+
+  async exportNotes(args) {
+    args ??= {}
+    this.assertReady()
+    const bookId = args.bookId
+    const notes = entries(this.db.notes).filter(n => !bookId || n.bookId === bookId)
+    const lines = []
+    for (const note of notes) {
+      const book = this.db.books.get(note.bookId)
+      const chapter = this.db.chapters.get(note.chapterId)
+      lines.push(`## ${book?.name || '未知书籍'} · ${chapter?.title || '未知章节'}\n`)
+      if (note.quote) lines.push(`> ${note.quote}\n`)
+      lines.push(`${note.text}\n`)
+      lines.push(`---\n`)
+    }
+    return { text: lines.join('\n'), count: notes.length }
   }
 
   async createFolder(args) {
