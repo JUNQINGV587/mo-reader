@@ -32,6 +32,10 @@ window.__ModuleLoader__.load({
       fontFamily: 'serif',
       readerTheme: 'paper',
       ttsRate: 1,
+      ttsEngine: 'system', // system | azure | iflytek | baidu
+      ttsVoice: '',
+      ttsPitch: 1,
+      ttsVolume: 1,
       replacements: [],
       mode: 'scroll',
       flipStyle: 'slide',
@@ -833,6 +837,7 @@ window.__ModuleLoader__.load({
       const [noteText, setNoteText] = useState('');
       const [aiQuestion, setAiQuestion] = useState('');
       const [aiResult, setAiResult] = useState(null);
+      const [voices, setVoices] = useState([]);
       const [quote, setQuote] = useState('');
       const [scrollPercent, setScrollPercent] = useState(0);
       const [retryNonce, setRetryNonce] = useState(0);
@@ -942,6 +947,13 @@ window.__ModuleLoader__.load({
         }
       }, [mode]);
       useEffect(() => { webglRef.current = supportsWebGL(); }, []);
+      // 加载系统语音列表
+      useEffect(() => {
+        const loadVoices = () => { const list = window.speechSynthesis?.getVoices() || []; setVoices(list); };
+        loadVoices();
+        window.speechSynthesis?.addEventListener('voiceschanged', loadVoices);
+        return () => window.speechSynthesis?.removeEventListener('voiceschanged', loadVoices);
+      }, []);
       useEffect(() => { setMode(prefMode); }, [prefMode]);
       useEffect(() => { modeRef.current = mode; }, [mode]);
       useEffect(() => { setFlipStyle(prefFlipStyle); }, [prefFlipStyle]);
@@ -1518,6 +1530,18 @@ window.__ModuleLoader__.load({
           followPageForSpeech(spoken);
           const utterance = new SpeechSynthesisUtterance(spoken);
           utterance.rate = Number(settings.ttsRate || 1);
+          utterance.pitch = Number(settings.ttsPitch || 1);
+          utterance.volume = Number(settings.ttsVolume || 1);
+          // 选择声音
+          if (settings.ttsVoice) {
+            const voice = voices.find(v => v.name === settings.ttsVoice);
+            if (voice) utterance.voice = voice;
+          }
+          // 引擎选择：系统语音用 SpeechSynthesis，其他引擎预留接口
+          if (settings.ttsEngine && settings.ttsEngine !== 'system') {
+            // TODO: Azure/讯飞/百度 TTS API 接入（需要 API Key）
+            notify(`${settings.ttsEngine} 引擎暂未接入，使用系统语音`);
+          }
           let started = false;
           // 有些环境（没有装语音包、系统合成失败）speak() 之后既不 start 也不 end，
           // 状态会永远停在「停止」。这里给每句一个启动看门狗。
@@ -2182,7 +2206,17 @@ window.__ModuleLoader__.load({
                 ['关闭', prefAmbience === 'off', () => persistPref('ambience', 'off')],
               ])),
               rangeRow('行距', (settings.lineHeight || 1.9).toFixed(1), '', h('input', { type: 'range', min: 1.4, max: 2.5, step: .1, value: settings.lineHeight || 1.9, onChange: (e) => onSettings({ lineHeight: Number(e.target.value) }) })),
-              rangeRow('语速', (settings.ttsRate || 1).toFixed(1), '×', h('input', { type: 'range', min: .5, max: 2, step: .1, value: settings.ttsRate || 1, onChange: (e) => onSettings({ ttsRate: Number(e.target.value) }) }))))) : null,
+              rangeRow('语速', (settings.ttsRate || 1).toFixed(1), '×', h('input', { type: 'range', min: .5, max: 2, step: .1, value: settings.ttsRate || 1, onChange: (e) => onSettings({ ttsRate: Number(e.target.value) }) })),
+              rangeRow('音调', (settings.ttsPitch || 1).toFixed(1), '×', h('input', { type: 'range', min: .5, max: 2, step: .1, value: settings.ttsPitch || 1, onChange: (e) => onSettings({ ttsPitch: Number(e.target.value) }) })),
+              rangeRow('音量', Math.round((settings.ttsVolume || 1) * 100), '%', h('input', { type: 'range', min: 0, max: 1, step: .1, value: settings.ttsVolume || 1, onChange: (e) => onSettings({ ttsVolume: Number(e.target.value) }) })),
+              settingRow('引擎', h('select', { value: settings.ttsEngine || 'system', onChange: (e) => onSettings({ ttsEngine: e.target.value }) },
+                h('option', { value: 'system' }, '系统语音'),
+                h('option', { value: 'azure' }, 'Azure TTS'),
+                h('option', { value: 'iflytek' }, '讯飞'),
+                h('option', { value: 'baidu' }, '百度'))),
+              settingRow('声音', h('select', { value: settings.ttsVoice || '', onChange: (e) => onSettings({ ttsVoice: e.target.value }) },
+                h('option', { value: '' }, '默认'),
+                ...voices.map(v => h('option', { key: v.name, value: v.name }, `${v.name} (${v.lang})`))))))) : null,
         drawer === 'toc' ? h('aside', { className: 'mr-drawer mr-drawer-left', role: 'dialog', 'aria-modal': true, 'aria-label': '目录' },
           h('div', { className: 'mr-drawer-head' },
             h('h2', null, '目录'),
