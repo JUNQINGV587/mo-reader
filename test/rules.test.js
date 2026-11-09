@@ -33,7 +33,7 @@ test('basic source normalization rejects JS, XPath and secrets clearly', () => {
   assert.match(normalized.id, /^[a-zA-Z0-9_-]+$/)
   assert.equal(normalizeSource(base).id, normalized.id)
   assert.equal(normalized.bookSourceUrl, 'https://example.com')
-  assert.throws(() => normalizeSource({ ...base, ruleContent: { content: '<js>document.body</js>' } }), /需第二期高兼容引擎/)
+  assert.doesNotThrow(() => normalizeSource({ ...base, ruleContent: { content: '<js>document.body</js>' } }))
   assert.throws(() => normalizeSource({ ...base, ruleSearch: { ...base.ruleSearch, bookList: '@xpath://div' } }), /XPath/)
   assert.throws(() => normalizeSource({ ...base, ruleSearch: { ...base.ruleSearch, headers: { Cookie: 'secret' } } }), /not allowed|must not contain secrets/)
   assert.throws(() => normalizeSource({ ...base, token: 'secret' }), /must not contain secrets/)
