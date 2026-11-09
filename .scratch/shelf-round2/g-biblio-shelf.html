@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="dsh-design" content="desktop">
+<meta name="viewport" content="width=1280">
+<title>方向 G · 书目书架 · 墨读</title>
+<style>
+:root{
+  --paper:#FAF8F2;--side:#F2EEE4;--ink:#171512;--muted:#5E594F;--red:#A8332A;--line:#E0D9CB;
+  --serif:"Songti SC","Noto Serif CJK SC","Source Han Serif SC",serif;
+  --sans:"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--paper);color:var(--ink);font-family:var(--sans);-webkit-font-smoothing:antialiased}
+button,a{font:inherit;color:inherit}
+button{background:none;border:0;cursor:pointer}
+a{text-decoration:none}
+.app{display:grid;grid-template-columns:236px 1fr;min-height:800px}
+.side{background:var(--side);color:var(--ink);padding:54px 16px 18px;display:flex;flex-direction:column;border-right:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;padding:0 8px 24px}
+.brand .seal{width:30px;height:30px;flex:none;background:#171512;color:#F6E7D2;font:15px/28px var(--serif);text-align:center}
+.brand-name{font:21px/1.35 var(--serif);letter-spacing:.1em;width:64px;flex:none;padding:2px 0 3px}
+.brand-sub{font-size:11px;letter-spacing:.28em;color:#5E594F;margin:2px 0 0 40px}
+.nav{display:flex;flex-direction:column;gap:4px;margin-top:6px}
+.nav-item{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:4px;color:#5E594F;font-size:13px;text-align:left}
+.nav-item.on{background:#E8E0D2;color:var(--ink);box-shadow:inset 2px 0 0 var(--red)}
+.nav-item svg{width:16px;height:16px;flex:none;stroke:currentColor;fill:none;stroke-width:1.5}
+.nav-kbd{margin-left:auto;font-size:11px;color:#6B6154}
+.side-foot{margin-top:auto;border-top:1px solid var(--line);padding-top:14px}
+.week-top{display:flex;align-items:baseline;justify-content:space-between}
+.week-label{font-size:11px;letter-spacing:.08em;color:#5E594F}
+.week-value{font:15px/1 var(--serif);letter-spacing:.02em}
+.week-bars{display:flex;gap:4px;margin-top:12px;height:14px;align-items:flex-end}
+.week-bars span{width:9px;background:#D8CCB8}
+.week-bars span.on{background:var(--red)}
+.week-note{font-size:11px;line-height:1.5;color:#5E594F;margin:10px 0 0}
+.main{display:flex;flex-direction:column;min-width:0}
+.topbar{display:flex;align-items:center;gap:18px;padding:12px 40px;border-bottom:1px solid var(--line);height:52px;flex:none}
+.search{display:flex;align-items:center;gap:10px;border-bottom:1px solid #D8CCB8;padding:7px 0;width:300px;color:#6B6154;font-size:12px}
+.search svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.6}
+.search .kbd{margin-left:auto;font-size:11px;color:#6B6154}
+.status{margin-left:auto;display:flex;align-items:center;gap:10px;font-size:11px;color:#5E594F}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--red)}
+.stage{padding:16px 40px 10px;flex:1;display:flex;flex-direction:column;min-height:0}
+.head{display:flex;align-items:flex-end;gap:24px;margin-bottom:14px;flex:none}
+.kicker{font-size:11px;letter-spacing:.1em;color:#5E594F;margin:0 0 8px}
+h1{font:36px/1.1 var(--serif);margin:0;font-weight:400}
+.lede{font-size:13px;color:#5E594F;margin:10px 0 0}
+.head-right{margin-left:auto;display:flex;align-items:center;gap:18px}
+.viewchip{display:flex;align-items:center;gap:8px;border:1px solid #C8BBA6;padding:7px 12px;font-size:12px;color:var(--ink)}
+.viewchip svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.5}
+.ghost{display:flex;align-items:center;gap:6px;font-size:12px;color:#5E594F;min-height:28px}
+.hero{display:flex;gap:24px;padding:12px 20px;border:1px solid #D8CCB8;background:#F5F0E6;margin-bottom:10px;flex:none;align-items:flex-start}
+.hero-cover{position:relative;width:110px;height:150px;flex:none;background:#EFE3CC;border:1px solid rgba(23,21,18,.16);padding:12px 10px;box-shadow:0 8px 18px rgba(23,21,18,.1);overflow:hidden}
+.hero-cover .seal{display:block;width:20px;height:20px;background:var(--red);color:#F6E7D2;font:11px/19px var(--serif);text-align:center}
+.hero-cover .t{font:15px/1.35 var(--serif);margin-top:12px;max-width:88px}
+.hero-cover .m{position:absolute;left:-4px;right:-4px;bottom:0;height:30px;background:#D8C6A8;clip-path:polygon(0 72%,16% 38%,28% 55%,42% 22%,56% 48%,70% 18%,84% 44%,100% 28%,100% 100%,0 100%)}
+.hero-cover .a{position:absolute;left:10px;bottom:8px;font-size:11px;color:rgba(23,21,18,.78)}
+.hero-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+.hero-eyebrow{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.08em;color:var(--red)}
+.hero-eyebrow i{width:5px;height:5px;border-radius:50%;background:var(--red)}
+.hero h2{font:26px/1.2 var(--serif);margin:0;font-weight:400}
+.hero-meta{font-size:13px;color:#5E594F;line-height:1.6}
+.hero-last{font-size:12px;color:#5E594F}
+.hero-right{margin-left:auto;text-align:right;display:flex;flex-direction:column;align-items:flex-end;gap:8px}
+.hero-progress{display:flex;align-items:baseline;gap:6px}
+.hero-progress .n{font:15px/1.2 var(--serif);color:var(--red);padding:2px 0 3px}
+.hero-progress .t{font-size:12px;color:#5E594F}
+.hero-bar{width:180px;height:2px;background:#D8CCB8;margin:4px 0 2px}
+.hero-bar i{display:block;height:100%;width:42%;background:var(--red)}
+.hero-cta{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--red);border-bottom:1px solid rgba(168,51,42,.4);padding:6px 0 7px;min-height:32px}
+.hero-cta svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.6}
+.list-head{display:flex;align-items:center;justify-content:space-between;border-top:2px solid var(--ink);padding:10px 0 6px;flex:none}
+.list-head span{font-size:11px;letter-spacing:.1em;color:#5E594F}
+.biblio{display:flex;flex-direction:column;flex:1;min-height:0}
+.row{display:flex;align-items:center;gap:14px;padding:0 0 0 0;min-height:56px;border-bottom:1px solid var(--line);position:relative;text-align:left}
+.row:hover{background:#F2EDE2}
+.row .spinebar{width:6px;align-self:stretch;background:var(--c);flex:none;box-shadow:inset -1px 0 rgba(0,0,0,.08)}
+.row .no{width:28px;flex:none;font-size:11px;color:#6B6154;letter-spacing:.04em;padding-left:6px}
+.row .main-col{flex:1;min-width:0}
+.row .title{font:21px/1.3 var(--serif);font-weight:400;margin:0;display:block}
+.row .sub{font-size:12px;color:#5E594F;margin-top:2px;display:block}
+.row .recent{font-size:12px;color:#5E594F;width:150px;text-align:right;flex:none}
+.row .mini{width:30px;height:40px;flex:none;display:flex;align-items:center;justify-content:center;background:var(--c);color:var(--t);font:15px/1 var(--serif);box-shadow:inset 0 0 0 1px rgba(0,0,0,.12);margin-right:2px}
+.foot{display:flex;align-items:center;justify-content:space-between;gap:20px;border-top:1px solid var(--line);padding-top:8px;margin-top:10px;font-size:11px;color:#5E594F;flex:none}
+.foot span{color:#5E594F}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <span class="seal">墨</span>
+      <div><div class="brand-name">墨读</div><div class="brand-sub">MO READ</div></div>
+    </div>
+    <nav class="nav" aria-label="主导航">
+      <a class="nav-item on" href="#"><svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="1"/><path d="M4 10h16M9 5v14"/></svg>书架<span class="nav-kbd">⌘1</span></a>
+      <a class="nav-item" href="#"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M16 16l4 4"/></svg>发现<span class="nav-kbd">⌘2</span></a>
+      <a class="nav-item" href="#"><svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"/></svg>书源<span class="nav-kbd">⌘3</span></a>
+      <a class="nav-item" href="#"><svg viewBox="0 0 24 24"><path d="M5 8h14M5 16h14M8 5v6M16 13v6"/></svg>设置<span class="nav-kbd">⌘4</span></a>
+    </nav>
+    <div class="side-foot">
+      <div class="week-top"><span class="week-label">本周</span><span class="week-value">3 时 42 分</span></div>
+      <div class="week-bars" aria-hidden="true"><span style="height:6px"></span><span style="height:9px"></span><span class="on" style="height:14px"></span><span style="height:8px"></span><span style="height:5px"></span><span style="height:7px"></span><span style="height:4px"></span></div>
+      <p class="week-note">昨天读得最久 ·《月亮与六便士》</p>
+    </div>
+  </aside>
+  <main class="main">
+    <div class="topbar">
+      <div class="search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M16 16l4 4"/></svg>搜书名、作者<span class="kbd">⌘K</span></div>
+      <div class="status"><span class="dot"></span>离线可用<span>十一月六日 · 周五</span></div>
+    </div>
+    <div class="stage">
+      <div class="head">
+        <div>
+          <p class="kicker">本机书库 · 八本</p>
+          <h1>书架</h1>
+          <p class="lede">在读放大，其余列目。</p>
+        </div>
+        <div class="head-right">
+          <div class="viewchip"><svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="1"/><path d="M9 5v14"/></svg>书目书架</div>
+          <a class="ghost" href="#"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" fill="none"><path d="M20 12a8 8 0 1 1-2.3-5.7"/><path d="M20 4v5h-5"/></svg>补查</a>
+        </div>
+      </div>
+      <section class="hero" aria-label="在读">
+        <button class="hero-cover" aria-label="我可是正道大师兄">
+          <span class="seal">我</span>
+          <div class="t">我可是正道<br>大师兄</div>
+          <div class="m"></div>
+          <span class="a">本地 TXT</span>
+        </button>
+        <div class="hero-body">
+          <div class="hero-eyebrow"><i></i>01 · 在读</div>
+          <h2>我可是正道大师兄</h2>
+          <p class="hero-meta">连载 · 本地 TXT</p>
+          <p class="hero-last">三天前读到「山门夜话」</p>
+        </div>
+        <div class="hero-right">
+          <div class="hero-progress"><span class="n">42%</span><span class="t">第 12 / 28 章</span></div>
+          <div class="hero-bar"><i></i></div>
+          <button class="hero-cta">继续阅读 <svg viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></svg></button>
+        </div>
+      </section>
+      <div class="list-head"><span>架上其余 · 七本</span><span>最近翻阅</span></div>
+      <div class="biblio">
+        <a class="row" href="#" style="--c:#24344D;--t:#F1E7D2"><span class="spinebar"></span><span class="no">02</span><span class="main-col"><span class="title">月亮与六便士</span><span class="sub">毛姆 · 小说</span></span><span class="recent">昨天翻阅</span><span class="mini">月</span></a>
+        <a class="row" href="#" style="--c:#A4552F;--t:#FFF3E0"><span class="spinebar"></span><span class="no">03</span><span class="main-col"><span class="title">人类简史</span><span class="sub">赫拉利 · 历史</span></span><span class="recent">未开始</span><span class="mini">史</span></a>
+        <a class="row" href="#" style="--c:#6B2B22;--t:#EFDCC2"><span class="spinebar"></span><span class="no">04</span><span class="main-col"><span class="title">百年孤独</span><span class="sub">马尔克斯 · 小说</span></span><span class="recent">未开始</span><span class="mini">孤</span></a>
+        <a class="row" href="#" style="--c:#C9D6DC;--t:#26302A"><span class="spinebar"></span><span class="no">05</span><span class="main-col"><span class="title">局外人</span><span class="sub">加缪 · 小说</span></span><span class="recent">未开始</span><span class="mini">局</span></a>
+        <a class="row" href="#" style="--c:#E8D9B8;--t:#2B2A1F"><span class="spinebar"></span><span class="no">06</span><span class="main-col"><span class="title">The Little Prince</span><span class="sub">Saint-Exupéry · 小说</span></span><span class="recent">未开始</span><span class="mini">星</span></a>
+        <a class="row" href="#" style="--c:#2F4A3A;--t:#EFE3CC"><span class="spinebar"></span><span class="no">07</span><span class="main-col"><span class="title">mr-two-chapters</span><span class="sub">本地 TXT · 测试</span></span><span class="recent">未开始</span><span class="mini">两</span></a>
+        <a class="row" href="#" style="--c:#4A3B52;--t:#EDE4EE"><span class="spinebar"></span><span class="no">08</span><span class="main-col"><span class="title">curl-test</span><span class="sub">本地 TXT · 测试</span></span><span class="recent">未开始</span><span class="mini">卷</span></a>
+      </div>
+      <footer class="foot"><p>共 8 本 · 本机保存 · 不上传</p><p>上次补查 <span>2 小时前</span></p></footer>
+    </div>
+  </main>
+</div>
+</body>
+</html>

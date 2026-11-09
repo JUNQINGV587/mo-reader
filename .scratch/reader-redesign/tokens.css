@@ -1,0 +1,97 @@
+/* 墨读阅读页 · 设计变量（素雅书卷）
+   两版对比稿共用：纸色、墨色、朱砂、字级、间距。 */
+
+:root {
+  /* 纸与墨 */
+  --paper: #f6f1e6;
+  --paper-2: #fbf7ee;
+  --paper-3: #efe8d9;
+  --ink: #2b261e;
+  --ink-soft: #4a4133;
+  --muted: #867b68;
+  --muted-2: #a2967f;
+  --line: #e2d8c4;
+  --line-strong: #cfc1a6;
+  --accent: #9a3b2b;
+  --accent-soft: rgba(154, 59, 43, 0.12);
+
+  /* 字体：优先系统里真实存在的宋体族 */
+  --serif: "Noto Serif CJK SC", "Noto Serif SC", "Songti SC", SimSun, serif;
+  --sans: system-ui, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+
+  /* 字级 */
+  --t-1: 11px;
+  --t-2: 12px;
+  --t-3: 13px;
+  --t-4: 15px;
+  --t-5: 18px;
+  --t-6: 20px;
+  --t-7: 27px;
+  --t-8: 34px;
+
+  /* 间距 */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+  --s-7: 48px;
+  --s-8: 64px;
+  --s-9: 96px;
+
+  /* 形状与动效 */
+  --r-s: 3px;
+  --r-m: 10px;
+  --r-pill: 999px;
+  --shadow-float: 0 12px 32px rgba(66, 48, 28, 0.12);
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--serif);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: var(--r-s);
+}
+
+svg {
+  display: block;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

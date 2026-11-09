@@ -33,6 +33,7 @@ export function memoryDb() {
     chapters: memoryTable(),
     jobs: memoryTable(),
     notes: memoryTable(),
+    folders: memoryTable(),
     settings: { get: () => settings, async set(value) { settings = structuredClone(value) } },
     domain: { async close() {} },
   }

@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A · 书斋</title>
+<link rel="stylesheet" href="tokens.css">
+<style>
+  /* A · 书斋 —— 一本书摊在桌上：双页、页码、书脊、常驻页眉页脚 */
+  .v-a {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    position: relative;
+    isolation: isolate;
+  }
+  .grain {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    opacity: .05;
+    mix-blend-mode: multiply;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+  .topbar, .spread, .pager { position: relative; z-index: 1; }
+
+  /* 顶栏 */
+  .topbar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+    height: 46px;
+    padding: 0 14px 0 6px;
+    border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  }
+  .icon-btn {
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    border-radius: var(--r-s);
+    color: var(--muted);
+    transition: color .18s var(--ease), background .18s var(--ease);
+  }
+  .icon-btn:hover { color: var(--ink); background: rgba(120, 100, 70, .07); }
+  .book { display: flex; align-items: baseline; gap: 10px; margin-left: 2px; }
+  .book-name { font-size: var(--t-3); letter-spacing: .04em; color: var(--ink-soft); }
+  .book-chap { font-size: var(--t-2); color: var(--muted); letter-spacing: .04em; }
+  .top-actions { margin-left: auto; display: flex; gap: 0; }
+  .progress { position: absolute; left: 0; right: 0; bottom: -1px; height: 2px; overflow: hidden; }
+  .progress i {
+    display: block;
+    height: 100%;
+    width: 20%;
+    background: var(--accent);
+    opacity: .5;
+    transition: width .35s var(--ease);
+  }
+
+  /* 双页书心 */
+  .spread {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 0 52px;
+  }
+  .run-head {
+    flex: none;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    height: 36px;
+    padding-bottom: 7px;
+    font-size: var(--t-2);
+    letter-spacing: .16em;
+    color: var(--muted-2);
+  }
+  .run-head .recto { text-align: right; }
+  .spread-body { position: relative; flex: 1; min-height: 0; }
+  .viewport { position: relative; height: 100%; overflow: hidden; }
+  .columns {
+    height: 100%;
+    column-gap: 72px;
+    column-fill: auto;
+    transition: transform .3s var(--ease);
+    will-change: transform;
+  }
+  .spine {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 108px;
+    transform: translateX(-50%);
+    pointer-events: none;
+    background:
+      linear-gradient(90deg,
+        transparent 0%,
+        rgba(74, 54, 32, .032) 30%,
+        rgba(74, 54, 32, .078) 48%,
+        rgba(74, 54, 32, .078) 52%,
+        rgba(74, 54, 32, .032) 70%,
+        transparent 100%);
+  }
+  .spine::after {
+    content: "";
+    position: absolute;
+    top: 4px;
+    bottom: 4px;
+    left: 50%;
+    width: 1px;
+    background: rgba(74, 54, 32, .10);
+  }
+
+  /* 章节起首 */
+  .chap-open { break-inside: avoid; padding-bottom: 34px; text-align: center; }
+  .chap-no {
+    font-size: var(--t-2);
+    letter-spacing: .44em;
+    text-indent: .44em;
+    color: var(--muted);
+  }
+  .chap-title {
+    margin: 16px 0 0;
+    font-size: var(--t-7);
+    line-height: 1.5;
+    font-weight: 600;
+    letter-spacing: .03em;
+    color: var(--ink);
+  }
+  .chap-rule {
+    width: 34px;
+    height: 1px;
+    margin: 22px auto 0;
+    background: var(--accent);
+    opacity: .5;
+  }
+
+  /* 正文 */
+  .columns p {
+    margin: 0;
+    font-size: var(--t-5);
+    line-height: 1.95;
+    text-indent: 2em;
+    text-align: justify;
+    text-justify: inter-ideograph;
+    letter-spacing: .012em;
+    color: var(--ink);
+  }
+
+  /* 翻页提示 */
+  .edge {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    display: grid;
+    place-items: center;
+    width: 40px;
+    height: 104px;
+    border-radius: var(--r-m);
+    color: var(--muted);
+    opacity: 0;
+    transition: opacity .2s var(--ease), background .2s var(--ease), color .2s var(--ease);
+  }
+  .viewport:hover .edge { opacity: .5; }
+  .edge:hover { opacity: 1; color: var(--ink); background: rgba(120, 100, 70, .06); }
+  .edge.left { left: 0; }
+  .edge.right { right: 0; }
+
+  /* 页脚 */
+  .pager {
+    flex: none;
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    height: 46px;
+    padding: 0 14px;
+    border-top: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  }
+  .turn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 10px;
+    border-radius: var(--r-s);
+    font-size: var(--t-2);
+    letter-spacing: .04em;
+    color: var(--muted);
+    transition: color .18s var(--ease), background .18s var(--ease);
+  }
+  .turn:hover { color: var(--ink); background: rgba(120, 100, 70, .06); }
+  .turn.next { justify-self: end; }
+  .folio {
+    font-size: var(--t-2);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: .2em;
+    color: var(--muted);
+  }
+  .folio .dash { margin: 0 .55em; opacity: .45; }
+  .folio.single .dash,
+  .folio.single #folioR { display: none; }
+
+  @media (max-width: 760px) {
+    .topbar { height: 44px; }
+    .book-chap { display: none; }
+    .spread { padding: 0 18px; }
+    .spine { display: none; }
+    .run-head { height: 28px; letter-spacing: .12em; }
+    .run-head .recto { display: none; }
+    .chap-title { font-size: 22px; }
+    .columns p { font-size: 17px; line-height: 1.95; }
+    .pager { height: 44px; padding: 0 8px; }
+    .turn { padding: 7px 6px; }
+  }
+</style>
+</head>
+<body class="v-a">
+  <div class="grain" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <button class="icon-btn" aria-label="返回书架">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>
+    </button>
+    <div class="book">
+      <span class="book-name">我可是正道大师兄</span>
+      <span class="book-chap">第二十四章</span>
+    </div>
+    <div class="top-actions">
+      <button class="icon-btn" aria-label="目录">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+      </button>
+      <button class="icon-btn" aria-label="更多">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="6" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="18" cy="12" r="1.4"/></svg>
+      </button>
+    </div>
+    <div class="progress" aria-hidden="true"><i></i></div>
+  </header>
+
+  <main class="spread">
+    <div class="run-head">
+      <span class="verso">我可是正道大师兄</span>
+      <span class="recto">第二十四章</span>
+    </div>
+    <div class="spread-body">
+      <div class="viewport" id="viewport">
+        <div class="columns" id="cols">
+          <header class="chap-open">
+            <div class="chap-no">第二十四章</div>
+            <h1 class="chap-title">公子我好喜欢你啊诶嘿嘿嘿嘿</h1>
+            <div class="chap-rule"></div>
+          </header>
+      <p>“大胆妖僧，竟敢害我流云国百姓！”</p>
+      <p>一道呵斥之声在大殿内响起，如果不是这声线是个男人的话，江云还以为是陆凝儿要出手降妖。</p>
+      <p>说话的人是那名身着黄袍的贵公子，他站起身，锵的一声拔出剑来，直指莲台之上的空尘禅师。</p>
+      <p>而伴随着此人的动作，他身边的那名女子也站了起来，两人身上流露出神藏境后期的气息。</p>
+      <p>那对相貌普通的男女亦是如此，从他们身上的气息看，这二人已然达到了四极境初期。</p>
+      <p>“公子，我们……”陆凝儿转头看向江云。</p>
+      <p>“不急。”</p>
+      <p>江云轻轻摇头，他本欲出手斩妖，但既然有人要动手了，那么他也乐的清闲。</p>
+      <p>黄袍男子出言呵斥，莲台之上，空尘禅师却是无言一笑，他伸出手在空中一抓，众人体内的精气反倒以更快的速度向他汇聚过去。</p>
+      <p>黄袍公子怒意更盛，挺剑而出，直奔空尘禅师而去。</p>
+      <p>而在他身边的那名面纱女子，则是取出了一柄腰刀，和他一同杀向空尘禅师。</p>
+      <p>“不过神藏境界，也敢同本座动手。”空尘禅师冷哼一声，抬手间一掌推出，似缓实急地轰向二人。</p>
+      <p>“殿下小心！”</p>
+      <p>相貌普通的那名男子心中一惊，急忙出言提醒，同时飞身而出，试图救援黄袍男子。</p>
+      <p>但他们二人距离黄袍男子太远，未等触及到黄袍男子的身体，空尘禅师的那一掌已然打了出去。</p>
+      <p>“砰！”</p>
+      <p>好像空气被压缩，空尘禅师一掌之下，光线都发生了扭曲，黄袍男子和白纱女子像撞墙的鸟儿折了翅膀，从空中坠落在地。</p>
+      <p>“这还是个皇子？”</p>
+      <p>江云看着倒地吐血、正在往自己嘴里塞丹药准备再上一次的黄袍男子，略有惊愕。</p>
+      <p>这流云国的皇子这么莽的吗？</p>
+      <p>与此同时，那对相貌普通、看起来像是皇子随从的男女，也将攻击打到了空尘禅师的身上。</p>
+      <p>一层金光从空尘禅师身上释放出来，将两名四极境修士的攻击挡下，随后反手一挥，两掌同时拍在了二人的胸口。</p>
+      <p>顿时，两人吐血横飞出去，飞的比黄袍男子还远。</p>
+      <p>“这老家伙有点硬啊。”江云盯着空尘禅师。</p>
+      <p>“本欲与你流云国国师做过一场，夺了流云国的龙脉气运助本座修行，却不料被你们发现了。”</p>
+      <p>空尘禅师没有立刻动手，端坐莲台之上，看着台下众人：</p>
+      <p>“也罢，该是本座时运不济，贪图这百名贵人的福禄精气，这才露了行藏，不过一国太子的龙运，却也够本座饱餐一顿了。”</p>
+      <p>江云在台下吃瓜，倒是明白了几分。</p>
+      <p>这黄袍男子不是别人，正是流云国当今太子，顾东平。</p>
+      <p>空尘禅师盯着顾东平，眼中露出贪婪：</p>
+      <p>“这些人修了我的禅法，便会为我所控，你们没有修炼禅法，但听了诵经之声，便是中了本座的欢喜咒，同样逃不掉。”</p>
+      <p>他坐在莲台上，高举双臂：</p>
+      <p>“芸芸众生，皈依于我……”</p>
+      <p>顾东平拄剑站起，意欲再战，但在听到空尘禅师的诵经声后，眼中突然变得一片迷茫。</p>
+      <p>在江云的“法眼”下，空尘禅师昂首诵经，口中发出不明意味的声调。</p>
+      <p>而大殿之内，则迅速被一层粉色妖雾所笼罩。</p>
+      <p>在这粉色妖雾之下，所有人都像失了智一样，眼中一片赤红，原本的清明完全消失。</p>
+      <p>男男女女呼气急促，开始扯掉身上的衣物，捉对厮杀起来……</p>
+      <p>而顾东平和他的随从也受到了影响。</p>
+      <p>那相貌普通的男子被其伴侣一肩膀摔倒，随后欺身而上；顾东平一边解自己的腰带一边扭头去找别人的老婆，被那白纱女子拽了回来一脚踹进了裆里……</p>
+      <p>嘶……</p>
+      <p>江云看得凉飕飕的。</p>
+      <p>“希望太子没……”</p>
+      <p>没等他说完，身体便被人抱住，身穿襦裙的小萝莉扑了上来，两只眼睛仿佛变成了心形——</p>
+      <p>“公子，我好喜欢你啊，我好喜欢你啊…诶嘿嘿嘿嘿……”</p>
+      <p>妈耶！</p>
+      <p>江云吓了一大跳。</p>
+      <p>她的眼睛亮晶晶的，脸色酡红，小嘴粉嘟嘟的：</p>
+      <p>“我好喜欢你啊公子，好喜欢……”</p>
+      <p>“虽然我很喜欢活泼的小姑娘，但也不用这么活泼……”</p>
+      <p>江云一边按住抱着自己乱亲的陆凝儿，一边看着场中的景象，还有余力在心里吐槽。</p>
+      <p>有男女、女男。</p>
+      <p>也有男男、女女……</p>
+      <p>不远处还有一位抱着柱子的老兄，属实是位猛汉。</p>
+      <p>空尘禅师的“欢喜咒”不仅会扰乱人的七情六欲，还会影响神智。</p>
+      <p>中咒较浅的陆凝儿还在“诶嘿嘿嘿嘿我喜欢你”。</p>
+      <p>中咒深刻的已经开始阿巴阿巴阿巴了……</p>
+      <p>“该结束了。”</p>
+      <p>江云摇了摇头，抱着陆凝儿，身体向前踏出了一步：</p>
+      <p>“观自在菩萨，行深般若波罗蜜多时，照见五蕴皆空，度一切苦厄。舍利子，色不异空，空不异色，色即是空，空即是色，受想行识……”</p>
+      <p>清朗的声音在大殿之中响起，江云踏步向前。</p>
+      <p>每一步落下，都有一朵法力凝聚的莲花绽放。</p>
+      <p>一层氤氲光华自他周身散发出去，涤荡心灵，光华所过之处，混乱的信徒开始恢复清明。</p>
+      <p>“你是何人！”</p>
+      <p>空尘禅师惊呼出声，再无之前的高手风范。</p>
+      <p>直到对方出声诵经，他才注意到那个人的身影。</p>
+      <p>并非是没有看见，而是在潜意识里，他把对方给忽略了。</p>
+      <p>就像大多数人都能看见自己的鼻子，但日常生活中，却根本注意不到鼻子的存在。</p>
+      <p>这本身就相当不妙。</p>
+      <p>空尘禅师自问也是一方高手，灵觉何其敏锐，明明对方就在眼前，又为何会视而不见？</p>
+      <p>而现在，面前的白袍公子更是步步生莲，口诵佛经，竟是要将他的咒法悉数化去！</p>
+      <p>“我是谁并不重要。”白袍公子怀中抱妹，单臂持武僧礼，“重要的是，贫僧这就超度施主。”</p>
+      <p>“狂妄！”</p>
+      <p>空尘禅师大怒，抬手间一抹金光浮现，却是一柄金刚降魔杵。</p>
+      <p>这降魔宝杵约有一尺来长，前段呈三棱状，周身法光流转，有道道雷霆缠绕。</p>
+      <p>“去！”空尘禅师一声低喝。</p>
+      <p>“轰”的一声，这降魔宝杵破空而至，带起道道雷光，径直打在了江云的心口。</p>
+      <p>空尘禅师脸上浮现出一抹喜色，心想这小子看起来云淡风轻，没想到真打起来却是个银样蜡枪头，连他的宝杵都躲不过去。</p>
+      <p>他自出道以来，磨砺这宝杵多年，早已将其炼制成一柄杀伐利器。</p>
+      <p>凡是被降魔宝杵打中的，不死也要筋断骨折。</p>
+      <p>这小子已经完了，空尘禅师心想。</p>
+        </div>
+        <button class="edge left" aria-label="上一页">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>
+        </button>
+        <button class="edge right" aria-label="下一页">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>
+        </button>
+      </div>
+      <div class="spine" aria-hidden="true"></div>
+    </div>
+  </main>
+
+  <footer class="pager">
+    <button class="turn prev">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>
+      上一章
+    </button>
+    <div class="folio"><span id="folioL">01</span><span class="dash">—</span><span id="folioR">02</span></div>
+    <button class="turn next">
+      下一章
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>
+    </button>
+  </footer>
+
+<script>
+  const viewport = document.getElementById('viewport');
+  const cols = document.getElementById('cols');
+  const bar = document.querySelector('.progress i');
+  let index = 0, pages = 1, step = 560, perViewNow = 2;
+
+  function layout() {
+    const w = viewport.clientWidth;
+    const h = viewport.clientHeight;
+    const perView = w >= 760 ? 2 : 1;
+    perViewNow = perView;
+    const gap = perView === 2 ? 72 : 0;
+    const colW = perView === 2 ? (w - gap) / 2 : w;
+    cols.style.columnWidth = colW + 'px';
+    cols.style.columnGap = gap + 'px';
+
+    /* 栏高取整到行高，末行不会被切一半 */
+    const lh = parseFloat(getComputedStyle(cols.querySelector('p')).lineHeight) || 35;
+    const head = cols.querySelector('.chap-open');
+    head.style.height = 'auto';
+    head.style.height = Math.ceil(head.offsetHeight / lh) * lh + 'px';
+    cols.style.height = Math.floor(h / lh) * lh + 'px';
+
+    step = colW + gap;
+    const total = Math.max(1, Math.round((cols.scrollWidth + gap) / step));
+    pages = Math.max(1, total - (perView - 1));
+    if (index > pages - 1) index = pages - 1;
+    apply();
+  }
+
+  function apply() {
+    cols.style.transform = 'translateX(' + (-index * step) + 'px)';
+    const folio = document.querySelector('.folio');
+    folio.classList.toggle('single', perViewNow === 1);
+    document.getElementById('folioL').textContent = perViewNow === 1
+      ? (index + 1) + ' / ' + pages
+      : String(index * 2 + 1).padStart(2, '0');
+    document.getElementById('folioR').textContent = String(Math.min(index * 2 + 2, pages * 2)).padStart(2, '0');
+    bar.style.width = Math.round(((index + 1) / pages) * 100) + '%';
+  }
+
+  function turn(d) {
+    const n = Math.min(pages - 1, Math.max(0, index + d));
+    if (n !== index) { index = n; apply(); }
+  }
+
+  viewport.addEventListener('click', e => {
+    if (e.target.closest('.edge')) return;
+    const r = viewport.getBoundingClientRect();
+    turn(e.clientX - r.left < r.width / 2 ? -1 : 1);
+  });
+  document.querySelector('.edge.left').addEventListener('click', () => turn(-1));
+  document.querySelector('.edge.right').addEventListener('click', () => turn(1));
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight') turn(1);
+    if (e.key === 'ArrowLeft') turn(-1);
+  });
+  window.addEventListener('resize', layout);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(layout);
+  layout();
+</script>
+</body>
+</html>

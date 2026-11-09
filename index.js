@@ -23,6 +23,7 @@ export const REMOTE_METHODS = Object.freeze([
   'state', 'importSource', 'restoreBuiltinSources', 'removeSource', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
   'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
   'exportBackup', 'importBackup', 'fetchCover', 'cacheBookCover', 'bookCandidates', 'applyBookMeta',
+  'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead',
 ])
 
 function assertObject(value, label = 'arguments') {
@@ -156,6 +157,7 @@ export class ReaderService extends TypertRemoteService {
     return {
       sources: [importedSource(), ...entries(this.db.sources)].map(clone),
       books: entries(this.db.books).map(book => this.bookView(book)),
+      folders: entries(this.db.folders).map(clone),
       jobs: entries(this.db.jobs).map(jobView),
       settings: clone(this.db.settings.get()),
       notes: entries(this.db.notes).map(clone),
@@ -603,6 +605,8 @@ export class ReaderService extends TypertRemoteService {
     const meta = args.meta && typeof args.meta === 'object' ? args.meta : {}
     let enriched = { ...meta }
     if (meta.sourceId && meta.bookUrl) {
+      const stored = this.db.sources.get(meta.sourceId)
+      console.log('[applyBookMeta] meta', JSON.stringify({ sourceId: meta.sourceId, bookUrl: meta.bookUrl, hasSource: !!stored, builtin: stored?.builtin, hasBookInfo: !!stored?.rules?.bookInfo }))
       let source = this.db.sources.get(meta.sourceId)
       if (source?.builtin && !source.rules?.bookInfo) {
         const raw = BUILTIN_SOURCES.find((item) => normalizeSource(item).id === source.id)
@@ -611,6 +615,7 @@ export class ReaderService extends TypertRemoteService {
       if (source) {
         try {
           const info = await this.engine.bookInfo(source, meta.bookUrl)
+          console.log('[applyBookMeta] bookInfo result', JSON.stringify({ coverUrl: info.coverUrl, intro: info.intro?.substring(0, 100), keys: Object.keys(info) }))
           for (const key of ['author', 'intro', 'coverUrl']) if (!enriched[key] && info[key]) enriched[key] = info[key]
         } catch (error) {
           this.log('warn', 'book info failed', error)
@@ -702,6 +707,111 @@ export class ReaderService extends TypertRemoteService {
     if (!this.db.notes.get(noteId)) throw new ReaderError('reader/not-found', 'Note not found.')
     await this.db.notes.delete(noteId)
     return { removed: true, id: noteId }
+  }
+
+  async createFolder(args) {
+    args ??= {}
+    this.assertReady()
+    const name = requiredString(args.name, 'name', 200).trim()
+    const folder = { id: id('folder'), name, createdAt: now() }
+    await this.db.folders.put(folder.id, folder)
+    return clone(folder)
+  }
+
+  async renameFolder(args) {
+    args ??= {}
+    this.assertReady()
+    const folder = this.db.folders.get(requiredString(args.folderId, 'folderId'))
+    if (!folder) throw new ReaderError('reader/not-found', 'Folder not found.')
+    const next = { ...folder, name: requiredString(args.name, 'name', 200).trim() }
+    await this.db.folders.put(next.id, next)
+    return clone(next)
+  }
+
+  async removeFolder(args) {
+    args ??= {}
+    this.assertReady()
+    const folder = this.db.folders.get(requiredString(args.folderId, 'folderId'))
+    if (!folder) throw new ReaderError('reader/not-found', 'Folder not found.')
+    // Move all books in this folder back to root
+    for (const book of entries(this.db.books)) {
+      if (book.folderId === folder.id) await this.db.books.put(book.id, { ...book, folderId: undefined, updatedAt: now() })
+    }
+    await this.db.folders.delete(folder.id)
+    return { removed: true, id: folder.id }
+  }
+
+  async moveBooksToFolder(args) {
+    args ??= {}
+    this.assertReady()
+    const folderId = args.folderId === null || args.folderId === undefined ? undefined : requiredString(args.folderId, 'folderId')
+    if (folderId && !this.db.folders.get(folderId)) throw new ReaderError('reader/not-found', 'Folder not found.')
+    const bookIds = Array.isArray(args.bookIds) ? args.bookIds : [args.bookId]
+    if (!bookIds.length) throw new ReaderError('reader/invalid-input', 'No books selected.')
+    const moved = []
+    for (const bookId of bookIds) {
+      const book = this.book(bookId)
+      await this.db.books.put(book.id, { ...book, folderId, updatedAt: now() })
+      moved.push(bookId)
+    }
+    return { moved, folderId }
+  }
+
+  async batchDeleteBooks(args) {
+    args ??= {}
+    this.assertReady()
+    const bookIds = Array.isArray(args.bookIds) ? args.bookIds : [args.bookId]
+    if (!bookIds.length) throw new ReaderError('reader/invalid-input', 'No books selected.')
+    const removed = []
+    for (const bookId of bookIds) {
+      const book = this.db.books.get(bookId)
+      if (!book) continue
+      await this.removeBook({ bookId })
+      removed.push(bookId)
+    }
+    return { removed }
+  }
+
+  async batchDownloadBooks(args) {
+    args ??= {}
+    this.assertReady()
+    const bookIds = Array.isArray(args.bookIds) ? args.bookIds : [args.bookId]
+    if (!bookIds.length) throw new ReaderError('reader/invalid-input', 'No books selected.')
+    const queued = []
+    for (const bookId of bookIds) {
+      const book = this.db.books.get(bookId)
+      if (!book) continue
+      const job = await this.download({ bookId })
+      queued.push({ bookId, jobId: job.id })
+    }
+    return { queued }
+  }
+
+  async exportBook(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const format = args.format || 'txt'
+    const chapters = this.chapters(book.id)
+    if (!chapters.length) throw new ReaderError('reader/invalid-input', '这本书还没有章节。')
+    if (format === 'txt' || format === 'md') {
+      const lines = []
+      for (const chapter of chapters) {
+        if (format === 'md') lines.push(`\n\n# ${chapter.title}\n\n`)
+        else lines.push(`\n\n${chapter.title}\n\n`)
+        if (typeof chapter.text === 'string') lines.push(chapter.text)
+      }
+      return { name: book.name, format, text: lines.join('') }
+    }
+    throw new ReaderError('reader/invalid-input', `不支持的导出格式 ${format}，目前只支持 txt 和 md。`)
+  }
+
+  async markBookRead(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    await this.db.books.put(book.id, { ...book, readAt: now(), updatedAt: now() })
+    return this.bookView(this.book(book.id))
   }
 
   async exportBackup() {
