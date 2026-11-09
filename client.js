@@ -3065,7 +3065,6 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
   .mr-chapter{width:min(var(--mr-text,672px),calc(100% - 160px))}
   .mr-tools{right:8px}
   .mr-tool-btn{width:48px;padding:6px 0}
-  .mr-shelf-gallery{grid-template-columns:repeat(2,minmax(0,1fr))}
   .mr-book-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
   .mr-drawer{width:320px}
 }
@@ -3077,7 +3076,6 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
   .mr-chapter{width:min(var(--mr-text,672px),calc(100% - 240px))}
   .mr-tools{right:20px}
   .mr-tool-btn{width:56px;padding:10px 0}
-  .mr-shelf-gallery{grid-template-columns:repeat(3,minmax(0,1fr))}
   .mr-book-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
   .mr-drawer{width:400px}
 }
