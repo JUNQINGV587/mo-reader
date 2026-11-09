@@ -22,7 +22,7 @@ const COVER_MAX_BYTES = 2 * 1024 * 1024
 export const REMOTE_METHODS = Object.freeze([
   'state', 'importSource', 'removeSource', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
   'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
-  'exportBackup', 'importBackup', 'fetchCover',
+  'exportBackup', 'importBackup', 'fetchCover', 'cacheBookCover', 'bookCandidates', 'applyBookMeta',
 ])
 
 function assertObject(value, label = 'arguments') {
@@ -249,6 +249,7 @@ export class ReaderService extends TypertRemoteService {
       download: previous?.download ?? { status: 'none', auto: false },
     }
     await this.db.books.put(book.id, book)
+    await this.cacheCover(book)
     if (args.download === true) {
       const job = await this.download({ bookId: book.id })
       return { ...this.bookView(book), download: { ...this.bookView(book).download, status: 'queued', jobId: job.id } }
@@ -531,6 +532,73 @@ export class ReaderService extends TypertRemoteService {
     return { dataUrl, cached: false }
   }
 
+  async cacheCover(book) {
+    const url = String(book?.coverUrl || '').trim()
+    if (!url || /^data:/i.test(url) || book.coverLocal) return book
+    try {
+      const result = await this.fetchCover({ bookId: book.id })
+      const next = { ...book, coverLocal: result.dataUrl, updatedAt: now() }
+      await this.db.books.put(next.id, next)
+      return next
+    } catch {
+      return book
+    }
+  }
+
+  async cacheBookCover(args) {
+    args ??= {}
+    this.assertReady()
+    const book = { ...this.book(args.bookId), coverLocal: '' }
+    if (!book.coverUrl) throw new ReaderError('reader/not-found', '这本书还没有封面地址。')
+    const next = await this.cacheCover(book)
+    return { book: this.bookView(next), cached: Boolean(next.coverLocal) }
+  }
+
+  async bookCandidates(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const keyword = requiredString(args.query ?? book.name, 'query', 200)
+    const targets = [importedSource(), ...entries(this.db.sources)].filter(source => source.enabled !== false && source.rules?.search?.url)
+    const settled = await Promise.allSettled(targets.map(async (source) => {
+      try {
+        const items = await this.engine.search(source, { query: keyword, page: 1 })
+        return items.slice(0, 2).map(item => ({ ...item, sourceId: source.id, sourceName: source.name }))
+      } catch {
+        return []
+      }
+    }))
+    const candidates = []
+    for (const outcome of settled) if (outcome.status === 'fulfilled') candidates.push(...outcome.value)
+    return { query: keyword, candidates: candidates.slice(0, 8).map(item => ({
+      sourceId: item.sourceId,
+      sourceName: item.sourceName,
+      name: String(item.name || '').trim(),
+      author: String(item.author || '').trim(),
+      intro: String(item.intro || '').trim(),
+      coverUrl: String(item.coverUrl || '').trim(),
+      bookUrl: String(item.bookUrl || '').trim(),
+    })) }
+  }
+
+  async applyBookMeta(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const meta = args.meta && typeof args.meta === 'object' ? args.meta : {}
+    const next = {
+      ...book,
+      author: String(meta.author ?? book.author ?? '').trim(),
+      intro: String(meta.intro ?? book.intro ?? '').trim(),
+      coverUrl: String(meta.coverUrl ?? book.coverUrl ?? '').trim(),
+      coverLocal: String(meta.coverUrl ?? '') === String(book.coverUrl ?? '') ? book.coverLocal : '',
+      updatedAt: now(),
+    }
+    await this.db.books.put(next.id, next)
+    const cached = await this.cacheCover(next)
+    return this.bookView(cached)
+  }
+
   async setSettings(args) {
     const partial = args ?? {}
     this.assertReady()
@@ -636,3 +704,4 @@ export class ReaderService extends TypertRemoteService {
 }
 
 export default ReaderService
+

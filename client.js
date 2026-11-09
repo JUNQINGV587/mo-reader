@@ -11,6 +11,7 @@ window.__ModuleLoader__.load({
       'state', 'importSource', 'removeSource', 'search', 'discover', 'addBook', 'removeBook',
       'toc', 'chapter', 'saveProgress', 'download', 'cancelJob', 'checkUpdates', 'importLocal',
       'setSettings', 'setBookSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
+      'cacheBookCover', 'bookCandidates', 'applyBookMeta',
     ];
     const jsonCodec = () => ({ mode: 'strict', typeSymbol: '@local/mo-reader#Json', create: () => z.json() });
     const readerContribution = {
@@ -203,7 +204,7 @@ window.__ModuleLoader__.load({
     ];
 
     function BookCover({ book, small = false }) {
-      const cover = book.coverUrl || book.cover;
+      const cover = book.coverLocal || book.coverUrl || book.cover;
       const name = book.name || book.title || '书';
       const tone = SHELF_COVER_TONES[hashHue(name) % SHELF_COVER_TONES.length];
       return h('div', { className: `mr-cover ${small ? 'small' : ''}`, style: { background: tone.bg } },
@@ -304,14 +305,14 @@ window.__ModuleLoader__.load({
         onOpen?.(book, {
           rect: rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null,
           panel: panel ? { left: panel.left, top: panel.top, width: panel.width, height: panel.height } : null,
-          cover: book.coverUrl || book.cover || '',
+          cover: book.coverLocal || book.coverUrl || book.cover || '',
           bookId: String(book.id || book.bookId || ''),
         });
       };
       const coverNode = (book, name, variant = 1) => {
         const display = name.replace(/\.(?:txt|epub|md|pdf)$/i, '');
         const latin = !/[\u3400-\u9fff]/.test(display);
-        const cover = book.coverUrl || book.cover || '';
+        const cover = book.coverLocal || book.coverUrl || book.cover || '';
         const sealBg = ['#211C16', '#B08A46', '#B08A46', '#B08A46', '#211C16', '#B08A46', '#211C16', '#B08A46'];
         const sealFg = ['#F4F1E9', '#211C16', '#211C16', '#211C16', '#F4F1E9', '#211C16', '#F4F1E9', '#211C16'];
         const idx = (variant - 1) % 8;
@@ -1897,6 +1898,37 @@ window.__ModuleLoader__.load({
           data.cover ? h('img', { src: data.cover, alt: '' }) : h('span', null, name.slice(0, 1))));
     }
 
+    function MetaSheet({ state, onClose, onPick }) {
+      if (!state) return null
+      const title = String(state.book?.name || state.book?.title || '').replace(/\.(?:txt|epub|md)$/i, '')
+      const candidates = state.candidates || []
+      const body = state.busy
+        ? h('p', { className: 'mr-meta-status' }, '正在搜书源…')
+        : state.error
+          ? h('p', { className: 'mr-meta-status' }, '补全信息暂时不可用，可以跳过。')
+          : candidates.length === 0
+            ? h('p', { className: 'mr-meta-status' }, '没搜到合适的，可以跳过。')
+          : h('div', { className: 'mr-meta-list' }, candidates.map((item, index) => h('button', {
+            key: `${item.sourceId}-${index}`,
+            type: 'button',
+            className: 'mr-meta-row',
+            onClick: () => onPick(item),
+          },
+          h('span', { className: 'mr-meta-cover' }, item.coverUrl ? h('img', { src: item.coverUrl, alt: '', loading: 'lazy' }) : String(item.name || '?').slice(0, 1)),
+          h('span', { className: 'mr-meta-copy' },
+            h('strong', null, item.name || '未命名'),
+            h('small', null, [item.author, item.sourceName].filter(Boolean).join(' · ')),
+            item.intro ? h('em', null, item.intro) : null))))
+      return h('div', { className: 'mr-meta-backdrop', role: 'dialog', 'aria-label': '补全书籍信息', onClick: onClose },
+        h('div', { className: 'mr-meta-sheet', onClick: (event) => event.stopPropagation() },
+          h('header', { className: 'mr-meta-head' },
+            h('h2', null, '补全书籍信息'),
+            h('button', { type: 'button', className: 'mr-meta-close', 'aria-label': '关闭', onClick: onClose }, h(Glyph, { name: 'close' }))),
+          h('p', { className: 'mr-meta-sub' }, `从书源里挑一条最像「${title}」的信息，或者跳过。`),
+          body,
+          h('footer', { className: 'mr-meta-foot' }, h('button', { type: 'button', className: 'mr-meta-skip', onClick: onClose }, '跳过'))))
+    }
+
     function ReaderApp({ ctx }) {
       const [data, setData] = useState({ sources: [], books: [], jobs: [], notes: [], settings: DEFAULT_SETTINGS });
       const [tab, setTab] = useState('library');
@@ -1906,6 +1938,7 @@ window.__ModuleLoader__.load({
       const [selectedSource, setSelectedSource] = useState('');
       const [results, setResults] = useState(null)
       const [shelfOnline, setShelfOnline] = useState(null)
+      const [metaSheet, setMetaSheet] = useState(null)
       const [shelfOnlineBusy, setShelfOnlineBusy] = useState(false)
       const [shelfOnlineFailed, setShelfOnlineFailed] = useState(0)
       const shelfSearchTicket = useRef(0);
@@ -2035,6 +2068,27 @@ window.__ModuleLoader__.load({
         }));
         return call(ctx, 'setBookSettings', { bookId, ...partial }).catch((cause) => notify(cause.message || String(cause), 'error'));
       };
+      const openMetaSheet = async (book) => {
+        const bookId = book.id || book.bookId;
+        setMetaSheet({ book, bookId, candidates: null, busy: true });
+        try {
+          const result = await call(ctx, 'bookCandidates', { bookId });
+          setMetaSheet({ book, bookId, candidates: result?.candidates || [], busy: false });
+        } catch (cause) {
+          const message = cause.message || String(cause);
+          setMetaSheet({ book, bookId, candidates: [], busy: false, error: message });
+        }
+      };
+      const applyMetaCandidate = async (candidate) => {
+        const bookId = metaSheet?.bookId;
+        if (!bookId) return;
+        setMetaSheet(null);
+        try {
+          await call(ctx, 'applyBookMeta', { bookId, meta: candidate });
+          await refresh(true);
+          notify('已补全书籍信息', 'success');
+        } catch (cause) { notify(cause.message || String(cause), 'error'); }
+      };
       const localImport = async (file) => {
         if (file.size > 50 * 1024 * 1024) return notify('单本书不能超过 50MB', 'error');
         const format = file.name.toLowerCase().endsWith('.epub') ? 'epub' : 'txt';
@@ -2048,7 +2102,9 @@ window.__ModuleLoader__.load({
             for (let i = 0; i < bytes.length; i += 32768) binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
             args.base64 = btoa(binary);
           }
-          await call(ctx, 'importLocal', args); await refresh(true); notify('书籍已导入', 'success'); setTab('library');
+          const imported = await call(ctx, 'importLocal', args);
+          await refresh(true); notify('书籍已导入', 'success'); setTab('library');
+          if (imported && !String(imported.author || '').trim()) void openMetaSheet(imported);
         } catch (cause) { notify(cause.message || String(cause), 'error'); }
         finally { setBusy(false); }
       };
@@ -2081,7 +2137,7 @@ window.__ModuleLoader__.load({
         h(ReaderView, { ctx, book: activeBook, settings, notes, notice, onDismissNotice: () => setNotice(null), deferMs: opening ? 200 : 0, onSettings: updateSettings, onBookSettings: (partial) => updateBookSettings(activeBook.id || activeBook.bookId, partial), onClose: () => { setOpening(null); setReading(null); refresh(true); }, onSaveNote: saveNote, onDeleteNote: (note) => run(() => call(ctx, 'deleteNote', { id: note.id })).catch(() => {}), notify }),
         opening ? h(OpenTransition, { key: opening.bookId || 'open', data: opening, onDone: () => setOpening(null) }) : null);
 
-      return h(React.Fragment, null, h('style', null, css), h('div', { className: 'mr-root' },
+      return h(React.Fragment, null, h('style', null, css), h(MetaSheet, { state: metaSheet, onClose: () => setMetaSheet(null), onPick: applyMetaCandidate }), h('div', { className: 'mr-root' },
         h('nav', { className: 'mr-nav', 'aria-label': '墨读' },
           h('div', { className: 'mr-brand' }, h(ReaderIcon, { size: 30 }), h('div', null, h('strong', null, '墨读'), h('small', null, '读想读的书'))),
           h('div', { className: 'mr-nav-items' }, nav.map(([id, label, icon]) => h('button', { key: id, className: tab === id ? 'active' : '', onClick: () => setTab(id) }, h(Glyph, { name: icon }), h('span', null, label)))),
@@ -2141,6 +2197,26 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-shelf-online-list{display:flex;flex-direction:column;gap:2px}
 .mr-shelf-online-row{display:flex;align-items:center;gap:14px;padding:12px 4px;border-bottom:1px solid var(--mr-line)}
 .mr-shelf-online-row:last-child{border-bottom:0}
+.mr-meta-backdrop{position:absolute;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(24,21,16,.30);backdrop-filter:blur(2px)}
+.mr-meta-sheet{width:min(560px,100%);max-height:min(600px,100%);overflow:auto;padding:18px 20px 14px;border-radius:14px;background:var(--dsw-alias-bg-base,#fff);border:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1));box-shadow:0 24px 60px rgba(0,0,0,.22)}
+.mr-meta-head{display:flex;align-items:center;justify-content:space-between}
+.mr-meta-head h2{margin:0;font-size:15px;font-weight:600;color:var(--dsw-alias-text-1)}
+.mr-meta-close{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border:0;border-radius:8px;background:none;color:var(--dsw-alias-text-2);cursor:pointer}
+.mr-meta-close:hover{background:var(--dsw-alias-bg-2,rgba(0,0,0,.05));color:var(--dsw-alias-text-1)}
+.mr-meta-sub{margin:4px 0 14px;font-size:12px;line-height:1.6;color:var(--dsw-alias-text-2)}
+.mr-meta-status{margin:0;padding:18px 0;font-size:12px;color:var(--dsw-alias-text-2)}
+.mr-meta-list{display:flex;flex-direction:column;gap:6px}
+.mr-meta-row{display:flex;align-items:flex-start;gap:12px;width:100%;padding:10px;border:1px solid transparent;border-radius:10px;background:none;text-align:left;cursor:pointer}
+.mr-meta-row:hover{border-color:var(--dsw-alias-border-l2,rgba(0,0,0,.12));background:var(--dsw-alias-bg-2,rgba(0,0,0,.03))}
+.mr-meta-cover{display:flex;align-items:center;justify-content:center;flex:none;width:38px;height:52px;overflow:hidden;border-radius:4px;background:var(--dsw-alias-bg-3,rgba(0,0,0,.06));font-size:14px;color:var(--dsw-alias-text-2)}
+.mr-meta-cover img{width:100%;height:100%;object-fit:cover}
+.mr-meta-copy{display:flex;flex-direction:column;gap:2px;min-width:0}
+.mr-meta-copy strong{font-size:13px;font-weight:600;color:var(--dsw-alias-text-1)}
+.mr-meta-copy small{font-size:11px;color:var(--dsw-alias-text-2)}
+.mr-meta-copy em{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:11px;font-style:normal;line-height:1.6;color:var(--dsw-alias-text-3)}
+.mr-meta-foot{display:flex;justify-content:flex-end;margin-top:10px}
+.mr-meta-skip{padding:6px 10px;border:0;border-radius:8px;background:none;color:var(--dsw-alias-text-2);font-size:12px;cursor:pointer}
+.mr-meta-skip:hover{background:var(--dsw-alias-bg-2,rgba(0,0,0,.05));color:var(--dsw-alias-text-1)}
 .mr-shelf-online-cover{flex:none;width:42px;height:56px;border-radius:4px;overflow:hidden;background:var(--mr-sunken);display:flex;align-items:center;justify-content:center;font-size:16px;color:var(--mr-muted)}
 .mr-shelf-online-cover img{width:100%;height:100%;object-fit:cover}
 .mr-shelf-online-info{min-width:0;flex:1}
