@@ -9,9 +9,10 @@ window.__ModuleLoader__.load({
     const PANEL_ID = 'reader';
     const REMOTE_METHODS = [
       'state', 'importSource', 'removeSource', 'restoreBuiltinSources', 'search', 'discover', 'addBook', 'removeBook',
-      'toc', 'chapter', 'saveProgress', 'download', 'cancelJob', 'checkUpdates', 'importLocal',
+      'toc', 'chapter', 'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal',
       'setSettings', 'setBookSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
       'cacheBookCover', 'bookCandidates', 'applyBookMeta',
+      'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead',
     ];
     const jsonCodec = () => ({ mode: 'strict', typeSymbol: '@local/mo-reader#Json', create: () => z.json() });
     const readerContribution = {
@@ -262,8 +263,12 @@ window.__ModuleLoader__.load({
       }, badge.label);
     }
 
-    function ShelfBoard({ books, reducedMotion = false, onOpen, headActions, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline }) {
+    function ShelfBoard({ books, folders = [], reducedMotion = false, onOpen, headActions, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead }) {
       const [query, setQuery] = useState('');
+      const [selectMode, setSelectMode] = useState(false);
+      const [selected, setSelected] = useState(new Set());
+      const [folderFilter, setFolderFilter] = useState(null);
+      const [folderSheet, setFolderSheet] = useState(false);
       const searchRef = useRef(null);
       useEffect(() => {
         const onKey = (event) => {
@@ -279,6 +284,17 @@ window.__ModuleLoader__.load({
       }, []);
       const layout = shelfLayout(books);
       const lastRead = layout.lastRead;
+      const folderMap = useMemo(() => new Map(folders.map(f => [f.id, f])), [folders]);
+      const booksInFolder = useMemo(() => {
+        const map = new Map();
+        for (const book of layout.books) {
+          const fid = book.folderId || null;
+          if (!map.has(fid)) map.set(fid, []);
+          map.get(fid).push(book);
+        }
+        return map;
+      }, [layout.books]);
+      const visibleBooks = folderFilter ? (booksInFolder.get(folderFilter) || []) : (booksInFolder.get(null) || []);
       const debounceRef = useRef(null);
       useEffect(() => {
         if (!onSearchOnline) return undefined;
@@ -293,10 +309,24 @@ window.__ModuleLoader__.load({
       const normalizedQuery = query.trim().toLowerCase();
       const matches = normalizedQuery
         ? layout.books.filter((book) => `${book.name || book.title || ''} ${book.author || ''}`.toLowerCase().includes(normalizedQuery))
-        : layout.books;
-      const heroBook = normalizedQuery ? null : lastRead;
+        : visibleBooks;
+      const heroBook = normalizedQuery || folderFilter || selectMode ? null : lastRead;
       const gridBooks = matches.filter((book) => book !== heroBook);
+      const toggleSelect = (book) => {
+        const id = book.id || book.bookId;
+        setSelected(prev => {
+          const next = new Set(prev);
+          if (next.has(id)) next.delete(id); else next.add(id);
+          return next;
+        });
+      };
+      const toggleSelectAll = () => {
+        if (selected.size === gridBooks.length) setSelected(new Set());
+        else setSelected(new Set(gridBooks.map(b => b.id || b.bookId)));
+      };
+      const exitSelect = () => { setSelectMode(false); setSelected(new Set()); };
       const open = (book, event) => {
+        if (selectMode) { toggleSelect(book); return; }
         const scope = event.currentTarget.closest?.('.mr-shelf-hero, .mr-shelf-book') || event.currentTarget;
         const cover = scope.querySelector?.('.mr-shelf-cover') || event.currentTarget.querySelector?.('.mr-shelf-cover');
         const rect = cover?.getBoundingClientRect?.() || scope.getBoundingClientRect?.();
@@ -362,10 +392,42 @@ window.__ModuleLoader__.load({
         h('div', { className: 'mr-shelf-head' },
           h('div', { className: 'mr-shelf-head-copy' },
             h('div', { className: 'kicker' },
-              h('span', null, normalizedQuery ? `找到 ${matches.length} 本` : `本机书库 · ${layout.count} 本`),
+              h('span', null, normalizedQuery ? `找到 ${matches.length} 本` : folderFilter ? (folderMap.get(folderFilter)?.name || '文件夹') : `本机书库 · ${layout.count} 本`),
               h('span', { className: 'tag' }, '画廊')),
             h('h1', null, '书架')),
-          headActions ? h('div', { className: 'mr-shelf-head-actions' }, headActions) : null),
+          h('div', { className: 'mr-shelf-head-actions' },
+            headActions,
+            h(Button, { kind: selectMode ? 'primary' : 'secondary', onClick: () => { setSelectMode(!selectMode); setSelected(new Set()); } }, selectMode ? '退出多选' : '多选'))),
+        folders.length > 0 || selectMode ? h('div', { className: 'mr-shelf-folder-bar' },
+          h('button', { className: `mr-folder-chip${!folderFilter ? ' active' : ''}`, onClick: () => setFolderFilter(null) }, '全部'),
+          folders.map(f => h('button', {
+            key: f.id,
+            className: `mr-folder-chip${folderFilter === f.id ? ' active' : ''}`,
+            onClick: () => setFolderFilter(f.id),
+            onDoubleClick: () => { const name = window.prompt('重命名文件夹', f.name); if (name) onRenameFolder?.(f.id, name); },
+          }, f.name)),
+          h('button', { className: 'mr-folder-chip mr-folder-add', onClick: () => { const name = window.prompt('新建文件夹'); if (name) onCreateFolder?.(name); } }, '+ 新建'),
+          folderFilter ? h('button', { className: 'mr-folder-chip mr-folder-del', onClick: () => { if (window.confirm(`删除文件夹「${folderMap.get(folderFilter)?.name}」？里面的书会回到书架。`)) { onRemoveFolder?.(folderFilter); setFolderFilter(null); } } }, '删除此文件夹') : null) : null,
+        selectMode ? h('div', { className: 'mr-select-bar' },
+          h('label', { className: 'mr-select-all' }, h('input', { type: 'checkbox', checked: selected.size === gridBooks.length && gridBooks.length > 0, onChange: toggleSelectAll }), `全选 (${selected.size}/${gridBooks.length})`),
+          h('div', { className: 'mr-select-actions' },
+            h(Button, { kind: 'secondary', disabled: !selected.size, onClick: () => setFolderSheet(true) }, '移动到…'),
+            h(Button, { kind: 'secondary', disabled: !selected.size, onClick: () => onBatchDownload?.(Array.from(selected)) }, '下载'),
+            h(Button, { kind: 'secondary', disabled: !selected.size, onClick: () => onExport?.(Array.from(selected)) }, '导出'),
+            h(Button, { kind: 'secondary', disabled: !selected.size, onClick: () => onMarkRead?.(Array.from(selected)) }, '标已读'),
+            h(Button, { kind: 'danger', disabled: !selected.size, onClick: () => { if (window.confirm(`删除 ${selected.size} 本书？`)) onBatchDelete?.(Array.from(selected)); } }, '删除'),
+            h(Button, { kind: 'text', onClick: exitSelect }, '取消'))) : null,
+        folderSheet ? h('div', { className: 'mr-folder-sheet-backdrop', onClick: () => setFolderSheet(false) },
+          h('div', { className: 'mr-folder-sheet', onClick: (e) => e.stopPropagation() },
+            h('h3', null, `移动 ${selected.size} 本书到…`),
+            h('div', { className: 'mr-folder-sheet-list' },
+              h('button', { className: 'mr-folder-sheet-item', onClick: () => { onMoveToFolder?.(Array.from(selected), null); setFolderSheet(false); exitSelect(); } }, '📚 移出文件夹（回到书架）'),
+              folders.map(f => h('button', {
+                key: f.id,
+                className: 'mr-folder-sheet-item',
+                onClick: () => { onMoveToFolder?.(Array.from(selected), f.id); setFolderSheet(false); exitSelect(); },
+              }, `📁 ${f.name}`))),
+            h(Button, { kind: 'text', onClick: () => setFolderSheet(false) }, '取消'))) : null,
         layout.count === 0
           ? h('div', { className: 'mr-shelf-empty' },
               h('div', { className: 'mr-shelf-empty-icon' }, h(Glyph, { name: 'book', size: 24 })),
@@ -392,14 +454,16 @@ window.__ModuleLoader__.load({
                           const id = book.id || book.bookId || index;
                           const name = String(book.name || book.title || '未命名');
                           const variant = (index % 7) + 2;
+                          const isSelected = selected.has(id);
                           return h('button', {
                             key: `book-${id}`,
-                            className: 'mr-shelf-piece',
+                            className: `mr-shelf-piece${isSelected ? ' mr-selected' : ''}`,
                             type: 'button',
                             'aria-label': `${name}${book.author ? `，${book.author}` : ''}`,
                             title: name,
                             onClick: (event) => open(book, event),
                           },
+                          selectMode ? h('span', { className: 'mr-select-check' }, h('input', { type: 'checkbox', checked: isSelected, readOnly: true })) : null,
                           coverNode(book, name, variant),
                           h(DownloadBadge, { book, onToggle: onToggleDownload }),
                           Number(book.unread || book.unreadCount || 0) > 0 ? h('span', { className: 'mr-new-badge' }, `+${Number(book.unread || book.unreadCount)} 章`) : null,
@@ -428,7 +492,7 @@ window.__ModuleLoader__.load({
           h('span', { className: 'wall' }, normalizedQuery ? `${String(matches.length).padStart(2, '0')} 本 · 匹配` : `${String(layout.count).padStart(2, '0')} 本 · 都在墙上`)));
     }
 
-    function Library({ books, onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality, ambience, reducedMotion = false, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline }) {
+    function Library({ books, folders = [], onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality, ambience, reducedMotion = false, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead }) {
       if (!books.length) return h(Empty, {
         title: '书架还是空的', detail: '去发现搜书，或导入本地书籍。',
       });
@@ -437,7 +501,7 @@ window.__ModuleLoader__.load({
         h('button', { className: view === 'list' ? 'active' : '', onClick: () => onView('list') }, '列表'));
       const checkButton = h(Button, { icon: 'refresh', onClick: onCheck, disabled: busy }, '补查');
       const actions = h(React.Fragment, null, viewToggle, checkButton);
-      if (view === 'shelf') return h(ShelfBoard, { key: 'shelf', books, reducedMotion, onOpen, headActions: actions, onToggleDownload, online, onlineBusy, onlineFailed, onSearchOnline, onAddOnline });
+      if (view === 'shelf') return h(ShelfBoard, { key: 'shelf', books, folders, reducedMotion, onOpen, headActions: actions, onToggleDownload, online, onlineBusy, onlineFailed, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead });
       return h(React.Fragment, null,
         h('div', { className: 'mr-section-head' },
           h('div', null, h('h2', null, '我的书架'), h('p', null, `${books.length} 本 · 本机保存`)),
@@ -1931,7 +1995,7 @@ window.__ModuleLoader__.load({
     }
 
     function ReaderApp({ ctx }) {
-      const [data, setData] = useState({ sources: [], books: [], jobs: [], notes: [], settings: DEFAULT_SETTINGS });
+      const [data, setData] = useState({ sources: [], books: [], jobs: [], notes: [], folders: [], settings: DEFAULT_SETTINGS });
       const [tab, setTab] = useState('library');
       const [loading, setLoading] = useState(true);
       const [busy, setBusy] = useState(false);
@@ -2161,7 +2225,15 @@ window.__ModuleLoader__.load({
         h('section', { className: 'mr-content' },
           h(Notice, { notice, onClose: () => setNotice(null) }),
           loading ? h('div', { className: 'mr-loading' }, '正在打开墨读…') : null,
-          !loading && tab === 'library' ? h(Library, { books, busy, view: shelfView, onView: setShelfView, ctx, online: shelfOnline, onlineBusy: shelfOnlineBusy, onlineFailed: shelfOnlineFailed, onSearchOnline: searchShelfOnline, onAddOnline: (item) => addBook(item), theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: prefersReducedMotion() || settings.reducedMotion === 'on', onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}),
+          !loading && tab === 'library' ? h(Library, { books, folders: data.folders || [], busy, view: shelfView, onView: setShelfView, ctx, online: shelfOnline, onlineBusy: shelfOnlineBusy, onlineFailed: shelfOnlineFailed, onSearchOnline: searchShelfOnline, onAddOnline: (item) => addBook(item), theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: prefersReducedMotion() || settings.reducedMotion === 'on', onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}),
+            onCreateFolder: (name) => run(() => call(ctx, 'createFolder', { name }), '文件夹已创建').catch(() => {}),
+            onRenameFolder: (folderId, name) => run(() => call(ctx, 'renameFolder', { folderId, name }), '已重命名').catch(() => {}),
+            onRemoveFolder: (folderId) => run(() => call(ctx, 'removeFolder', { folderId }), '文件夹已删除').catch(() => {}),
+            onMoveToFolder: (bookIds, folderId) => run(() => call(ctx, 'moveBooksToFolder', { bookIds, folderId }), '已移动').catch(() => {}),
+            onBatchDelete: (bookIds) => run(() => call(ctx, 'batchDeleteBooks', { bookIds }), `已删除 ${bookIds.length} 本`).catch(() => {}),
+            onBatchDownload: (bookIds) => run(() => call(ctx, 'batchDownloadBooks', { bookIds }), `已开始下载 ${bookIds.length} 本`).catch(() => {}),
+            onExport: (bookIds) => { bookIds.forEach(id => run(() => call(ctx, 'exportBook', { bookId: id, format: 'txt' }), '导出完成').then(r => { if (r?.text) { const blob = new Blob([r.text], { type: 'text/plain;charset=utf-8' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${r.name || id}.txt`; a.click(); URL.revokeObjectURL(a.href); } }, () => {})); },
+            onMarkRead: (bookIds) => { bookIds.forEach(id => run(() => call(ctx, 'markBookRead', { bookId: id }), '已标记').catch(() => {})); },
             onToggleDownload: (book) => {
               const status = book.downloadStatus || book.download?.status;
               const bookId = book.id || book.bookId;
@@ -2300,6 +2372,23 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-shelf-cta:focus-visible{outline:2px solid var(--mr-accent);outline-offset:2px}
 .mr-shelf-foot{display:flex;align-items:center;justify-content:space-between;gap:16px;border-top:1px solid var(--mr-border);padding-top:12px;margin-top:auto;font-size:11px;color:var(--mr-muted)}
 .mr-shelf-foot .wall{color:var(--mr-muted)}
+.mr-shelf-folder-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px 0 4px}
+.mr-folder-chip{min-height:28px;padding:0 12px;border:1px solid var(--mr-border);border-radius:14px;background:var(--mr-card);color:var(--mr-muted);font-size:12px;white-space:nowrap;transition:background .15s,color .15s}
+.mr-folder-chip:hover{background:var(--mr-sunken);color:var(--mr-text)}
+.mr-folder-chip.active{background:var(--mr-accent);color:var(--mr-on-accent);border-color:var(--mr-accent)}
+.mr-folder-add{border-style:dashed;color:var(--mr-accent)}
+.mr-folder-del{color:var(--dsw-alias-state-danger-primary,#c44);border-color:var(--dsw-alias-state-danger-primary,#c44)}
+.mr-select-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;background:var(--mr-card);border:1px solid var(--mr-border);border-radius:10px;margin:8px 0}
+.mr-select-all{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--mr-text);cursor:pointer}
+.mr-select-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.mr-shelf-piece.mr-selected{outline:2px solid var(--mr-accent);outline-offset:2px;border-radius:8px}
+.mr-select-check{position:absolute;top:6px;left:6px;z-index:2;background:var(--mr-card);border-radius:50%;width:22px;height:22px;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,.15)}
+.mr-folder-sheet-backdrop{position:absolute;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.3);backdrop-filter:blur(2px)}
+.mr-folder-sheet{width:min(360px,90vw);max-height:60vh;overflow:auto;background:var(--mr-card);border:1px solid var(--mr-border);border-radius:14px;padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.2)}
+.mr-folder-sheet h3{margin:0 0 12px;font-size:16px;color:var(--mr-text)}
+.mr-folder-sheet-list{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+.mr-folder-sheet-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--mr-border);border-radius:8px;background:var(--mr-paper);color:var(--mr-text);font-size:14px;text-align:left;cursor:pointer;transition:background .15s}
+.mr-folder-sheet-item:hover{background:var(--mr-sunken)}
 .mr-shelf-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px;border:1px dashed var(--mr-border);border-radius:8px;background:color-mix(in srgb,var(--mr-card) 55%,transparent)}
 .mr-shelf-empty-icon{width:48px;height:48px;border-radius:50%;background:var(--mr-sunken);display:flex;align-items:center;justify-content:center;margin-bottom:12px;color:var(--mr-accent)}
 .mr-shelf-empty h3{color:var(--mr-text);font:400 18px/1.3 var(--mr-serif);margin:0 0 6px}
