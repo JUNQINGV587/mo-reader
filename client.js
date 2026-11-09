@@ -213,6 +213,78 @@ window.__ModuleLoader__.load({
         h('span', { style: { color: tone.fg } }, name.slice(0, 1)));
     }
 
+    function ShareCard({ book, onClose }) {
+      const name = String(book.name || book.title || '未命名').replace(/\.(?:txt|epub|md|pdf)$/i, '');
+      const author = book.author || '未知作者';
+      const intro = book.intro || book.description || '';
+      const cover = book.coverLocal || book.coverUrl || book.cover;
+      const canvasRef = useRef(null);
+      useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        const w = 600, h = 800;
+        canvas.width = w * 2; canvas.height = h * 2;
+        ctx.scale(2, 2);
+        // 背景
+        ctx.fillStyle = '#f6f1e6'; ctx.fillRect(0, 0, w, h);
+        // 顶部装饰线
+        ctx.fillStyle = '#9a3b2b'; ctx.fillRect(0, 0, w, 4);
+        // 封面
+        if (cover) {
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          img.onload = () => { ctx.drawImage(img, 40, 60, 200, 280); drawText(); };
+          img.onerror = () => drawText();
+          img.src = cover;
+        } else drawText();
+        function drawText() {
+          // 书名
+          ctx.fillStyle = '#2b261e'; ctx.font = 'bold 28px serif';
+          const lines = wrapText(ctx, name, w - 80, 28);
+          lines.forEach((line, i) => ctx.fillText(line, 40, 400 + i * 36));
+          // 作者
+          ctx.fillStyle = '#867b68'; ctx.font = '16px sans-serif';
+          ctx.fillText(author, 40, 400 + lines.length * 36 + 20);
+          // 简介
+          if (intro) {
+            ctx.fillStyle = '#5a5248'; ctx.font = '14px sans-serif';
+            const introLines = wrapText(ctx, intro.slice(0, 120), w - 80, 14);
+            introLines.slice(0, 4).forEach((line, i) => ctx.fillText(line, 40, 480 + lines.length * 36 + i * 22));
+          }
+          // 底部
+          ctx.fillStyle = '#867b68'; ctx.font = '12px sans-serif';
+          ctx.fillText('墨读 · 本机阅读', 40, h - 40);
+        }
+        function wrapText(ctx, text, maxWidth, fontSize) {
+          const lines = [];
+          let line = '';
+          for (const char of text) {
+            const test = line + char;
+            if (ctx.measureText(test).width > maxWidth) { lines.push(line); line = char; }
+            else line = test;
+          }
+          if (line) lines.push(line);
+          return lines;
+        }
+      }, [book]);
+      const download = () => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const a = document.createElement('a');
+        a.href = canvas.toDataURL('image/png');
+        a.download = `${name}.png`;
+        a.click();
+      };
+      return h('div', { className: 'mr-share-backdrop', onClick: onClose },
+        h('div', { className: 'mr-share-card', onClick: (e) => e.stopPropagation() },
+          h('h3', null, '分享书籍'),
+          h('canvas', { ref: canvasRef, className: 'mr-share-canvas' }),
+          h('div', { className: 'mr-share-actions' },
+            h(Button, { onClick: download }, '保存图片'),
+            h(Button, { kind: 'text', onClick: onClose }, '关闭'))));
+    }
+
 
 
     const SHELF_MAX_BOOKS = 48;
@@ -269,6 +341,7 @@ window.__ModuleLoader__.load({
       const [selected, setSelected] = useState(new Set());
       const [folderFilter, setFolderFilter] = useState(null);
       const [folderSheet, setFolderSheet] = useState(false);
+      const [shareBook, setShareBook] = useState(null);
       const [sortBy, setSortBy] = useState('recent');
       const searchRef = useRef(null);
       useEffect(() => {
@@ -448,6 +521,7 @@ window.__ModuleLoader__.load({
                 onClick: () => { onMoveToFolder?.(Array.from(selected), f.id); setFolderSheet(false); exitSelect(); },
               }, `📁 ${f.name}`))),
             h(Button, { kind: 'text', onClick: () => setFolderSheet(false) }, '取消'))) : null,
+        shareBook ? h(ShareCard, { book: shareBook, onClose: () => setShareBook(null) }) : null,
         layout.count === 0
           ? h('div', { className: 'mr-shelf-empty' },
               h('div', { className: 'mr-shelf-empty-icon' }, h(Glyph, { name: 'book', size: 24 })),
@@ -482,6 +556,7 @@ window.__ModuleLoader__.load({
                             'aria-label': `${name}${book.author ? `，${book.author}` : ''}`,
                             title: name,
                             onClick: (event) => open(book, event),
+                            onContextMenu: (event) => { event.preventDefault(); setShareBook(book); },
                           },
                           selectMode ? h('span', { className: 'mr-select-check' }, h('input', { type: 'checkbox', checked: isSelected, readOnly: true })) : null,
                           coverNode(book, name, variant),
@@ -2448,6 +2523,11 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-stat-card{display:flex;flex-direction:column;align-items:center;padding:16px;border:1px solid var(--mr-border);border-radius:10px;background:var(--mr-sunken)}
 .mr-stat-card strong{font-size:28px;font-weight:600;color:var(--mr-accent)}
 .mr-stat-card span{font-size:12px;color:var(--mr-muted);margin-top:4px}
+.mr-share-backdrop{position:absolute;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.4);backdrop-filter:blur(4px)}
+.mr-share-card{background:var(--mr-card);border:1px solid var(--mr-border);border-radius:16px;padding:24px;box-shadow:0 24px 80px rgba(0,0,0,.25);text-align:center}
+.mr-share-card h3{margin:0 0 16px;font-size:18px;color:var(--mr-text)}
+.mr-share-canvas{width:300px;height:400px;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.15)}
+.mr-share-actions{display:flex;gap:10px;justify-content:center;margin-top:16px}
 .mr-shelf-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px;border:1px dashed var(--mr-border);border-radius:8px;background:color-mix(in srgb,var(--mr-card) 55%,transparent)}
 .mr-shelf-empty-icon{width:48px;height:48px;border-radius:50%;background:var(--mr-sunken);display:flex;align-items:center;justify-content:center;margin-bottom:12px;color:var(--mr-accent)}
 .mr-shelf-empty h3{color:var(--mr-text);font:400 18px/1.3 var(--mr-serif);margin:0 0 6px}
