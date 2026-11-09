@@ -792,7 +792,145 @@ window.__ModuleLoader__.load({
                 if (s.minutes > 0) streak++; else break;
               }
               return streak;
-            })()), h('span', null, '连续阅读（天）')))),
+            })()), h('span', null, '连续阅读（天）'))),
+          // 阅读热力图（最近 12 周）
+          h('div', { className: 'mr-heatmap' },
+            h('h4', null, '阅读热力图'),
+            h('div', { className: 'mr-heatmap-grid' },
+              (() => {
+                const cells = [];
+                const today = new Date();
+                // 最近 12 周（84 天）
+                for (let i = 83; i >= 0; i--) {
+                  const d = new Date(today); d.setDate(d.getDate() - i);
+                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                  const level = s.minutes > 60 ? 4 : s.minutes > 30 ? 3 : s.minutes > 10 ? 2 : s.minutes > 0 ? 1 : 0;
+                  cells.push(h('div', { key: i, className: `mr-heatmap-cell level-${level}`, title: `${d.toISOString().slice(0, 10)}: ${s.minutes}分钟` }));
+                }
+                return cells;
+              })())),
+            h('div', { className: 'mr-heatmap-legend' },
+              h('span', null, '少'),
+              [0,1,2,3,4].map(l => h('div', { key: l, className: `mr-heatmap-cell level-${l}` })),
+              h('span', null, '多'))),
+          // 年度统计
+          h('div', { className: 'mr-yearly-stats' },
+            h('h4', null, `${new Date().getFullYear()} 年度统计`),
+            h('div', { className: 'mr-yearly-grid' },
+              h('div', { className: 'mr-yearly-item' }, h('strong', null, (() => {
+                let total = 0;
+                const year = new Date().getFullYear();
+                for (let i = 0; i < 365; i++) {
+                  const d = new Date(year, 0, 1); d.setDate(d.getDate() + i);
+                  if (d > new Date()) break;
+                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                  total += s.minutes || 0;
+                }
+                return total;
+              })()), h('span', null, '总分钟')),
+              h('div', { className: 'mr-yearly-item' }, h('strong', null, (() => {
+                let total = 0;
+                const year = new Date().getFullYear();
+                for (let i = 0; i < 365; i++) {
+                  const d = new Date(year, 0, 1); d.setDate(d.getDate() + i);
+                  if (d > new Date()) break;
+                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                  const s = JSON.parse(localStorage.getItem(key) || '{"pages":0}');
+                  total += s.pages || 0;
+                }
+                return total;
+              })()), h('span', null, '总页数')),
+              h('div', { className: 'mr-yearly-item' }, h('strong', null, (() => {
+                let days = 0;
+                const year = new Date().getFullYear();
+                for (let i = 0; i < 365; i++) {
+                  const d = new Date(year, 0, 1); d.setDate(d.getDate() + i);
+                  if (d > new Date()) break;
+                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                  if (s.minutes > 0) days++;
+                }
+                return days;
+              })()), h('span', null, '阅读天数')),
+              h('div', { className: 'mr-yearly-item' }, h('strong', null, (() => {
+                let total = 0;
+                const year = new Date().getFullYear();
+                for (let i = 0; i < 365; i++) {
+                  const d = new Date(year, 0, 1); d.setDate(d.getDate() + i);
+                  if (d > new Date()) break;
+                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                  total += s.minutes || 0;
+                }
+                const days = Math.max(1, Math.floor((new Date() - new Date(year, 0, 1)) / 86400000) + 1);
+                return Math.round(total / days);
+              })()), h('span', null, '日均分钟'))),
+          // 阅读时长分布
+          h('div', { className: 'mr-duration-dist' },
+            h('h4', null, '阅读时长分布'),
+            h('div', { className: 'mr-dist-bars' },
+              (() => {
+                const buckets = { '0-10分钟': 0, '10-30分钟': 0, '30-60分钟': 0, '60分钟以上': 0 };
+                for (let i = 0; i < 365; i++) {
+                  const d = new Date(); d.setDate(d.getDate() - i);
+                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                  const m = s.minutes || 0;
+                  if (m === 0) continue;
+                  if (m <= 10) buckets['0-10分钟']++;
+                  else if (m <= 30) buckets['10-30分钟']++;
+                  else if (m <= 60) buckets['30-60分钟']++;
+                  else buckets['60分钟以上']++;
+                }
+                const max = Math.max(...Object.values(buckets), 1);
+                return Object.entries(buckets).map(([label, count]) =>
+                  h('div', { key: label, className: 'mr-dist-row' },
+                    h('span', { className: 'mr-dist-label' }, label),
+                    h('div', { className: 'mr-dist-bar' },
+                      h('div', { className: 'mr-dist-fill', style: { width: `${count / max * 100}%` } })),
+                    h('span', { className: 'mr-dist-count' }, `${count}天`)));
+              })())),
+          // 阅读时段分析
+          h('div', { className: 'mr-time-dist' },
+            h('h4', null, '阅读时段分析'),
+            h('div', { className: 'mr-time-grid' },
+              (() => {
+                const hours = Array.from({ length: 24 }, (_, i) => ({ hour: i, minutes: 0 }));
+                for (let i = 0; i < 365; i++) {
+                  const d = new Date(); d.setDate(d.getDate() - i);
+                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0,"lastActive":0}');
+                  if (s.lastActive > 0) {
+                    const h = new Date(s.lastActive).getHours();
+                    hours[h].minutes += s.minutes || 0;
+                  }
+                }
+                const max = Math.max(...hours.map(h => h.minutes), 1);
+                return hours.map(({ hour, minutes }) =>
+                  h('div', { key: hour, className: 'mr-time-cell', title: `${hour}:00-${hour+1}:00: ${Math.round(minutes)}分钟` },
+                    h('div', { className: 'mr-time-bar', style: { height: `${Math.max(minutes / max * 100, 4)}%` } }),
+                    h('span', { className: 'mr-time-label' }, hour)));
+              })()))),
+          // 阅读趋势（最近 30 天）
+          h('div', { className: 'mr-trend-chart' },
+            h('h4', null, '阅读趋势（近 30 天）'),
+            h('div', { className: 'mr-trend-bars' },
+              (() => {
+                const days = [];
+                for (let i = 29; i >= 0; i--) {
+                  const d = new Date(); d.setDate(d.getDate() - i);
+                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                  days.push({ date: d.toISOString().slice(5, 10), minutes: s.minutes || 0 });
+                }
+                const max = Math.max(...days.map(d => d.minutes), 1);
+                return days.map(({ date, minutes }) =>
+                  h('div', { key: date, className: 'mr-trend-col', title: `${date}: ${minutes}分钟` },
+                    h('div', { className: 'mr-trend-bar', style: { height: `${Math.max(minutes / max * 100, 2)}%` } }),
+                    h('span', { className: 'mr-trend-label' }, date.slice(-2))));
+              })()))),
         h('section', { className: 'mr-panel' }, h('h3', null, '笔记导出'),
           h('p', { className: 'mr-help' }, '把划线和笔记导出为 Markdown。'),
           h(Button, { icon: 'download', onClick: () => onExportNotes?.(), disabled: busy }, '导出笔记')),
@@ -823,7 +961,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'mr-shortcuts-row' }, h('span', null, 'AI 助手'), h('kbd', null, 'A')),
             h('div', { className: 'mr-shortcuts-row' }, h('span', null, '听书'), h('kbd', null, 'T')),
             h('div', { className: 'mr-shortcuts-row' }, h('span', null, '切换模式'), h('kbd', null, 'M')),
-            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '关闭面板'), h('kbd', null, 'Esc')))));
+            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '关闭面板'), h('kbd', null, 'Esc'))));
     }
 
     function ReaderView({ ctx, book, settings, onSettings, onBookSettings, notes, onClose, onSaveNote, onDeleteNote, notify, notice, onDismissNotice, deferMs = 0 }) {
@@ -2739,6 +2877,48 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-folder-sheet-item:hover{background:var(--mr-sunken)}
 .mr-sort-select{min-height:32px;padding:0 8px;border:1px solid var(--mr-border);border-radius:6px;background:var(--mr-card);color:var(--mr-text);font-size:12px}
 .mr-stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+/* 阅读热力图 */
+.mr-heatmap{margin-top:20px}
+.mr-heatmap h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--fg-2)}
+.mr-heatmap-grid{display:grid;grid-template-columns:repeat(12,1fr);gap:3px}
+.mr-heatmap-cell{width:100%;aspect-ratio:1;border-radius:2px;background:var(--bg-1)}
+.mr-heatmap-cell.level-0{background:var(--bg-1)}
+.mr-heatmap-cell.level-1{background:#ebedf0}
+.mr-heatmap-cell.level-2{background:#9be9a8}
+.mr-heatmap-cell.level-3{background:#40c463}
+.mr-heatmap-cell.level-4{background:#30a14e}
+.mr-heatmap-legend{display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11px;color:var(--fg-3)}
+.mr-heatmap-legend .mr-heatmap-cell{width:12px;height:12px}
+/* 年度统计 */
+.mr-yearly-stats{margin-top:20px}
+.mr-yearly-stats h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--fg-2)}
+.mr-yearly-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.mr-yearly-item{text-align:center;padding:16px 12px;background:var(--bg-0);border:1px solid var(--line);border-radius:8px}
+.mr-yearly-item strong{display:block;font-size:28px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--accent)}
+.mr-yearly-item span{font-size:11px;color:var(--fg-3);margin-top:4px}
+/* 阅读时长分布 */
+.mr-duration-dist{margin-top:20px}
+.mr-duration-dist h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--fg-2)}
+.mr-dist-bars{display:flex;flex-direction:column;gap:8px}
+.mr-dist-row{display:flex;align-items:center;gap:12px}
+.mr-dist-label{width:80px;font-size:12px;color:var(--fg-2);text-align:right}
+.mr-dist-bar{flex:1;height:24px;background:var(--bg-1);border-radius:4px;overflow:hidden}
+.mr-dist-fill{height:100%;background:var(--accent);border-radius:4px;transition:width .3s}
+.mr-dist-count{width:50px;font-size:12px;color:var(--fg-3)}
+/* 阅读时段分析 */
+.mr-time-dist{margin-top:20px}
+.mr-time-dist h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--fg-2)}
+.mr-time-grid{display:flex;align-items:flex-end;gap:2px;height:80px}
+.mr-time-cell{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;height:100%}
+.mr-time-bar{width:100%;background:var(--accent);border-radius:2px;min-height:4px}
+.mr-time-label{font-size:10px;color:var(--fg-3)}
+/* 阅读趋势 */
+.mr-trend-chart{margin-top:20px}
+.mr-trend-chart h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--fg-2)}
+.mr-trend-bars{display:flex;align-items:flex-end;gap:2px;height:100px}
+.mr-trend-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;height:100%}
+.mr-trend-bar{width:100%;background:var(--accent);border-radius:2px;min-height:2px;opacity:.85}
+.mr-trend-label{font-size:9px;color:var(--fg-3)}
 .mr-stat-card{display:flex;flex-direction:column;align-items:center;padding:16px;border:1px solid var(--mr-border);border-radius:10px;background:var(--mr-sunken)}
 .mr-stat-card strong{font-size:28px;font-weight:600;color:var(--mr-accent)}
 .mr-stat-card span{font-size:12px;color:var(--mr-muted);margin-top:4px}
