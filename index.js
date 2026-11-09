@@ -20,7 +20,7 @@ import { base64ToBuffer, clone, id, MAX_ARCHIVE_BYTES, MAX_TEXT_BYTES, now, page
 const COVER_MAX_BYTES = 2 * 1024 * 1024
 
 export const REMOTE_METHODS = Object.freeze([
-  'state', 'importSource', 'removeSource', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
+  'state', 'importSource', 'restoreBuiltinSources', 'removeSource', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
   'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
   'exportBackup', 'importBackup', 'fetchCover', 'cacheBookCover', 'bookCandidates', 'applyBookMeta',
 ])
@@ -73,6 +73,21 @@ export class ReaderService extends TypertRemoteService {
       this.log('warn', 'Startup update check failed', error)
     }
     for (const job of entries(this.db.jobs)) if (job.status === 'queued') this.scheduleJob(job.id)
+  }
+
+  async restoreBuiltinSources(args) {
+    args ??= {}
+    this.assertReady()
+    const settings = this.db.settings.get()
+    let added = 0
+    for (const raw of BUILTIN_SOURCES) {
+      const source = normalizeSource(raw)
+      if (this.db.sources.get(source.id)) continue
+      await this.db.sources.put(source.id, { ...source, builtin: true })
+      added += 1
+    }
+    await this.db.settings.set({ ...settings, builtinSourcesAt: settings.builtinSourcesAt ?? now() })
+    return { added, total: BUILTIN_SOURCES.length }
   }
 
   async seedBuiltinSources() {
@@ -558,7 +573,7 @@ export class ReaderService extends TypertRemoteService {
     args ??= {}
     this.assertReady()
     const book = this.book(args.bookId)
-    const keyword = requiredString(args.query ?? book.name, 'query', 200)
+    const keyword = requiredString(String(args.query ?? book.name ?? '').replace(/\.(?:txt|epub|md|pdf)$/i, '').trim(), 'query', 200)
     const targets = [importedSource(), ...entries(this.db.sources)].filter(source => source.enabled !== false && source.rules?.search?.url)
     const settled = await Promise.allSettled(targets.map(async (source) => {
       try {

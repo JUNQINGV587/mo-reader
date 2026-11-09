@@ -8,7 +8,7 @@ window.__ModuleLoader__.load({
     const { useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
     const PANEL_ID = 'reader';
     const REMOTE_METHODS = [
-      'state', 'importSource', 'removeSource', 'search', 'discover', 'addBook', 'removeBook',
+      'state', 'importSource', 'removeSource', 'restoreBuiltinSources', 'search', 'discover', 'addBook', 'removeBook',
       'toc', 'chapter', 'saveProgress', 'download', 'cancelJob', 'checkUpdates', 'importLocal',
       'setSettings', 'setBookSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
       'cacheBookCover', 'bookCandidates', 'applyBookMeta',
@@ -498,7 +498,7 @@ window.__ModuleLoader__.load({
     function writeSourceLibrary(value) {
       try { window.localStorage.setItem(SOURCE_LIBRARY_KEY, JSON.stringify(value)); } catch {}
     }
-    function Sources({ sources, onImport, onRemove, busy, onPullLibrary }) {
+    function Sources({ sources, onImport, onRemove, busy, onPullLibrary, onRestoreBuiltin }) {
       const [draft, setDraft] = useState('');
       const [allowHttp, setAllowHttp] = useState(false);
       const [library, setLibrary] = useState(readSourceLibrary);
@@ -516,6 +516,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'mr-inline-actions' },
             h(Button, { kind: 'primary', icon: 'plus', disabled: busy || !draft.trim(), onClick: () => onImport(draft, allowHttp).then(() => setDraft('')) }, '导入'),
             h(Button, { icon: 'upload', onClick: () => fileRef.current?.click(), disabled: busy }, '选文件'),
+            h(Button, { icon: 'refresh', onClick: () => onRestoreBuiltin(), disabled: busy }, '恢复内置'),
             h('input', { ref: fileRef, type: 'file', accept: '.json,application/json', hidden: true, onChange: async (e) => { const file = e.target.files?.[0]; if (file) setDraft(await file.text()); e.target.value = ''; } }))),
         h('section', { className: 'mr-panel' },
           h('h3', null, '在线源库'),
@@ -1907,7 +1908,7 @@ window.__ModuleLoader__.load({
         : state.error
           ? h('p', { className: 'mr-meta-status' }, '补全信息暂时不可用，可以跳过。')
           : candidates.length === 0
-            ? h('p', { className: 'mr-meta-status' }, '没搜到合适的，可以跳过。')
+            ? h('p', { className: 'mr-meta-status' }, state.debug ? `没搜到合适的，可以跳过。（${state.debug}）` : '没搜到合适的，可以跳过。')
           : h('div', { className: 'mr-meta-list' }, candidates.map((item, index) => h('button', {
             key: `${item.sourceId}-${index}`,
             type: 'button',
@@ -2070,10 +2071,25 @@ window.__ModuleLoader__.load({
       };
       const openMetaSheet = async (book) => {
         const bookId = book.id || book.bookId;
+        const query = String(book.name || book.title || '').replace(/\.(?:txt|epub|md|pdf)$/i, '').trim();
         setMetaSheet({ book, bookId, candidates: null, busy: true });
         try {
-          const result = await call(ctx, 'bookCandidates', { bookId });
-          setMetaSheet({ book, bookId, candidates: result?.candidates || [], busy: false });
+          const sources = (data.sources || []).filter((item) => item.id || item.bookSourceUrl);
+          const perSource = await Promise.allSettled(sources.map(async (source) => {
+            const list = await withTimeout(call(ctx, 'search', { sourceId: source.id, query }), 15000);
+            return (list || []).slice(0, 2).map((item) => ({
+              sourceId: source.id,
+              sourceName: source.name,
+              name: String(item.name || '').trim(),
+              author: String(item.author || '').trim(),
+              intro: String(item.intro || '').trim(),
+              coverUrl: String(item.coverUrl || '').trim(),
+              bookUrl: String(item.bookUrl || '').trim(),
+            }));
+          }));
+          const candidates = perSource.flatMap((outcome) => (outcome.status === 'fulfilled' ? outcome.value : [])).slice(0, 8);
+          const failed = perSource.filter((outcome) => outcome.status === 'rejected').map((outcome) => String(outcome.reason?.message || outcome.reason).slice(0, 40));
+          setMetaSheet({ book, bookId, candidates, busy: false, debug: `${sources.map((x) => x.id).join(',')} | ${failed.join(' / ')}` });
         } catch (cause) {
           const message = cause.message || String(cause);
           setMetaSheet({ book, bookId, candidates: [], busy: false, error: message });
@@ -2163,6 +2179,7 @@ window.__ModuleLoader__.load({
             }, onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
           !loading && tab === 'sources' ? h(Sources, { sources, busy, onImport: importSource,
+              onRestoreBuiltin: () => run(() => call(ctx, 'restoreBuiltinSources'), '内置书源已恢复').then((result) => { if (result) setNotice({ kind: 'success', text: `已恢复 ${result.added} 个内置书源` }); }, () => {}),
               onPullLibrary: (next) => {
                 const pending = run(() => call(ctx, 'importSource', { url: next.url, allowHttp: next.allowHttp === true }), '拉取完成');
                 pending.then((result) => { if (result) setNotice({ kind: 'info', text: importSummary(result) }); }, () => {});
