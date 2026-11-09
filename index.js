@@ -603,7 +603,11 @@ export class ReaderService extends TypertRemoteService {
     const meta = args.meta && typeof args.meta === 'object' ? args.meta : {}
     let enriched = { ...meta }
     if (meta.sourceId && meta.bookUrl) {
-      const source = this.db.sources.get(meta.sourceId)
+      let source = this.db.sources.get(meta.sourceId)
+      if (source?.builtin && !source.rules?.bookInfo) {
+        const raw = BUILTIN_SOURCES.find((item) => normalizeSource(item).id === source.id)
+        if (raw) source = { ...source, rules: normalizeSource(raw).rules }
+      }
       if (source) {
         try {
           const info = await this.engine.bookInfo(source, meta.bookUrl)
