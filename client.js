@@ -1061,7 +1061,8 @@ window.__ModuleLoader__.load({
         const offset = pending.offset != null
           ? pending.offset
           : (pending.percent || 0) / 100 * Math.max(1, node.offsetHeight);
-        el.scrollTop = Math.max(0, nodeTop(node) + offset);
+        // 裁章后的坐标换算必须立即完成；继承 CSS smooth 会把内部恢复动画展示给读者。
+        el.scrollTo({ top: Math.max(0, nodeTop(node) + offset), behavior: 'instant' });
       };
       // 窗口裁章会一次性移除视口上方几千像素，必须在这一帧 paint 之前把 scrollTop 摆回去，
       // 否则用户会看到「闪一下又归位」（真机上就是跳页）。
@@ -3157,7 +3158,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 
     return {
       inject: ['slots', 'layout', 'remote'],
-      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, scrollMotion, Settings } } : {}),
+      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, scrollMotion, Settings, ReaderView, readerStyle: css } } : {}),
       async apply(ctx) {
         const unmount = await ctx.remote.$mount(readerContribution);
         const ui = ctx.inject(['remote.reader'], (inner) => {
