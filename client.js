@@ -809,7 +809,7 @@ window.__ModuleLoader__.load({
                   cells.push(h('div', { key: i, className: `mr-heatmap-cell level-${level}`, title: `${d.toISOString().slice(0, 10)}: ${s.minutes}分钟` }));
                 }
                 return cells;
-              })())),
+              })()),
             h('div', { className: 'mr-heatmap-legend' },
               h('span', null, '少'),
               [0,1,2,3,4].map(l => h('div', { key: l, className: `mr-heatmap-cell level-${l}` })),
@@ -866,7 +866,7 @@ window.__ModuleLoader__.load({
                 }
                 const days = Math.max(1, Math.floor((new Date() - new Date(year, 0, 1)) / 86400000) + 1);
                 return Math.round(total / days);
-              })()), h('span', null, '日均分钟'))),
+              })()), h('span', null, '日均分钟')))),
           // 阅读时长分布
           h('div', { className: 'mr-duration-dist' },
             h('h4', null, '阅读时长分布'),
@@ -912,7 +912,7 @@ window.__ModuleLoader__.load({
                   h('div', { key: hour, className: 'mr-time-cell', title: `${hour}:00-${hour+1}:00: ${Math.round(minutes)}分钟` },
                     h('div', { className: 'mr-time-bar', style: { height: `${Math.max(minutes / max * 100, 4)}%` } }),
                     h('span', { className: 'mr-time-label' }, hour)));
-              })()))),
+              })())),
           // 阅读趋势（最近 30 天）
           h('div', { className: 'mr-trend-chart' },
             h('h4', null, '阅读趋势（近 30 天）'),
@@ -961,7 +961,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'mr-shortcuts-row' }, h('span', null, 'AI 助手'), h('kbd', null, 'A')),
             h('div', { className: 'mr-shortcuts-row' }, h('span', null, '听书'), h('kbd', null, 'T')),
             h('div', { className: 'mr-shortcuts-row' }, h('span', null, '切换模式'), h('kbd', null, 'M')),
-            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '关闭面板'), h('kbd', null, 'Esc'))));
+            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '关闭面板'), h('kbd', null, 'Esc')))));
     }
 
     function ReaderView({ ctx, book, settings, onSettings, onBookSettings, notes, onClose, onSaveNote, onDeleteNote, notify, notice, onDismissNotice, deferMs = 0 }) {
@@ -3157,7 +3157,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 
     return {
       inject: ['slots', 'layout', 'remote'],
-      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, scrollMotion } } : {}),
+      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, scrollMotion, Settings } } : {}),
       async apply(ctx) {
         const unmount = await ctx.remote.$mount(readerContribution);
         const ui = ctx.inject(['remote.reader'], (inner) => {
