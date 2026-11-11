@@ -28,7 +28,13 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
     },
     async content() { return { text: '正文', html: '<p>正文</p>' } },
   }
-  const service = new ReaderService(ctx, { engine })
+  const service = new ReaderService(ctx, {
+    engine,
+    fetchRemote: async () => ({
+      url: 'https://library.example/sources.json',
+      text: JSON.stringify([{ bookSourceName: '订阅源', bookSourceUrl: 'https://sub.example', rules: {} }]),
+    }),
+  })
   service.db = await openReaderStorage(ctx)
   t.after(async () => {
     await service.db.domain.close()
@@ -46,6 +52,10 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   assert.match(imported.id, /^[a-zA-Z0-9_-]+$/)
   assert.equal(imported.bookSourceUrl, 'https://example.com')
   assert.equal(service.source(imported.id).bookSourceUrl, 'https://example.com')
+  const subscribed = await service.subscribeSourceLibrary({ url: 'https://library.example/sources.json' })
+  assert.equal(subscribed.imported, 1)
+  const subscriptionSourceId = subscribed.subscription.sourceIds[0]
+  await service.setSourceEnabled({ id: subscriptionSourceId, enabled: false })
 
   const book = await service.addBook({ sourceId: imported.id, bookUrl: 'https://example.com/book/1' })
   assert.match(book.id, /^[a-zA-Z0-9_-]+$/)
@@ -57,7 +67,7 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   const chapter = await service.chapter({ bookId: book.id, chapterId: toc[0].id })
   assert.equal(chapter.text, '正文')
 
-  for (const table of ['sources', 'books', 'chapters']) {
+  for (const table of ['sources', 'subscriptions', 'books', 'chapters']) {
     for (const [key, record] of service.db[table].entries()) {
       assert.match(key, /^[a-zA-Z0-9_-]+$/)
       assert.equal(record.id, key)
@@ -69,4 +79,6 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   assert.equal(service.db.books.get(book.id).bookUrl, 'https://example.com/book/1')
   assert.equal(service.db.chapters.get(toc[0].id).text, '正文')
   assert.equal(service.db.chapters.get(toc[0].id).url, 'https://example.com/chapter/1')
+  assert.equal(service.db.subscriptions.get(subscribed.subscription.id).url, 'https://library.example/sources.json')
+  assert.equal(service.db.sources.get(subscriptionSourceId).enabled, false)
 })

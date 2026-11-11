@@ -8,7 +8,7 @@ window.__ModuleLoader__.load({
     const { useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
     const PANEL_ID = 'reader';
     const REMOTE_METHODS = [
-      'state', 'importSource', 'removeSource', 'restoreBuiltinSources', 'search', 'discover', 'addBook', 'removeBook',
+      'state', 'importSource', 'subscribeSourceLibrary', 'removeSubscription', 'removeSource', 'setSourceEnabled', 'restoreBuiltinSources', 'search', 'discover', 'addBook', 'removeBook',
       'toc', 'chapter', 'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal',
       'setSettings', 'setBookSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
       'cacheBookCover', 'bookCandidates', 'applyBookMeta',
@@ -983,7 +983,8 @@ window.__ModuleLoader__.load({
         setRecent(rememberSearch(term));
         onSearch(term);
       };
-      const sourceNames = [...new Set(sources.map((source) => source.bookSourceName || source.name).filter(Boolean))];
+      const searchableSources = sources.filter((source) => source.id !== 'local' && source.enabled !== false);
+      const sourceNames = [...new Set(searchableSources.map((source) => source.bookSourceName || source.name).filter(Boolean))];
       const allResults = results || [];
       const visible = sourceFilter ? allResults.filter((book) => book.sourceName === sourceFilter) : allResults;
       const searched = !!lastQuery;
@@ -991,10 +992,10 @@ window.__ModuleLoader__.load({
         h(ScreenHead, {
           kicker: 'MO READ · 窗边 / 发现',
           title: '发现',
-          sub: `搜索全部 ${sources.length} 个书源 · 按书名或作者`,
-          aside: h('div', { className: 'mr-screen-stat' }, h('b', null, sources.length), h('span', null, '个书源')),
+          sub: `搜索全部 ${searchableSources.length} 个书源 · 按书名或作者`,
+          aside: h('div', { className: 'mr-screen-stat' }, h('b', null, searchableSources.length), h('span', null, '个书源')),
         }),
-        !sources.length ? h(Empty, { icon: 'source', title: '先导入书源', detail: '支持 URL、文件或粘贴 JSON。' }) : h('div', { className: 'mr-discover-layout' },
+        !searchableSources.length ? h(Empty, { icon: 'source', title: '先导入书源', detail: '支持 URL、文件或粘贴 JSON。' }) : h('div', { className: 'mr-discover-layout' },
           h('section', { className: 'mr-search-panel', 'aria-label': '搜索与书源筛选' },
             h('p', { className: 'mr-card-kicker' }, 'SEARCH · 书源'),
             h('h2', null, '搜一本书'),
@@ -1045,23 +1046,15 @@ window.__ModuleLoader__.load({
       const skippedText = skipped ? `跳过 ${skipped} 个${first ? `（${first.slice(0, 40)}）` : ''}` : '';
       return skippedText ? `已导入 ${imported} 个书源，${skippedText}` : `已导入 ${imported} 个书源`;
     }
-    const SOURCE_LIBRARY_KEY = 'mo-reader:source-library';
-    function readSourceLibrary() {
-      try { return JSON.parse(window.localStorage.getItem(SOURCE_LIBRARY_KEY) || 'null') || { url: '', at: '' }; }
-      catch { return { url: '', at: '' }; }
-    }
-    function writeSourceLibrary(value) {
-      try { window.localStorage.setItem(SOURCE_LIBRARY_KEY, JSON.stringify(value)); } catch {}
-    }
-    function Sources({ sources, onImport, onRemove, busy, onPullLibrary, onRestoreBuiltin }) {
+    function Sources({ sources, subscriptions = [], onImport, onRemove, onToggle, onSubscribe, onUnsubscribe, busy, onRestoreBuiltin }) {
       const [draft, setDraft] = useState('');
       const [allowHttp, setAllowHttp] = useState(false);
-      const [library, setLibrary] = useState(readSourceLibrary);
-      const [libraryText, setLibraryText] = useState(library.url || '');
+      const [libraryText, setLibraryText] = useState('');
       const [libraryHttp, setLibraryHttp] = useState(false);
       const fileRef = useRef(null);
-      const pulling = busy;
-      const available = sources.filter((source) => !source.lastError).length;
+      const subscribing = busy;
+      const available = sources.filter((source) => source.enabled !== false && !source.lastError).length;
+      const subscribedCount = subscriptions.reduce((count, item) => count + (item.sourceIds?.length || 0), 0);
       return h('div', { className: 'mr-screen mr-sources-screen' },
         h(ScreenHead, {
           kicker: 'MO READ · 窗边 / 书源',
@@ -1082,19 +1075,21 @@ window.__ModuleLoader__.load({
                 h(Button, { icon: 'refresh', onClick: () => onRestoreBuiltin(), disabled: busy }, '恢复内置'),
                 h('input', { ref: fileRef, type: 'file', accept: '.json,application/json', hidden: true, onChange: async (e) => { const file = e.target.files?.[0]; if (file) setDraft(await file.text()); e.target.value = ''; } }))),
             h('section', { className: 'mr-window-card', 'aria-labelledby': 'source-library-title' },
-              h('h2', { id: 'source-library-title' }, '在线源库'),
-              h('p', { className: 'mr-help' }, '填一个公开源库地址，拉取后导入全部可用书源。'),
+              h('h2', { id: 'source-library-title' }, '订阅源库'),
+              h('p', { className: 'mr-help' }, '粘贴公开源库地址。订阅、来源关系和启停状态会保存在本机，重开后继续使用。'),
               h('div', { className: 'mr-online-row' },
-                h('input', { value: libraryText, onChange: (e) => setLibraryText(e.target.value), placeholder: 'https://…/sources.json', 'aria-label': '在线源库地址' }),
-                h(Button, { kind: 'primary', icon: 'download', disabled: pulling || !libraryText.trim(), onClick: async () => {
-                  const ok = await onPullLibrary({ url: libraryText.trim(), allowHttp: libraryHttp });
-                  if (ok === false) return;
-                  const next = { url: libraryText.trim(), at: new Date().toISOString() };
-                  setLibrary(next);
-                  writeSourceLibrary(next);
-                } }, '拉取')),
+                h('input', { value: libraryText, onChange: (e) => setLibraryText(e.target.value), placeholder: 'https://…/sources.json', 'aria-label': '公开源库地址' }),
+                h(Button, { kind: 'primary', icon: 'download', disabled: subscribing || !libraryText.trim(), onClick: () => onSubscribe({ url: libraryText.trim(), allowHttp: libraryHttp }) }, '订阅')),
               h('label', { className: 'mr-check' }, h('input', { type: 'checkbox', checked: libraryHttp, onChange: (e) => setLibraryHttp(e.target.checked) }), '允许明文 HTTP'),
-              library.at ? h('p', { className: 'mr-help' }, `上次拉取 ${new Date(library.at).toLocaleString('zh-CN', { hour12: false })}`) : null)),
+              subscriptions.length ? h('div', { className: 'mr-subscription-list' },
+                subscriptions.map((item) => h('div', { className: 'mr-subscription-row', key: item.id },
+                  h('div', { className: 'mr-subscription-copy' },
+                    h('strong', { title: item.url }, item.url),
+                    h('span', null, `${item.sourceIds?.length || 0} 个书源${item.lastSuccessAt ? ` · ${new Date(item.lastSuccessAt).toLocaleDateString('zh-CN')} 更新` : ''}`)),
+                  h('span', { className: 'mr-subscription-actions' },
+                    h('span', { className: `mr-tag${item.status === 'partial' ? ' failed' : ''}` }, item.status === 'partial' ? '部分可用' : '已订阅'),
+                    h(Button, { kind: 'text', disabled: busy, title: '取消订阅，不删除书源', onClick: () => onUnsubscribe(item.id) }, '取消'))))) : null,
+              h('p', { className: 'mr-help' }, `${subscriptions.length} 个订阅 · 关联 ${subscribedCount} 个书源`))),
           h('section', { className: 'mr-sources-list', 'aria-label': '已配置书源列表' },
             h('div', { className: 'mr-sources-list-head' },
               h('h2', null, '已配置'),
@@ -1102,14 +1097,17 @@ window.__ModuleLoader__.load({
             sources.length ? sources.map((source) => {
               const id = source.id || source.bookSourceUrl;
               const name = source.bookSourceName || source.name || '书源';
+              const disabled = source.enabled === false;
+              const local = source.id === 'local' || source.bookSourceUrl === 'local:';
               const unsupportedLabels = { login: '登录', captcha: '验证码', payment: '付费', webview: '内置网页' };
               const unsupported = (Array.isArray(source.unsupported) ? source.unsupported : []).map((item) => unsupportedLabels[item] || item);
-              return h('article', { className: 'mr-source-row', key: id },
+              return h('article', { className: `mr-source-row${disabled ? ' is-disabled' : ''}`, key: id },
                 h('span', { className: 'mr-source-icon', 'aria-hidden': true }, name.slice(0, 1)),
                 h('div', null, h('h3', null, name), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl)),
                 h('div', { className: 'mr-source-side' },
-                  h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || (unsupported.length ? `不支持：${unsupported.join('、')}` : '') }, source.lastError ? '解析失败 · 需更新规则' : unsupported.length ? `不支持 · ${unsupported.join('/')}` : source.builtin ? '内置 · 可用' : (source.compatibility || '基础规则')),
-                  source.builtin ? null : h(Button, { kind: 'text danger', onClick: () => onRemove(source), disabled: busy }, '移除')));
+                  h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || (unsupported.length ? `不支持：${unsupported.join('、')}` : '') }, local ? '本机导入' : disabled ? '已停用' : source.lastError ? '解析失败 · 需更新规则' : unsupported.length ? `不支持 · ${unsupported.join('/')}` : source.builtin ? '内置 · 可用' : (source.compatibility || '基础规则')),
+                  local ? null : h(Button, { kind: 'text', onClick: () => onToggle(source), disabled: busy, 'aria-pressed': !disabled }, disabled ? '启用' : '停用'),
+                  source.builtin || local ? null : h(Button, { kind: 'text danger', onClick: () => onRemove(source), disabled: busy }, '移除')));
             }) : h(Empty, { icon: 'source', title: '暂无书源', detail: '导入后即可搜索和追更。' }))));
     }
 
@@ -2893,7 +2891,7 @@ window.__ModuleLoader__.load({
     }
 
     function ReaderApp({ ctx }) {
-      const [data, setData] = useState({ sources: [], books: [], jobs: [], notes: [], folders: [], settings: DEFAULT_SETTINGS });
+      const [data, setData] = useState({ sources: [], subscriptions: [], books: [], jobs: [], notes: [], folders: [], settings: DEFAULT_SETTINGS });
       const [tab, setTab] = useState('library');
       const [loading, setLoading] = useState(true);
       const [busy, setBusy] = useState(false);
@@ -2976,6 +2974,20 @@ window.__ModuleLoader__.load({
         const pending = run(() => call(ctx, 'importSource', /^https?:\/\//i.test(value) ? { url: value, allowHttp } : { text: value, allowHttp }), '书源已导入');
         pending.then((result) => { if (result) setNotice({ kind: 'info', text: importSummary(result) }); }, () => {});
         return pending;
+      };
+      const subscribeLibrary = async (payload) => {
+        try {
+          const result = await run(() => call(ctx, 'subscribeSourceLibrary', payload));
+          const skipped = Array.isArray(result?.skipped) ? result.skipped.length : 0;
+          notify(`已订阅 ${result?.imported ?? 0} 个书源${skipped ? `，跳过 ${skipped} 个` : ''}`, skipped ? 'info' : 'success');
+          return result;
+        } catch { return false; }
+      };
+      const removeSubscription = (id) => run(() => call(ctx, 'removeSubscription', { id }), '已取消订阅，书源仍保留').catch(() => false);
+      const toggleSource = (item) => {
+        const enabling = item.enabled === false;
+        const id = item.id || item.bookSourceUrl;
+        return run(() => call(ctx, 'setSourceEnabled', { id, enabled: enabling }), enabling ? '书源已启用' : '书源已停用').catch(() => false);
       };
       const search = async (query) => {
         const keyword = String(query || '').trim();
@@ -3167,13 +3179,11 @@ window.__ModuleLoader__.load({
               return run(() => pending, '已暂停').catch(() => {});
             }, onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
-          !loading && tab === 'sources' ? h(Sources, { sources, busy, onImport: importSource,
+          !loading && tab === 'sources' ? h(Sources, { sources, subscriptions: data.subscriptions || [], busy, onImport: importSource,
               onRestoreBuiltin: () => run(() => call(ctx, 'restoreBuiltinSources'), '内置书源已恢复').then((result) => { if (result) setNotice({ kind: 'success', text: `已恢复 ${result.added} 个内置书源` }); }, () => {}),
-              onPullLibrary: (next) => {
-                const pending = run(() => call(ctx, 'importSource', { url: next.url, allowHttp: next.allowHttp === true }), '拉取完成');
-                pending.then((result) => { if (result) setNotice({ kind: 'info', text: importSummary(result) }); }, () => {});
-                return pending.then(() => true, () => false);
-              },
+              onSubscribe: subscribeLibrary,
+              onUnsubscribe: removeSubscription,
+              onToggle: toggleSource,
               onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
           !loading && tab === 'stats' ? h(Stats) : null,
           !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy,
@@ -3725,6 +3735,12 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-source-side .mr-tag{display:inline-flex;align-items:center;min-height:24px;padding:2px 6px;border:1px solid var(--mr-border);font-size:10px;color:var(--mr-muted);white-space:nowrap}
 .mr-source-side .mr-tag.failed{border-color:var(--mr-update,#a85132);color:var(--mr-update-ink,#9a452a);background:var(--mr-update-soft,#f3e4db)}
 .mr-source-side .mr-button{min-height:28px;padding:0 5px;font-size:11px}
+.mr-subscription-list{display:flex;flex-direction:column;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid var(--mr-line)}
+.mr-subscription-row{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}.mr-subscription-actions{display:flex;align-items:center;gap:4px;flex-shrink:0}
+.mr-subscription-copy{display:flex;flex-direction:column;gap:2px;min-width:0}
+.mr-subscription-copy strong{overflow:hidden;font-size:11px;font-weight:500;text-overflow:ellipsis;white-space:nowrap}
+.mr-subscription-copy span{font-size:10px;color:var(--mr-muted)}
+.mr-source-row.is-disabled .mr-source-icon,.mr-source-row.is-disabled h3,.mr-source-row.is-disabled p{opacity:.5}
 .mr-settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
 .mr-settings-grid .mr-panel{margin:0;min-width:0}
 .mr-settings-grid .mr-panel--wide{grid-column:1/-1}
@@ -3740,7 +3756,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
   .mr-discovery-state{min-height:240px;padding:24px 14px}
   .mr-sources-left{display:flex;flex-direction:column;gap:12px}.mr-window-card{padding:15px}
   .mr-online-row{flex-direction:column;align-items:stretch}.mr-online-row input{flex:none;width:100%;height:38px}.mr-online-row .mr-button{width:100%}
-  .mr-source-row{grid-template-columns:30px minmax(0,1fr);gap:9px;padding:12px 0}.mr-source-side{grid-column:2;justify-content:space-between}.mr-source-side .mr-tag{white-space:normal}
+  .mr-source-row{grid-template-columns:30px minmax(0,1fr);gap:9px;padding:12px 0}.mr-source-side{grid-column:2;flex-wrap:wrap;justify-content:space-between;gap:6px}.mr-source-side .mr-tag{white-space:normal}
   .mr-settings-grid{display:flex;flex-direction:column;align-items:stretch;gap:12px}
 }
 @media(max-width:720px){

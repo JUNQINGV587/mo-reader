@@ -253,3 +253,94 @@ test('built-in sources cannot be removed', async () => {
   await assert.rejects(() => service.removeSource({ id: builtin.id }), /内置书源不能删除/)
   assert.equal(db.sources.get(builtin.id)?.builtin, true)
 })
+
+test('source subscriptions persist source relationships and enabled state', async () => {
+  const library = [
+    { bookSourceName: '源甲', bookSourceUrl: 'https://a.example', rules: {} },
+    { bookSourceName: '源乙', bookSourceUrl: 'https://b.example', rules: {} },
+  ]
+  const { service, db } = await serviceFixture({}, {
+    fetchRemote: async () => ({ text: JSON.stringify(library), url: 'https://lib.example/sources.json' }),
+  })
+  const first = await service.subscribeSourceLibrary({ url: 'https://lib.example/sources.json' })
+  assert.equal(first.imported, 2)
+  assert.equal((await service.state()).subscriptions.length, 1)
+  const firstSource = (await service.state()).sources.find(item => item.name === '源甲')
+  await service.setSourceEnabled({ id: firstSource.id, enabled: false })
+  assert.equal((await service.state()).sources.find(item => item.id === firstSource.id).enabled, false)
+
+  await service.subscribeSourceLibrary({ url: 'https://lib.example/sources.json' })
+  assert.equal(db.sources.get(firstSource.id).enabled, false, '重复订阅不得重新启用已停用源')
+  assert.equal((await service.state()).subscriptions[0].sourceIds.length, 2)
+
+  const backup = JSON.parse(await service.exportBackup())
+  assert.equal(backup.subscriptions.length, 1)
+  assert.equal(backup.sources.find(item => item.id === firstSource.id).enabled, false)
+  const restored = await service.importBackup({ data: backup })
+  assert.equal(restored.subscriptions[0].url, 'https://lib.example/sources.json')
+  assert.equal(restored.sources.find(item => item.id === firstSource.id).enabled, false)
+
+  const subscriptionId = restored.subscriptions[0].id
+  assert.equal((await service.removeSubscription({ id: subscriptionId })).removed, true)
+  assert.equal((await service.state()).subscriptions.length, 0)
+  assert.equal(!!db.sources.get(firstSource.id), true, '取消订阅不应删除书源')
+  await assert.rejects(() => service.removeSubscription({ id: subscriptionId }), error => error.code === 'reader/not-found')
+})
+
+test('partial source libraries keep the subscription without claiming full success', async () => {
+  const library = [
+    { bookSourceName: '可用源', bookSourceUrl: 'https://valid.example', rules: {} },
+    { bookSourceName: '坏源', bookSourceUrl: 'not-a-url', rules: {} },
+  ]
+  const { service } = await serviceFixture({}, {
+    fetchRemote: async () => ({ text: JSON.stringify(library), url: 'https://lib.example/partial.json' }),
+  })
+  const result = await service.subscribeSourceLibrary({ url: 'https://lib.example/partial.json' })
+  assert.equal(result.imported, 1)
+  assert.equal(result.skipped.length, 1)
+  assert.equal(result.subscription.status, 'partial')
+  assert.equal(result.subscription.lastSuccessAt, undefined)
+  assert.equal(result.subscription.lastCheckedAt !== undefined, true)
+})
+
+test('legacy sources without an enabled field migrate as enabled', async () => {
+  const calls = []
+  const engine = { async search() { calls.push('search'); return [] } }
+  const { service, db } = await serviceFixture(engine)
+  await db.sources.put('legacy', { id: 'legacy', name: '旧源', bookSourceUrl: 'https://legacy.example', rules: {} })
+  const state = await service.state()
+  assert.equal(state.sources.find(item => item.id === 'legacy').enabled, true)
+  await service.search({ sourceId: 'legacy', query: '书' })
+  assert.deepEqual(calls, ['search'])
+})
+
+test('disabled sources are rejected by every remote read path and skipped by updates', async () => {
+  const calls = []
+  const engine = {
+    async search() { calls.push('search'); return [] },
+    async discover() { calls.push('discover'); return [] },
+    async bookInfo() { calls.push('bookInfo'); return { name: '远程书', author: '作者' } },
+    async toc() { calls.push('toc'); return [] },
+    async content() { calls.push('content'); return { text: '正文', html: '<p>正文</p>' } },
+  }
+  const { service, db } = await serviceFixture(engine)
+  await db.sources.put(source.id, { ...source, enabled: false })
+  const book = { id: 'disabled-book', sourceId: source.id, bookUrl: 'https://example.com/book', name: '书', local: false, download: { status: 'none' } }
+  await db.books.put(book.id, book)
+  await db.chapters.put('disabled-chapter', { id: 'disabled-chapter', bookId: book.id, index: 0, title: '章', url: 'https://example.com/c1' })
+  const disabled = error => error?.code === 'reader/source-disabled'
+  await assert.rejects(() => service.search({ sourceId: source.id, query: '书' }), disabled)
+  await assert.rejects(() => service.discover({ sourceId: source.id }), disabled)
+  await assert.rejects(() => service.addBook({ sourceId: source.id, bookUrl: 'https://example.com/book/2' }), disabled)
+  await assert.rejects(() => service.toc({ bookId: book.id, refresh: true }), disabled)
+  await assert.rejects(() => service.chapter({ bookId: book.id, chapterId: 'disabled-chapter' }), disabled)
+  await assert.rejects(() => service.download({ bookId: book.id }), disabled)
+  await assert.rejects(() => service.applyBookMeta({ bookId: book.id, meta: { sourceId: source.id, bookUrl: book.bookUrl } }), disabled)
+  const updates = await service.checkUpdates()
+  assert.deepEqual({ checked: updates.checked, skipped: updates.skipped }, { checked: 0, skipped: 1 })
+  assert.equal(calls.length, 0, '停用源不得触发任何引擎请求')
+
+  await service.setSourceEnabled({ id: source.id, enabled: true })
+  await service.search({ sourceId: source.id, query: '书' })
+  assert.deepEqual(calls, ['search'])
+})
