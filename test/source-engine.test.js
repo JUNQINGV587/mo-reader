@@ -40,6 +40,88 @@ test('source engine executes GET/POST form configuration and CSS rules without r
   assert.equal(content.text.includes('bad()'), false)
 })
 
+test('source engine blocks host escape from JS rules', async () => {
+  const engine = new SourceEngine({
+    fetch: async url => ({ url, headers: { 'content-type': 'text/html' }, text: '<h1>safe</h1>' }),
+  })
+  const hostile = {
+    ...source,
+    rules: { ...source.rules, bookInfo: { name: '<js>this.constructor.constructor("return process.env")()</js>' } },
+  }
+  await assert.rejects(engine.bookInfo(hostile, 'https://example.com/book/a'), /JS|script|generation|沙箱/i)
+  const throughFetch = { ...source, rules: { ...source.rules, bookInfo: { name: '<js>fetch.constructor("return process.env")()</js>' } } }
+  await assert.rejects(engine.bookInfo(throughFetch, 'https://example.com/book/a'), /JS|script|generation|沙箱/i)
+})
+
+test('source engine does not expose the host fetch function through sandbox globals', async () => {
+  const engine = new SourceEngine({
+    fetch: async url => ({ url, headers: { 'content-type': 'text/html' }, text: '<h1>safe</h1>' }),
+  })
+  const hostile = { ...source, rules: { ...source.rules, bookInfo: { name: '<js>__request.constructor("return process.env")()</js>' } } }
+  await assert.rejects(engine.bookInfo(hostile, 'https://example.com/book/a'), /JS|script|generation|沙箱|not defined/i)
+})
+
+test('source engine allows JS field rules to fetch only through the source adapter', async () => {
+  const calls = []
+  const engine = new SourceEngine({
+    fetch: async url => {
+      calls.push(url)
+      if (url.endsWith('/title.json')) return { url, headers: { 'content-type': 'application/json' }, text: '{"name":"远程书名"}' }
+      return { url, headers: { 'content-type': 'text/html' }, text: '<h1>detail</h1>' }
+    },
+  })
+  const remote = {
+    ...source,
+    rules: { ...source.rules, bookInfo: { name: '<js>fetch("/title.json").then(r => r.json()).then(d => d.name)</js>' } },
+  }
+  const result = await engine.bookInfo(remote, 'https://example.com/book/a')
+  assert.equal(result.name, '远程书名')
+  assert.deepEqual(calls, ['https://example.com/book/a', 'https://example.com/title.json'])
+})
+
+test('source engine rejects off-origin JS requests and runaway scripts', async () => {
+  const calls = []
+  const engine = new SourceEngine({
+    fetch: async url => {
+      calls.push(url)
+      return { url, headers: { 'content-type': 'text/html' }, text: '<h1>detail</h1>' }
+    },
+  })
+  const offOrigin = { ...source, rules: { ...source.rules, bookInfo: { name: '<js>fetch("https://evil.example/secret")</js>' } } }
+  await assert.rejects(engine.bookInfo(offOrigin, 'https://example.com/book/a'), /origin/)
+  assert.deepEqual(calls, ['https://example.com/book/a'])
+  const runaway = { ...source, rules: { ...source.rules, bookInfo: { name: '<js>(() => { while (true) {} })()</js>' } } }
+  await assert.rejects(engine.bookInfo(runaway, 'https://example.com/book/a'), /超时|timed out/i)
+  const asyncRunaway = { ...source, rules: { ...source.rules, bookInfo: { name: '<js>fetch("/data").then(() => { while (true) {} })</js>' } } }
+  await assert.rejects(engine.bookInfo(asyncRunaway, 'https://example.com/book/a'), /超时|timed out/i)
+})
+
+test('source engine runs safe JS fields in search and content', async () => {
+  const engine = new SourceEngine({
+    fetch: async url => {
+      if (url.includes('/api')) return { url, headers: { 'content-type': 'application/json' }, text: '{"items":[{"title":"JS 书","id":"a"}]}' }
+      if (url.includes('/toc')) return { url, headers: { 'content-type': 'application/json' }, text: '{"items":[{"name":"第1章","url":"/chapter/1"}]}' }
+      return { url, headers: { 'content-type': 'text/html' }, text: '<article><p>JS 正文</p><script>bad()</script></article>' }
+    },
+  })
+  const jsSource = {
+    ...source,
+    rules: {
+      ...source.rules,
+      search: { url: '/api', bookList: '$.items[*]', name: '@js:document.title', bookUrl: ['@js:"/book/" + document.id'] },
+      content: { content: '<js>html.match(/<article>[\\s\\S]*<\\/article>/)[0]</js>' },
+    },
+  }
+  const found = await engine.search(jsSource, { query: 'x' })
+  assert.equal(found.items[0].name, 'JS 书')
+  assert.equal(found.items[0].bookUrl, 'https://example.com/book/a')
+  const content = await engine.content(jsSource, { id: 'a', name: 'JS 书', bookUrl: found.items[0].bookUrl }, { id: 'c', title: '第一章', url: 'https://example.com/chapter/1' })
+  assert.equal(content.text, 'JS 正文')
+  assert.equal(content.text.includes('bad()'), false)
+  const scriptedToc = { ...jsSource, rules: { ...jsSource.rules, toc: { url: '/toc', list: '$.items[*]', chapterName: '@js:document.name', chapterUrl: '@js:document.url' } } }
+  assert.equal((await engine.toc(scriptedToc, { id: 'a', name: 'JS 书', bookUrl: found.items[0].bookUrl })).length, 1)
+})
+
 test('source engine supports JSONPath search and empty discovery', async () => {
   const engine = new SourceEngine({
     fetch: async url => ({
