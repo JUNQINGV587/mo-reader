@@ -39,7 +39,7 @@ window.__ModuleLoader__.load({
       replacements: [],
       mode: 'scroll',
       flipStyle: 'slide',
-      measureWidth: 800,
+      measureWidth: 960,
       animations: true,
       motionQuality: 'auto',
       ambience: 'full',
@@ -144,6 +144,7 @@ window.__ModuleLoader__.load({
         download: 'M12 3v12m-5-5 5 5 5-5M5 21h14',
         refresh: 'M20 6v5h-5M4 18v-5h5M6.1 8a7 7 0 0 1 11.8-2L20 11M4 13l2.1 5a7 7 0 0 0 11.8-2',
         trash: 'M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6',
+        folder: 'M3 7h7l2 2h9v10H3zM3 7V5h7l2 2',
         note: 'M5 3h14v18H5zM8 8h8M8 12h8M8 16h5',
         play: 'M8 5l11 7-11 7z',
         stop: 'M7 7h10v10H7z',
@@ -154,6 +155,7 @@ window.__ModuleLoader__.load({
         sun: 'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM12 3v1.6M12 19.4V21M3 12h1.6M19.4 12H21M5.6 5.6l1.1 1.1M17.3 17.3l1.1 1.1M18.4 5.6l-1.1 1.1M6.7 17.3l-1.1 1.1',
         up: 'M12 19V6m-6 6 6-6 6 6',
         moon: 'M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z',
+        chart: 'M4 19V11M10 19V5M16 19v-5M21 19V8',
       };
       return h('svg', {
         className: 'mr-glyph', width: size, height: size, viewBox: '0 0 24 24',
@@ -292,10 +294,108 @@ window.__ModuleLoader__.load({
 
 
 
-    const SHELF_MAX_BOOKS = 48;
+    function shelfBookId(book) {
+      const value = book?.id ?? book?.bookId ?? book?.bookUrl ?? book?.url;
+      return value === undefined || value === null ? '' : String(value);
+    }
+
+    function shelfFilterMatches(book, filter = 'all') {
+      if (filter === 'reading') {
+        const progress = book?.lastRead || book?.progress;
+        return Boolean(book?.lastReadAt || (progress && (progress.chapterId || Number(progress.percent) > 0)));
+      }
+      if (filter === 'updates') return Number(book?.unread || book?.unreadCount || 0) > 0;
+      if (filter === 'downloaded') {
+        const job = book && typeof book.download === 'object' ? book.download : null;
+        return (book?.downloadStatus || (typeof book?.download === 'string' ? book.download : job?.status)) === 'completed';
+      }
+      return true;
+    }
+
+    function shelfTimestamp(value) {
+      if (value === null || value === undefined || value === '') return 0;
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) return numeric;
+      const parsed = Date.parse(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    }
+
+    function shelfSortBooks(books, sortBy = 'recent') {
+      const result = [...(Array.isArray(books) ? books : [])];
+      if (sortBy === 'recent') result.sort((a, b) => shelfTimestamp(b.lastReadAt || b.updatedAt) - shelfTimestamp(a.lastReadAt || a.updatedAt));
+      else if (sortBy === 'added') result.sort((a, b) => shelfTimestamp(b.createdAt) - shelfTimestamp(a.createdAt));
+      else if (sortBy === 'name') result.sort((a, b) => String(a.name || a.title || '').localeCompare(String(b.name || b.title || '')));
+      else if (sortBy === 'progress') result.sort((a, b) => Number((b.lastRead || b.progress)?.percent || 0) - Number((a.lastRead || a.progress)?.percent || 0));
+      return result;
+    }
+
+    function selectShelfBooks(books, { query = '', folder = null, filter = 'all', sortBy = 'recent' } = {}) {
+      const keyword = String(query).trim().toLowerCase();
+      const result = (Array.isArray(books) ? books : []).filter((book) => {
+        const folderId = book.folderId || null;
+        if (folder === null ? folderId !== null : folderId !== folder) return false;
+        if (keyword && !`${book.name || book.title || ''} ${book.author || ''}`.toLowerCase().includes(keyword)) return false;
+        return shelfFilterMatches(book, filter);
+      });
+      return shelfSortBooks(result, sortBy);
+    }
+
+    function shelfResultKey({ query = '', filter = 'all', sortBy = 'recent', folder = null } = {}) {
+      return JSON.stringify([String(query).trim().toLowerCase(), filter, sortBy, folder || null]);
+    }
+
+    function shelfPageGeometry({ width = 0, height = 0, mobile = false } = {}) {
+      const safeWidth = Math.max(0, Number(width) || 0);
+      const safeHeight = Math.max(0, Number(height) || 0);
+      if (mobile) {
+        const rows = safeHeight >= 540 ? 3 : 2;
+        return { mobile: true, columns: 3, rows, capacity: 3 * rows, rowHeight: 0 };
+      }
+      const columns = Math.max(3, Math.min(8, Math.floor(safeWidth / 145) || 3));
+      const gap = 12;
+      const tileWidth = Math.max(0, (safeWidth - gap * (columns - 1)) / columns);
+      const rowHeight = Math.max(170, tileWidth * 4 / 3 + 64);
+      const rows = Math.max(1, Math.min(3, Math.floor((safeHeight + gap) / (rowHeight + gap)) || 1));
+      return { mobile: false, columns, rows, capacity: columns * rows, rowHeight };
+    }
+
+    function shelfPageCount(itemCount, geometry) {
+      const capacity = Math.max(1, Number(typeof geometry === 'number' ? geometry : geometry?.capacity) || 1);
+      return Math.max(1, Math.ceil(Math.max(0, Number(itemCount) || 0) / capacity));
+    }
+
+    function paginateShelf(books, requestedPage = 0, geometry = { capacity: 12 }) {
+      const list = Array.isArray(books) ? books : [];
+      const capacity = Math.max(1, Number(typeof geometry === 'number' ? geometry : geometry?.capacity) || 1);
+      const pageCount = shelfPageCount(list.length, capacity);
+      const page = Math.max(0, Math.min(pageCount - 1, Math.floor(Number(requestedPage) || 0)));
+      const start = page * capacity;
+      const items = list.slice(start, start + capacity);
+      return { items, page, pageCount, capacity, start, anchorId: items.length ? shelfBookId(items[0]) : null };
+    }
+
+    function shelfAnchorPage(books, anchorId, geometry = { capacity: 12 }, fallbackPage = 0) {
+      const list = Array.isArray(books) ? books : [];
+      const capacity = Math.max(1, Number(typeof geometry === 'number' ? geometry : geometry?.capacity) || 1);
+      const index = anchorId ? list.findIndex((book) => shelfBookId(book) === String(anchorId)) : -1;
+      if (index >= 0) return Math.floor(index / capacity);
+      return Math.max(0, Math.min(shelfPageCount(list.length, capacity) - 1, Math.floor(Number(fallbackPage) || 0)));
+    }
+
+    const shelfPagination = {
+      id: shelfBookId,
+      matchesFilter: shelfFilterMatches,
+      sortBooks: shelfSortBooks,
+      selectBooks: selectShelfBooks,
+      resultKey: shelfResultKey,
+      geometry: shelfPageGeometry,
+      pageCount: shelfPageCount,
+      paginate: paginateShelf,
+      anchorPage: shelfAnchorPage,
+    };
 
     function shelfLayout(books = []) {
-      const list = (Array.isArray(books) ? books : []).slice(0, SHELF_MAX_BOOKS);
+      const list = Array.isArray(books) ? [...books] : [];
       const lastRead = list.find((book) => {
         const progress = book.lastRead || book.progress;
         return progress && (Number(progress.percent) > 0 || progress.chapterId);
@@ -330,25 +430,86 @@ window.__ModuleLoader__.load({
       const badge = downloadBadge(book);
       if (!badge) return null;
       const toggle = (event) => { event.preventDefault(); event.stopPropagation(); onToggle?.(book); };
+      const action = badge.kind === 'paused' ? '点击继续下载' : badge.kind === 'running' || badge.kind === 'queued' ? '点击暂停下载' : badge.kind === 'failed' ? '点击重新下载' : '已下载，点击重新拉取新章';
+      const aria = badge.kind === 'done' ? '已下载，点击重新拉取新章' : `${badge.label}，${action}`;
       return h('span', {
         className: `mr-dl-badge ${badge.kind}`,
         role: 'button',
         tabIndex: 0,
-        title: badge.kind === 'paused' ? '点击继续下载' : badge.kind === 'running' || badge.kind === 'queued' ? '点击暂停下载' : badge.kind === 'failed' ? '点击重新下载' : '已下载，点击重新拉取新章',
+        title: action,
+        'aria-label': aria,
         onClick: toggle,
         onKeyDown: (event) => { if (event.key === 'Enter' || event.key === ' ') toggle(event); },
-      }, badge.label);
+      },
+        badge.kind === 'done' ? h(Glyph, { name: 'download', size: 14 }) : null,
+        h('span', { className: 'mr-dl-label' }, badge.label));
     }
 
-    function ShelfBoard({ books, folders = [], reducedMotion = false, onOpen, headActions, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead }) {
+    function ShelfBoard({ books, folders = [], reducedMotion = false, onOpen, onCheck, busy = false, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead }) {
       const [query, setQuery] = useState('');
       const [selectMode, setSelectMode] = useState(false);
       const [selected, setSelected] = useState(new Set());
+      const [selectionBusy, setSelectionBusy] = useState(false);
       const [folderFilter, setFolderFilter] = useState(null);
       const [folderSheet, setFolderSheet] = useState(false);
       const [shareBook, setShareBook] = useState(null);
-      const [sortBy, setSortBy] = useState('recent');
+      const sortBy = 'recent';
+      const [mobileSearch, setMobileSearch] = useState(false);
+      const [page, setPage] = useState(0);
+      const [pageMotion, setPageMotion] = useState(null);
+      const [geometry, setGeometry] = useState(() => shelfPageGeometry({
+        width: window.innerWidth,
+        height: window.innerHeight,
+        mobile: window.matchMedia?.('(max-width: 760px)').matches || window.innerWidth <= 760,
+      }));
       const searchRef = useRef(null);
+      const wallRef = useRef(null);
+      const trackRef = useRef(null);
+      const debounceRef = useRef(null);
+      const pageRef = useRef(page);
+      const pageMotionSeqRef = useRef(0);
+      const geometryRef = useRef(geometry);
+      const gridBooksRef = useRef([]);
+      const anchorRef = useRef(null);
+      const gestureRef = useRef(null);
+      const suppressClickRef = useRef(false);
+      const longPressRef = useRef(null);
+      const suppressOpenRef = useRef(false);
+      pageRef.current = page;
+      geometryRef.current = geometry;
+
+      const layout = useMemo(() => shelfLayout(books), [books]);
+      const folderMap = useMemo(() => new Map(folders.map((folder) => [folder.id, folder])), [folders]);
+      const normalizedQuery = query.trim().toLowerCase();
+      const resultKey = shelfResultKey({ query: normalizedQuery, filter: 'all', sortBy, folder: folderFilter });
+      const sortedMatches = useMemo(() => selectShelfBooks(layout.books, {
+        query: normalizedQuery, filter: 'all', folder: folderFilter, sortBy,
+      }), [layout.books, normalizedQuery, folderFilter, sortBy]);
+      const gridBooks = sortedMatches;
+      gridBooksRef.current = gridBooks;
+      const pageData = paginateShelf(gridBooks, page, geometry);
+      const mobilePages = geometry.mobile
+        ? Array.from({ length: pageData.pageCount }, (_, index) => paginateShelf(gridBooks, index, geometry))
+        : [];
+      const allSelected = gridBooks.length > 0 && gridBooks.every((book) => selected.has(shelfBookId(book)));
+
+      const setCurrentPage = (nextPage, { scroll = true } = {}) => {
+        const currentPage = pageRef.current;
+        const next = paginateShelf(gridBooksRef.current, nextPage, geometryRef.current);
+        if (scroll && !geometryRef.current.mobile && !reducedMotion && next.page !== currentPage) {
+          pageMotionSeqRef.current += 1;
+          setPageMotion({ direction: next.page > currentPage ? 'next' : 'prev', seq: pageMotionSeqRef.current });
+        } else {
+          setPageMotion(null);
+        }
+        pageRef.current = next.page;
+        anchorRef.current = next.anchorId;
+        setPage(next.page);
+        if (scroll && geometryRef.current.mobile && trackRef.current) {
+          trackRef.current.scrollTo({ left: next.page * trackRef.current.clientWidth, behavior: 'instant' });
+        }
+      };
+
       useEffect(() => {
         const onKey = (event) => {
           if (!(event.metaKey || event.ctrlKey) || String(event.key).toLowerCase() !== 'k') return;
@@ -356,25 +517,17 @@ window.__ModuleLoader__.load({
           const field = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
           if (field && !target.closest?.('.mr-root')) return;
           event.preventDefault();
+          setMobileSearch(true);
           searchRef.current?.focus();
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, []);
-      const layout = shelfLayout(books);
-      const lastRead = layout.lastRead;
-      const folderMap = useMemo(() => new Map(folders.map(f => [f.id, f])), [folders]);
-      const booksInFolder = useMemo(() => {
-        const map = new Map();
-        for (const book of layout.books) {
-          const fid = book.folderId || null;
-          if (!map.has(fid)) map.set(fid, []);
-          map.get(fid).push(book);
-        }
-        return map;
-      }, [layout.books]);
-      const visibleBooks = folderFilter ? (booksInFolder.get(folderFilter) || []) : (booksInFolder.get(null) || []);
-      const debounceRef = useRef(null);
+
+      useEffect(() => {
+        if (mobileSearch) searchRef.current?.focus();
+      }, [mobileSearch]);
+
       useEffect(() => {
         if (!onSearchOnline) return undefined;
         const keyword = query.trim();
@@ -383,36 +536,122 @@ window.__ModuleLoader__.load({
         debounceRef.current = setTimeout(() => onSearchOnline(keyword), 500);
         return () => clearTimeout(debounceRef.current);
       }, [query, onSearchOnline]);
+
+      useLayoutEffect(() => {
+        const node = wallRef.current;
+        if (!node) return undefined;
+        const measure = () => {
+          const rect = node.getBoundingClientRect();
+          const mobile = window.matchMedia?.('(max-width: 760px)').matches || window.innerWidth <= 760;
+          const pager = mobile ? null : node.querySelector('.mr-shelf-pager');
+          const pagerHeight = pager ? pager.getBoundingClientRect().height : 0;
+          const next = shelfPageGeometry({
+            width: rect.width,
+            height: Math.max(0, rect.height - pagerHeight),
+            mobile,
+          });
+          const previous = geometryRef.current;
+          const changed = previous.mobile !== next.mobile || previous.columns !== next.columns || previous.rows !== next.rows;
+          if (!changed) return;
+          if (previous.capacity !== next.capacity || previous.mobile !== next.mobile) {
+            const anchorId = anchorRef.current || paginateShelf(gridBooksRef.current, pageRef.current, previous).anchorId;
+            const nextPage = shelfAnchorPage(gridBooksRef.current, anchorId, next, pageRef.current);
+            pageRef.current = nextPage;
+            setPage(nextPage);
+          }
+          geometryRef.current = next;
+          setGeometry(next);
+        };
+        measure();
+        const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(measure) : null;
+        observer?.observe(node);
+        window.addEventListener('resize', measure);
+        return () => {
+          observer?.disconnect();
+          window.removeEventListener('resize', measure);
+        };
+      }, []);
+
+      const previousResultKeyRef = useRef(resultKey);
+      useLayoutEffect(() => {
+        if (previousResultKeyRef.current !== resultKey) {
+          previousResultKeyRef.current = resultKey;
+          const first = paginateShelf(gridBooks, 0, geometry);
+          pageRef.current = 0;
+          anchorRef.current = first.anchorId;
+          setPage(0);
+          if (trackRef.current) trackRef.current.scrollLeft = 0;
+          const ids = new Set(gridBooks.map(shelfBookId));
+          setSelected((previous) => new Set([...previous].filter((id) => ids.has(id))));
+          return;
+        }
+        if (!anchorRef.current) {
+          anchorRef.current = paginateShelf(gridBooks, page, geometry).anchorId;
+          return;
+        }
+        const anchorId = anchorRef.current;
+        const nextPage = shelfAnchorPage(gridBooks, anchorId, geometry, pageRef.current);
+        if (nextPage !== pageRef.current) {
+          pageRef.current = nextPage;
+          setPage(nextPage);
+        }
+        if (geometry.mobile && trackRef.current) {
+          const left = nextPage * trackRef.current.clientWidth;
+          if (Math.abs(trackRef.current.scrollLeft - left) > 2) trackRef.current.scrollTo({ left, behavior: 'instant' });
+        }
+      }, [resultKey, gridBooks, geometry]);
+
       const onlineItems = Array.isArray(online) ? online : [];
       const shelfUrls = new Set(layout.books.map((book) => book.bookUrl || book.url).filter(Boolean));
-      const normalizedQuery = query.trim().toLowerCase();
-      const matches = normalizedQuery
-        ? layout.books.filter((book) => `${book.name || book.title || ''} ${book.author || ''}`.toLowerCase().includes(normalizedQuery))
-        : visibleBooks;
-      const sortedMatches = useMemo(() => {
-        const arr = [...matches];
-        if (sortBy === 'recent') arr.sort((a, b) => (b.lastReadAt || b.updatedAt || 0) - (a.lastReadAt || a.updatedAt || 0));
-        else if (sortBy === 'added') arr.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-        else if (sortBy === 'name') arr.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
-        else if (sortBy === 'progress') arr.sort((a, b) => (b.lastRead?.percent || 0) - (a.lastRead?.percent || 0));
-        return arr;
-      }, [matches, sortBy]);
-      const heroBook = normalizedQuery || folderFilter || selectMode ? null : lastRead;
-      const gridBooks = sortedMatches.filter((book) => book !== heroBook);
       const toggleSelect = (book) => {
-        const id = book.id || book.bookId;
-        setSelected(prev => {
-          const next = new Set(prev);
+        const id = shelfBookId(book);
+        if (!id) return;
+        setSelected((previous) => {
+          const next = new Set(previous);
           if (next.has(id)) next.delete(id); else next.add(id);
           return next;
         });
       };
       const toggleSelectAll = () => {
-        if (selected.size === gridBooks.length) setSelected(new Set());
-        else setSelected(new Set(gridBooks.map(b => b.id || b.bookId)));
+        setSelected(allSelected ? new Set() : new Set(gridBooks.map(shelfBookId).filter(Boolean)));
       };
       const exitSelect = () => { setSelectMode(false); setSelected(new Set()); };
+      const runSelectionAction = async (action) => {
+        if (selectionBusy) return;
+        setSelectionBusy(true);
+        try { await action(); exitSelect(); } catch { /* 失败时保留选择，便于重试。 */ } finally { setSelectionBusy(false); }
+      };
+      const cancelLongPress = () => {
+        if (longPressRef.current) clearTimeout(longPressRef.current.timer);
+        longPressRef.current = null;
+      };
+      const startLongPress = (event, book, id) => {
+        if (selectMode || !id || event.button !== 0 && event.pointerType === 'mouse') return;
+        if (event.target.closest?.('.mr-dl-badge, .mr-select-check')) return;
+        cancelLongPress();
+        const point = { x: event.clientX, y: event.clientY };
+        const timer = setTimeout(() => {
+          longPressRef.current = null;
+          suppressOpenRef.current = true;
+          setSelectMode(true);
+          setSelected(new Set([id]));
+          try { navigator.vibrate?.(8); } catch {}
+          setTimeout(() => { suppressOpenRef.current = false; }, 900);
+        }, 520);
+        longPressRef.current = { ...point, timer };
+      };
+      const moveLongPress = (event) => {
+        const press = longPressRef.current;
+        if (!press) return;
+        if (Math.abs(event.clientX - press.x) > 8 || Math.abs(event.clientY - press.y) > 8) cancelLongPress();
+      };
       const open = (book, event) => {
+        if (suppressOpenRef.current) {
+          suppressOpenRef.current = false;
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
         if (selectMode) { toggleSelect(book); return; }
         const scope = event.currentTarget.closest?.('.mr-shelf-hero, .mr-shelf-book') || event.currentTarget;
         const cover = scope.querySelector?.('.mr-shelf-cover') || event.currentTarget.querySelector?.('.mr-shelf-cover');
@@ -423,7 +662,7 @@ window.__ModuleLoader__.load({
           rect: rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null,
           panel: panel ? { left: panel.left, top: panel.top, width: panel.width, height: panel.height } : null,
           cover: book.coverLocal || book.coverUrl || book.cover || '',
-          bookId: String(book.id || book.bookId || ''),
+          bookId: shelfBookId(book),
         });
       };
       const coverNode = (book, name, variant = 1) => {
@@ -441,15 +680,119 @@ window.__ModuleLoader__.load({
             variant === 1 ? h('span', { className: 'mr-shelf-mtn', 'aria-hidden': 'true' }) : null),
           cover ? h('img', { src: cover, alt: '', loading: 'lazy', onError: (event) => { event.currentTarget.style.visibility = 'hidden'; } }) : null);
       };
-      const progress = heroBook ? (heroBook.lastRead || heroBook.progress || {}) : {};
-      const rawPercent = Number(progress.percent);
-      const percent = Number.isFinite(rawPercent) ? Math.max(0, Math.min(100, Math.round(rawPercent))) : 0;
-      const chapter = progress.chapterTitle || (Number.isInteger(progress.chapterIndex) ? `第 ${progress.chapterIndex + 1} 章` : '');
-      const heroTitle = heroBook ? String(heroBook.name || heroBook.title || '未命名').replace(/\.(?:txt|epub|md|pdf)$/i, '') : '';
-      const byline = heroBook ? [heroBook.author, chapter, percent > 0 ? `已读 ${percent}%` : ''].filter(Boolean).join(' · ') : '';
-      return h('div', { className: `mr-shelf${reducedMotion ? ' mr-reduced' : ''}` },
+      const renderBook = (book, index) => {
+        const id = shelfBookId(book) || `anonymous-${index}`;
+        const name = String(book.name || book.title || '未命名');
+        const variant = (index % 7) + 2;
+        const isSelected = selected.has(id);
+        return h('button', {
+          key: `book-${id}`,
+          className: `mr-shelf-piece mr-shelf-book${isSelected ? ' mr-selected' : ''}`,
+          type: 'button',
+          'aria-label': `${name}${book.author ? `，${book.author}` : ''}`,
+          'aria-pressed': selectMode ? isSelected : undefined,
+          'data-book-id': id,
+          title: name,
+          onClick: (event) => open(book, event),
+          onPointerDown: (event) => startLongPress(event, book, id),
+          onPointerMove: moveLongPress,
+          onPointerUp: cancelLongPress,
+          onPointerCancel: cancelLongPress,
+          onPointerLeave: cancelLongPress,
+          onContextMenu: (event) => { event.preventDefault(); if (!suppressOpenRef.current) setShareBook(book); },
+          onKeyDown: (event) => {
+            if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
+              event.preventDefault();
+              setShareBook(book);
+            }
+          },
+        },
+        selectMode ? h('span', { className: `mr-select-check${isSelected ? ' mr-checked' : ''}`, 'aria-hidden': 'true' },
+          isSelected ? h(Glyph, { name: 'check', size: 15 }) : null) : null,
+        h('span', { className: 'mr-shelf-visual' },
+          h('span', { className: 'mr-shelf-cover-frame' },
+            coverNode(book, name, variant),
+            !selectMode ? h(DownloadBadge, { book, onToggle: onToggleDownload }) : null,
+            Number(book.unread || book.unreadCount || 0) > 0 ? h('span', { className: 'mr-new-badge' }, `+${Number(book.unread || book.unreadCount)} 章`) : null)),
+        h('span', { className: 'mr-shelf-cap' },
+          h('strong', null, name.replace(/\.(?:txt|epub|md|pdf)$/i, '')),
+          book.author ? h('small', null, book.author) : null));
+      };
+      const onTrackScroll = () => {
+        if (!geometry.mobile || !trackRef.current) return;
+        const node = trackRef.current;
+        const nextPage = Math.max(0, Math.min(pageData.pageCount - 1, Math.round(node.scrollLeft / Math.max(1, node.clientWidth))));
+        if (nextPage !== pageRef.current) {
+          const next = paginateShelf(gridBooksRef.current, nextPage, geometryRef.current);
+          pageRef.current = nextPage;
+          anchorRef.current = next.anchorId;
+          setPage(nextPage);
+        }
+      };
+      const onTrackPointerDown = (event) => {
+        if (!geometry.mobile || (event.pointerType !== 'touch' && event.pointerType !== 'pen')) return;
+        gestureRef.current = { x: event.clientX, y: event.clientY, scrollLeft: trackRef.current?.scrollLeft || 0 };
+        suppressClickRef.current = false;
+      };
+      const onTrackPointerMove = (event) => {
+        const gesture = gestureRef.current;
+        if (!gesture) return;
+        if (Math.abs(event.clientX - gesture.x) > 8 || Math.abs(event.clientY - gesture.y) > 8 || Math.abs((trackRef.current?.scrollLeft || 0) - gesture.scrollLeft) > 5) {
+          suppressClickRef.current = true;
+        }
+      };
+      const onTrackPointerEnd = () => {
+        gestureRef.current = null;
+        setTimeout(() => { suppressClickRef.current = false; }, 250);
+      };
+      const onTrackClickCapture = (event) => {
+        if (!suppressClickRef.current) return;
+        event.preventDefault();
+        event.stopPropagation();
+        suppressClickRef.current = false;
+      };
+      const clearSearch = () => { setQuery(''); searchRef.current?.focus(); };
+      const openDeskSidebar = () => {
+        const root = document.querySelector('.mr-root');
+        if (root) root.style.zIndex = '50';
+        // 宿主按钮的 aria-label 会随界面语言变化；data-sidebar-opener 是稳定契约。
+        const toggle = document.querySelector('[data-sidebar-opener]');
+        if (toggle) { toggle.click(); return; }
+        const hostNewSession = [...document.querySelectorAll('button')].find((button) => {
+          const label = (button.getAttribute('aria-label') || '').trim().toLowerCase();
+          const text = (button.innerText || '').trim().toLowerCase();
+          return ['new session', '新建会话'].includes(label) || ['new session', '新会话'].includes(text);
+        });
+        if (hostNewSession) hostNewSession.click();
+      };
+      const renameFolder = (folder) => {
+        const name = window.prompt('重命名文件夹', folder.name);
+        if (name) onRenameFolder?.(folder.id, name);
+      };
+      const emptyTitle = layout.count === 0 ? '窗边还空着' : normalizedQuery ? `没有找到「${query.trim()}」` : folderFilter ? '这个文件夹还空着' : '没有可展示的书';
+      const emptyDetail = layout.count === 0 ? '去发现搜书，或导入本地书籍。' : normalizedQuery ? '换个书名或作者，也可以看看在线结果。' : folderFilter ? '移动书籍到这里，或返回书库。' : '全部藏书都还在，换个搜索或排序试试。';
+      const pageNumbers = [...new Set([0, pageData.pageCount - 1, pageData.page - 1, pageData.page, pageData.page + 1].filter((index) => index >= 0 && index < pageData.pageCount))].sort((a, b) => a - b);
+
+      return h('div', { className: `mr-shelf mr-window-shelf${reducedMotion ? ' mr-reduced' : ''}${mobileSearch ? ' mr-mobile-search-open' : ''}${selectMode ? ' mr-selecting' : ''}` },
         h('div', { className: 'mr-shelf-topbar' },
-          h('div', { className: 'mr-shelf-search', role: 'search' },
+          h('button', {
+            className: 'mr-shelf-back',
+            type: 'button',
+            'aria-label': '打开 DSH 侧栏',
+            title: '打开 DSH 侧栏',
+            onClick: openDeskSidebar,
+          }, h(Glyph, { name: 'back', size: 18 })),
+          h('div', { className: `mr-shelf-search${mobileSearch ? ' mr-search-open' : ''}`, role: 'search' },
+            h('button', {
+              className: 'mr-shelf-mobile-search-toggle',
+              type: 'button',
+              'aria-label': mobileSearch ? '收起搜索' : '展开搜索',
+              'aria-expanded': mobileSearch,
+              onClick: () => {
+                if (mobileSearch) { setMobileSearch(false); setQuery(''); searchRef.current?.blur(); }
+                else setMobileSearch(true);
+              },
+            }, h(Glyph, { name: mobileSearch ? 'close' : 'search', size: 18 })),
             h('input', {
               ref: searchRef,
               type: 'text',
@@ -470,107 +813,89 @@ window.__ModuleLoader__.load({
               className: 'mr-shelf-search-clear',
               type: 'button',
               'aria-label': '清空搜索',
-              onClick: () => { setQuery(''); searchRef.current?.focus(); },
+              onClick: clearSearch,
             }, h(Glyph, { name: 'close', size: 14 })) : h('span', { className: 'kbd' }, '⌘K')),
-          h('div', { className: 'mr-shelf-status' },
-            h('span', { className: 'dot' }),
-            h('span', null, '离线可用'),
-            h('span', null, '十一月六日 · 周五'))),
-        h('div', { className: 'mr-shelf-head' },
-          h('div', { className: 'mr-shelf-head-copy' },
-            h('div', { className: 'kicker' },
-              h('span', null, normalizedQuery ? `找到 ${sortedMatches.length} 本` : folderFilter ? (folderMap.get(folderFilter)?.name || '文件夹') : `本机书库 · ${layout.count} 本`),
-              h('span', { className: 'tag' }, '画廊')),
-            h('h1', null, '书架')),
-          h('div', { className: 'mr-shelf-head-actions' },
-            h('select', { className: 'mr-sort-select', value: sortBy, onChange: (e) => setSortBy(e.target.value) },
-              h('option', { value: 'recent' }, '最近阅读'),
-              h('option', { value: 'added' }, '添加时间'),
-              h('option', { value: 'name' }, '书名'),
-              h('option', { value: 'progress' }, '进度')),
-            headActions,
-            h(Button, { kind: selectMode ? 'primary' : 'secondary', onClick: () => { setSelectMode(!selectMode); setSelected(new Set()); } }, selectMode ? '退出多选' : '多选'))),
-        folders.length > 0 || selectMode ? h('div', { className: 'mr-shelf-folder-bar' },
-          h('button', { className: `mr-folder-chip${!folderFilter ? ' active' : ''}`, onClick: () => setFolderFilter(null) }, '全部'),
-          folders.map(f => h('button', {
-            key: f.id,
-            className: `mr-folder-chip${folderFilter === f.id ? ' active' : ''}`,
-            onClick: () => setFolderFilter(f.id),
-            onDoubleClick: () => { const name = window.prompt('重命名文件夹', f.name); if (name) onRenameFolder?.(f.id, name); },
-          }, f.name)),
+          h('button', {
+            className: 'mr-shelf-refresh',
+            type: 'button',
+            'aria-label': '检查更新',
+            title: '检查更新',
+            disabled: busy || !onCheck,
+            onClick: onCheck,
+          }, h(Glyph, { name: 'refresh', size: 18 })),
+          h('div', { className: 'mr-shelf-status' }, h('span', { className: 'dot' }), h('span', null, '本机保存'))),
+        folders.length > 0 && !selectMode ? h('div', { className: 'mr-shelf-folder-bar' },
+          h('button', { className: `mr-folder-chip${!folderFilter ? ' active' : ''}`, onClick: () => setFolderFilter(null) }, '书库'),
+          folders.map((folder) => h('button', {
+            key: folder.id,
+            className: `mr-folder-chip${folderFilter === folder.id ? ' active' : ''}`,
+            'aria-label': `${folder.name}，双击或按 F2 重命名`,
+            onClick: () => setFolderFilter(folder.id),
+            onDoubleClick: () => renameFolder(folder),
+            onKeyDown: (event) => { if (event.key === 'F2') { event.preventDefault(); renameFolder(folder); } },
+          }, folder.name)),
           h('button', { className: 'mr-folder-chip mr-folder-add', onClick: () => { const name = window.prompt('新建文件夹'); if (name) onCreateFolder?.(name); } }, '+ 新建'),
-          folderFilter ? h('button', { className: 'mr-folder-chip mr-folder-del', onClick: () => { if (window.confirm(`删除文件夹「${folderMap.get(folderFilter)?.name}」？里面的书会回到书架。`)) { onRemoveFolder?.(folderFilter); setFolderFilter(null); } } }, '删除此文件夹') : null) : null,
-        selectMode ? h('div', { className: 'mr-select-bar' },
-          h('label', { className: 'mr-select-all' }, h('input', { type: 'checkbox', checked: selected.size === gridBooks.length && gridBooks.length > 0, onChange: toggleSelectAll }), `全选 (${selected.size}/${gridBooks.length})`),
+          folderFilter ? h('button', { className: 'mr-folder-chip mr-folder-del', onClick: () => { if (window.confirm(`删除文件夹「${folderMap.get(folderFilter)?.name}」？里面的书会回到书架。`)) { onRemoveFolder?.(folderFilter); setFolderFilter(null); } } }, '删除文件夹') : null) : null,
+        selectMode ? h('div', { className: 'mr-select-bar', role: 'toolbar', 'aria-label': '书籍多选操作' },
+          h('div', { className: 'mr-select-head' },
+            h('label', { className: 'mr-select-all' }, h('input', { type: 'checkbox', checked: allSelected, onChange: toggleSelectAll }), h('span', null, `全选 (${selected.size}/${gridBooks.length})`)),
+            h('button', { className: 'mr-select-close', type: 'button', 'aria-label': '取消', title: '退出多选', onClick: exitSelect }, h(Glyph, { name: 'close', size: 18 }))),
           h('div', { className: 'mr-select-actions' },
-            h(Button, { kind: 'secondary', disabled: !selected.size, onClick: () => setFolderSheet(true) }, '移动到…'),
-            h(Button, { kind: 'secondary', disabled: !selected.size, onClick: () => onBatchDownload?.(Array.from(selected)) }, '下载'),
-            h(Button, { kind: 'secondary', disabled: !selected.size, onClick: () => onExport?.(Array.from(selected)) }, '导出'),
-            h(Button, { kind: 'secondary', disabled: !selected.size, onClick: () => onMarkRead?.(Array.from(selected)) }, '标已读'),
-            h(Button, { kind: 'danger', disabled: !selected.size, onClick: () => { if (window.confirm(`删除 ${selected.size} 本书？`)) onBatchDelete?.(Array.from(selected)); } }, '删除'),
-            h(Button, { kind: 'text', onClick: exitSelect }, '取消'))) : null,
-        normalizedQuery && sortedMatches.length === 0
-          ? h('div', { className: 'mr-shelf-search-empty' },
-              h('p', null, `没有找到「${query.trim()}」`),
-              h('p', { className: 'hint' }, '换个书名或作者，或清空搜索。'),
-              h(Button, { kind: 'secondary', onClick: () => { setQuery(''); searchRef.current?.focus(); } }, '清空搜索'))
-          : null,
+            h(Button, { icon: 'folder', disabled: selectionBusy || !selected.size, onClick: () => setFolderSheet(true) }, h('span', null, '移动')),
+            h(Button, { icon: 'download', disabled: selectionBusy || !selected.size, onClick: () => runSelectionAction(() => onBatchDownload?.(Array.from(selected))) }, h('span', null, '下载')),
+            h(Button, { icon: 'upload', disabled: selectionBusy || !selected.size, onClick: () => runSelectionAction(() => onExport?.(Array.from(selected))) }, h('span', null, '导出')),
+            h(Button, { icon: 'check', disabled: selectionBusy || !selected.size, onClick: () => runSelectionAction(() => onMarkRead?.(Array.from(selected))) }, h('span', null, '已读')),
+            h(Button, { icon: 'trash', kind: 'mr-select-delete', disabled: selectionBusy || !selected.size, onClick: () => { if (window.confirm(`删除 ${selected.size} 本书？`)) runSelectionAction(() => onBatchDelete?.(Array.from(selected))); } }, h('span', null, '删除')))) : null,
         folderSheet ? h('div', { className: 'mr-folder-sheet-backdrop', onClick: () => setFolderSheet(false) },
-          h('div', { className: 'mr-folder-sheet', onClick: (e) => e.stopPropagation() },
+          h('div', { className: 'mr-folder-sheet', onClick: (event) => event.stopPropagation() },
             h('h3', null, `移动 ${selected.size} 本书到…`),
             h('div', { className: 'mr-folder-sheet-list' },
-              h('button', { className: 'mr-folder-sheet-item', onClick: () => { onMoveToFolder?.(Array.from(selected), null); setFolderSheet(false); exitSelect(); } }, '📚 移出文件夹（回到书架）'),
-              folders.map(f => h('button', {
-                key: f.id,
+              h('button', { className: 'mr-folder-sheet-item', onClick: () => { setFolderSheet(false); runSelectionAction(() => onMoveToFolder?.(Array.from(selected), null)); } }, '📚 移出文件夹（回到书架）'),
+              folders.map((folder) => h('button', {
+                key: folder.id,
                 className: 'mr-folder-sheet-item',
-                onClick: () => { onMoveToFolder?.(Array.from(selected), f.id); setFolderSheet(false); exitSelect(); },
-              }, `📁 ${f.name}`))),
+                onClick: () => { setFolderSheet(false); runSelectionAction(() => onMoveToFolder?.(Array.from(selected), folder.id)); },
+              }, `📁 ${folder.name}`))),
             h(Button, { kind: 'text', onClick: () => setFolderSheet(false) }, '取消'))) : null,
         shareBook ? h(ShareCard, { book: shareBook, onClose: () => setShareBook(null) }) : null,
-        layout.count === 0
-          ? h('div', { className: 'mr-shelf-empty' },
-              h('div', { className: 'mr-shelf-empty-icon' }, h(Glyph, { name: 'book', size: 24 })),
-              h('h3', null, '墙上还空着'),
-              h('p', null, '去发现搜书，或导入本地书籍。'))
-          : h('div', { className: 'mr-shelf-gallery' },
-              heroBook ? h('section', { className: 'mr-shelf-hero', 'aria-label': '继续阅读' },
-                h('button', { className: 'mr-shelf-hero-cover', type: 'button', 'aria-label': `继续阅读 ${heroTitle}`, onClick: (event) => open(heroBook, event) }, coverNode(heroBook, heroTitle, 1), h(DownloadBadge, { book: heroBook, onToggle: onToggleDownload }), Number(heroBook.unread || heroBook.unreadCount || 0) > 0 ? h('span', { className: 'mr-new-badge' }, `+${Number(lastRead.unread || lastRead.unreadCount)} 章`) : null),
-                h('div', { className: 'mr-shelf-hero-info' },
-                  h('p', { className: 'mr-shelf-eyebrow' }, '01 · 继续阅读'),
-                  h('h3', { className: 'mr-shelf-hero-title' }, heroTitle),
-                  byline ? h('p', { className: 'mr-shelf-hero-by' }, byline) : null,
-                  h('div', { className: 'mr-shelf-progress', 'aria-hidden': 'true' }, h('i', { style: { width: `${percent}%` } })),
-                  h('button', { className: 'mr-shelf-cta', type: 'button', onClick: (event) => open(heroBook, event) }, '继续阅读 →'))) : null,
-              normalizedQuery && matches.length === 0
-                ? h('div', { className: 'mr-shelf-search-empty' },
-                    h('p', null, `没有找到「${query.trim()}」`),
-                    h('p', { className: 'hint' }, '换个书名或作者，或清空搜索。'),
-                    h(Button, { kind: 'secondary', onClick: () => { setQuery(''); searchRef.current?.focus(); } }, '清空搜索'))
-                : h('div', { className: 'mr-shelf-grid' },
-                    normalizedQuery && gridBooks.length === 0
-                      ? h('p', { className: 'mr-shelf-grid-note' }, '在读的这本就是')
-                      : gridBooks.map((book, index) => {
-                          const id = book.id || book.bookId || index;
-                          const name = String(book.name || book.title || '未命名');
-                          const variant = (index % 7) + 2;
-                          const isSelected = selected.has(id);
-                          return h('button', {
-                            key: `book-${id}`,
-                            className: `mr-shelf-piece${isSelected ? ' mr-selected' : ''}`,
-                            type: 'button',
-                            'aria-label': `${name}${book.author ? `，${book.author}` : ''}`,
-                            title: name,
-                            onClick: (event) => open(book, event),
-                            onContextMenu: (event) => { event.preventDefault(); setShareBook(book); },
-                          },
-                          selectMode ? h('span', { className: 'mr-select-check' }, h('input', { type: 'checkbox', checked: isSelected, readOnly: true })) : null,
-                          coverNode(book, name, variant),
-                          h(DownloadBadge, { book, onToggle: onToggleDownload }),
-                          Number(book.unread || book.unreadCount || 0) > 0 ? h('span', { className: 'mr-new-badge' }, `+${Number(book.unread || book.unreadCount)} 章`) : null,
-                          h('span', { className: 'mr-shelf-cap' },
-                            h('strong', null, name.replace(/\.(?:txt|epub|md|pdf)$/i, '')),
-                            book.author ? h('small', null, book.author) : null));
-                        }))),
+        h('div', { className: 'mr-shelf-gallery' },
+          h('section', { className: 'mr-shelf-wall', ref: wallRef, 'aria-label': '书架书籍' },
+            gridBooks.length === 0
+              ? h('div', { className: 'mr-shelf-empty' },
+                  h('div', { className: 'mr-shelf-empty-icon' }, h(Glyph, { name: 'book', size: 24 })),
+                  h('h3', null, emptyTitle),
+                  h('p', null, emptyDetail),
+                  normalizedQuery ? h(Button, { kind: 'secondary', onClick: clearSearch }, '清空搜索') : null)
+              : h('div', {
+                    key: geometry.mobile ? 'mobile' : pageMotion ? `desktop-${pageMotion.seq}` : 'desktop',
+                    className: `mr-shelf-grid${geometry.mobile ? ' mr-mobile-track' : ''}${!geometry.mobile && !reducedMotion && pageMotion ? ` mr-page-${pageMotion.direction}` : ''}`,
+                    ref: trackRef,
+                    style: { '--shelf-columns': geometry.columns, '--shelf-rows': geometry.rows },
+                    'data-page': pageData.page,
+                    'data-page-count': pageData.pageCount,
+                    'data-capacity': geometry.capacity,
+                    onScroll: onTrackScroll,
+                    onPointerDown: onTrackPointerDown,
+                    onPointerMove: onTrackPointerMove,
+                    onPointerUp: onTrackPointerEnd,
+                    onPointerCancel: onTrackPointerEnd,
+                    onClickCapture: onTrackClickCapture,
+                    onAnimationEnd: (event) => {
+                      if (event.target === event.currentTarget && pageMotion) setPageMotion(null);
+                    },
+                  }, geometry.mobile
+                    ? mobilePages.map((entry, pageIndex) => h('div', {
+                        className: 'mr-shelf-mobile-page',
+                        key: `page-${pageIndex}`,
+                        'data-mobile-page': pageIndex,
+                      }, entry.items.map((book, index) => renderBook(book, pageIndex * geometry.capacity + index))))
+                    : pageData.items.map((book, index) => renderBook(book, pageData.start + index))),
+          !geometry.mobile && gridBooks.length > 0 ? h('nav', { className: 'mr-shelf-pager', 'aria-label': '书架页码' },
+            h('button', { type: 'button', 'aria-label': '上一页', disabled: pageData.page === 0, onClick: () => setCurrentPage(pageData.page - 1) }, '←'),
+            pageNumbers.map((number, index) => h(React.Fragment, { key: number },
+              index > 0 && number - pageNumbers[index - 1] > 1 ? h('span', { className: 'mr-shelf-page-gap', 'aria-hidden': 'true' }, '…') : null,
+              h('button', { type: 'button', className: number === pageData.page ? 'active' : '', 'aria-label': `第 ${number + 1} 页`, 'aria-current': number === pageData.page ? 'page' : undefined, onClick: () => setCurrentPage(number) }, number + 1))),
+            h('button', { type: 'button', 'aria-label': '下一页', disabled: pageData.page >= pageData.pageCount - 1, onClick: () => setCurrentPage(pageData.page + 1) }, '→')) : null)),
         normalizedQuery ? h('section', { className: 'mr-shelf-online', 'aria-label': '在线搜索结果' },
           h('div', { className: 'mr-shelf-online-head' },
             h('h2', null, '在线'),
@@ -587,21 +912,17 @@ window.__ModuleLoader__.load({
                 item.intro ? h('p', null, String(item.intro).slice(0, 90)) : null),
               h(Button, { kind: added ? 'soft' : 'primary', disabled: added || !onAddOnline, onClick: () => onAddOnline?.(item) }, added ? '已在书架' : '加书架'));
           })) : null) : null,
-        h('div', { className: 'mr-shelf-foot' },
-          h('span', null, `共 ${layout.count} 本 · 本机保存 · 不上传`),
-          h('span', { className: 'wall' }, normalizedQuery ? `${String(matches.length).padStart(2, '0')} 本 · 匹配` : `${String(layout.count).padStart(2, '0')} 本 · 都在墙上`)));
+        );
+
     }
 
     function Library({ books, folders = [], onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality, ambience, reducedMotion = false, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead }) {
-      if (!books.length) return h(Empty, {
-        title: '书架还是空的', detail: '去发现搜书，或导入本地书籍。',
-      });
       const viewToggle = h('div', { className: 'mr-view-toggle', role: 'group', 'aria-label': '书架视图' },
         h('button', { className: view === 'shelf' ? 'active' : '', onClick: () => onView('shelf') }, '书架'),
         h('button', { className: view === 'list' ? 'active' : '', onClick: () => onView('list') }, '列表'));
       const checkButton = h(Button, { icon: 'refresh', onClick: onCheck, disabled: busy }, '补查');
       const actions = h(React.Fragment, null, viewToggle, checkButton);
-      if (view === 'shelf') return h(ShelfBoard, { key: 'shelf', books, folders, reducedMotion, onOpen, headActions: actions, onToggleDownload, online, onlineBusy, onlineFailed, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead });
+      if (view === 'shelf') return h(ShelfBoard, { key: 'shelf', books, folders, reducedMotion, onOpen, onCheck, busy, onToggleDownload, online, onlineBusy, onlineFailed, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead });
       return h(React.Fragment, null,
         h('div', { className: 'mr-section-head' },
           h('div', null, h('h2', null, '我的书架'), h('p', null, `${books.length} 本 · 本机保存`)),
@@ -625,24 +946,94 @@ window.__ModuleLoader__.load({
         })));
     }
 
+    const RECENT_SEARCHES_KEY = 'mo-reader:recent-searches';
+    function readRecentSearches() {
+      try {
+        const value = JSON.parse(globalThis.localStorage?.getItem(RECENT_SEARCHES_KEY) || '[]');
+        return Array.isArray(value) ? value.filter((item) => typeof item === 'string' && item.trim()).slice(0, 4) : [];
+      } catch { return []; }
+    }
+    function rememberSearch(term) {
+      const value = String(term || '').trim();
+      if (!value) return [];
+      const next = [value, ...readRecentSearches().filter((item) => item !== value)].slice(0, 4);
+      try { globalThis.localStorage?.setItem(RECENT_SEARCHES_KEY, JSON.stringify(next)); } catch {}
+      return next;
+    }
+
+    function ScreenHead({ kicker, title, sub, aside }) {
+      return h('header', { className: 'mr-screen-head' },
+        h('div', { className: 'mr-screen-copy' },
+          h('p', { className: 'mr-screen-kicker' }, kicker),
+          h('h1', null, title),
+          sub ? h('p', { className: 'mr-screen-sub' }, sub) : null),
+        aside ? h('div', { className: 'mr-screen-aside' }, aside) : null);
+    }
+
     function Discover({ sources, onSearch, onAdd, results, busy, failed }) {
       const [query, setQuery] = useState('');
-      if (!sources.length) return h(Empty, { icon: 'source', title: '先导入书源', detail: '支持 URL、文件或粘贴 JSON。' });
-      return h('div', { className: 'mr-discover' },
-        h('div', { className: 'mr-section-head' }, h('div', null, h('h2', null, '发现好书'), h('p', null, `搜索全部 ${sources.length} 个书源`))),
-        h('form', { className: 'mr-searchbar', onSubmit: (event) => { event.preventDefault(); onSearch(query); } },
-          h('input', { value: query, onChange: (e) => setQuery(e.target.value), placeholder: '书名或作者', 'aria-label': '搜索' }),
-          h(Button, { kind: 'primary', icon: 'search', type: 'submit', disabled: busy }, '搜索')),
-        busy ? h('div', { className: 'mr-loading' }, '正在查找…') : null,
-        !busy && failed ? h('p', { className: 'mr-help' }, `${failed} 个书源没响应，已跳过。`) : null,
-        !busy && results && results.length === 0 ? h(Empty, { icon: 'search', title: '没有找到', detail: '换个关键词或书源试试。' }) : null,
-        h('div', { className: 'mr-results' }, (results || []).map((book, index) => {
-          const name = book.name || book.title || '未命名';
-          return h('article', { className: 'mr-result', key: `${book.bookUrl || book.url || name}-${index}` },
-            h(BookCover, { book, small: true }),
-            h('div', { className: 'mr-result-info' }, h('h3', null, name), h('p', null, [book.author, book.kind, book.sourceName].filter(Boolean).map(plainText).join(' · ') || '书籍'), book.intro ? h('p', { className: 'mr-intro' }, book.intro) : null),
-            h(Button, { kind: 'primary soft', icon: 'plus', onClick: () => onAdd(book), disabled: busy }, '加书架'));
-        })));
+      const [lastQuery, setLastQuery] = useState('');
+      const [sourceFilter, setSourceFilter] = useState('');
+      const [recent, setRecent] = useState(readRecentSearches);
+      const runSearch = (value) => {
+        const term = String(value ?? query).trim();
+        if (!term || busy) return;
+        setQuery(term);
+        setLastQuery(term);
+        setRecent(rememberSearch(term));
+        onSearch(term);
+      };
+      const sourceNames = [...new Set(sources.map((source) => source.bookSourceName || source.name).filter(Boolean))];
+      const allResults = results || [];
+      const visible = sourceFilter ? allResults.filter((book) => book.sourceName === sourceFilter) : allResults;
+      const searched = !!lastQuery;
+      return h('div', { className: 'mr-screen mr-discover-screen' },
+        h(ScreenHead, {
+          kicker: 'MO READ · 窗边 / 发现',
+          title: '发现',
+          sub: `搜索全部 ${sources.length} 个书源 · 按书名或作者`,
+          aside: h('div', { className: 'mr-screen-stat' }, h('b', null, sources.length), h('span', null, '个书源')),
+        }),
+        !sources.length ? h(Empty, { icon: 'source', title: '先导入书源', detail: '支持 URL、文件或粘贴 JSON。' }) : h('div', { className: 'mr-discover-layout' },
+          h('section', { className: 'mr-search-panel', 'aria-label': '搜索与书源筛选' },
+            h('p', { className: 'mr-card-kicker' }, 'SEARCH · 书源'),
+            h('h2', null, '搜一本书'),
+            h('p', { className: 'mr-search-lead' }, `同时搜索${sourceNames.slice(0, 4).join('、') || '已配置书源'}${sourceNames.length > 4 ? '等' : ''}，结果按匹配度排序。`),
+            h('form', { className: 'mr-big-search', onSubmit: (event) => { event.preventDefault(); runSearch(); } },
+              h(Glyph, { name: 'search', size: 18 }),
+              h('input', { type: 'search', value: query, onChange: (e) => setQuery(e.target.value), placeholder: '书名、作者', 'aria-label': '搜索书名或作者' }),
+              h('button', { type: 'submit', disabled: busy || !query.trim() }, '搜索')),
+            sourceNames.length ? h('div', { className: 'mr-source-chips', 'aria-label': '按书源筛选结果' },
+              h('button', { type: 'button', className: `mr-source-chip ${sourceFilter ? '' : 'active'}`, onClick: () => setSourceFilter('') }, '全部书源'),
+              sourceNames.map((name) => h('button', { type: 'button', key: name, className: `mr-source-chip ${sourceFilter === name ? 'active' : ''}`, onClick: () => setSourceFilter(sourceFilter === name ? '' : name) }, name))) : null,
+            recent.length ? h('div', { className: 'mr-recent' },
+              h('span', null, '最近搜索'),
+              recent.map((term) => h('button', { type: 'button', key: term, onClick: () => runSearch(term) }, term))) : null),
+          h('section', { className: 'mr-results-panel', 'aria-label': '搜索结果', 'aria-live': 'polite' },
+            h('div', { className: 'mr-results-head' },
+              h('h2', null, searched ? `搜「${lastQuery}」` : '搜索结果'),
+              h('span', null, searched ? `${visible.length} 本${sourceFilter ? ` · ${sourceFilter}` : ''}` : '输入书名或作者')),
+            busy ? h('div', { className: 'mr-discovery-state' }, h('span', { className: 'mr-spinner', 'aria-hidden': true }), h('h3', null, '正在查找'), h('p', null, '同时搜索所有可用书源…'))
+              : failed ? h('div', { className: 'mr-source-warning' }, h(Glyph, { name: 'source', size: 18 }), h('p', null, `${failed} 个书源没响应，已跳过；其余结果仍在下方。`))
+                : null,
+            !busy && searched && visible.length === 0 ? h('div', { className: 'mr-discovery-state' },
+              h('div', { className: 'mr-discovery-icon' }, h(Glyph, { name: 'search', size: 24 })),
+              h('h3', null, '没有找到'),
+              h('p', null, sourceFilter ? `${sourceFilter} 里没有匹配结果，换个书源或关键词。` : '换个关键词或检查书源。')) : null,
+            !busy && !searched ? h('div', { className: 'mr-discovery-state' },
+              h('div', { className: 'mr-discovery-icon' }, h(Glyph, { name: 'search', size: 24 })),
+              h('h3', null, '搜一本书'),
+              h('p', null, '输入书名或作者，也可以从左侧最近搜索开始。')) : null,
+            h('div', { className: 'mr-discovery-results' }, visible.map((book, index) => {
+              const name = book.name || book.title || '未命名';
+              return h('article', { className: 'mr-discovery-result', key: `${book.bookUrl || book.url || name}-${index}` },
+                h(BookCover, { book, small: true }),
+                h('div', { className: 'mr-discovery-result-copy' },
+                  h('h3', { title: name }, name),
+                  h('p', null, [book.author, book.kind].filter(Boolean).map(plainText).join(' · ') || '书籍'),
+                  sourceFilter ? null : h('span', { className: 'mr-discovery-source' }, book.sourceName || '书源')),
+                h(Button, { kind: 'primary soft', icon: 'plus', onClick: () => onAdd(book), disabled: busy }, '加书架'));
+            })))));
     }
 
     function importSummary(result) {
@@ -670,40 +1061,231 @@ window.__ModuleLoader__.load({
       const [libraryHttp, setLibraryHttp] = useState(false);
       const fileRef = useRef(null);
       const pulling = busy;
-      return h('div', { className: 'mr-sources' },
-        h('div', { className: 'mr-section-head' }, h('div', null, h('h2', null, '书源管理'), h('p', null, '基础规则 · 本机校验'))),
-        h('section', { className: 'mr-panel' },
-          h('h3', null, '导入书源'),
-          h('textarea', { value: draft, onChange: (e) => setDraft(e.target.value), placeholder: '粘贴书源 JSON，或填写公开 URL', rows: 5 }),
-          h('label', { className: 'mr-check' }, h('input', { type: 'checkbox', checked: allowHttp, onChange: (e) => setAllowHttp(e.target.checked) }), '允许明文 HTTP'),
-          h('p', { className: 'mr-help' }, '不绕过登录、付费或验证码。JavaScript 规则将在第二期支持。'),
-          h('div', { className: 'mr-inline-actions' },
-            h(Button, { kind: 'primary', icon: 'plus', disabled: busy || !draft.trim(), onClick: () => onImport(draft, allowHttp).then(() => setDraft('')) }, '导入'),
-            h(Button, { icon: 'upload', onClick: () => fileRef.current?.click(), disabled: busy }, '选文件'),
-            h(Button, { icon: 'refresh', onClick: () => onRestoreBuiltin(), disabled: busy }, '恢复内置'),
-            h('input', { ref: fileRef, type: 'file', accept: '.json,application/json', hidden: true, onChange: async (e) => { const file = e.target.files?.[0]; if (file) setDraft(await file.text()); e.target.value = ''; } }))),
-        h('section', { className: 'mr-panel' },
-          h('h3', null, '在线源库'),
-          h('p', { className: 'mr-help' }, '填一个公开源库地址（返回书源 JSON 数组），拉取后导入全部可用书源。'),
-          h('label', { className: 'mr-check' }, h('input', { type: 'checkbox', checked: libraryHttp, onChange: (e) => setLibraryHttp(e.target.checked) }), '允许明文 HTTP'),
-          h('div', { className: 'mr-inline-actions' },
-            h('input', { className: 'mr-input', value: libraryText, onChange: (e) => setLibraryText(e.target.value), placeholder: 'https://…/sources.json', style: { flex: '1 1 320px' } }),
-            h(Button, { kind: 'primary', icon: 'download', disabled: pulling || !libraryText.trim(), onClick: async () => {
-              const ok = await onPullLibrary({ url: libraryText.trim(), allowHttp: libraryHttp });
-              if (ok === false) return;
-              const next = { url: libraryText.trim(), at: new Date().toISOString() };
-              setLibrary(next);
-              writeSourceLibrary(next);
-            } }, '拉取'),
-            library.at ? h('span', { className: 'mr-help' }, `上次拉取 ${new Date(library.at).toLocaleString('zh-CN', { hour12: false })}`) : null)),
-        h('section', { className: 'mr-source-list' }, sources.length ? sources.map((source) => {
-          const id = source.id || source.bookSourceUrl;
-          return h('article', { className: 'mr-source-row', key: id },
-            h('div', { className: 'mr-source-mark' }, h(Glyph, { name: 'source' })),
-            h('div', null, h('h3', null, source.bookSourceName || source.name || '书源'), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl)),
-            h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || '' }, source.lastError ? '解析失败' : source.builtin ? '内置' : (source.compatibility || '基础规则')),
-            source.builtin ? null : h(Button, { kind: 'text danger', icon: 'trash', onClick: () => onRemove(source), disabled: busy }, '移除'));
-        }) : h(Empty, { icon: 'source', title: '暂无书源', detail: '导入后即可搜索和追更。' })));
+      const available = sources.filter((source) => !source.lastError).length;
+      return h('div', { className: 'mr-screen mr-sources-screen' },
+        h(ScreenHead, {
+          kicker: 'MO READ · 窗边 / 书源',
+          title: '书源',
+          sub: `基础规则 · 本机校验 · ${sources.length} 个书源`,
+          aside: h('div', { className: 'mr-screen-stat' }, h('b', null, sources.length), h('span', null, '个书源')),
+        }),
+        h('div', { className: 'mr-sources-layout' },
+          h('div', { className: 'mr-sources-left' },
+            h('section', { className: 'mr-window-card', 'aria-labelledby': 'source-import-title' },
+              h('h2', { id: 'source-import-title' }, '导入书源'),
+              h('p', { className: 'mr-help' }, '粘贴书源 JSON，或填写公开 URL。不绕过登录、付费或验证码。'),
+              h('textarea', { value: draft, onChange: (e) => setDraft(e.target.value), placeholder: '粘贴书源 JSON，或填写公开 URL', rows: 5, 'aria-label': '书源 JSON 或 URL' }),
+              h('label', { className: 'mr-check' }, h('input', { type: 'checkbox', checked: allowHttp, onChange: (e) => setAllowHttp(e.target.checked) }), '允许明文 HTTP'),
+              h('div', { className: 'mr-inline-actions' },
+                h(Button, { kind: 'primary', icon: 'plus', disabled: busy || !draft.trim(), onClick: () => onImport(draft, allowHttp).then(() => setDraft('')) }, '导入'),
+                h(Button, { icon: 'upload', onClick: () => fileRef.current?.click(), disabled: busy }, '选文件'),
+                h(Button, { icon: 'refresh', onClick: () => onRestoreBuiltin(), disabled: busy }, '恢复内置'),
+                h('input', { ref: fileRef, type: 'file', accept: '.json,application/json', hidden: true, onChange: async (e) => { const file = e.target.files?.[0]; if (file) setDraft(await file.text()); e.target.value = ''; } }))),
+            h('section', { className: 'mr-window-card', 'aria-labelledby': 'source-library-title' },
+              h('h2', { id: 'source-library-title' }, '在线源库'),
+              h('p', { className: 'mr-help' }, '填一个公开源库地址，拉取后导入全部可用书源。'),
+              h('div', { className: 'mr-online-row' },
+                h('input', { value: libraryText, onChange: (e) => setLibraryText(e.target.value), placeholder: 'https://…/sources.json', 'aria-label': '在线源库地址' }),
+                h(Button, { kind: 'primary', icon: 'download', disabled: pulling || !libraryText.trim(), onClick: async () => {
+                  const ok = await onPullLibrary({ url: libraryText.trim(), allowHttp: libraryHttp });
+                  if (ok === false) return;
+                  const next = { url: libraryText.trim(), at: new Date().toISOString() };
+                  setLibrary(next);
+                  writeSourceLibrary(next);
+                } }, '拉取')),
+              h('label', { className: 'mr-check' }, h('input', { type: 'checkbox', checked: libraryHttp, onChange: (e) => setLibraryHttp(e.target.checked) }), '允许明文 HTTP'),
+              library.at ? h('p', { className: 'mr-help' }, `上次拉取 ${new Date(library.at).toLocaleString('zh-CN', { hour12: false })}`) : null)),
+          h('section', { className: 'mr-sources-list', 'aria-label': '已配置书源列表' },
+            h('div', { className: 'mr-sources-list-head' },
+              h('h2', null, '已配置'),
+              h('span', null, `${sources.length} 个 · ${available} 个可用`)),
+            sources.length ? sources.map((source) => {
+              const id = source.id || source.bookSourceUrl;
+              const name = source.bookSourceName || source.name || '书源';
+              return h('article', { className: 'mr-source-row', key: id },
+                h('span', { className: 'mr-source-icon', 'aria-hidden': true }, name.slice(0, 1)),
+                h('div', null, h('h3', null, name), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl)),
+                h('div', { className: 'mr-source-side' },
+                  h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || '' }, source.lastError ? '解析失败 · 需更新规则' : source.builtin ? '内置 · 可用' : (source.compatibility || '基础规则')),
+                  source.builtin ? null : h(Button, { kind: 'text danger', onClick: () => onRemove(source), disabled: busy }, '移除')));
+            }) : h(Empty, { icon: 'source', title: '暂无书源', detail: '导入后即可搜索和追更。' }))));
+    }
+
+    function Stats() {
+      return h('div', { className: 'mr-screen mr-stats-screen' },
+        h(ScreenHead, {
+          kicker: 'MO READ · 窗边 / 统计',
+          title: '阅读统计',
+          sub: '本机阅读记录 · 不上传',
+          aside: h('span', { className: 'mr-screen-note' }, '近 365 天'),
+        }),
+        h('div', { className: 'mr-stats-layout' },
+      h('section', { className: 'mr-panel mr-panel--wide' }, h('h3', null, '概览'),
+        h('div', { className: 'mr-stats-grid' },
+          h('div', { className: 'mr-stat-card' }, h('strong', null, (() => {
+            const today = new Date().toISOString().slice(0, 10);
+            const stats = JSON.parse(localStorage.getItem(`mo-reader:stats:${today}`) || '{"minutes":0}');
+            return stats.minutes;
+          })()), h('span', null, '今日阅读（分钟）')),
+          h('div', { className: 'mr-stat-card' }, h('strong', null, (() => {
+            let total = 0;
+            for (let i = 0; i < 7; i++) {
+              const d = new Date(); d.setDate(d.getDate() - i);
+              const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+              const s = JSON.parse(localStorage.getItem(key) || '{"pages":0}');
+              total += s.pages || 0;
+            }
+            return total;
+          })()), h('span', null, '本周阅读（页）')),
+          h('div', { className: 'mr-stat-card' }, h('strong', null, (() => {
+            let streak = 0;
+            for (let i = 0; i < 365; i++) {
+              const d = new Date(); d.setDate(d.getDate() - i);
+              const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+              const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+              if (s.minutes > 0) streak++; else break;
+            }
+            return streak;
+          })()), h('span', null, '连续阅读（天）'))),
+        // 阅读热力图（最近 12 周）
+        h('div', { className: 'mr-heatmap' },
+          h('h4', null, '阅读热力图'),
+          h('div', { className: 'mr-heatmap-grid' },
+            (() => {
+              const cells = [];
+              const today = new Date();
+              // 最近 12 周（84 天）
+              for (let i = 83; i >= 0; i--) {
+                const d = new Date(today); d.setDate(d.getDate() - i);
+                const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                const level = s.minutes > 60 ? 4 : s.minutes > 30 ? 3 : s.minutes > 10 ? 2 : s.minutes > 0 ? 1 : 0;
+                cells.push(h('div', { key: i, className: `mr-heatmap-cell level-${level}`, title: `${d.toISOString().slice(0, 10)}: ${s.minutes}分钟` }));
+              }
+              return cells;
+            })()),
+          h('div', { className: 'mr-heatmap-legend' },
+            h('span', null, '少'),
+            [0,1,2,3,4].map(l => h('div', { key: l, className: `mr-heatmap-cell level-${l}` })),
+            h('span', null, '多'))),
+        // 年度统计
+        h('div', { className: 'mr-yearly-stats' },
+          h('h4', null, `${new Date().getFullYear()} 年度统计`),
+          h('div', { className: 'mr-yearly-grid' },
+            h('div', { className: 'mr-yearly-item' }, h('strong', null, (() => {
+              let total = 0;
+              const year = new Date().getFullYear();
+              for (let i = 0; i < 365; i++) {
+                const d = new Date(year, 0, 1); d.setDate(d.getDate() + i);
+                if (d > new Date()) break;
+                const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                total += s.minutes || 0;
+              }
+              return total;
+            })()), h('span', null, '总分钟')),
+            h('div', { className: 'mr-yearly-item' }, h('strong', null, (() => {
+              let total = 0;
+              const year = new Date().getFullYear();
+              for (let i = 0; i < 365; i++) {
+                const d = new Date(year, 0, 1); d.setDate(d.getDate() + i);
+                if (d > new Date()) break;
+                const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                const s = JSON.parse(localStorage.getItem(key) || '{"pages":0}');
+                total += s.pages || 0;
+              }
+              return total;
+            })()), h('span', null, '总页数')),
+            h('div', { className: 'mr-yearly-item' }, h('strong', null, (() => {
+              let days = 0;
+              const year = new Date().getFullYear();
+              for (let i = 0; i < 365; i++) {
+                const d = new Date(year, 0, 1); d.setDate(d.getDate() + i);
+                if (d > new Date()) break;
+                const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                if (s.minutes > 0) days++;
+              }
+              return days;
+            })()), h('span', null, '阅读天数')),
+            h('div', { className: 'mr-yearly-item' }, h('strong', null, (() => {
+              let total = 0;
+              const year = new Date().getFullYear();
+              for (let i = 0; i < 365; i++) {
+                const d = new Date(year, 0, 1); d.setDate(d.getDate() + i);
+                if (d > new Date()) break;
+                const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                total += s.minutes || 0;
+              }
+              const days = Math.max(1, Math.floor((new Date() - new Date(year, 0, 1)) / 86400000) + 1);
+              return Math.round(total / days);
+            })()), h('span', null, '日均分钟')))),
+        // 阅读时长分布
+        h('div', { className: 'mr-duration-dist' },
+          h('h4', null, '阅读时长分布'),
+          h('div', { className: 'mr-dist-bars' },
+            (() => {
+              const buckets = { '0-10分钟': 0, '10-30分钟': 0, '30-60分钟': 0, '60分钟以上': 0 };
+              for (let i = 0; i < 365; i++) {
+                const d = new Date(); d.setDate(d.getDate() - i);
+                const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                const m = s.minutes || 0;
+                if (m === 0) continue;
+                if (m <= 10) buckets['0-10分钟']++;
+                else if (m <= 30) buckets['10-30分钟']++;
+                else if (m <= 60) buckets['30-60分钟']++;
+                else buckets['60分钟以上']++;
+              }
+              const max = Math.max(...Object.values(buckets), 1);
+              return Object.entries(buckets).map(([label, count]) =>
+                h('div', { key: label, className: 'mr-dist-row' },
+                  h('span', { className: 'mr-dist-label' }, label),
+                  h('div', { className: 'mr-dist-bar' },
+                    h('div', { className: 'mr-dist-fill', style: { width: `${count / max * 100}%` } })),
+                  h('span', { className: 'mr-dist-count' }, `${count}天`)));
+            })())),
+        // 阅读时段分析
+        h('div', { className: 'mr-time-dist' },
+          h('h4', null, '阅读时段分析'),
+          h('div', { className: 'mr-time-grid' },
+            (() => {
+              const hours = Array.from({ length: 24 }, (_, i) => ({ hour: i, minutes: 0 }));
+              for (let i = 0; i < 365; i++) {
+                const d = new Date(); d.setDate(d.getDate() - i);
+                const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0,"lastActive":0}');
+                if (s.lastActive > 0) {
+                  const h = new Date(s.lastActive).getHours();
+                  hours[h].minutes += s.minutes || 0;
+                }
+              }
+              const max = Math.max(...hours.map(h => h.minutes), 1);
+              return hours.map(({ hour, minutes }) =>
+                h('div', { key: hour, className: 'mr-time-cell', title: `${hour}:00-${hour+1}:00: ${Math.round(minutes)}分钟` },
+                  h('div', { className: 'mr-time-bar', style: { height: `${Math.max(minutes / max * 100, 4)}%` } }),
+                  h('span', { className: 'mr-time-label' }, hour)));
+            })())),
+        // 阅读趋势（最近 30 天）
+        h('div', { className: 'mr-trend-chart' },
+          h('h4', null, '阅读趋势（近 30 天）'),
+          h('div', { className: 'mr-trend-bars' },
+            (() => {
+              const days = [];
+              for (let i = 29; i >= 0; i--) {
+                const d = new Date(); d.setDate(d.getDate() - i);
+                const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
+                const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
+                days.push({ date: d.toISOString().slice(5, 10), minutes: s.minutes || 0 });
+              }
+              const max = Math.max(...days.map(d => d.minutes), 1);
+              return days.map(({ date, minutes }) =>
+                h('div', { key: date, className: 'mr-trend-col', title: `${date}: ${minutes}分钟` },
+                  h('div', { className: 'mr-trend-bar', style: { height: `${Math.max(minutes / max * 100, 2)}%` } }),
+                  h('span', { className: 'mr-trend-label' }, date.slice(-2))));
+            })())))
+        ));
     }
 
     function Settings({ settings, onSettings, onLocal, onExport, onImport, busy, onExportNotes, onUploadFont }) {
@@ -721,8 +1303,14 @@ window.__ModuleLoader__.load({
         });
         return onSettings({ replacements });
       };
-      return h('div', { className: 'mr-settings' },
-        h('div', { className: 'mr-section-head' }, h('div', null, h('h2', null, '阅读设置'), h('p', null, '排版、净化与备份'))),
+      return h('div', { className: 'mr-screen mr-settings mr-settings-screen' },
+        h(ScreenHead, {
+          kicker: 'MO READ · 窗边 / 设置',
+          title: '设置',
+          sub: '排版、净化与本机数据',
+          aside: h('span', { className: 'mr-screen-note' }, '本机保存 · 不上传'),
+        }),
+        h('div', { className: 'mr-settings-grid' },
         h('section', { className: 'mr-panel' }, h('h3', null, '动画'),
           h('p', { className: 'mr-help' }, '无 WebGL 或减少动态时自动瞬时翻页。'),
           h('div', { className: 'mr-setting-row' }, h('span', null, '默认方式'), h('div', { className: 'mr-mode-picker' },
@@ -766,171 +1354,6 @@ window.__ModuleLoader__.load({
             h(Button, { icon: 'upload', onClick: () => backupRef.current?.click(), disabled: busy }, '恢复'),
             h('input', { ref: backupRef, type: 'file', accept: '.json,application/json', hidden: true, onChange: async (e) => { const file = e.target.files?.[0]; if (file) onImport(file); e.target.value = ''; } }))),
         h('section', { className: 'mr-panel mr-roadmap' }, h('h3', null, '分期说明'), h('p', null, '当前为文字核心版。高兼容脚本、AI 与多媒体将在后续阶段提供。')),
-        h('section', { className: 'mr-panel' }, h('h3', null, '阅读统计'),
-          h('div', { className: 'mr-stats-grid' },
-            h('div', { className: 'mr-stat-card' }, h('strong', null, (() => {
-              const today = new Date().toISOString().slice(0, 10);
-              const stats = JSON.parse(localStorage.getItem(`mo-reader:stats:${today}`) || '{"minutes":0}');
-              return stats.minutes;
-            })()), h('span', null, '今日阅读（分钟）')),
-            h('div', { className: 'mr-stat-card' }, h('strong', null, (() => {
-              let total = 0;
-              for (let i = 0; i < 7; i++) {
-                const d = new Date(); d.setDate(d.getDate() - i);
-                const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
-                const s = JSON.parse(localStorage.getItem(key) || '{"pages":0}');
-                total += s.pages || 0;
-              }
-              return total;
-            })()), h('span', null, '本周阅读（页）')),
-            h('div', { className: 'mr-stat-card' }, h('strong', null, (() => {
-              let streak = 0;
-              for (let i = 0; i < 365; i++) {
-                const d = new Date(); d.setDate(d.getDate() - i);
-                const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
-                const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
-                if (s.minutes > 0) streak++; else break;
-              }
-              return streak;
-            })()), h('span', null, '连续阅读（天）'))),
-          // 阅读热力图（最近 12 周）
-          h('div', { className: 'mr-heatmap' },
-            h('h4', null, '阅读热力图'),
-            h('div', { className: 'mr-heatmap-grid' },
-              (() => {
-                const cells = [];
-                const today = new Date();
-                // 最近 12 周（84 天）
-                for (let i = 83; i >= 0; i--) {
-                  const d = new Date(today); d.setDate(d.getDate() - i);
-                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
-                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
-                  const level = s.minutes > 60 ? 4 : s.minutes > 30 ? 3 : s.minutes > 10 ? 2 : s.minutes > 0 ? 1 : 0;
-                  cells.push(h('div', { key: i, className: `mr-heatmap-cell level-${level}`, title: `${d.toISOString().slice(0, 10)}: ${s.minutes}分钟` }));
-                }
-                return cells;
-              })()),
-            h('div', { className: 'mr-heatmap-legend' },
-              h('span', null, '少'),
-              [0,1,2,3,4].map(l => h('div', { key: l, className: `mr-heatmap-cell level-${l}` })),
-              h('span', null, '多'))),
-          // 年度统计
-          h('div', { className: 'mr-yearly-stats' },
-            h('h4', null, `${new Date().getFullYear()} 年度统计`),
-            h('div', { className: 'mr-yearly-grid' },
-              h('div', { className: 'mr-yearly-item' }, h('strong', null, (() => {
-                let total = 0;
-                const year = new Date().getFullYear();
-                for (let i = 0; i < 365; i++) {
-                  const d = new Date(year, 0, 1); d.setDate(d.getDate() + i);
-                  if (d > new Date()) break;
-                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
-                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
-                  total += s.minutes || 0;
-                }
-                return total;
-              })()), h('span', null, '总分钟')),
-              h('div', { className: 'mr-yearly-item' }, h('strong', null, (() => {
-                let total = 0;
-                const year = new Date().getFullYear();
-                for (let i = 0; i < 365; i++) {
-                  const d = new Date(year, 0, 1); d.setDate(d.getDate() + i);
-                  if (d > new Date()) break;
-                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
-                  const s = JSON.parse(localStorage.getItem(key) || '{"pages":0}');
-                  total += s.pages || 0;
-                }
-                return total;
-              })()), h('span', null, '总页数')),
-              h('div', { className: 'mr-yearly-item' }, h('strong', null, (() => {
-                let days = 0;
-                const year = new Date().getFullYear();
-                for (let i = 0; i < 365; i++) {
-                  const d = new Date(year, 0, 1); d.setDate(d.getDate() + i);
-                  if (d > new Date()) break;
-                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
-                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
-                  if (s.minutes > 0) days++;
-                }
-                return days;
-              })()), h('span', null, '阅读天数')),
-              h('div', { className: 'mr-yearly-item' }, h('strong', null, (() => {
-                let total = 0;
-                const year = new Date().getFullYear();
-                for (let i = 0; i < 365; i++) {
-                  const d = new Date(year, 0, 1); d.setDate(d.getDate() + i);
-                  if (d > new Date()) break;
-                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
-                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
-                  total += s.minutes || 0;
-                }
-                const days = Math.max(1, Math.floor((new Date() - new Date(year, 0, 1)) / 86400000) + 1);
-                return Math.round(total / days);
-              })()), h('span', null, '日均分钟')))),
-          // 阅读时长分布
-          h('div', { className: 'mr-duration-dist' },
-            h('h4', null, '阅读时长分布'),
-            h('div', { className: 'mr-dist-bars' },
-              (() => {
-                const buckets = { '0-10分钟': 0, '10-30分钟': 0, '30-60分钟': 0, '60分钟以上': 0 };
-                for (let i = 0; i < 365; i++) {
-                  const d = new Date(); d.setDate(d.getDate() - i);
-                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
-                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
-                  const m = s.minutes || 0;
-                  if (m === 0) continue;
-                  if (m <= 10) buckets['0-10分钟']++;
-                  else if (m <= 30) buckets['10-30分钟']++;
-                  else if (m <= 60) buckets['30-60分钟']++;
-                  else buckets['60分钟以上']++;
-                }
-                const max = Math.max(...Object.values(buckets), 1);
-                return Object.entries(buckets).map(([label, count]) =>
-                  h('div', { key: label, className: 'mr-dist-row' },
-                    h('span', { className: 'mr-dist-label' }, label),
-                    h('div', { className: 'mr-dist-bar' },
-                      h('div', { className: 'mr-dist-fill', style: { width: `${count / max * 100}%` } })),
-                    h('span', { className: 'mr-dist-count' }, `${count}天`)));
-              })())),
-          // 阅读时段分析
-          h('div', { className: 'mr-time-dist' },
-            h('h4', null, '阅读时段分析'),
-            h('div', { className: 'mr-time-grid' },
-              (() => {
-                const hours = Array.from({ length: 24 }, (_, i) => ({ hour: i, minutes: 0 }));
-                for (let i = 0; i < 365; i++) {
-                  const d = new Date(); d.setDate(d.getDate() - i);
-                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
-                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0,"lastActive":0}');
-                  if (s.lastActive > 0) {
-                    const h = new Date(s.lastActive).getHours();
-                    hours[h].minutes += s.minutes || 0;
-                  }
-                }
-                const max = Math.max(...hours.map(h => h.minutes), 1);
-                return hours.map(({ hour, minutes }) =>
-                  h('div', { key: hour, className: 'mr-time-cell', title: `${hour}:00-${hour+1}:00: ${Math.round(minutes)}分钟` },
-                    h('div', { className: 'mr-time-bar', style: { height: `${Math.max(minutes / max * 100, 4)}%` } }),
-                    h('span', { className: 'mr-time-label' }, hour)));
-              })())),
-          // 阅读趋势（最近 30 天）
-          h('div', { className: 'mr-trend-chart' },
-            h('h4', null, '阅读趋势（近 30 天）'),
-            h('div', { className: 'mr-trend-bars' },
-              (() => {
-                const days = [];
-                for (let i = 29; i >= 0; i--) {
-                  const d = new Date(); d.setDate(d.getDate() - i);
-                  const key = `mo-reader:stats:${d.toISOString().slice(0, 10)}`;
-                  const s = JSON.parse(localStorage.getItem(key) || '{"minutes":0}');
-                  days.push({ date: d.toISOString().slice(5, 10), minutes: s.minutes || 0 });
-                }
-                const max = Math.max(...days.map(d => d.minutes), 1);
-                return days.map(({ date, minutes }) =>
-                  h('div', { key: date, className: 'mr-trend-col', title: `${date}: ${minutes}分钟` },
-                    h('div', { className: 'mr-trend-bar', style: { height: `${Math.max(minutes / max * 100, 2)}%` } }),
-                    h('span', { className: 'mr-trend-label' }, date.slice(-2))));
-              })()))),
         h('section', { className: 'mr-panel' }, h('h3', null, '笔记导出'),
           h('p', { className: 'mr-help' }, '把划线和笔记导出为 Markdown。'),
           h(Button, { icon: 'download', onClick: () => onExportNotes?.(), disabled: busy }, '导出笔记')),
@@ -961,11 +1384,12 @@ window.__ModuleLoader__.load({
             h('div', { className: 'mr-shortcuts-row' }, h('span', null, 'AI 助手'), h('kbd', null, 'A')),
             h('div', { className: 'mr-shortcuts-row' }, h('span', null, '听书'), h('kbd', null, 'T')),
             h('div', { className: 'mr-shortcuts-row' }, h('span', null, '切换模式'), h('kbd', null, 'M')),
-            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '关闭面板'), h('kbd', null, 'Esc')))));
+            h('div', { className: 'mr-shortcuts-row' }, h('span', null, '关闭面板'), h('kbd', null, 'Esc'))))));
     }
 
     function ReaderView({ ctx, book, settings, onSettings, onBookSettings, notes, onClose, onSaveNote, onDeleteNote, notify, notice, onDismissNotice, deferMs = 0 }) {
       const [toc, setToc] = useState([]);
+      const [chromeOpen, setChromeOpen] = useState(false);
       const [chapter, setChapter] = useState(null);
       const [chapterIndex, setChapterIndex] = useState(-1);
       const [loading, setLoading] = useState(true);
@@ -2127,16 +2551,6 @@ window.__ModuleLoader__.load({
       };
       const onPagedPointerUp = (event) => endPagedDrag(event, false);
       const onPagedPointerCancel = (event) => endPagedDrag(event, true);
-      const onPagedClick = (event) => {
-        if (turnRef.current || suppressClickRef.current) return;
-        if (event.target?.closest?.('button,a,input,textarea,select')) return;
-        const selection = window.getSelection?.();
-        if (selection && !selection.isCollapsed) return;
-        const rect = pagedRef.current?.getBoundingClientRect();
-        if (!rect) return;
-        turnPage(event.clientX < rect.left + rect.width / 2 ? -1 : 1);
-      };
-
       const bookLabel = String(book.title || book.name || '').trim().replace(/\.(txt|epub|md)$/i, '');
       const chapterNodesFor = (entry, options = {}) => {
         const index = entry.index;
@@ -2249,16 +2663,33 @@ window.__ModuleLoader__.load({
         ? Math.max(0, Math.min(100, (chapterIndex + pageFraction) / toc.length * 100))
         : 0;
 
+      const toggleReaderChrome = (event) => {
+        if (!window.matchMedia('(max-width: 720px)').matches) return;
+        if (suppressClickRef.current) return;
+        if (String(window.getSelection?.() || '').trim()) return;
+        const target = event.target;
+        if (target?.closest?.('button, a, input, textarea, select, .mr-drawer, .mr-modal, .mr-drawer-backdrop, .mr-modal-backdrop')) return;
+        setChromeOpen((value) => !value);
+      };
       return h('div', {
-        className: `mr-reader theme-${theme} font-${settings.fontFamily === 'sans' ? 'sans' : 'serif'}${motionOff ? ' mr-reduced' : ''}`,
-        style: { '--mr-text': `${Math.max(360, (settings.measureWidth || 800) - 128)}px` },
+        className: `mr-reader theme-${theme} font-${settings.fontFamily === 'sans' ? 'sans' : 'serif'}${motionOff ? ' mr-reduced' : ''}${chromeOpen ? ' mr-chrome-open' : ' mr-chrome-hidden'}`,
+        style: {
+          '--mr-text': `${Math.max(360, (settings.measureWidth || 960) - 128)}px`,
+          '--mr-text-half': `${Math.max(360, (settings.measureWidth || 960) - 128) / 2}px`,
+        },
       },
+        h('header', { className: 'mr-reader-top' },
+          h('button', { type: 'button', className: 'mr-reader-top-btn', 'aria-label': '返回书架', onClick: closeReader }, h(Glyph, { name: 'back', size: 20 })),
+          h('div', { className: 'mr-reader-top-copy' },
+            h('strong', null, bookLabel),
+            h('span', null, name)),
+          h('button', { type: 'button', className: 'mr-reader-top-btn', 'aria-label': '排版设置', onClick: () => setDrawer(drawer === 'settings' ? '' : 'settings') }, h(Glyph, { name: 'type', size: 18 }))),
         notice ? h(Notice, { notice, onClose: onDismissNotice }) : null,
         h('div', { className: 'mr-ambience', ref: ambienceHostRef, 'aria-hidden': true }),
         h('div', { className: 'mr-rail', 'aria-hidden': true }, h('i', { style: { width: `${bookPercent}%` } })),
         h('main', mode === 'paged'
-          ? { className: 'mr-paged-view', ref: pagedRef, onClick: onPagedClick, onPointerDown: onPagedPointerDown, onPointerMove: onPagedPointerMove, onPointerUp: onPagedPointerUp, onPointerCancel: onPagedPointerCancel }
-          : { className: 'mr-chapter-scroll', ref: scrollRef, onScroll },
+          ? { className: 'mr-paged-view', ref: pagedRef, onClick: toggleReaderChrome, onPointerDown: onPagedPointerDown, onPointerMove: onPagedPointerMove, onPointerUp: onPagedPointerUp, onPointerCancel: onPagedPointerCancel }
+          : { className: 'mr-chapter-scroll', ref: scrollRef, onScroll, onClick: toggleReaderChrome },
           loading ? h('div', { className: 'mr-loading' }, '正在打开章节…') : error ? h('div', { className: 'mr-error-block' }, h('p', null, error), h(Button, { onClick: () => { if (toc.length && failedIndex >= 0) openChapter(failedIndex); else { setLoading(true); setError(''); setRetryNonce((value) => value + 1); } } }, '重试')) :
             mode === 'paged'
               ? h('div', { className: 'mr-page-window' },
@@ -2326,9 +2757,9 @@ window.__ModuleLoader__.load({
                 h('strong', null, settings.fontSize || 19),
                 h('button', { type: 'button', className: 'mr-step-btn', onClick: () => onSettings({ fontSize: Math.min(36, (settings.fontSize || 19) + 1) }) }, '增大'))),
               settingRow('版心', segment([
-                ['640', (settings.measureWidth || 800) === 640, () => onSettings({ measureWidth: 640 })],
-                ['800', (settings.measureWidth || 800) === 800, () => onSettings({ measureWidth: 800 })],
-                ['960', (settings.measureWidth || 800) === 960, () => onSettings({ measureWidth: 960 })],
+                ['640', (settings.measureWidth || 960) === 640, () => onSettings({ measureWidth: 640 })],
+                ['800', (settings.measureWidth || 960) === 800, () => onSettings({ measureWidth: 800 })],
+                ['960', (settings.measureWidth || 960) === 960, () => onSettings({ measureWidth: 960 })],
               ])),
               settingRow('阅读方式', segment([
                 ['翻页', mode === 'paged', () => { pendingPercentRef.current = scrollPercent; setMode('paged'); persistPref('mode', 'paged'); }],
@@ -2695,7 +3126,7 @@ window.__ModuleLoader__.load({
         setReading(book);
       };
       const nav = [
-        ['library', '书架', 'shelf'], ['discover', '发现', 'compass'], ['sources', '书源', 'source'], ['settings', '设置', 'settings'],
+        ['library', '书架', 'shelf'], ['discover', '发现', 'compass'], ['sources', '书源', 'source'], ['stats', '统计', 'chart'], ['settings', '设置', 'settings'],
       ];
       if (activeBook) return h(React.Fragment, null, h('style', null, css),
         h(ReaderView, { ctx, book: activeBook, settings, notes, notice, onDismissNotice: () => setNotice(null), deferMs: opening ? 200 : 0, onSettings: updateSettings, onBookSettings: (partial) => updateBookSettings(activeBook.id || activeBook.bookId, partial), onClose: () => { setOpening(null); setReading(null); refresh(true); }, onSaveNote: saveNote, onDeleteNote: (note) => run(() => call(ctx, 'deleteNote', { id: note.id })).catch(() => {}), notify }),
@@ -2703,21 +3134,21 @@ window.__ModuleLoader__.load({
 
       return h(React.Fragment, null, h('style', null, css), h(MetaSheet, { state: metaSheet, onClose: () => setMetaSheet(null), onPick: applyMetaCandidate }), h('div', { className: 'mr-root' },
         h('nav', { className: 'mr-nav', 'aria-label': '墨读' },
-          h('div', { className: 'mr-brand' }, h(ReaderIcon, { size: 30 }), h('div', null, h('strong', null, '墨读'), h('small', null, '读想读的书'))),
+          h('div', { className: 'mr-brand', title: '墨读', 'aria-label': '墨读' }, h(ReaderIcon, { size: 26 })),
           h('div', { className: 'mr-nav-items' }, nav.map(([id, label, icon]) => h('button', { key: id, className: tab === id ? 'active' : '', onClick: () => setTab(id) }, h(Glyph, { name: icon }), h('span', null, label)))),
           h('div', { className: 'mr-local' }, h('span', null), '本机保存')),
         h('section', { className: 'mr-content' },
           h(Notice, { notice, onClose: () => setNotice(null) }),
           loading ? h('div', { className: 'mr-loading' }, '正在打开墨读…') : null,
-          !loading && tab === 'library' ? h(Library, { books, folders: data.folders || [], busy, view: shelfView, onView: setShelfView, ctx, online: shelfOnline, onlineBusy: shelfOnlineBusy, onlineFailed: shelfOnlineFailed, onSearchOnline: searchShelfOnline, onAddOnline: (item) => addBook(item), theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: prefersReducedMotion() || settings.reducedMotion === 'on', onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}),
+          !loading && tab === 'library' ? h(Library, { books, folders: data.folders || [], busy, view: shelfView, onView: setShelfView, ctx, online: shelfOnline, onlineBusy: shelfOnlineBusy, onlineFailed: shelfOnlineFailed, onSearchOnline: searchShelfOnline, onAddOnline: (item) => addBook(item), theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: motionOff, onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}),
             onCreateFolder: (name) => run(() => call(ctx, 'createFolder', { name }), '文件夹已创建').catch(() => {}),
             onRenameFolder: (folderId, name) => run(() => call(ctx, 'renameFolder', { folderId, name }), '已重命名').catch(() => {}),
             onRemoveFolder: (folderId) => run(() => call(ctx, 'removeFolder', { folderId }), '文件夹已删除').catch(() => {}),
-            onMoveToFolder: (bookIds, folderId) => run(() => call(ctx, 'moveBooksToFolder', { bookIds, folderId }), '已移动').catch(() => {}),
-            onBatchDelete: (bookIds) => run(() => call(ctx, 'batchDeleteBooks', { bookIds }), `已删除 ${bookIds.length} 本`).catch(() => {}),
-            onBatchDownload: (bookIds) => run(() => call(ctx, 'batchDownloadBooks', { bookIds }), `已开始下载 ${bookIds.length} 本`).catch(() => {}),
-            onExport: (bookIds) => { bookIds.forEach(id => run(() => call(ctx, 'exportBook', { bookId: id, format: 'txt' }), '导出完成').then(r => { if (r?.text) { const blob = new Blob([r.text], { type: 'text/plain;charset=utf-8' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${r.name || id}.txt`; a.click(); URL.revokeObjectURL(a.href); } else if (r?.base64) { const blob = new Blob([Uint8Array.from(atob(r.base64), c => c.charCodeAt(0))], { type: 'application/epub+zip' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${r.name || id}.epub`; a.click(); URL.revokeObjectURL(a.href); } }, () => {})); },
-            onMarkRead: (bookIds) => { bookIds.forEach(id => run(() => call(ctx, 'markBookRead', { bookId: id }), '已标记').catch(() => {})); },
+            onMoveToFolder: (bookIds, folderId) => run(() => call(ctx, 'moveBooksToFolder', { bookIds, folderId }), '已移动'),
+            onBatchDelete: (bookIds) => run(() => call(ctx, 'batchDeleteBooks', { bookIds }), `已删除 ${bookIds.length} 本`),
+            onBatchDownload: (bookIds) => run(() => call(ctx, 'batchDownloadBooks', { bookIds }), `已开始下载 ${bookIds.length} 本`),
+            onExport: (bookIds) => Promise.all(bookIds.map(id => run(() => call(ctx, 'exportBook', { bookId: id, format: 'txt' }), '导出完成').then(r => { if (r?.text) { const blob = new Blob([r.text], { type: 'text/plain;charset=utf-8' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${r.name || id}.txt`; a.click(); URL.revokeObjectURL(a.href); } else if (r?.base64) { const blob = new Blob([Uint8Array.from(atob(r.base64), c => c.charCodeAt(0))], { type: 'application/epub+zip' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${r.name || id}.epub`; a.click(); URL.revokeObjectURL(a.href); } }))),
+            onMarkRead: (bookIds) => Promise.all(bookIds.map(id => run(() => call(ctx, 'markBookRead', { bookId: id }), '已标记'))),
             onToggleDownload: (book) => {
               const status = book.downloadStatus || book.download?.status;
               const bookId = book.id || book.bookId;
@@ -2742,6 +3173,7 @@ window.__ModuleLoader__.load({
                 return pending.then(() => true, () => false);
               },
               onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
+          !loading && tab === 'stats' ? h(Stats) : null,
           !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy,
             onExportNotes: () => run(() => call(ctx, 'exportNotes'), '导出完成').then(r => { if (r?.text) { const blob = new Blob([r.text], { type: 'text/markdown;charset=utf-8' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = '墨读笔记.md'; a.click(); URL.revokeObjectURL(a.href); } }, () => {}),
             onUploadFont: (file) => { const reader = new FileReader(); reader.onload = (e) => { const fontFamily = `custom-${Date.now()}`; const style = document.createElement('style'); style.textContent = `@font-face{font-family:'${fontFamily}';src:url('${e.target.result}')}`; document.head.appendChild(style); updateSettings({ fontFamily }); setNotice({ kind: 'success', text: '字体已应用' }); }; reader.readAsDataURL(file); },
@@ -2757,12 +3189,12 @@ body[data-ds-dark-theme] .mr-shelf-cover{box-shadow:0 0 0 1px rgba(242,232,213,.
 .mr-brand{display:flex;align-items:center;gap:10px;padding:0 10px 28px;color:var(--mr-text)}.mr-brand svg{color:var(--mr-accent)}.mr-brand strong{display:block;font-family:var(--mr-serif);font-size:21px;letter-spacing:2px}.mr-brand small{display:block;color:var(--mr-muted);font-size:11px;margin-top:2px;letter-spacing:0}
 .mr-nav-items{display:flex;flex-direction:column;gap:4px}.mr-nav-items button{min-height:44px;border:0;border-left:2px solid transparent;border-radius:8px;background:transparent;color:var(--mr-muted);display:flex;align-items:center;gap:12px;padding:0 14px;text-align:left;font-size:13px}.mr-nav-items button:hover{background:var(--mr-sunken);color:var(--mr-text)}.mr-nav-items button.active{border-left-color:transparent;background:var(--mr-sunken);color:var(--mr-text);font-weight:600}.mr-nav-items button.active svg{color:var(--mr-text)}
 .mr-local{margin-top:auto;color:var(--mr-muted);font-size:11px;display:flex;align-items:center;gap:7px;padding:10px}.mr-local span{width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-state-success-primary)}
-.mr-content{flex:1;min-width:0;height:100%;overflow-y:auto;padding:24px clamp(20px,3vw,44px);position:relative;background:var(--mr-paper)}.mr-content>div:not(.mr-notice){max-width:1180px;margin:0 auto}
+.mr-content{flex:1;min-width:0;height:100%;overflow-y:auto;padding:24px clamp(20px,3vw,44px);position:relative;background:var(--mr-paper)}.mr-content>div:not(.mr-notice):not(.mr-window-shelf){max-width:1180px;margin:0 auto}
 .mr-section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:24px}.mr-section-head h2{font:400 32px/1.2 var(--mr-serif);margin:0;letter-spacing:-.5px;color:var(--mr-text)}.mr-section-head p{margin:7px 0 0;color:var(--mr-muted);font-size:13px}
 .mr-section-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.mr-view-toggle{display:inline-flex;padding:2px;border:1px solid var(--mr-border);border-radius:8px;background:var(--mr-sunken)}
+.mr-view-toggle{display:inline-flex;padding:2px;border:1px solid var(--mr-border);border-radius:8px;background:transparent}
 .mr-view-toggle button{min-height:32px;padding:0 12px;border:0;border-radius:6px;background:transparent;color:var(--mr-muted);font-size:12px}
-.mr-view-toggle button.active{background:var(--mr-card);color:var(--mr-text);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.mr-view-toggle button.active{background:color-mix(in srgb,var(--mr-accent) 14%,var(--mr-paper));color:var(--mr-accent);font-weight:600;box-shadow:none}
 body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba(0,0,0,.4)}
 .mr-shelf{position:relative;z-index:1;display:flex;flex-direction:column;gap:0;min-height:100%}
 .mr-shelf-topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 0 16px;margin-bottom:20px}
@@ -2805,6 +3237,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-shelf-search .kbd{font-size:11px;border:1px solid var(--mr-border);border-radius:4px;padding:1px 4px;color:var(--mr-muted)}
 .mr-shelf-search-clear{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--mr-muted);cursor:pointer}
 .mr-shelf-search-clear:hover{background:var(--mr-card);color:var(--mr-text)}
+.mr-shelf-back{display:inline-flex;align-items:center;justify-content:center;flex:none;width:40px;height:40px;padding:0;border:1px solid var(--mr-border);border-radius:9px;background:var(--mr-paper);color:var(--mr-muted);cursor:pointer;margin-right:auto}.mr-shelf-back:hover{border-color:var(--mr-accent);color:var(--mr-accent)}.mr-shelf-refresh{display:inline-flex;align-items:center;justify-content:center;flex:none;width:40px;height:40px;padding:0;border:1px solid var(--mr-border);border-radius:9px;background:var(--mr-paper);color:var(--mr-muted);cursor:pointer}.mr-shelf-refresh:hover{border-color:var(--mr-accent);color:var(--mr-accent)}.mr-shelf-refresh:disabled{opacity:.45;cursor:default}
 .mr-shelf-search-clear:focus-visible{outline:2px solid var(--mr-accent);outline-offset:2px}
 .mr-shelf-search-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;min-height:260px;padding:24px;border:1px dashed var(--mr-border);border-radius:10px;text-align:center}
 .mr-shelf-search-empty p{margin:0;font-size:13px;color:var(--mr-muted)}
@@ -2828,8 +3261,8 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-dl-badge.queued{background:color-mix(in srgb,var(--mr-ink) 45%,transparent)}
 .mr-dl-badge.paused{background:color-mix(in srgb,var(--mr-ink) 55%,transparent)}
 .mr-dl-badge.failed{background:#a8422f}
-.mr-dl-badge.done{background:color-mix(in srgb,var(--mr-accent) 78%,#000 6%)}
-.mr-shelf-piece{position:relative;display:flex;flex-direction:column;gap:10px;min-width:0;padding:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer;appearance:none;border-radius:4px;opacity:0;animation:mr-fade-in .2s ease forwards}
+.mr-dl-badge.done{background:color-mix(in srgb,var(--mr-accent) 78%,#000 6%)}.mr-dl-badge>svg{display:none}
+.mr-shelf-piece{position:relative;display:flex;flex-direction:column;gap:10px;min-width:0;padding:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer;appearance:none;border-radius:4px;opacity:0;animation:mr-fade-in .2s ease forwards;-webkit-touch-callout:none;user-select:none}
 .mr-shelf-piece:focus-visible{outline:2px solid var(--mr-accent);outline-offset:4px}
 .mr-shelf-piece:hover .mr-shelf-cover{transform:translateY(-4px)}
 .mr-shelf-piece:active .mr-shelf-cover{transform:translateY(-2px)}
@@ -2857,19 +3290,16 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-shelf-cta{min-height:40px;padding:0 18px;border:0;border-radius:8px;background:var(--mr-accent);color:var(--mr-on-accent);font-size:13px;font-weight:600;cursor:pointer}
 .mr-shelf-cta:hover{background:var(--mr-accent-hover)}
 .mr-shelf-cta:focus-visible{outline:2px solid var(--mr-accent);outline-offset:2px}
-.mr-shelf-foot{display:flex;align-items:center;justify-content:space-between;gap:16px;border-top:1px solid var(--mr-border);padding-top:12px;margin-top:auto;font-size:11px;color:var(--mr-muted)}
-.mr-shelf-foot .wall{color:var(--mr-muted)}
 .mr-shelf-folder-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:8px 0 4px}
 .mr-folder-chip{min-height:28px;padding:0 12px;border:1px solid var(--mr-border);border-radius:14px;background:var(--mr-card);color:var(--mr-muted);font-size:12px;white-space:nowrap;transition:background .15s,color .15s}
 .mr-folder-chip:hover{background:var(--mr-sunken);color:var(--mr-text)}
 .mr-folder-chip.active{background:var(--mr-accent);color:var(--mr-on-accent);border-color:var(--mr-accent)}
 .mr-folder-add{border-style:dashed;color:var(--mr-accent)}
 .mr-folder-del{color:var(--dsw-alias-state-danger-primary,#c44);border-color:var(--dsw-alias-state-danger-primary,#c44)}
-.mr-select-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;background:var(--mr-card);border:1px solid var(--mr-border);border-radius:10px;margin:8px 0}
-.mr-select-all{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--mr-text);cursor:pointer}
-.mr-select-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.mr-shelf-piece.mr-selected{outline:2px solid var(--mr-accent);outline-offset:2px;border-radius:8px}
-.mr-select-check{position:absolute;top:6px;left:6px;z-index:2;background:var(--mr-card);border-radius:50%;width:22px;height:22px;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 3px rgba(0,0,0,.15)}
+.mr-select-bar{display:flex;flex-direction:column;align-items:stretch;gap:4px;width:min(100%,560px);padding:8px 12px 10px;background:var(--mr-paper);border:1px solid var(--mr-border);border-radius:14px;box-shadow:0 12px 36px rgba(62,48,31,.12);margin:8px auto 12px}.mr-select-head{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:32px;padding-bottom:4px;border-bottom:1px solid var(--mr-border)}.mr-select-actions{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:4px;width:100%}.mr-select-actions .mr-button{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;width:100%;min-width:0;height:48px;padding:4px 0 2px;border:0;border-radius:10px;background:transparent;box-shadow:none;color:var(--mr-text);font-size:11px;line-height:1.2;white-space:nowrap}.mr-select-actions .mr-button:hover{background:var(--mr-sunken)}.mr-select-actions .mr-button:disabled{opacity:.35;background:transparent}.mr-select-actions .mr-button.mr-select-delete{color:var(--dsw-alias-state-danger-primary,#a8332a)}
+.mr-select-all{display:flex;align-items:center;gap:8px;min-height:32px;font-size:12px;font-weight:500;color:var(--mr-text);cursor:pointer}.mr-select-all input{width:16px;height:16px;margin:0;accent-color:var(--mr-accent)}.mr-select-close{display:inline-flex;align-items:center;justify-content:center;flex:none;width:36px;height:36px;margin:-4px -4px -4px 0;padding:0;border:0;border-radius:50%;background:transparent;color:var(--mr-muted);cursor:pointer}.mr-select-close:hover{background:var(--mr-sunken);color:var(--mr-text)}
+.mr-shelf-piece{transition:transform .16s ease}.mr-shelf-piece.mr-selected{outline:0;z-index:2;transform:scale(1.025);transform-origin:center}.mr-shelf-piece.mr-selected .mr-shelf-cover{box-shadow:0 10px 26px rgba(62,48,31,.24)}
+.mr-select-check{position:absolute;top:7px;right:7px;left:auto;z-index:2;box-sizing:border-box;width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;border:1.5px solid color-mix(in srgb,var(--mr-text) 48%,transparent);background:color-mix(in srgb,var(--mr-paper) 92%,transparent);color:var(--mr-text);box-shadow:0 1px 4px rgba(38,30,20,.14);pointer-events:none}.mr-select-check.mr-checked{border-color:var(--mr-accent);background:var(--mr-accent);color:var(--mr-on-accent)}.mr-select-check svg{display:block;flex:none}
 .mr-folder-sheet-backdrop{position:absolute;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.3);backdrop-filter:blur(2px)}
 .mr-folder-sheet{width:min(360px,90vw);max-height:60vh;overflow:auto;background:var(--mr-card);border:1px solid var(--mr-border);border-radius:14px;padding:20px;box-shadow:0 20px 60px rgba(0,0,0,.2)}
 .mr-folder-sheet h3{margin:0 0 12px;font-size:16px;color:var(--mr-text)}
@@ -2880,46 +3310,46 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 /* 阅读热力图 */
 .mr-heatmap{margin-top:20px}
-.mr-heatmap h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--fg-2)}
-.mr-heatmap-grid{display:grid;grid-template-columns:repeat(12,1fr);gap:3px}
-.mr-heatmap-cell{width:100%;aspect-ratio:1;border-radius:2px;background:var(--bg-1)}
-.mr-heatmap-cell.level-0{background:var(--bg-1)}
+.mr-heatmap h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--mr-text)}
+.mr-heatmap-grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:3px;max-width:420px}
+.mr-heatmap-cell{width:100%;aspect-ratio:1;border-radius:2px;background:var(--mr-sunken)}
+.mr-heatmap-cell.level-0{background:var(--mr-sunken)}
 .mr-heatmap-cell.level-1{background:#ebedf0}
 .mr-heatmap-cell.level-2{background:#9be9a8}
 .mr-heatmap-cell.level-3{background:#40c463}
 .mr-heatmap-cell.level-4{background:#30a14e}
-.mr-heatmap-legend{display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11px;color:var(--fg-3)}
+.mr-heatmap-legend{display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11px;color:var(--mr-muted)}
 .mr-heatmap-legend .mr-heatmap-cell{width:12px;height:12px}
 /* 年度统计 */
 .mr-yearly-stats{margin-top:20px}
-.mr-yearly-stats h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--fg-2)}
+.mr-yearly-stats h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--mr-text)}
 .mr-yearly-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-.mr-yearly-item{text-align:center;padding:16px 12px;background:var(--bg-0);border:1px solid var(--line);border-radius:8px}
-.mr-yearly-item strong{display:block;font-size:28px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--accent)}
-.mr-yearly-item span{font-size:11px;color:var(--fg-3);margin-top:4px}
+.mr-yearly-item{text-align:center;padding:16px 12px;background:var(--mr-paper);border:1px solid var(--mr-border);border-radius:8px}
+.mr-yearly-item strong{display:block;font-size:28px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--mr-accent)}
+.mr-yearly-item span{font-size:11px;color:var(--mr-muted);margin-top:4px}
 /* 阅读时长分布 */
 .mr-duration-dist{margin-top:20px}
-.mr-duration-dist h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--fg-2)}
+.mr-duration-dist h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--mr-text)}
 .mr-dist-bars{display:flex;flex-direction:column;gap:8px}
 .mr-dist-row{display:flex;align-items:center;gap:12px}
-.mr-dist-label{width:80px;font-size:12px;color:var(--fg-2);text-align:right}
-.mr-dist-bar{flex:1;height:24px;background:var(--bg-1);border-radius:4px;overflow:hidden}
-.mr-dist-fill{height:100%;background:var(--accent);border-radius:4px;transition:width .3s}
-.mr-dist-count{width:50px;font-size:12px;color:var(--fg-3)}
+.mr-dist-label{width:80px;font-size:12px;color:var(--mr-body);text-align:right}
+.mr-dist-bar{flex:1;height:24px;background:var(--mr-sunken);border-radius:4px;overflow:hidden}
+.mr-dist-fill{height:100%;background:var(--mr-accent);border-radius:4px;transition:width .3s}
+.mr-dist-count{width:50px;font-size:12px;color:var(--mr-muted)}
 /* 阅读时段分析 */
 .mr-time-dist{margin-top:20px}
-.mr-time-dist h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--fg-2)}
+.mr-time-dist h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--mr-text)}
 .mr-time-grid{display:flex;align-items:flex-end;gap:2px;height:80px}
 .mr-time-cell{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;height:100%}
-.mr-time-bar{width:100%;background:var(--accent);border-radius:2px;min-height:4px}
-.mr-time-label{font-size:10px;color:var(--fg-3)}
+.mr-time-bar{width:100%;background:var(--mr-accent);border-radius:2px;min-height:4px}
+.mr-time-label{font-size:10px;color:var(--mr-muted)}
 /* 阅读趋势 */
 .mr-trend-chart{margin-top:20px}
-.mr-trend-chart h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--fg-2)}
+.mr-trend-chart h4{font-size:13px;font-weight:600;margin:0 0 12px;color:var(--mr-text)}
 .mr-trend-bars{display:flex;align-items:flex-end;gap:2px;height:100px}
 .mr-trend-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;height:100%}
-.mr-trend-bar{width:100%;background:var(--accent);border-radius:2px;min-height:2px;opacity:.85}
-.mr-trend-label{font-size:9px;color:var(--fg-3)}
+.mr-trend-bar{width:100%;background:var(--mr-accent);border-radius:2px;min-height:2px;opacity:.85}
+.mr-trend-label{font-size:9px;color:var(--mr-muted)}
 .mr-stat-card{display:flex;flex-direction:column;align-items:center;padding:16px;border:1px solid var(--mr-border);border-radius:10px;background:var(--mr-sunken)}
 .mr-stat-card strong{font-size:28px;font-weight:600;color:var(--mr-accent)}
 .mr-stat-card span{font-size:12px;color:var(--mr-muted);margin-top:4px}
@@ -2947,7 +3377,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-empty{text-align:center;padding:70px 20px;color:var(--mr-muted)}.mr-empty-icon{width:58px;height:58px;border-radius:18px;background:var(--mr-sunken);display:flex;align-items:center;justify-content:center;margin:0 auto 16px;color:var(--mr-accent)}.mr-empty h3{color:var(--mr-text);font:400 18px/1.3 var(--mr-serif);margin:0 0 8px}.mr-empty p{font-size:13px;margin:0;line-height:1.7}
 .mr-searchbar{display:flex;gap:10px;margin-bottom:22px}.mr-searchbar select{max-width:190px}.mr-root input,.mr-root textarea,.mr-root select,.mr-reader input,.mr-reader textarea,.mr-reader select{border:1px solid var(--mr-border);border-radius:8px;background:var(--dsw-specific-input-major,var(--mr-sunken));color:var(--mr-text);padding:9px 12px;outline:none}.mr-root input:focus,.mr-root textarea:focus,.mr-root select:focus,.mr-reader textarea:focus{border-color:var(--mr-accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--mr-accent) 18%,transparent)}.mr-reader input,.mr-reader textarea,.mr-reader select{background:var(--mr-sunken)}.mr-root input[type=range]{padding:0;min-height:24px}.mr-searchbar input{flex:1;min-width:0}.mr-searchbar select{min-width:130px}.mr-results{display:flex;flex-direction:column;gap:10px}.mr-result{display:flex;align-items:center;gap:15px;padding:14px;border:1px solid var(--mr-border);border-radius:12px;background:var(--mr-card);box-shadow:var(--mr-shadow)}.mr-result-info{flex:1;min-width:0}.mr-result-info h3{font:400 15px/1.45 var(--mr-serif);margin:0 0 5px}.mr-result-info p{font-size:12px;color:var(--mr-muted);margin:0}.mr-result-info .mr-intro{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-top:7px;line-height:1.5}
 .mr-panel{border:1px solid var(--mr-border);border-radius:12px;background:var(--mr-card);box-shadow:var(--mr-shadow);padding:20px;margin-bottom:16px}.mr-panel h3{font:400 18px/1.35 var(--mr-serif);margin:0 0 14px}.mr-panel textarea{width:100%;resize:vertical;line-height:1.6}.mr-help{font-size:12px;color:var(--mr-muted);line-height:1.6}.mr-check{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mr-muted);margin-top:12px}.mr-check input{width:16px;height:16px;padding:0}.mr-inline-actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:12px}.mr-source-list{display:flex;flex-direction:column;gap:9px}.mr-source-row{display:flex;align-items:center;gap:12px;padding:13px 15px;border:1px solid var(--mr-border);border-radius:11px;background:var(--mr-card)}.mr-source-row>div:nth-child(2){flex:1;min-width:0}.mr-source-row h3{font:400 15px/1.4 var(--mr-serif);margin:0 0 4px}.mr-source-row p{font-size:11px;color:var(--mr-muted);margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mr-source-mark{color:var(--mr-accent)}.mr-tag{font-size:10px;border:1px solid var(--mr-border);padding:3px 7px;border-radius:10px;color:var(--mr-muted);white-space:nowrap}
-.mr-setting-row{display:flex;align-items:center;justify-content:space-between;gap:20px;margin:15px 0;font-size:13px}.mr-stepper{display:flex;align-items:center;gap:12px}.mr-stepper strong{min-width:42px;text-align:center}.mr-setting-row input[type=range],.mr-drawer input[type=range]{accent-color:var(--mr-accent,var(--reader-accent));height:20px}.mr-mode-picker{display:inline-flex;gap:2px;padding:2px;border:1px solid var(--mr-border);border-radius:8px;background:var(--mr-sunken)}.mr-mode-choice{min-height:32px;padding:0 12px;border:0;border-radius:6px;background:transparent;color:var(--mr-muted);font-size:12px;white-space:nowrap}.mr-mode-choice:hover{color:var(--mr-text)}.mr-mode-choice.active{background:var(--mr-card);color:var(--mr-text);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.08)}.mr-theme-picker{display:flex;gap:10px}.mr-swatch{width:34px;height:34px;border-radius:50%;border:2px solid transparent;box-shadow:0 0 0 1px var(--mr-border)}.mr-swatch.active{border-color:var(--mr-accent);box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),0 0 0 4px var(--mr-accent)}.mr-swatch.paper{background:#f4ecdc}.mr-swatch.light{background:#fff}.mr-swatch.green{background:#e3eee5}.mr-swatch.dark{background:#202522}.mr-roadmap p{color:var(--mr-muted);font-size:12px;line-height:1.7;margin:0}
+.mr-setting-row{display:flex;align-items:center;justify-content:space-between;gap:20px;margin:15px 0;font-size:13px}.mr-stepper{display:flex;align-items:center;gap:12px}.mr-stepper strong{min-width:42px;text-align:center}.mr-setting-row input[type=range],.mr-drawer input[type=range]{accent-color:var(--mr-accent,var(--reader-accent));height:20px}.mr-mode-picker{display:inline-flex;gap:2px;padding:2px;border:1px solid var(--mr-border);border-radius:8px;background:transparent}.mr-mode-choice{min-height:32px;padding:0 12px;border:0;border-radius:6px;background:transparent;color:var(--mr-muted);font-size:12px;white-space:nowrap}.mr-mode-choice:hover{color:var(--mr-text)}.mr-mode-choice.active{background:color-mix(in srgb,var(--mr-accent) 14%,var(--mr-paper));color:var(--mr-accent);font-weight:600;box-shadow:none}.mr-theme-picker{display:flex;gap:10px}.mr-swatch{width:34px;height:34px;border-radius:50%;border:2px solid transparent;box-shadow:0 0 0 1px var(--mr-border)}.mr-swatch.active{border-color:var(--mr-accent);box-shadow:0 0 0 2px var(--dsw-alias-bg-layer-1),0 0 0 4px var(--mr-accent)}.mr-swatch.paper{background:#f4ecdc}.mr-swatch.light{background:#fff}.mr-swatch.green{background:#e3eee5}.mr-swatch.dark{background:#202522}.mr-roadmap p{color:var(--mr-muted);font-size:12px;line-height:1.7;margin:0}
 .mr-notice{position:sticky;top:-20px;z-index:20;margin:-12px auto 16px;max-width:760px;padding:11px 13px;border-radius:10px;background:var(--mr-card);border:1px solid var(--mr-border);box-shadow:var(--mr-shadow);display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:13px}.mr-notice.error{border-color:var(--dsw-alias-state-error-primary)}.mr-notice.success{border-color:var(--dsw-alias-state-success-primary)}.mr-notice button{border:0;background:transparent;color:inherit;padding:4px;display:flex}.mr-loading{text-align:center;color:var(--mr-muted);font-size:13px;padding:36px}.mr-error-block{text-align:center;padding:50px 20px;color:var(--dsw-alias-state-error-primary)}
 .mr-reader>.mr-notice{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:60;margin:0;max-width:min(560px,calc(100% - 32px));width:max-content}
 .mr-reader{--reader-bg:#f6f1e6;--reader-text:#2b261e;--reader-muted:#867b68;--reader-border:#e2d8c4;--reader-accent:#9a3b2b;--reader-card:#fbf7ee;--mr-card:var(--reader-bg);--mr-sunken:color-mix(in srgb,var(--reader-text) 6%,var(--reader-bg));--mr-border:var(--reader-border);--mr-text:var(--reader-text);--mr-muted:var(--reader-muted);--mr-accent:var(--reader-accent);--mr-accent-hover:color-mix(in srgb,var(--reader-accent) 84%,#000);--mr-on-accent:var(--reader-bg);height:100%;min-height:0;display:flex;flex-direction:column;position:relative;overflow:hidden;background:var(--reader-bg);color:var(--reader-text)}
@@ -2962,7 +3392,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-tool-btn svg{display:block}
 .mr-tools hr{width:22px;height:1px;margin:5px auto;border:0;background:color-mix(in srgb,var(--reader-text) 12%,transparent)}
 .mr-folio{position:absolute;left:50%;bottom:24px;transform:translateX(-50%);z-index:3;font:400 11px/1 'Noto Serif CJK SC',Georgia,serif;letter-spacing:.24em;color:var(--reader-muted);pointer-events:none;font-variant-numeric:tabular-nums}
-.mr-tabbar{display:none}
+.mr-reader-top{display:none}.mr-tabbar{display:none}
 .mr-chapter-scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;position:relative;z-index:2;overflow-anchor:none}
 .mr-paged-view{flex:1;min-height:0;overflow:hidden;position:relative;z-index:2;touch-action:pan-y}
 .mr-page-window{position:relative;width:min(var(--mr-text,672px),calc(100% - 56px));height:100%;margin:0 auto;overflow:hidden}
@@ -3057,12 +3487,23 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-ambience{position:absolute;inset:0;z-index:0;overflow:hidden;pointer-events:none;contain:strict}.mr-ambience canvas{display:block;width:100%;height:100%}.mr-chapter-scroll,.mr-paged-view{position:relative;z-index:2}.mr-loading,.mr-error-block{position:relative;z-index:2}
 @media(max-width:880px){.mr-tools{display:none}.mr-tabbar{position:absolute;left:0;right:0;bottom:0;z-index:7;display:flex;align-items:center;justify-content:space-around;height:54px;background:var(--reader-bg);border-top:1px solid color-mix(in srgb,var(--reader-text) 10%,transparent)}.mr-tab-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;flex:1;height:100%;padding:0;border:0;background:none;color:var(--reader-muted);font:400 11px/1 'Noto Serif CJK SC',Georgia,serif;letter-spacing:.04em}.mr-tab-btn:hover:not(:disabled){color:var(--reader-text)}.mr-paged-view{padding-bottom:54px}.mr-folio{bottom:70px}.mr-page-window{width:min(var(--mr-text,672px),calc(100% - 40px))}}
 @media(min-width:881px){.mr-page-window,.mr-chapter{width:min(var(--mr-text,672px),calc(100% - 200px))}}
-@media(max-width:720px){.mr-shelf-search .kbd{display:none}.mr-root{flex-direction:column;padding-left:0}.mr-section-actions{width:100%;justify-content:space-between}.mr-reader{padding-left:0}.mr-page-window{width:calc(100% - 32px)}.mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-content{order:1;padding:20px 14px}.mr-section-head{flex-wrap:wrap;margin-bottom:18px}.mr-section-head h2{font-size:22px;white-space:nowrap}.mr-book-grid{grid-template-columns:1fr;gap:10px}.mr-book-open{padding:13px}.mr-book-actions{position:relative}.mr-searchbar{flex-wrap:wrap}.mr-searchbar select{max-width:none;width:100%}.mr-searchbar input{flex:1}.mr-result{align-items:flex-start;padding:12px;gap:10px}.mr-result .mr-button{align-self:center;padding-inline:9px}.mr-result-info .mr-intro{-webkit-line-clamp:1}.mr-source-row{flex-wrap:wrap}.mr-source-row .mr-tag{display:none}.mr-panel{padding:16px}.mr-notice{top:-12px}.mr-chapter{width:calc(100% - 40px);padding:64px 0 84px}.mr-chapter-title{font-size:25px}.mr-chapter-no{letter-spacing:.42em;text-indent:.42em}.mr-drawer{left:0;right:0;width:auto}.mr-chapter-meta{letter-spacing:.04em}.mr-modal{padding:0}.mr-set-label{width:56px}}
+@media(max-width:720px){
+.mr-reader{position:fixed;inset:0;z-index:2147483000;width:100vw;height:100vh;height:100dvh;border-radius:0}
+.mr-reader-top{display:flex;align-items:center;gap:8px;flex:0 0 auto;padding:calc(6px + env(safe-area-inset-top,0px)) 10px 6px;border-bottom:1px solid color-mix(in srgb,var(--reader-border) 72%,transparent);background:color-mix(in srgb,var(--reader-bg) 94%,transparent);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);z-index:9}
+.mr-reader-top-btn{flex:none;width:38px;height:38px;display:flex;align-items:center;justify-content:center;border:0;border-radius:10px;background:transparent;color:var(--reader-muted)}
+.mr-reader-top-btn:active{background:color-mix(in srgb,var(--reader-text) 7%,transparent)}
+.mr-reader-top-copy{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;padding:0 2px}
+.mr-reader-top-copy strong,.mr-reader-top-copy span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mr-reader-top-copy strong{font:500 14px/1.3 var(--mr-serif);color:var(--reader-text)}
+.mr-reader-top-copy span{font:400 10px/1.3 var(--mr-serif);color:var(--reader-muted)}
+.mr-reader .mr-tabbar{padding-bottom:env(safe-area-inset-bottom,0px);height:calc(54px + env(safe-area-inset-bottom,0px))}
+.mr-reader .mr-paged-view{padding-bottom:calc(54px + env(safe-area-inset-bottom,0px))}
+.mr-shelf-search .kbd{display:none}.mr-root{flex-direction:column;padding-left:0}.mr-section-actions{width:100%;justify-content:space-between}.mr-reader{padding-left:0}.mr-page-window{width:calc(100% - 32px)}.mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-content{order:1;padding:20px 14px}.mr-section-head{flex-wrap:wrap;margin-bottom:18px}.mr-section-head h2{font-size:22px;white-space:nowrap}.mr-book-grid{grid-template-columns:1fr;gap:10px}.mr-book-open{padding:13px}.mr-book-actions{position:relative}.mr-searchbar{flex-wrap:wrap}.mr-searchbar select{max-width:none;width:100%}.mr-searchbar input{flex:1}.mr-result{align-items:flex-start;padding:12px;gap:10px}.mr-result .mr-button{align-self:center;padding-inline:9px}.mr-result-info .mr-intro{-webkit-line-clamp:1}.mr-source-row{flex-wrap:wrap}.mr-source-row .mr-tag{display:none}.mr-panel{padding:16px}.mr-notice{top:-12px}.mr-chapter{width:calc(100% - 40px);padding:64px 0 84px}.mr-chapter-title{font-size:25px}.mr-chapter-no{letter-spacing:.42em;text-indent:.42em}.mr-drawer{left:0;right:0;width:auto}.mr-chapter-meta{letter-spacing:.04em}.mr-modal{padding:0}.mr-set-label{width:56px}}
 /* 平板适配（721-1024px） */
 @media(min-width:721px) and (max-width:1024px){
   .mr-nav{width:140px;flex:0 0 140px;padding:20px 10px 14px}
   .mr-content{padding:20px 24px}
-  .mr-content>div:not(.mr-notice){max-width:900px}
+  .mr-content>div:not(.mr-notice):not(.mr-window-shelf){max-width:900px}
   .mr-chapter{width:min(var(--mr-text,672px),calc(100% - 160px))}
   .mr-tools{right:8px}
   .mr-tool-btn{width:48px;padding:6px 0}
@@ -3073,7 +3514,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 @media(min-width:1025px){
   .mr-nav{width:200px;flex:0 0 200px;padding:28px 18px 20px}
   .mr-content{padding:28px clamp(24px,4vw,56px)}
-  .mr-content>div:not(.mr-notice){max-width:1280px}
+  .mr-content>div:not(.mr-notice):not(.mr-window-shelf){max-width:1280px}
   .mr-chapter{width:min(var(--mr-text,672px),calc(100% - 240px))}
   .mr-tools{right:20px}
   .mr-tool-btn{width:56px;padding:10px 0}
@@ -3154,11 +3595,179 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-ai-result{background:var(--reader-card);border:1px solid var(--reader-border);border-radius:10px;padding:14px;animation:mr-fade-in .3s ease}
 .mr-ai-result-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;font-size:12px;color:var(--reader-muted);letter-spacing:.1em}
 .mr-ai-result p{margin:0;font-size:14px;line-height:1.8;white-space:pre-wrap}
+/* 窗边书架：共用外壳与真实数据分页。 */
+.mr-root{--mr-accent:#6b4a2d;--mr-accent-hover:#543921;--mr-on-accent:#fffaf0;--mr-paper:#f6f0e1;--mr-card:#fbf7ec;--mr-sunken:#e9e1d0;--mr-text:#29261f;--mr-body:#29261f;--mr-muted:#766e60;--mr-border:#d5ccb8;--mr-line:#d5ccb8;--mr-ink:#211c16;background:var(--mr-paper)}
+.mr-nav{width:84px;flex:0 0 84px;padding:16px 8px 12px;border-right:1px solid var(--mr-border);background:#e7e0cf}
+.mr-brand{justify-content:center;padding:0 0 24px}.mr-brand>div{display:none}.mr-brand svg{color:var(--mr-accent)}
+.mr-nav-items{gap:7px}.mr-nav-items button{min-height:50px;flex-direction:column;justify-content:center;gap:4px;padding:5px 0;border-left:0;border-radius:10px;font-size:10px;text-align:center}.mr-nav-items button.active{border-left:0;background:#f6f0e1;color:var(--mr-accent)}
+.mr-local{justify-content:center;padding:10px 0;font-size:0}.mr-content{background:var(--mr-paper)}
+.mr-content>.mr-window-shelf{max-width:none;height:100%;min-height:0}
+.mr-window-shelf{display:flex;flex-direction:column;gap:0;min-height:0;color:var(--mr-text)}
+.mr-window-shelf .mr-shelf-topbar{flex:0 0 auto;min-height:28px;padding:0;margin:0 0 10px}
+.mr-window-shelf .mr-shelf-head{flex:0 0 auto;align-items:center;margin:0 0 14px;gap:14px}.mr-window-shelf .mr-shelf-head h1{font-size:30px}.mr-window-shelf .mr-shelf-head .kicker{margin-bottom:5px}
+.mr-window-shelf .mr-shelf-head-actions{justify-content:flex-end;gap:8px}.mr-window-shelf .mr-shelf-head-actions .mr-button{background:transparent}.mr-window-shelf .mr-sort-select{background:transparent;border-color:transparent;min-height:36px}
+.mr-window-shelf .mr-shelf-search{height:38px;border-radius:10px;background:var(--mr-paper)}.mr-window-shelf .mr-shelf-search input{width:min(220px,24vw);background:var(--mr-paper)}
+.mr-window-shelf .mr-shelf-folder-bar{flex:0 0 auto;padding:0 0 10px;gap:6px}.mr-window-shelf .mr-folder-chip{background:transparent;min-height:28px}.mr-window-shelf .mr-folder-chip.active{background:var(--mr-accent)}
+.mr-window-shelf .mr-select-bar{flex:0 0 auto}
+.mr-window-shelf .mr-shelf-gallery{display:flex;flex-direction:column;gap:16px;flex:1 1 auto;align-items:stretch;min-height:0}.mr-window-shelf.mr-no-hero .mr-shelf-gallery{grid-template-columns:minmax(0,1fr)}
+.mr-window-shelf .mr-shelf-hero{flex:0 0 auto;display:grid;grid-template-columns:110px minmax(0,1fr);align-items:center;gap:18px;min-width:0;padding:16px;border:1px solid var(--mr-border);border-radius:4px;background:#eee6d4;overflow:hidden}
+.mr-window-shelf .mr-shelf-hero-cover{width:110px;max-width:110px;justify-self:center}.mr-window-shelf .mr-shelf-hero-cover .mr-shelf-cover{aspect-ratio:3/4}.mr-window-shelf .mr-shelf-hero-info{align-self:center}.mr-window-shelf .mr-shelf-hero-title{font-size:22px;white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.mr-window-shelf .mr-shelf-hero-by{white-space:normal}.mr-window-shelf .mr-shelf-cta{margin-top:12px;min-height:36px;padding:0 14px}
+.mr-shelf-wall{position:relative;flex:1 1 auto;min-width:0;min-height:0;display:grid;grid-template-rows:minmax(0,1fr) auto}
+.mr-window-shelf .mr-shelf-grid:not(.mr-mobile-track){min-height:0;display:grid;grid-template-columns:repeat(var(--shelf-columns),minmax(0,1fr));grid-template-rows:repeat(var(--shelf-rows),minmax(0,1fr));gap:12px 18px;align-content:stretch}
+@keyframes mrShelfPageNext{from{opacity:0;transform:translateX(26px)}to{opacity:1;transform:translateX(0)}}
+@keyframes mrShelfPagePrev{from{opacity:0;transform:translateX(-26px)}to{opacity:1;transform:translateX(0)}}
+.mr-window-shelf .mr-shelf-grid.mr-page-next{animation:mrShelfPageNext .22s cubic-bezier(.2,.7,.2,1) both}
+.mr-window-shelf .mr-shelf-grid.mr-page-prev{animation:mrShelfPagePrev .22s cubic-bezier(.2,.7,.2,1) both}
+@media(prefers-reduced-motion:reduce){.mr-window-shelf .mr-shelf-grid.mr-page-next,.mr-window-shelf .mr-shelf-grid.mr-page-prev{animation:none}}
+.mr-window-shelf .mr-shelf-piece{--shelf-cap-space:47px;height:100%;min-height:0;display:flex;flex-direction:column;justify-content:center;gap:7px;container-type:size;opacity:1;animation:none;border-radius:3px}.mr-window-shelf .mr-shelf-visual{position:relative;display:flex;justify-content:center;align-items:center;width:100%;min-height:0}.mr-window-shelf .mr-shelf-cover-frame{position:relative;display:block;flex:0 0 auto;width:min(100cqw,calc((100cqh - var(--shelf-cap-space)) * .6667));aspect-ratio:2/3}.mr-window-shelf .mr-shelf-cover{width:100%;height:100%;min-height:0;aspect-ratio:2/3;border-radius:3px;box-shadow:0 5px 12px rgba(62,48,31,.16)}.mr-window-shelf .mr-shelf-piece:hover .mr-shelf-cover{transform:translateY(-2px)}.mr-window-shelf .mr-shelf-cap{flex:0 0 40px;width:min(100cqw,calc((100cqh - var(--shelf-cap-space)) * .6667));align-self:center}.mr-window-shelf .mr-shelf-cap strong{font-size:13px;line-height:1.35}.mr-window-shelf .mr-shelf-cap small{font-size:10px;margin-top:3px}.mr-window-shelf .mr-shelf-fallback-title{font-size:15px}
+.mr-shelf-pager{display:flex;flex:0 0 auto;align-items:center;justify-content:flex-end;gap:3px;padding-top:8px}.mr-shelf-pager button{min-width:28px;height:28px;padding:0 6px;border:0;border-radius:5px;background:transparent;color:var(--mr-muted);font-size:11px}.mr-shelf-pager button:hover:not(:disabled){background:var(--mr-sunken);color:var(--mr-text)}.mr-shelf-pager button[aria-current=page]{background:var(--mr-accent);color:var(--mr-on-accent)}.mr-shelf-pager button:focus-visible{outline:2px solid var(--mr-accent);outline-offset:1px}
+.mr-window-shelf .mr-shelf-grid-note{height:100%;min-height:180px;background:rgba(251,247,236,.36)}
+.mr-window-shelf .mr-shelf-online{flex:0 0 auto;margin-top:16px;padding-top:12px;border-color:var(--mr-border)}.mr-window-shelf .mr-shelf-online-row{border-color:var(--mr-border)}
+.mr-shelf-mobile-search-toggle{display:none;min-width:36px;height:36px;padding:0;border:1px solid var(--mr-border);border-radius:9px;background:var(--mr-card);color:var(--mr-text);align-items:center;justify-content:center}
+@media(max-width:720px){
+  .mr-root{position:fixed;inset:0;z-index:2147483000;height:100dvh;box-sizing:border-box;padding-top:env(safe-area-inset-top);background:var(--mr-paper)}
+  .mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-nav-items button.active{background:#f6f0e1}
+  .mr-content{padding:14px 12px 84px}.mr-content>.mr-window-shelf{min-height:100%;height:auto}
+  .mr-window-shelf .mr-shelf-topbar{position:static;width:100%;justify-content:flex-end;min-height:36px;margin:0 0 10px}.mr-window-shelf .mr-shelf-status{display:none}.mr-shelf-mobile-search-toggle{display:inline-flex}.mr-window-shelf .mr-shelf-back{width:36px;height:36px}.mr-window-shelf .mr-shelf-refresh{width:36px;height:36px;background:var(--mr-paper)}.mr-window-shelf.mr-mobile-search-open .mr-shelf-refresh{display:none}.mr-window-shelf.mr-mobile-search-open .mr-shelf-back{display:none}.mr-window-shelf .mr-shelf-search{display:flex;flex:0 0 auto;min-width:0;height:36px;padding:0 6px}.mr-window-shelf .mr-shelf-search:not(.mr-search-open){height:36px;padding:0;border:0;background:transparent}.mr-window-shelf .mr-shelf-search:not(.mr-search-open) .mr-shelf-mobile-search-toggle{border:1px solid var(--mr-border);background:var(--mr-paper)}.mr-window-shelf.mr-mobile-search-open .mr-shelf-topbar{position:static;width:100%;justify-content:flex-end;min-height:36px;margin:0 0 10px}.mr-window-shelf.mr-mobile-search-open .mr-shelf-head{display:flex}.mr-window-shelf.mr-mobile-search-open .mr-shelf-search{display:flex;flex:1;height:36px;padding:0 4px;border:0;border-bottom:1px solid var(--mr-border);border-radius:0;background:transparent}.mr-window-shelf.mr-mobile-search-open .mr-shelf-search input{background:transparent}.mr-window-shelf.mr-mobile-search-open .mr-shelf-search:focus-within{box-shadow:none}.mr-window-shelf .mr-shelf-search.mr-search-open .mr-shelf-mobile-search-toggle{min-width:28px;height:32px;border:0;background:transparent}.mr-window-shelf .mr-shelf-search:not(.mr-search-open) input{display:none}.mr-window-shelf .mr-shelf-search input{width:100%;min-width:0;height:100%;box-sizing:border-box;font-size:16px;line-height:normal}.mr-window-shelf .mr-shelf-search .kbd{display:none}
+  .mr-window-shelf .mr-shelf-head{align-items:flex-start;margin-bottom:8px;gap:8px}.mr-window-shelf .mr-shelf-head h1{font-size:25px}.mr-window-shelf .mr-shelf-head .kicker{display:none}.mr-window-shelf .mr-shelf-head-actions{justify-content:flex-start;gap:6px;width:100%}.mr-window-shelf .mr-sort-select{max-width:88px;min-height:36px;padding:0 4px;font-size:12px}.mr-window-shelf .mr-view-toggle{height:36px;padding:2px}.mr-window-shelf .mr-view-toggle button{min-height:30px;padding:0 8px;font-size:12px}.mr-window-shelf .mr-shelf-head-actions .mr-button{min-height:36px;padding:0 9px;font-size:12px;white-space:nowrap}
+
+  .mr-trend-col{min-width:0}.mr-trend-label{font-size:8px}.mr-trend-col:not(:nth-child(5n+1)) .mr-trend-label{display:none}
+  .mr-time-cell{min-width:0}.mr-time-label{font-size:8px}.mr-time-cell:not(:nth-child(3n+1)) .mr-time-label{visibility:hidden}
+  .mr-window-shelf .mr-shelf-folder-bar{flex-wrap:nowrap;overflow-x:auto;padding-bottom:7px;scrollbar-width:none}.mr-window-shelf .mr-folder-chip{min-height:27px;padding:0 10px;font-size:11px}
+  .mr-window-shelf .mr-shelf-gallery,.mr-window-shelf.mr-no-hero .mr-shelf-gallery{display:flex;flex-direction:column;gap:12px;min-height:0}.mr-window-shelf .mr-shelf-hero{flex:0 0 auto;display:flex;gap:14px;padding:12px;min-height:132px}.mr-window-shelf .mr-shelf-hero-cover{flex:0 0 82px;width:82px}.mr-window-shelf .mr-shelf-hero-cover .mr-shelf-fallback-title{display:none}.mr-window-shelf .mr-shelf-hero-cover .mr-new-badge{left:4px;top:4px}.mr-window-shelf .mr-shelf-hero-cover .mr-dl-badge{right:auto;left:4px;top:auto;bottom:4px}.mr-window-shelf .mr-shelf-hero-title{font-size:18px}.mr-window-shelf .mr-shelf-hero-by{font-size:10px}.mr-window-shelf .mr-shelf-cta{min-height:32px;height:32px;margin-top:8px;font-size:11px}.mr-window-shelf .mr-shelf-progress-label{display:none}
+  .mr-shelf-wall{flex:0 0 auto;height:clamp(420px,145vw,620px);min-height:0;display:block;overflow:hidden}.mr-window-shelf .mr-shelf-grid.mr-mobile-track{overflow-x:auto;overflow-y:hidden;scroll-snap-type:x mandatory;overscroll-behavior-x:contain;touch-action:pan-x pan-y;scrollbar-width:none;-webkit-overflow-scrolling:touch}.mr-window-shelf .mr-shelf-grid.mr-mobile-track::-webkit-scrollbar{display:none}
+  .mr-window-shelf .mr-shelf-grid.mr-mobile-track{display:flex;gap:10px;width:100%;height:100%;min-height:0}.mr-window-shelf .mr-shelf-mobile-page{flex:0 0 100%;width:100%;height:100%;min-height:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(var(--shelf-rows,3),minmax(0,1fr));gap:9px 7px;scroll-snap-align:start;scroll-snap-stop:always}
+@media(max-width:720px) and (max-height:900px){.mr-window-shelf .mr-shelf-wall{height:clamp(420px,125vw,560px)}}
+  .mr-window-shelf .mr-shelf-piece{--shelf-cap-space:45px;gap:6px}.mr-window-shelf .mr-shelf-cap{flex-basis:40px}.mr-window-shelf .mr-shelf-cap strong{font-size:12.5px;line-height:1.3}.mr-window-shelf .mr-shelf-cap small{font-size:10px;line-height:1.3}.mr-window-shelf .mr-shelf-fallback{padding:8px}.mr-window-shelf .mr-shelf-fallback-title{font-size:12px}.mr-window-shelf .mr-shelf-seal{right:6px;bottom:6px;width:22px;height:22px;font-size:11px}.mr-window-shelf .mr-new-badge{left:5px;top:5px;height:16px;min-width:0;padding:0 4px;font-size:8px}.mr-window-shelf .mr-dl-badge{left:5px;right:auto;top:auto;bottom:5px;width:20px;min-width:20px;height:20px;padding:0;border-radius:50%;font-size:0}.mr-window-shelf .mr-dl-badge::before{font:600 11px/1 var(--mr-sans)}.mr-window-shelf .mr-dl-badge::after{content:'';position:absolute;inset:-4px}.mr-window-shelf .mr-dl-badge.done::before{content:none}.mr-window-shelf .mr-dl-badge.done{left:auto;right:2px;top:calc(100% + 23px);bottom:auto;width:18px;min-width:18px;height:18px;border-radius:4px;background:transparent;color:var(--mr-muted);box-shadow:none;backdrop-filter:none}.mr-window-shelf .mr-dl-badge.done>svg{display:block}.mr-window-shelf .mr-dl-badge.done::after{inset:-7px 0 -7px -7px}.mr-window-shelf .mr-dl-badge.running::before{content:'↓'}.mr-window-shelf .mr-dl-badge.queued::before{content:'…'}.mr-window-shelf .mr-dl-badge.paused::before{content:'Ⅱ'}.mr-window-shelf .mr-dl-badge.failed::before{content:'!'}
+  .mr-shelf-pager{display:none}
+  .mr-window-shelf .mr-select-bar{position:fixed;left:12px;right:12px;bottom:calc(72px + env(safe-area-inset-bottom,0px));z-index:80;width:auto;max-width:480px;margin:0 auto;padding:8px 10px 6px;border-radius:16px;background:color-mix(in srgb,var(--mr-paper) 96%,transparent);backdrop-filter:blur(16px)}
+  .mr-window-shelf.mr-selecting .mr-shelf-wall{padding-bottom:132px}
+  .mr-window-shelf .mr-select-actions .mr-button{height:52px;padding:4px 0 2px;font-size:11px}
+}
+@media(max-width:360px){
+  .mr-window-shelf .mr-shelf-head-actions{gap:4px}.mr-window-shelf .mr-sort-select{max-width:74px;padding:0 2px;font-size:11.5px}.mr-window-shelf .mr-view-toggle{padding:1px}.mr-window-shelf .mr-view-toggle button{padding:0 6px;font-size:11.5px}.mr-window-shelf .mr-shelf-head-actions .mr-button{padding:0 7px;font-size:11.5px}
+}
+@media(orientation:landscape) and (max-height:500px){.mr-nav{width:64px;flex:0 0 64px;order:0;padding:12px 6px}.mr-nav-items{flex-direction:column}.mr-nav-items button{min-height:44px;flex:0 0 auto}.mr-content>.mr-window-shelf{min-height:0}.mr-window-shelf .mr-shelf-head .kicker{display:none}}
+@media(prefers-reduced-motion:reduce){.mr-window-shelf .mr-shelf-piece{animation:none;opacity:1}.mr-window-shelf .mr-shelf-cover{transition:none}.mr-shelf-wall{scroll-behavior:auto}}
+.mr-stats-layout{display:grid;grid-template-columns:1fr;gap:20px}
+.mr-stats-layout>.mr-panel{margin:0}
+
+/* 窗边共用页头与发现/书源/设置外壳 */
+.mr-reader.theme-paper{--reader-accent:#6b4a2d;--reader-bg:#f6f0e1;--reader-card:#fbf7ec;--reader-border:#d5ccb8}
+.mr-screen{max-width:1120px;margin:0 auto;color:var(--mr-text)}
+.mr-screen-head{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;padding:2px 0 18px;border-bottom:1px solid var(--mr-border);margin-bottom:22px}
+.mr-screen-copy{min-width:0}
+.mr-screen-kicker{margin:0 0 6px;font-size:10px;line-height:1.5;letter-spacing:.18em;text-transform:uppercase;color:var(--mr-muted)}
+.mr-screen-head h1{margin:0;font:400 42px/1.05 var(--mr-serif);letter-spacing:-.035em}
+.mr-screen-sub{margin:9px 0 0;font-size:12px;line-height:1.6;color:var(--mr-muted)}
+.mr-screen-aside{flex:none;display:flex;align-items:flex-end;gap:14px;padding-bottom:3px}
+.mr-screen-stat{display:flex;align-items:baseline;gap:5px;color:var(--mr-muted)}.mr-screen-stat b{font:400 24px/1 var(--mr-serif);color:var(--mr-text)}.mr-screen-stat span{font-size:11px}
+.mr-screen-note{padding-bottom:2px;font-size:11px;color:var(--mr-muted);white-space:nowrap}
+.mr-card-kicker{margin:0 0 5px;font-size:10px;line-height:1.4;letter-spacing:.16em;text-transform:uppercase;color:var(--mr-muted)}
+.mr-discover-layout{display:grid;grid-template-columns:340px minmax(0,1fr);gap:24px;align-items:start}
+.mr-search-panel{display:flex;flex-direction:column;gap:14px;padding:20px;border:1px solid var(--mr-border);background:var(--mr-card);box-shadow:var(--mr-shadow)}
+.mr-search-panel h2{margin:0;font:400 24px/1.25 var(--mr-serif)}
+.mr-search-lead{margin:0;font-size:12px;line-height:1.7;color:var(--mr-muted)}
+.mr-big-search{display:flex;align-items:center;gap:8px;min-height:46px;padding-left:12px;border:1px solid var(--mr-border);background:var(--mr-paper)}
+.mr-big-search:focus-within{border-color:var(--mr-accent);background:var(--mr-card)}
+.mr-big-search svg{flex:none;color:var(--mr-muted)}
+.mr-big-search input{flex:1;min-width:0;height:44px;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none;font-size:13px;outline:0}
+.mr-big-search input:focus{box-shadow:none}
+.mr-big-search button{align-self:stretch;min-width:66px;padding:0 12px;border:0;background:var(--mr-accent);color:var(--mr-on-accent);font-size:12px}
+.mr-big-search button:disabled{opacity:.55}
+.mr-source-chips{display:flex;flex-wrap:wrap;gap:7px}
+.mr-source-chip{min-height:30px;padding:4px 8px;border:1px solid var(--mr-border);border-radius:0;background:var(--mr-paper);color:var(--mr-muted);font-size:11px;line-height:1.4}
+.mr-source-chip:hover{border-color:var(--mr-accent);color:var(--mr-accent)}
+.mr-source-chip.active{border-color:var(--mr-accent);background:var(--mr-accent-soft,#efe4d4);color:var(--mr-accent)}
+.mr-recent{display:flex;flex-direction:column;gap:1px;padding-top:12px;border-top:1px solid var(--mr-line)}
+.mr-recent>span{margin-bottom:3px;font-size:11px;color:var(--mr-muted)}
+.mr-recent button{display:flex;align-items:center;min-height:38px;padding:0;border:0;border-bottom:1px solid var(--mr-line);background:transparent;color:var(--mr-text);font-size:12px;text-align:left}
+.mr-recent button:hover{color:var(--mr-accent)}
+.mr-results-panel{min-width:0;min-height:0}
+.mr-results-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding-bottom:10px;border-bottom:1px solid var(--mr-border)}
+.mr-results-head h2{margin:0;font:400 24px/1.3 var(--mr-serif)}
+.mr-results-head>span{font-size:11px;color:var(--mr-muted);text-align:right}
+.mr-discovery-state{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:260px;padding:28px 20px;border-bottom:1px solid var(--mr-line);background:var(--mr-card);text-align:center}
+.mr-discovery-state h3{margin:14px 0 0;font:400 22px/1.35 var(--mr-serif)}
+.mr-discovery-state p{max-width:32em;margin:8px 0 0;font-size:12px;line-height:1.7;color:var(--mr-muted)}
+.mr-discovery-icon{display:grid;place-items:center;width:46px;height:46px;border-radius:50%;background:var(--mr-accent-soft,#efe4d4);color:var(--mr-accent)}
+.mr-spinner{width:34px;height:34px;border:3px solid var(--mr-line);border-top-color:var(--mr-accent);border-radius:50%;animation:mr-discovery-spin .9s linear infinite}
+@keyframes mr-discovery-spin{to{transform:rotate(360deg)}}
+.mr-source-warning{display:flex;align-items:flex-start;gap:10px;margin:12px 0 2px;padding:11px 12px;border-left:3px solid var(--mr-update,#a85132);background:var(--mr-update-soft,#f3e4db);color:var(--mr-text)}
+.mr-source-warning svg{flex:none;margin-top:2px;color:var(--mr-update,#a85132)}.mr-source-warning p{margin:0;font-size:12px;line-height:1.65}
+.mr-discovery-results{display:flex;flex-direction:column}
+.mr-discovery-result{display:flex;align-items:center;gap:14px;padding:13px 0;border-bottom:1px solid var(--mr-line)}
+.mr-discovery-result .mr-cover{width:46px;height:62px;flex-basis:46px;border-radius:2px;box-shadow:0 3px 10px rgba(35,28,20,.16)}
+.mr-discovery-result .mr-cover>span{font-size:20px}
+.mr-discovery-result-copy{flex:1;min-width:0}
+.mr-discovery-result-copy h3{margin:0;overflow:hidden;font:400 16px/1.4 var(--mr-serif);text-overflow:ellipsis;white-space:nowrap}
+.mr-discovery-result-copy p{margin:3px 0 0;overflow:hidden;font-size:11px;line-height:1.5;color:var(--mr-muted);text-overflow:ellipsis;white-space:nowrap}
+.mr-discovery-source{display:inline-block;margin-top:5px;padding:2px 6px;border:1px solid var(--mr-border);font-size:10px;line-height:1.4;color:var(--mr-muted)}
+.mr-discovery-result .mr-button{flex:none;min-height:34px;padding:0 10px;font-size:11px}
+.mr-sources-layout{display:grid;grid-template-columns:370px minmax(0,1fr);gap:22px;align-items:start}
+.mr-sources-left{display:flex;flex-direction:column;gap:16px}
+.mr-window-card{padding:18px;border:1px solid var(--mr-border);background:var(--mr-paper);box-shadow:none}
+.mr-window-card h2{margin:0 0 4px;font:400 20px/1.3 var(--mr-serif)}
+.mr-window-card .mr-help{margin:0 0 12px}
+.mr-window-card textarea{width:100%;resize:vertical;line-height:1.6;padding:10px;border:1px solid var(--mr-border);border-radius:8px;background:color-mix(in srgb,var(--mr-card) 38%,var(--mr-paper));color:var(--mr-text)}.mr-window-card textarea:focus{outline:none;border-color:var(--mr-accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--mr-accent) 12%,transparent)}
+.mr-online-row{display:flex;align-items:center;gap:8px;margin-top:10px}.mr-online-row input{flex:1;min-width:0;height:38px;padding:0 10px;border:1px solid var(--mr-border);border-radius:8px;background:color-mix(in srgb,var(--mr-card) 38%,var(--mr-paper));color:var(--mr-text);font-size:12px}.mr-online-row input:focus{outline:none;border-color:var(--mr-accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--mr-accent) 12%,transparent)}.mr-online-row .mr-button{flex:none;min-height:38px;padding:0 12px}
+.mr-sources-list{min-width:0}
+.mr-sources-list-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding-bottom:10px;border-bottom:1px solid var(--mr-border)}
+.mr-sources-list-head h2{margin:0;font:400 22px/1.3 var(--mr-serif)}
+.mr-sources-list-head span{font-size:11px;color:var(--mr-muted)}
+.mr-source-row{display:grid;grid-template-columns:30px minmax(0,1fr) auto;align-items:center;gap:12px;padding:13px 0;border-bottom:1px solid var(--mr-line);background:transparent;border-radius:0}
+.mr-source-row h3{margin:0;font:400 15px/1.4 var(--mr-serif)}
+.mr-source-row p{margin:2px 0 0;overflow:hidden;font-size:11px;color:var(--mr-muted);text-overflow:ellipsis;white-space:nowrap}
+.mr-source-icon{display:grid;place-items:center;width:30px;height:38px;border:1px solid var(--mr-border);background:var(--mr-paper);color:var(--mr-accent);font:400 15px/1 var(--mr-serif)}
+.mr-source-side{display:flex;align-items:center;gap:9px}
+.mr-source-side .mr-tag{display:inline-flex;align-items:center;min-height:24px;padding:2px 6px;border:1px solid var(--mr-border);font-size:10px;color:var(--mr-muted);white-space:nowrap}
+.mr-source-side .mr-tag.failed{border-color:var(--mr-update,#a85132);color:var(--mr-update-ink,#9a452a);background:var(--mr-update-soft,#f3e4db)}
+.mr-source-side .mr-button{min-height:28px;padding:0 5px;font-size:11px}
+.mr-settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
+.mr-settings-grid .mr-panel{margin:0;min-width:0}
+.mr-settings-grid .mr-panel--wide{grid-column:1/-1}
+.mr-settings-grid .mr-panel textarea{width:100%}
+@media(max-width:900px){.mr-screen-head h1{font-size:36px}.mr-discover-layout{grid-template-columns:300px minmax(0,1fr);gap:18px}.mr-sources-layout{grid-template-columns:1fr}.mr-sources-left{display:grid;grid-template-columns:1fr 1fr}.mr-settings-grid{grid-template-columns:1fr}.mr-settings-grid .mr-panel--wide{grid-column:auto}}
+@media(max-width:720px){
+  .mr-screen-head{align-items:flex-start;gap:14px;padding:24px 0 14px;margin-bottom:16px}.mr-screen-head h1{font-size:32px}.mr-screen-kicker{font-size:9px}.mr-screen-sub{font-size:11px}.mr-screen-aside{padding-top:4px}.mr-screen-stat b{font-size:20px}
+  .mr-discover-layout{display:block}.mr-search-panel{padding:15px;gap:12px;margin-bottom:16px}.mr-search-panel h2{font-size:21px}
+  .mr-big-search{min-height:44px}.mr-big-search input{height:42px}
+  .mr-source-chips{gap:6px}.mr-source-chip{min-height:32px}
+  .mr-results-head{align-items:flex-start;flex-direction:column;gap:3px}.mr-results-head>span{text-align:left}
+  .mr-discovery-result{gap:10px;padding:11px 0}.mr-discovery-result .mr-cover{width:42px;height:56px;flex-basis:42px}.mr-discovery-result .mr-button{min-height:40px;padding:0 8px}
+  .mr-discovery-state{min-height:240px;padding:24px 14px}
+  .mr-sources-left{display:flex;flex-direction:column;gap:12px}.mr-window-card{padding:15px}
+  .mr-online-row{flex-direction:column;align-items:stretch}.mr-online-row input{flex:none;width:100%;height:38px}.mr-online-row .mr-button{width:100%}
+  .mr-source-row{grid-template-columns:30px minmax(0,1fr);gap:9px;padding:12px 0}.mr-source-side{grid-column:2;justify-content:space-between}.mr-source-side .mr-tag{white-space:normal}
+  .mr-settings-grid{display:flex;flex-direction:column;align-items:stretch;gap:12px}
+}
+@media(max-width:720px){
+  .mr-window-shelf .mr-shelf-wall{height:auto;flex:0 0 auto;display:block;overflow:visible}
+  .mr-window-shelf .mr-shelf-grid.mr-mobile-track{display:block;width:100%;height:auto;overflow:visible;scroll-snap-type:none}
+  .mr-window-shelf .mr-shelf-mobile-page{display:grid;box-sizing:border-box;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:none;gap:22px 12px;width:100%;height:auto;min-height:0;flex:none;margin:0 0 22px;padding:4px;scroll-snap-align:none}
+  .mr-window-shelf .mr-shelf-mobile-page:last-child{margin-bottom:0}
+  .mr-window-shelf .mr-shelf-piece{height:auto;min-height:0;container-type:normal;justify-content:flex-start;gap:8px}
+  .mr-window-shelf .mr-shelf-cover-frame{width:100%;height:auto;aspect-ratio:2/3}
+  .mr-window-shelf .mr-shelf-cover{width:100%;height:auto;aspect-ratio:2/3}
+  .mr-window-shelf .mr-shelf-cap{width:100%;min-height:40px;flex:0 0 auto;flex-basis:auto;align-self:stretch;display:flex;flex-direction:column;justify-content:flex-start}
+}
+@media(max-width:720px){
+  .mr-reader-top{position:absolute;top:0;left:0;right:0}
+  .mr-reader .mr-chapter,.mr-reader .mr-paged-chapter{padding-top:calc(68px + env(safe-area-inset-top,0px))}
+  .mr-reader.mr-chrome-hidden .mr-reader-top,
+  .mr-reader.mr-chrome-hidden .mr-tabbar{display:none}
+  .mr-reader.mr-chrome-hidden .mr-folio{bottom:14px}
+}
+/* 桌面阅读：正文保持版心，工具像起点一样贴近正文，而不是屏幕边缘。 */
+@media(min-width:881px){
+  .mr-reader .mr-tools{left:calc(50% + var(--mr-text-half,336px) + 12px);right:auto;gap:6px}
+  .mr-reader .mr-tool-btn{width:64px;min-height:64px;padding:10px 0 8px;gap:6px;border-radius:12px}
+}
 `;
 
     return {
       inject: ['slots', 'layout', 'remote'],
-      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, scrollMotion, Settings, ReaderView, readerStyle: css } } : {}),
+      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, shelfPagination, ShelfBoard, scrollMotion, Stats, Settings, Discover, Sources, ReaderView, readerStyle: css } } : {}),
       async apply(ctx) {
         const unmount = await ctx.remote.$mount(readerContribution);
         const ui = ctx.inject(['remote.reader'], (inner) => {

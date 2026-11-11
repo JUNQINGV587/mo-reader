@@ -1,5 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { DEFAULT_SETTINGS, normalizeSettings } from '../lib/settings.js'
+
+test('desktop reading measure defaults to 960 while preserving explicit choices', () => {
+  assert.equal(DEFAULT_SETTINGS.measureWidth, 960)
+  assert.equal(normalizeSettings().measureWidth, 960)
+  assert.equal(normalizeSettings({ measureWidth: 800 }).measureWidth, 800)
+})
 
 async function loadSettings() {
   let captured
@@ -33,11 +40,11 @@ async function loadSettings() {
     delete globalThis.__MO_READER_TEST__
   }
   assert.ok(plugin.__test?.Settings, 'test hook exposes the Settings component')
-  return plugin.__test.Settings
+  return plugin.__test
 }
 
-test('settings returns every panel and keeps enhanced stats inside reading stats', async () => {
-  const Settings = await loadSettings()
+test('settings returns every non-stats panel', async () => {
+  const { Settings } = await loadSettings()
   const previousStorage = globalThis.localStorage
   globalThis.localStorage = { getItem: () => null }
   let tree
@@ -58,17 +65,43 @@ test('settings returns every panel and keeps enhanced stats inside reading stats
   }
 
   assert.equal(tree.args[0], 'div')
-  assert.equal(tree.args[1].className, 'mr-settings')
+  assert.equal(tree.args[1].className, 'mr-screen mr-settings mr-settings-screen')
   const children = tree.args.slice(2)
-  assert.equal(children.length, 14, 'page header plus all thirteen panels remain in the returned tree')
-  const headings = children.slice(1).map((panel) => panel.args[2].args[2])
+  assert.equal(children.length, 2, 'screen heading plus the settings grid')
+  const grid = children[1]
+  assert.equal(grid.args[1].className, 'mr-settings-grid')
+  const panels = grid.args.slice(2)
+  assert.equal(panels.length, 12, 'stats is no longer inside settings')
+  const headings = panels.map((panel) => panel.args[2].args[2])
+  assert.ok(!headings.includes('阅读统计'), 'settings still contains reading stats')
   assert.deepEqual(headings, [
     '动画', '默认排版', '替换净化', '本地书籍', '备份恢复', '分期说明',
-    '阅读统计', '笔记导出', '夜间定时', '听书定时', '阅读目标', '自定义字体', '快捷键',
+    '笔记导出', '夜间定时', '听书定时', '阅读目标', '自定义字体', '快捷键',
   ])
+})
 
-  const stats = children[7]
-  assert.deepEqual(stats.args.slice(3).map((child) => child.args[1].className), [
+test('stats is a standalone screen beside settings', async () => {
+  const { Stats } = await loadSettings()
+  const previousStorage = globalThis.localStorage
+  globalThis.localStorage = { getItem: () => null }
+  let tree
+  try {
+    tree = Stats()
+  } finally {
+    if (previousStorage === undefined) delete globalThis.localStorage
+    else globalThis.localStorage = previousStorage
+  }
+
+  assert.equal(tree.args[0], 'div')
+  assert.equal(tree.args[1].className, 'mr-screen mr-stats-screen')
+  const children = tree.args.slice(2)
+  assert.equal(children.length, 2, 'stats heading plus the stats layout')
+  const layout = children[1]
+  assert.equal(layout.args[1].className, 'mr-stats-layout')
+  const section = layout.args[2]
+  assert.equal(section.args[1].className, 'mr-panel mr-panel--wide')
+  assert.equal(section.args[2].args[2], '概览')
+  assert.deepEqual(section.args.slice(3).map((child) => child.args[1].className), [
     'mr-stats-grid', 'mr-heatmap', 'mr-yearly-stats',
     'mr-duration-dist', 'mr-time-dist', 'mr-trend-chart',
   ])

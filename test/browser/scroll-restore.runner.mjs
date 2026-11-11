@@ -95,7 +95,15 @@ try {
   assert.ok(result?.ok, '真实 DOM 跨章锚定回归失败')
 } finally {
   if (socket) socket.close()
-  if (browser) browser.kill('SIGTERM')
+  if (browser) {
+    browser.kill('SIGTERM')
+    if (browser.exitCode === null) await new Promise((resolve) => browser.once('exit', resolve))
+  }
   if (server) await server.close()
-  await rm(profile, { recursive: true, force: true })
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try { await rm(profile, { recursive: true, force: true }); break } catch (error) {
+      if (attempt === 3) throw error
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+  }
 }

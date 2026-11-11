@@ -62,7 +62,7 @@ test('shelf layout exposes a flat grid and the last-read book', async () => {
   assert.equal(full.lastRead.name, '书1')
 })
 
-test('shelf layout picks the most recent readable book and caps at 48', async () => {
+test('shelf layout picks the most recent readable book without capping the collection', async () => {
   const layout = await loadShelfLayout()
 
   const picked = layout([
@@ -72,7 +72,8 @@ test('shelf layout picks the most recent readable book and caps at 48', async ()
   ])
   assert.equal(picked.lastRead.name, '乙')
 
-  const capped = layout(Array.from({ length: 50 }, (_, index) => ({ name: `书${index + 1}` })))
-  assert.equal(capped.count, 48)
-  assert.equal(capped.books.at(-1).name, '书48')
+  const complete = layout(Array.from({ length: 140 }, (_, index) => ({ id: `book-${index + 1}`, name: `书${index + 1}` })))
+  assert.equal(complete.count, 140)
+  assert.equal(complete.books.length, 140)
+  assert.equal(complete.books.at(-1).name, '书140')
 })

@@ -81,6 +81,14 @@ async function runCase(reducedMotion) {
     const behavior = getComputedStyle(el).scrollBehavior
     const expectedBehavior = reducedMotion ? 'auto' : 'smooth'
     if (behavior !== expectedBehavior) throw new Error(`滚动行为应为 ${expectedBehavior}，实际为 ${behavior}`)
+    const chapterRect = host.querySelector('.mr-chapter').getBoundingClientRect()
+    const toolsRect = host.querySelector('.mr-tools').getBoundingClientRect()
+    const toolGap = toolsRect.left - chapterRect.right
+    const expectedToolGap = 12 + (el.offsetWidth - el.clientWidth) / 2
+    if (Math.abs(toolGap - expectedToolGap) > 2) throw new Error(`桌面工具组未贴近正文：实际 ${toolGap}px，含滚动条补偿应为 ${expectedToolGap}px`)
+    if (toolsRect.right > window.innerWidth) throw new Error('桌面工具组超出视口')
+    const toolButtonWidth = host.querySelector('.mr-tool-btn').getBoundingClientRect().width
+    if (Math.abs(toolButtonWidth - 64) > 1) throw new Error(`桌面工具按钮应为 64px，实际为 ${toolButtonWidth}px`)
     try {
       await waitFor(() => Math.abs(chapterTop(el, 1)) < 2, '初始章节锚点未稳定')
     } catch (error) {
