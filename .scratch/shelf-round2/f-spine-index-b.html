@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="dsh-design" content="desktop">
+<meta name="viewport" content="width=1280">
+<title>方向 F-B · 书脊目录 · 墨读</title>
+<style>
+:root{
+  --paper:#F2E9DA;--paper2:#F7EFE3;--ink:#241C15;--muted:#6F6354;--red:#A63A1F;--brass:#A9854A;--line:#D8C9B2;
+  --serif:"Songti SC","Noto Serif CJK SC","Source Han Serif SC",serif;
+  --sans:"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--paper);color:var(--ink);font-family:var(--sans);-webkit-font-smoothing:antialiased}
+button,a{font:inherit;color:inherit}
+button{background:none;border:0;cursor:pointer}
+a{text-decoration:none}
+.app{display:grid;grid-template-columns:236px 1fr;min-height:800px}
+.side{background:linear-gradient(180deg,#2A2017,#1E1710);color:#EDE0CC;padding:54px 16px 18px;display:flex;flex-direction:column}
+.brand{display:flex;align-items:center;gap:10px;padding:0 8px 24px}
+.brand .seal{width:30px;height:30px;flex:none;border:1px solid rgba(246,231,210,.45);background:var(--red);color:#F6E7D2;font:15px/28px var(--serif);text-align:center}
+.brand-name{font:21px/1.35 var(--serif);letter-spacing:.1em;width:64px;flex:none;padding:2px 0 3px}
+.brand-sub{font-size:11px;letter-spacing:.28em;color:rgba(239,232,216,.72);margin:2px 0 0 40px}
+.nav{display:flex;flex-direction:column;gap:4px;margin-top:6px}
+.nav-item{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:4px;color:rgba(239,232,216,.8);font-size:13px;text-align:left}
+.nav-item.on{background:rgba(255,255,255,.07);color:#F6E7D2;box-shadow:inset 2px 0 0 var(--red)}
+.nav-item svg{width:16px;height:16px;flex:none;stroke:currentColor;fill:none;stroke-width:1.5}
+.nav-kbd{margin-left:auto;font-size:11px;color:rgba(239,232,216,.62)}
+.side-foot{margin-top:auto;border-top:1px solid rgba(246,231,210,.16);padding-top:14px}
+.week-top{display:flex;align-items:baseline;justify-content:space-between}
+.week-label{font-size:11px;letter-spacing:.08em;color:rgba(239,232,216,.72)}
+.week-value{font:15px/1 var(--serif);letter-spacing:.02em}
+.week-bars{display:flex;gap:4px;margin-top:12px;height:14px;align-items:flex-end}
+.week-bars span{width:9px;background:rgba(239,232,216,.35)}
+.week-note{font-size:11px;line-height:1.5;color:rgba(239,232,216,.72);margin:10px 0 0}
+.main{display:flex;flex-direction:column;min-width:0}
+.topbar{display:flex;align-items:center;gap:18px;padding:12px 40px;border-bottom:1px solid rgba(36,28,21,.12);height:56px;flex:none}
+.search{display:flex;align-items:center;gap:10px;border:1px solid rgba(36,28,21,.22);padding:7px 12px;width:300px;color:var(--muted);font-size:12px}
+.search svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.6}
+.search .kbd{margin-left:auto;border:1px solid rgba(36,28,21,.18);padding:1px 4px;font-size:11px;color:var(--muted)}
+.status{margin-left:auto;display:flex;align-items:center;gap:10px;font-size:11px;color:var(--muted)}
+.dot{width:6px;height:6px;border-radius:50%;background:#5E7A5A}
+.stage{padding:22px 40px 18px;flex:1;display:flex;flex-direction:column;min-height:0}
+.head{display:flex;align-items:flex-end;gap:24px;margin-bottom:16px;flex:none}
+.kicker{font-size:11px;letter-spacing:.1em;color:var(--muted);margin:0 0 8px}
+h1{font:36px/1.1 var(--serif);margin:0;font-weight:400}
+.lede{font-size:13px;color:var(--muted);margin:10px 0 0}
+.head-right{margin-left:auto;display:flex;align-items:center;gap:18px}
+.viewchip{display:flex;align-items:center;gap:8px;border:1px solid rgba(36,28,21,.28);padding:7px 12px;font-size:12px;color:var(--ink)}
+.viewchip svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.5}
+.ghost{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);min-height:28px}
+.content{display:grid;grid-template-columns:300px minmax(0,1fr) 196px;gap:28px;flex:1;min-height:0}
+.now{display:flex;flex-direction:column;min-width:0}
+.cover{position:relative;width:150px;height:200px;background:#EFE3CC;border:1px solid rgba(36,28,21,.16);box-shadow:0 18px 30px rgba(36,28,21,.16),0 2px 0 rgba(255,255,255,.5) inset;padding:16px 14px;overflow:hidden}
+.cv-seal{display:block;width:22px;height:22px;background:var(--red);color:#F6E7D2;font:12px/21px var(--serif);text-align:center;border:1px solid rgba(246,231,210,.35)}
+.cv-title{font:23px/1.38 var(--serif);letter-spacing:.02em;margin:14px 0 0;max-width:122px}
+.cv-mountain{position:absolute;left:-10px;right:-10px;bottom:0;height:58px;background:#D8C6A8;clip-path:polygon(0 72%,16% 38%,28% 55%,42% 22%,56% 48%,70% 18%,84% 44%,100% 28%,100% 100%,0 100%)}
+.cv-author{position:absolute;left:14px;bottom:10px;font-size:11px;letter-spacing:.04em;color:rgba(36,28,21,.78)}
+.now-eyebrow{display:flex;align-items:center;gap:8px;margin:14px 0 6px;font-size:11px;letter-spacing:.08em;color:var(--red)}
+.now-eyebrow i{width:5px;height:5px;border-radius:50%;background:var(--red)}
+.now h2{font:21px/1.35 var(--serif);font-weight:400;margin:0 0 6px;max-width:268px}
+.now-meta{font-size:12px;color:var(--muted);line-height:1.6}
+.now-progress{margin-top:12px;max-width:268px}
+.now-progress .pt{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:6px}
+.now-progress .pct{color:var(--ink)}
+.bar{height:3px;background:rgba(36,28,21,.14)}
+.bar i{display:block;height:100%;width:42%;background:var(--red)}
+.now-cta{display:flex;align-items:center;gap:8px;margin-top:16px;padding:8px 0 9px;font-size:13px;color:var(--red);border-bottom:1px solid rgba(166,58,31,.35);min-height:34px;width:max-content}
+.now-cta svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.6}
+.shelf-wrap{display:flex;flex-direction:column;min-width:0;padding-top:2px}
+.shelf-note{display:flex;align-items:center;gap:10px;font-size:11px;letter-spacing:.08em;color:var(--muted);margin:0 0 10px}
+.shelf-note:after{content:"";flex:1;height:1px;background:rgba(36,28,21,.14)}
+.shelf{position:relative;padding:0 8px 0 2px;width:max-content;max-width:100%}
+.shelf-inner{display:flex;align-items:flex-end;gap:6px;width:max-content;padding:0 2px 10px}
+.spine{width:46px;height:204px;padding:10px 0 9px;display:flex;flex-direction:column;align-items:center;background:var(--bg);color:var(--t);border-radius:2px 2px 0 0;box-shadow:inset -1px 0 rgba(0,0,0,.16),0 7px 12px rgba(36,28,21,.14);transition:transform .18s ease,box-shadow .18s ease}
+.spine:hover,.spine:focus-visible{transform:translateY(-7px);box-shadow:inset -1px 0 rgba(0,0,0,.16),0 14px 20px rgba(36,28,21,.2);outline:none}
+.spine-num{font-size:11px;letter-spacing:.06em;line-height:1}
+.spine-title{writing-mode:vertical-rl;text-orientation:mixed;font:15px/1.4 var(--serif);letter-spacing:.08em;margin-top:12px;max-height:130px;overflow:hidden}
+.spine.latin .spine-title{font:12px/1.35 var(--serif);letter-spacing:.02em;max-height:132px}
+.spine-author{writing-mode:vertical-rl;text-orientation:mixed;font-size:11px;margin-top:auto;max-height:54px;overflow:hidden}
+.shelf-line{height:10px;background:linear-gradient(180deg,#8A5A34,#5C3A22 45%,#3E2617);box-shadow:0 9px 16px rgba(36,28,21,.22);border-radius:1px}
+.bookend{width:12px;height:66px;margin-left:4px;background:linear-gradient(90deg,#C6A268,#8C6B3D);clip-path:polygon(0 100%,0 12%,100% 0,100% 100%);align-self:flex-end;flex:none;box-shadow:0 2px 5px rgba(36,28,21,.2)}
+.shelf-foot{display:flex;align-items:center;justify-content:space-between;margin-top:12px;font-size:11px;color:var(--muted)}
+.rail{border-left:1px solid var(--line);padding-left:20px;display:flex;flex-direction:column;min-width:0}
+.rail h3{font:13px/1.4 var(--serif);font-weight:400;margin:0 0 4px;letter-spacing:.04em}
+.rail-sub{font-size:11px;color:var(--muted);margin:0 0 10px}
+.rail-list{display:flex;flex-direction:column}
+.rail-row{display:flex;align-items:baseline;gap:8px;padding:7px 0;border-bottom:1px solid rgba(36,28,21,.09);font-size:13px;color:#3F3428;text-align:left;min-height:34px}
+.rail-row .n{font-size:11px;color:#6A5C4C;width:20px;flex:none;letter-spacing:.04em}
+.rail-row:hover{color:var(--red)}
+.rail-row.on{color:var(--red);font-weight:600;border-bottom-color:rgba(166,58,31,.38)}
+.rail-row.on .n{color:var(--red)}
+.rail-foot{margin-top:auto;font-size:11px;line-height:1.6;color:var(--muted)}
+.foot{display:flex;align-items:center;justify-content:space-between;gap:20px;border-top:1px solid rgba(36,28,21,.14);padding-top:10px;margin-top:14px;font-size:11px;color:#6A5C4C;flex:none}
+.foot span{color:#6A5C4C}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <span class="seal">墨</span>
+      <div><div class="brand-name">墨读</div><div class="brand-sub">MO READ</div></div>
+    </div>
+    <nav class="nav" aria-label="主导航">
+      <a class="nav-item on" href="#"><svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="1"/><path d="M4 10h16M9 5v14"/></svg>书架<span class="nav-kbd">⌘1</span></a>
+      <a class="nav-item" href="#"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M16 16l4 4"/></svg>发现<span class="nav-kbd">⌘2</span></a>
+      <a class="nav-item" href="#"><svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"/></svg>书源<span class="nav-kbd">⌘3</span></a>
+      <a class="nav-item" href="#"><svg viewBox="0 0 24 24"><path d="M5 8h14M5 16h14M8 5v6M16 13v6"/></svg>设置<span class="nav-kbd">⌘4</span></a>
+    </nav>
+    <div class="side-foot">
+      <div class="week-top"><span class="week-label">本周</span><span class="week-value">3 时 42 分</span></div>
+      <div class="week-bars" aria-hidden="true"><span style="height:6px"></span><span style="height:9px"></span><span style="height:14px"></span><span style="height:8px"></span><span style="height:5px"></span><span style="height:7px"></span><span style="height:4px"></span></div>
+      <p class="week-note">昨天读得最久 ·《月亮与六便士》</p>
+    </div>
+  </aside>
+  <main class="main">
+    <div class="topbar">
+      <div class="search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M16 16l4 4"/></svg>搜书名、作者<span class="kbd">⌘K</span></div>
+      <div class="status"><span class="dot"></span>离线可用<span>十一月六日 · 周五</span></div>
+    </div>
+    <div class="stage">
+      <div class="head">
+        <div>
+          <p class="kicker">本机书库 · 八本</p>
+          <h1>书架</h1>
+          <p class="lede">书在架上，也在目录里。</p>
+        </div>
+        <div class="head-right">
+          <div class="viewchip"><svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="14" rx="1"/><path d="M9 5v14"/></svg>书脊目录</div>
+          <a class="ghost" href="#"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" fill="none"><path d="M20 12a8 8 0 1 1-2.3-5.7"/><path d="M20 4v5h-5"/></svg>补查</a>
+        </div>
+      </div>
+      <div class="content">
+        <section class="now" aria-label="在读">
+          <button class="cover" aria-label="我可是正道大师兄">
+            <span class="cv-seal">我</span>
+            <div class="cv-title">我可是正道<br>大师兄</div>
+            <div class="cv-mountain"></div>
+            <span class="cv-author">本地 TXT · 连载</span>
+          </button>
+          <div class="now-eyebrow"><i></i>01 · 在读</div>
+          <h2>我可是正道大师兄</h2>
+          <p class="now-meta">连载 · 本地 TXT<br>三天前读到「山门夜话」</p>
+          <div class="now-progress">
+            <div class="pt"><span>第 12 / 28 章</span><span class="pct">42%</span></div>
+            <div class="bar"><i></i></div>
+          </div>
+          <button class="now-cta">继续阅读 <svg viewBox="0 0 24 24"><path d="M5 12h13M13 6l6 6-6 6"/></svg></button>
+        </section>
+        <section class="shelf-wrap" aria-label="架上其余">
+          <p class="shelf-note">架上其余 · 七本</p>
+          <div class="shelf">
+            <div class="shelf-inner">
+              <button class="spine" style="--bg:#24344D;--t:#F1E7D2" aria-label="02 月亮与六便士"><span class="spine-num">02</span><span class="spine-title">月亮与六便士</span><span class="spine-author">毛姆</span></button>
+              <button class="spine" style="--bg:#A4552F;--t:#FFF3E0" aria-label="03 人类简史"><span class="spine-num">03</span><span class="spine-title">人类简史</span><span class="spine-author">赫拉利</span></button>
+              <button class="spine" style="--bg:#6B2B22;--t:#EFDCC2" aria-label="04 百年孤独"><span class="spine-num">04</span><span class="spine-title">百年孤独</span><span class="spine-author">马尔克斯</span></button>
+              <button class="spine" style="--bg:#C9D6DC;--t:#26302A" aria-label="05 局外人"><span class="spine-num">05</span><span class="spine-title">局外人</span><span class="spine-author">加缪</span></button>
+              <button class="spine latin" style="--bg:#E8D9B8;--t:#2B2A1F" aria-label="06 The Little Prince"><span class="spine-num">06</span><span class="spine-title">The Little Prince</span><span class="spine-author">Saint-Ex.</span></button>
+              <button class="spine latin" style="--bg:#2F4A3A;--t:#EFE3CC" aria-label="07 mr-two-chapters"><span class="spine-num">07</span><span class="spine-title">mr-two-chapters</span><span class="spine-author">本地</span></button>
+              <button class="spine latin" style="--bg:#4A3B52;--t:#EDE4EE" aria-label="08 curl-test"><span class="spine-num">08</span><span class="spine-title">curl-test</span><span class="spine-author">本地</span></button>
+              <span class="bookend" aria-hidden="true"></span>
+            </div>
+            <div class="shelf-line"></div>
+          </div>
+          <div class="shelf-foot"><span>02–08 · 按最近翻阅</span><span>悬停抽出</span></div>
+        </section>
+        <aside class="rail" aria-label="目录">
+          <h3>目录</h3>
+          <p class="rail-sub">八本 · 按最近翻阅</p>
+          <div class="rail-list">
+            <a class="rail-row on" href="#"><span class="n">01</span>我可是正道大师兄</a>
+            <a class="rail-row" href="#"><span class="n">02</span>月亮与六便士</a>
+            <a class="rail-row" href="#"><span class="n">03</span>人类简史</a>
+            <a class="rail-row" href="#"><span class="n">04</span>百年孤独</a>
+            <a class="rail-row" href="#"><span class="n">05</span>局外人</a>
+            <a class="rail-row" href="#"><span class="n">06</span>The Little Prince</a>
+            <a class="rail-row" href="#"><span class="n">07</span>mr-two-chapters</a>
+            <a class="rail-row" href="#"><span class="n">08</span>curl-test</a>
+          </div>
+          <p class="rail-foot">书脊上的编号与目录对应。<br>点书目看详情，点书脊抽出。</p>
+        </aside>
+      </div>
+      <footer class="foot"><p>共 8 本 · 本机保存 · 不上传</p><p>上次补查 <span>2 小时前</span></p></footer>
+    </div>
+  </main>
+</div>
+</body>
+</html>

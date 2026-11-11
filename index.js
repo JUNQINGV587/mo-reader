@@ -3,11 +3,16 @@ import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { createBackup, parseBackup } from './lib/backup.js'
 import { ReaderError } from './lib/errors.js'
 import { fetchRemote } from './lib/http.js'
-import { importEpub, importedSource, importTxt } from './lib/importers.js'
+import { importEpub, importedSource, importTxt, exportEpub } from './lib/importers.js'
 import { ACTIVE_JOBS, createJob, jobView, transitionJob } from './lib/jobs.js'
+
+const MAX_PARALLEL_JOBS = 4
+const MAX_PER_SOURCE_JOBS = 2
+const MAX_CHAPTER_ATTEMPTS = 2
 import { applyReplacements } from './lib/replacements.js'
 import { assertSettingKeys, normalizeReaderPrefs, normalizeSettings } from './lib/settings.js'
 import { normalizeSource } from './lib/rules.js'
+import { BUILTIN_SOURCES } from './lib/builtin-sources.js'
 import { SourceEngine } from './lib/source-engine.js'
 import { DEFAULT_SETTINGS, entries, openReaderStorage } from './lib/storage.js'
 import { base64ToBuffer, clone, id, MAX_ARCHIVE_BYTES, MAX_TEXT_BYTES, now, pageNumber, requiredString, stableId, textToBuffer } from './lib/utils.js'
@@ -15,9 +20,11 @@ import { base64ToBuffer, clone, id, MAX_ARCHIVE_BYTES, MAX_TEXT_BYTES, now, page
 const COVER_MAX_BYTES = 2 * 1024 * 1024
 
 export const REMOTE_METHODS = Object.freeze([
-  'state', 'importSource', 'removeSource', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
-  'saveProgress', 'download', 'cancelJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
-  'exportBackup', 'importBackup', 'fetchCover',
+  'state', 'importSource', 'restoreBuiltinSources', 'removeSource', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
+  'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
+  'exportBackup', 'importBackup', 'fetchCover', 'cacheBookCover', 'bookCandidates', 'applyBookMeta',
+  'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead', 'exportNotes',
+  'aiSummarize', 'aiTranslate', 'aiAsk',
 ])
 
 function assertObject(value, label = 'arguments') {
@@ -47,6 +54,7 @@ export class ReaderService extends TypertRemoteService {
 
   async [Service.init]() {
     this.db = await openReaderStorage(this.ctx)
+    await this.seedBuiltinSources()
     this.ctx.effect(() => async () => {
       this.disposed = true
       for (const job of entries(this.db.jobs)) {
@@ -67,6 +75,31 @@ export class ReaderService extends TypertRemoteService {
       this.log('warn', 'Startup update check failed', error)
     }
     for (const job of entries(this.db.jobs)) if (job.status === 'queued') this.scheduleJob(job.id)
+  }
+
+  async restoreBuiltinSources(args) {
+    args ??= {}
+    this.assertReady()
+    const settings = this.db.settings.get()
+    let added = 0
+    for (const raw of BUILTIN_SOURCES) {
+      const source = normalizeSource(raw)
+      if (this.db.sources.get(source.id)) continue
+      await this.db.sources.put(source.id, { ...source, builtin: true })
+      added += 1
+    }
+    await this.db.settings.set({ ...settings, builtinSourcesAt: settings.builtinSourcesAt ?? now() })
+    return { added, total: BUILTIN_SOURCES.length }
+  }
+
+  async seedBuiltinSources() {
+    const settings = this.db.settings.get()
+    if (settings.builtinSourcesAt) return
+    for (const raw of BUILTIN_SOURCES) {
+      const source = normalizeSource(raw)
+      if (!this.db.sources.get(source.id)) await this.db.sources.put(source.id, { ...source, builtin: true })
+    }
+    await this.db.settings.set({ ...settings, builtinSourcesAt: now() })
   }
 
   log(level, message, error) {
@@ -125,6 +158,7 @@ export class ReaderService extends TypertRemoteService {
     return {
       sources: [importedSource(), ...entries(this.db.sources)].map(clone),
       books: entries(this.db.books).map(book => this.bookView(book)),
+      folders: entries(this.db.folders).map(clone),
       jobs: entries(this.db.jobs).map(jobView),
       settings: clone(this.db.settings.get()),
       notes: entries(this.db.notes).map(clone),
@@ -147,24 +181,60 @@ export class ReaderService extends TypertRemoteService {
     } catch (error) {
       throw new ReaderError('reader/invalid-source', '书源不是有效 JSON。', undefined, { cause: error })
     }
+    if (Array.isArray(raw)) {
+      const imported = []
+      const skipped = []
+      raw.forEach((item, index) => {
+        try {
+          imported.push(normalizeSource(item, { allowHttp: args.allowHttp === true }))
+        } catch (error) {
+          skipped.push({ index, reason: error?.message || String(error) })
+        }
+      })
+      if (!imported.length) throw new ReaderError('reader/invalid-source', '这批书源都不符合规则，一个也没有导入。', undefined, { cause: skipped.length ? new Error(skipped[0].reason) : undefined })
+      for (const source of imported) await this.db.sources.put(source.id, source)
+      return { imported: imported.length, skipped, total: raw.length, names: imported.map(item => item.name) }
+    }
     const source = normalizeSource(raw, { allowHttp: args.allowHttp === true })
     await this.db.sources.put(source.id, source)
-    return clone(source)
+    return { imported: 1, skipped: [], total: 1, names: [source.name], ...clone(source) }
   }
 
   async removeSource(args) {
     args ??= {}
     this.assertReady()
     const source = this.source(args.id)
+    if (source.builtin) throw new ReaderError('reader/unsupported-source', '内置书源不能删除，可以关闭。')
     if (entries(this.db.books).some(book => book.sourceId === source.id)) throw new ReaderError('reader/source-in-use', '请先从书架移除该书源的书籍。')
     await this.db.sources.delete(source.id)
     return { removed: true, id: source.id }
   }
 
+  async markSourceStatus(sourceId, error) {
+    const source = this.db.sources.get(sourceId)
+    if (!source) return
+    const failed = !!error
+    if (!failed && !source.lastError) return
+    await this.db.sources.put(source.id, {
+      ...source,
+      lastError: failed ? String(error.message || error).slice(0, 200) : undefined,
+      lastErrorAt: failed ? now() : source.lastErrorAt,
+      updatedAt: now(),
+    })
+  }
+
   async search(args) {
     args ??= {}
     this.assertReady()
-    return this.engine.search(this.source(args.sourceId), { query: requiredString(args.query, 'query', 500), page: pageNumber(args.page) })
+    const source = this.source(args.sourceId)
+    try {
+      const list = await this.engine.search(source, { query: requiredString(args.query, 'query', 500), page: pageNumber(args.page) })
+      await this.markSourceStatus(source.id, null)
+      return list
+    } catch (error) {
+      await this.markSourceStatus(source.id, error)
+      throw error
+    }
   }
 
   async discover(args) {
@@ -178,8 +248,9 @@ export class ReaderService extends TypertRemoteService {
     this.assertReady()
     const source = this.source(args.sourceId)
     const bookUrl = requiredString(args.bookUrl, 'bookUrl', 4096)
-    const info = await this.engine.bookInfo(source, bookUrl)
-    if (!info.name) throw new ReaderError('reader/parse-error', '书籍详情缺少 name；请完善 bookInfo 规则。')
+    const hint = args.book && typeof args.book === 'object' ? args.book : {}
+    const info = { ...hint, ...(await this.engine.bookInfo(source, bookUrl)) }
+    if (!info.name) throw new ReaderError('reader/parse-error', '书籍详情缺少 name；请在搜索结果的书籍信息里补上书名。')
     const timestamp = now()
     const bookId = stableId('book', source.id, bookUrl)
     const previous = this.db.books.get(bookId)
@@ -196,6 +267,7 @@ export class ReaderService extends TypertRemoteService {
       download: previous?.download ?? { status: 'none', auto: false },
     }
     await this.db.books.put(book.id, book)
+    await this.cacheCover(book)
     if (args.download === true) {
       const job = await this.download({ bookId: book.id })
       return { ...this.bookView(book), download: { ...this.bookView(book).download, status: 'queued', jobId: job.id } }
@@ -274,6 +346,35 @@ export class ReaderService extends TypertRemoteService {
     return clone(progress)
   }
 
+  activeJobFor(bookId) {
+    return entries(this.db.jobs).find(job => job.bookId === bookId && job.type === 'download' && ['queued', 'running', 'paused'].includes(job.status))
+  }
+
+  async pauseJob(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const job = this.activeJobFor(book.id)
+    if (!job) throw new ReaderError('reader/not-found', 'No active download for this book.')
+    const paused = transitionJob(job, 'pause')
+    await this.db.jobs.put(paused.id, paused)
+    await this.db.books.put(book.id, { ...this.book(book.id), download: { status: 'paused', jobId: paused.id, auto: true }, updatedAt: now() })
+    return jobView(paused)
+  }
+
+  async resumeJob(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const job = this.activeJobFor(book.id)
+    if (!job || job.status !== 'paused') throw new ReaderError('reader/not-found', 'No paused download for this book.')
+    const resumed = transitionJob(job, 'resume')
+    await this.db.jobs.put(resumed.id, resumed)
+    await this.db.books.put(book.id, { ...this.book(book.id), download: { status: 'queued', jobId: resumed.id, auto: true }, updatedAt: now() })
+    this.scheduleJob(resumed.id)
+    return jobView(resumed)
+  }
+
   async download(args) {
     args ??= {}
     this.assertReady()
@@ -288,11 +389,32 @@ export class ReaderService extends TypertRemoteService {
     return jobView(job)
   }
 
+  canStartJob(job) {
+    if (this.runningJobs.size >= MAX_PARALLEL_JOBS) return false
+    const book = this.db.books.get(job.bookId)
+    if (!book) return true
+    let sameSource = 0
+    for (const id of this.runningJobs.keys()) {
+      const other = this.db.jobs.get(id)
+      const otherBook = other && this.db.books.get(other.bookId)
+      if (other && otherBook && otherBook.sourceId === book.sourceId) sameSource += 1
+    }
+    return sameSource < MAX_PER_SOURCE_JOBS
+  }
+
   scheduleJob(jobId) {
     if (this.disposed || this.runningJobs.has(jobId)) return
+    const pending = this.db.jobs.get(jobId)
+    if (!pending || pending.status !== 'queued') return
+    if (!this.canStartJob(pending)) return
     const promise = this.runJob(jobId)
       .catch(error => this.log('error', `Job ${jobId} could not update persisted state`, error))
-      .finally(() => this.runningJobs.delete(jobId))
+      .finally(() => {
+        this.runningJobs.delete(jobId)
+        for (const next of entries(this.db.jobs)) {
+          if (next.status === 'queued' && !this.runningJobs.has(next.id)) { this.scheduleJob(next.id); break }
+        }
+      })
     this.runningJobs.set(jobId, promise)
     return promise
   }
@@ -314,13 +436,29 @@ export class ReaderService extends TypertRemoteService {
         job = this.db.jobs.get(jobId)
         if (!job || job.status !== 'running' || this.disposed) return
         if (typeof chapter.text !== 'string') {
-          const content = await this.engine.content(this.source(book.sourceId), book, chapter)
+          let content = null
+          let lastError = null
+          for (let attempt = 1; attempt <= MAX_CHAPTER_ATTEMPTS; attempt += 1) {
+            try { content = await this.engine.content(this.source(book.sourceId), book, chapter); lastError = null; break }
+            catch (error) {
+              lastError = error
+              if (this.disposed) return
+              const status = error && error.details && error.details.status
+              if (attempt < MAX_CHAPTER_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, (status === 429 ? 1500 : 400) * attempt))
+            }
+          }
           job = this.db.jobs.get(jobId)
           if (!job || job.status !== 'running' || this.disposed) return
-          await this.db.chapters.put(chapter.id, { ...chapter, ...content, downloadedAt: now() })
+          if (content) await this.db.chapters.put(chapter.id, { ...chapter, ...content, downloadedAt: now() })
+          else {
+            this.log('warn', `Chapter ${chapter.id} skipped`, lastError)
+            job = { ...job, failedChapters: [...(job.failedChapters || []), chapter.id] }
+            await this.db.jobs.put(job.id, job)
+          }
         }
         job = transitionJob(this.db.jobs.get(jobId), 'chapter')
         await this.db.jobs.put(job.id, job)
+        if (!book.local) await new Promise(resolve => setTimeout(resolve, 200))
       }
       job = this.db.jobs.get(jobId)
       if (!job || job.status !== 'running') return
@@ -412,6 +550,92 @@ export class ReaderService extends TypertRemoteService {
     return { dataUrl, cached: false }
   }
 
+  async cacheCover(book) {
+    const url = String(book?.coverUrl || '').trim()
+    if (!url || /^data:/i.test(url) || book.coverLocal) return book
+    try {
+      const result = await this.fetchCover({ bookId: book.id })
+      const next = { ...book, coverLocal: result.dataUrl, updatedAt: now() }
+      await this.db.books.put(next.id, next)
+      return next
+    } catch {
+      return book
+    }
+  }
+
+  async cacheBookCover(args) {
+    args ??= {}
+    this.assertReady()
+    const book = { ...this.book(args.bookId), coverLocal: '' }
+    if (!book.coverUrl) throw new ReaderError('reader/not-found', '这本书还没有封面地址。')
+    const next = await this.cacheCover(book)
+    return { book: this.bookView(next), cached: Boolean(next.coverLocal) }
+  }
+
+  async bookCandidates(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const keyword = requiredString(String(args.query ?? book.name ?? '').replace(/\.(?:txt|epub|md|pdf)$/i, '').trim(), 'query', 200)
+    const targets = [importedSource(), ...entries(this.db.sources)].filter(source => source.enabled !== false && source.rules?.search?.url)
+    const settled = await Promise.allSettled(targets.map(async (source) => {
+      try {
+        const items = await this.engine.search(source, { query: keyword, page: 1 })
+        return items.slice(0, 2).map(item => ({ ...item, sourceId: source.id, sourceName: source.name }))
+      } catch {
+        return []
+      }
+    }))
+    const candidates = []
+    for (const outcome of settled) if (outcome.status === 'fulfilled') candidates.push(...outcome.value)
+    return { query: keyword, candidates: candidates.slice(0, 8).map(item => ({
+      sourceId: item.sourceId,
+      sourceName: item.sourceName,
+      name: String(item.name || '').trim(),
+      author: String(item.author || '').trim(),
+      intro: String(item.intro || '').trim(),
+      coverUrl: String(item.coverUrl || '').trim(),
+      bookUrl: String(item.bookUrl || '').trim(),
+    })) }
+  }
+
+  async applyBookMeta(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const meta = args.meta && typeof args.meta === 'object' ? args.meta : {}
+    let enriched = { ...meta }
+    if (meta.sourceId && meta.bookUrl) {
+      const stored = this.db.sources.get(meta.sourceId)
+      console.log('[applyBookMeta] meta', JSON.stringify({ sourceId: meta.sourceId, bookUrl: meta.bookUrl, hasSource: !!stored, builtin: stored?.builtin, hasBookInfo: !!stored?.rules?.bookInfo }))
+      let source = this.db.sources.get(meta.sourceId)
+      if (source?.builtin && !source.rules?.bookInfo) {
+        const raw = BUILTIN_SOURCES.find((item) => normalizeSource(item).id === source.id)
+        if (raw) source = { ...source, rules: normalizeSource(raw).rules }
+      }
+      if (source) {
+        try {
+          const info = await this.engine.bookInfo(source, meta.bookUrl)
+          console.log('[applyBookMeta] bookInfo result', JSON.stringify({ coverUrl: info.coverUrl, intro: info.intro?.substring(0, 100), keys: Object.keys(info) }))
+          for (const key of ['author', 'intro', 'coverUrl']) if (!enriched[key] && info[key]) enriched[key] = info[key]
+        } catch (error) {
+          this.log('warn', 'book info failed', error)
+        }
+      }
+    }
+    const next = {
+      ...book,
+      author: String(enriched.author ?? book.author ?? '').trim(),
+      intro: String(enriched.intro ?? book.intro ?? '').trim(),
+      coverUrl: String(enriched.coverUrl ?? book.coverUrl ?? '').trim(),
+      coverLocal: String(enriched.coverUrl ?? '') === String(book.coverUrl ?? '') ? book.coverLocal : '',
+      updatedAt: now(),
+    }
+    await this.db.books.put(next.id, next)
+    const cached = await this.cacheCover(next)
+    return this.bookView(cached)
+  }
+
   async setSettings(args) {
     const partial = args ?? {}
     this.assertReady()
@@ -486,6 +710,132 @@ export class ReaderService extends TypertRemoteService {
     return { removed: true, id: noteId }
   }
 
+  async exportNotes(args) {
+    args ??= {}
+    this.assertReady()
+    const bookId = args.bookId
+    const notes = entries(this.db.notes).filter(n => !bookId || n.bookId === bookId)
+    const lines = []
+    for (const note of notes) {
+      const book = this.db.books.get(note.bookId)
+      const chapter = this.db.chapters.get(note.chapterId)
+      lines.push(`## ${book?.name || '未知书籍'} · ${chapter?.title || '未知章节'}\n`)
+      if (note.quote) lines.push(`> ${note.quote}\n`)
+      lines.push(`${note.text}\n`)
+      lines.push(`---\n`)
+    }
+    return { text: lines.join('\n'), count: notes.length }
+  }
+
+  async createFolder(args) {
+    args ??= {}
+    this.assertReady()
+    const name = requiredString(args.name, 'name', 200).trim()
+    const folder = { id: id('folder'), name, createdAt: now() }
+    await this.db.folders.put(folder.id, folder)
+    return clone(folder)
+  }
+
+  async renameFolder(args) {
+    args ??= {}
+    this.assertReady()
+    const folder = this.db.folders.get(requiredString(args.folderId, 'folderId'))
+    if (!folder) throw new ReaderError('reader/not-found', 'Folder not found.')
+    const next = { ...folder, name: requiredString(args.name, 'name', 200).trim() }
+    await this.db.folders.put(next.id, next)
+    return clone(next)
+  }
+
+  async removeFolder(args) {
+    args ??= {}
+    this.assertReady()
+    const folder = this.db.folders.get(requiredString(args.folderId, 'folderId'))
+    if (!folder) throw new ReaderError('reader/not-found', 'Folder not found.')
+    // Move all books in this folder back to root
+    for (const book of entries(this.db.books)) {
+      if (book.folderId === folder.id) await this.db.books.put(book.id, { ...book, folderId: undefined, updatedAt: now() })
+    }
+    await this.db.folders.delete(folder.id)
+    return { removed: true, id: folder.id }
+  }
+
+  async moveBooksToFolder(args) {
+    args ??= {}
+    this.assertReady()
+    const folderId = args.folderId === null || args.folderId === undefined ? undefined : requiredString(args.folderId, 'folderId')
+    if (folderId && !this.db.folders.get(folderId)) throw new ReaderError('reader/not-found', 'Folder not found.')
+    const bookIds = Array.isArray(args.bookIds) ? args.bookIds : [args.bookId]
+    if (!bookIds.length) throw new ReaderError('reader/invalid-input', 'No books selected.')
+    const moved = []
+    for (const bookId of bookIds) {
+      const book = this.book(bookId)
+      await this.db.books.put(book.id, { ...book, folderId, updatedAt: now() })
+      moved.push(bookId)
+    }
+    return { moved, folderId }
+  }
+
+  async batchDeleteBooks(args) {
+    args ??= {}
+    this.assertReady()
+    const bookIds = Array.isArray(args.bookIds) ? args.bookIds : [args.bookId]
+    if (!bookIds.length) throw new ReaderError('reader/invalid-input', 'No books selected.')
+    const removed = []
+    for (const bookId of bookIds) {
+      const book = this.db.books.get(bookId)
+      if (!book) continue
+      await this.removeBook({ bookId })
+      removed.push(bookId)
+    }
+    return { removed }
+  }
+
+  async batchDownloadBooks(args) {
+    args ??= {}
+    this.assertReady()
+    const bookIds = Array.isArray(args.bookIds) ? args.bookIds : [args.bookId]
+    if (!bookIds.length) throw new ReaderError('reader/invalid-input', 'No books selected.')
+    const queued = []
+    for (const bookId of bookIds) {
+      const book = this.db.books.get(bookId)
+      if (!book) continue
+      const job = await this.download({ bookId })
+      queued.push({ bookId, jobId: job.id })
+    }
+    return { queued }
+  }
+
+  async exportBook(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const format = args.format || 'txt'
+    const chapters = this.chapters(book.id)
+    if (!chapters.length) throw new ReaderError('reader/invalid-input', '这本书还没有章节。')
+    if (format === 'txt' || format === 'md') {
+      const lines = []
+      for (const chapter of chapters) {
+        if (format === 'md') lines.push(`\n\n# ${chapter.title}\n\n`)
+        else lines.push(`\n\n${chapter.title}\n\n`)
+        if (typeof chapter.text === 'string') lines.push(chapter.text)
+      }
+      return { name: book.name, format, text: lines.join('') }
+    }
+    if (format === 'epub') {
+      const buffer = await exportEpub(book, chapters)
+      return { name: book.name, format, base64: buffer.toString('base64') }
+    }
+    throw new ReaderError('reader/invalid-input', `不支持的导出格式 ${format}，目前只支持 txt、md 和 epub。`)
+  }
+
+  async markBookRead(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    await this.db.books.put(book.id, { ...book, readAt: now(), updatedAt: now() })
+    return this.bookView(this.book(book.id))
+  }
+
   async exportBackup() {
     this.assertReady()
     return createBackup({
@@ -514,6 +864,55 @@ export class ReaderService extends TypertRemoteService {
     await this.db.settings.set({ ...DEFAULT_SETTINGS, ...backup.settings })
     return this.state()
   }
+
+  // AI 助手：摘要、翻译、问答
+  async aiSummarize(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const chapters = this.chapters(book.id)
+    const text = chapters.map(c => c.text || c.content || '').filter(Boolean).join('\n\n').slice(0, 8000)
+    if (!text) throw new ReaderError('reader/invalid-input', '这本书还没有内容。')
+    const result = await this.callLlm(`请用中文总结以下书籍内容，100字以内：\n\n${text}`)
+    return { summary: result }
+  }
+
+  async aiTranslate(args) {
+    args ??= {}
+    this.assertReady()
+    const text = String(args.text || '').slice(0, 4000)
+    const target = args.target || 'zh'
+    if (!text) throw new ReaderError('reader/invalid-input', '没有要翻译的内容。')
+    const lang = target === 'zh' ? '中文' : target === 'en' ? '英文' : target
+    const result = await this.callLlm(`请将以下内容翻译成${lang}，保持原意：\n\n${text}`)
+    return { translated: result }
+  }
+
+  async aiAsk(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const question = String(args.question || '').trim()
+    if (!question) throw new ReaderError('reader/invalid-input', '请输入问题。')
+    const chapters = this.chapters(book.id)
+    const context = chapters.slice(0, 3).map(c => c.text || c.content || '').filter(Boolean).join('\n\n').slice(0, 6000)
+    const result = await this.callLlm(`基于以下书籍内容回答问题：\n\n${context}\n\n问题：${question}\n\n请用中文回答：`)
+    return { answer: result }
+  }
+
+  async callLlm(prompt) {
+    if (!this.ctx.llm) throw new ReaderError('reader/ai-unavailable', 'AI 服务不可用。')
+    try {
+      const chunks = []
+      for await (const chunk of this.ctx.llm.stream({ messages: [{ role: 'user', content: prompt }] })) {
+        if (chunk.type === 'text') chunks.push(chunk.text)
+      }
+      return chunks.join('').trim()
+    } catch (error) {
+      throw new ReaderError('reader/ai-error', `AI 调用失败：${error.message}`)
+    }
+  }
 }
 
 export default ReaderService
+

@@ -20,7 +20,31 @@ test('all contracted methods are discovered by the Stage-3 Remote markers', asyn
   const { service } = await serviceFixture()
   const discovered = remoteMethods(service).map(marker => marker.exportName ?? marker.method)
   assert.deepEqual(discovered, [...REMOTE_METHODS])
-  assert.equal(new Set(discovered).size, 21)
+  assert.equal(new Set(discovered).size, REMOTE_METHODS.length)
+})
+
+test('pauseJob and resumeJob move a download between paused and queued', async () => {
+  const { service, db } = await serviceFixture()
+  const book = { id: 'book-1', bookId: 'book-1', name: '书', sourceId: source.id, sourceType: 'remote', download: { status: 'running', jobId: 'job-1' } }
+  await db.books.put(book.id, book)
+  await db.jobs.put('job-1', { id: 'job-1', type: 'download', bookId: book.id, status: 'running', total: 10, done: 3, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+  service.scheduleJob = () => Promise.resolve()
+  const paused = await service.pauseJob({ bookId: book.id })
+  assert.equal(paused.status, 'paused')
+  assert.equal(db.books.get(book.id).download.status, 'paused')
+  const resumed = await service.resumeJob({ bookId: book.id })
+  assert.equal(resumed.status, 'queued')
+  assert.equal(db.books.get(book.id).download.status, 'queued')
+})
+
+test('download jobs can be paused and resumed', () => {
+  const job = createJob({ bookId: 'b1', total: 10 })
+  const running = transitionJob(job, 'start')
+  const paused = transitionJob(running, 'pause')
+  assert.equal(paused.status, 'paused')
+  const resumed = transitionJob(paused, 'resume')
+  assert.equal(resumed.status, 'queued')
+  assert.throws(() => transitionJob(job, 'resume'))
 })
 
 test('real gateway SRC descriptor accepts every Remote signature', async () => {
@@ -148,4 +172,33 @@ test('Service.init opens storage, recovers persisted jobs and registers hourly u
   assert.equal(closed, true)
   assert.equal(service.disposed, true)
   assert.equal(stopIntervalCalled, false, 'ctx.interval owns its own disposer')
+})
+
+test('builtin sources are seeded once and can be turned off without re-adding', async () => {
+  const { service, db } = await serviceFixture()
+  await service.seedBuiltinSources()
+  const seeded = [...db.sources.entries()].map(([, value]) => value)
+  assert.deepEqual(seeded.map(item => item.name).sort(), ['17K 小说', '维基文库'])
+  assert.equal(seeded.every(item => item.builtin === true), true)
+  // Second call is a no-op even after the user deletes one.
+  await db.sources.delete(seeded[0].id)
+  await service.seedBuiltinSources()
+  assert.equal(db.sources.size, 1)
+})
+
+test('addBook accepts search-result data when a source has no bookInfo rule', async () => {
+  const { service } = await serviceFixture({ async bookInfo() { return {} } })
+  const { source: builtin } = { source }
+  await service.db.sources.put(builtin.id, builtin)
+  const book = await service.addBook({ sourceId: builtin.id, bookUrl: 'https://example.com/book/1', book: { name: '公版书', author: '作者甲' } })
+  assert.equal(book.name, '公版书')
+  assert.equal(book.author, '作者甲')
+})
+
+test('built-in sources cannot be removed', async () => {
+  const { service, db } = await serviceFixture()
+  await service.seedBuiltinSources()
+  const [builtin] = [...db.sources.entries()].map(([, value]) => value)
+  await assert.rejects(() => service.removeSource({ id: builtin.id }), /内置书源不能删除/)
+  assert.equal(db.sources.get(builtin.id)?.builtin, true)
 })
