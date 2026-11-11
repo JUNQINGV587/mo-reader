@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { isPrivateAddress, parseRemoteUrl } from '../lib/http.js'
 import { applyReplacements, normalizeReplacements } from '../lib/replacements.js'
-import { extractOne, mapList, normalizeSource, renderTemplate, responseDocument } from '../lib/rules.js'
+import { extractOne, mapList, normalizeSource, renderTemplate, responseDocument, selectAll } from '../lib/rules.js'
 
 test('URL templates encode key, page and book values', () => {
   assert.equal(
@@ -27,14 +27,15 @@ test('@Json and JSONPath rules extract nested search results', () => {
   assert.deepEqual(books, [{ name: 'Book A', bookUrl: '/a' }, { name: 'Book B', bookUrl: '/b' }])
 })
 
-test('basic source normalization rejects JS, XPath and secrets clearly', () => {
+test('basic source normalization accepts XPath and rejects unsupported syntax and secrets clearly', () => {
   const base = { bookSourceName: 'test', bookSourceUrl: 'https://example.com', ruleSearch: { url: '/search', bookList: '.book' } }
   const normalized = normalizeSource(base)
   assert.match(normalized.id, /^[a-zA-Z0-9_-]+$/)
   assert.equal(normalizeSource(base).id, normalized.id)
   assert.equal(normalized.bookSourceUrl, 'https://example.com')
   assert.doesNotThrow(() => normalizeSource({ ...base, ruleContent: { content: '<js>document.body</js>' } }))
-  assert.throws(() => normalizeSource({ ...base, ruleSearch: { ...base.ruleSearch, bookList: '@xpath://div' } }), /XPath/)
+  assert.doesNotThrow(() => normalizeSource({ ...base, ruleSearch: { ...base.ruleSearch, bookList: '@xpath://div' } }))
+  assert.throws(() => selectAll(responseDocument('<div/>'), '@xpath://div/following-sibling::div'), /XPath|unsupported/)
   assert.throws(() => normalizeSource({ ...base, ruleSearch: { ...base.ruleSearch, headers: { Cookie: 'secret' } } }), /not allowed|must not contain secrets/)
   assert.throws(() => normalizeSource({ ...base, token: 'secret' }), /must not contain secrets/)
   assert.throws(() => normalizeSource({ ...base, ruleSearch: { ...base.ruleSearch, headers: { 'X-Api-Key': 'secret' } } }), /not allowed|must not contain secrets/)

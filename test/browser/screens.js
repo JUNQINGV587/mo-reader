@@ -25,8 +25,15 @@ const sources = [
   { id: 'src-1', bookSourceName: '起点中文网', bookSourceUrl: 'https://a.example.com', builtin: true },
   { id: 'src-2', bookSourceName: '17K 小说', bookSourceUrl: 'https://www.17k.com', compatibility: '基础规则' },
   { id: 'src-3', bookSourceName: '维基文库', bookSourceUrl: 'https://zh.wikisource.org', lastError: 'timeout' },
-  { id: 'src-4', bookSourceName: '笔趣阁', bookSourceUrl: 'https://b.example.com', lastError: 'parse' },
-  { id: 'src-5', bookSourceName: '本机缓存', bookSourceUrl: 'local://cache' },
+  { id: 'src-4', bookSourceName: '笔趣阁', bookSourceUrl: 'https://b.example.com', enabled: false },
+  { id: 'src-5', bookSourceName: '番茄小说', bookSourceUrl: 'https://c.example.com' },
+  { id: 'local', bookSourceName: '本地导入', bookSourceUrl: 'local:' },
+]
+const subscriptions = [
+  { id: 'sub-1', url: 'https://library.example/sources.json', sourceIds: ['src-1', 'src-2'], status: 'ready', lastCheckedAt: '2026-11-11T08:00:00.000Z', lastSuccessAt: '2026-11-11T08:00:00.000Z' },
+  { id: 'sub-2', url: 'https://broken.example/sources.json', sourceIds: ['src-3'], status: 'error', lastCheckedAt: '2026-11-11T09:00:00.000Z', lastSuccessAt: '2026-11-10T08:00:00.000Z', lastFailureAt: '2026-11-11T09:00:00.000Z', lastError: '源库返回的不是有效 JSON。' },
+  { id: 'sub-3', url: 'https://slow.example/sources.json', sourceIds: ['src-4'], status: 'ready', checking: true },
+  { id: 'sub-4', url: 'https://new.example/sources.json', sourceIds: ['src-1'], status: 'pending', pending: { permissions: { origins: ['https://new.example'], capabilities: [{ origin: 'https://a.example', capabilities: ['js'] }] }, changes: { added: 2, updated: 1, removed: 0, addedNames: ['新站甲', '新站乙'], updatedNames: ['17K 小说'], removedNames: [] } } },
 ]
 const results = [
   { name: '凡人外传', author: '忘语', sourceName: '起点中文网', bookUrl: 'https://a.example.com/book/1', kind: '连载中' },
@@ -39,7 +46,7 @@ const render = (screen) => root.render(shell(screen))
 
 window.screensUI = {
   discover: () => render(h(Discover, { sources, onSearch: noop, onAdd: noop, results, busy: false, failed: 1 })),
-  sources: () => render(h(Sources, { sources, onImport: noop, onRemove: noop, busy: false, onPullLibrary: async () => false, onRestoreBuiltin: noop })),
+  sources: () => render(h(Sources, { sources, subscriptions, onImport: noop, onRemove: noop, onToggle: noop, onSubscribe: async () => false, onRefresh: (id) => { window.__refreshClicked = id; }, onConfirmUpdate: (id) => { window.__confirmClicked = id; }, onRejectUpdate: (id) => { window.__rejectClicked = id; }, onUnsubscribe: noop, busy: false, onRestoreBuiltin: noop })),
   settings: () => render(h(Settings, props)),
   measure() {
     const screen = document.querySelector('.mr-screen')
@@ -57,6 +64,21 @@ window.screensUI = {
       results: document.querySelectorAll('.mr-discovery-result').length,
       warning: document.querySelectorAll('.mr-source-warning').length,
       sourceRows: document.querySelectorAll('.mr-source-row').length,
+      subscriptionRows: document.querySelectorAll('.mr-subscription-row').length,
+      refreshButtons: document.querySelectorAll('.mr-subscription-actions [title="立即检查订阅更新"]').length,
+      checkingTags: document.querySelectorAll('.mr-subscription-actions .mr-tag.checking').length,
+      failedTags: document.querySelectorAll('.mr-subscription-actions .mr-tag.failed').length,
+      unsubscribeButtons: document.querySelectorAll('.mr-subscription-actions [title="取消订阅，不删除书源"]').length,
+      pendingTags: document.querySelectorAll('.mr-subscription-actions .mr-tag.pending').length,
+      pendingPermissions: document.querySelectorAll('.mr-pending-permissions').length,
+      pendingRowWidth: document.querySelector('.mr-subscription-row.is-pending')?.getBoundingClientRect().width || 0,
+      pendingCopyWidth: document.querySelector('.mr-subscription-row.is-pending .mr-subscription-copy')?.getBoundingClientRect().width || 0,
+      pendingActionsWidth: document.querySelector('.mr-subscription-row.is-pending .mr-subscription-actions')?.getBoundingClientRect().width || 0,
+      confirmButtons: document.querySelectorAll('.mr-subscription-actions [title="应用已获取并等待确认的更新"]').length,
+      rejectButtons: document.querySelectorAll('.mr-subscription-actions [title="放弃这次候选更新，继续使用旧版"]').length,
+      sourceChips: document.querySelectorAll('.mr-source-chip').length,
+      disabledRows: document.querySelectorAll('.mr-source-row.is-disabled').length,
+      toggleButtons: document.querySelectorAll('.mr-source-side [aria-pressed]').length,
       panels: document.querySelectorAll('.mr-settings-grid .mr-panel').length,
       panelWidth: panel ? Math.round(panel.getBoundingClientRect().width) : 0,
       onlineHeight: online ? Math.round(online.getBoundingClientRect().height) : 0,
