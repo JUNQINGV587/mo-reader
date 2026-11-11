@@ -1109,7 +1109,7 @@ window.__ModuleLoader__.load({
                   ].filter(Boolean).join(' · ');
                   const detail = isPending
                     ? `${item.sourceIds?.length || 0} 个在用书源 · ${changeText}`
-                    : `${item.sourceIds?.length || 0} 个书源 · ${item.lastSuccessAt ? `${when(item.lastSuccessAt)} 成功` : '尚未成功'}${failed && item.lastFailureAt ? ` · ${when(item.lastFailureAt)} 失败` : ''}`;
+                    : `${item.sourceIds?.length || 0} 个书源 · 检查 ${item.lastCheckedAt ? when(item.lastCheckedAt) : '—'} · ${item.lastSuccessAt ? `${when(item.lastSuccessAt)} 成功` : '尚未成功'}${failed && item.lastFailureAt ? ` · ${when(item.lastFailureAt)} 失败` : ''}`;
                   return h('div', { className: `mr-subscription-row${isPending ? ' is-pending' : ''}`, key: item.id, 'aria-busy': checking || undefined },
                     h('div', { className: 'mr-subscription-copy' },
                       h('strong', { title: item.url }, item.url),

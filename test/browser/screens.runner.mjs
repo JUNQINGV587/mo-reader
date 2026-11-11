@@ -108,6 +108,7 @@ try {
   assert.equal(report.sourcesDesktop.pendingPermissions, 1)
   assert.match(await evaluate("document.querySelector('.mr-pending-permissions').textContent", true), /新增脚本/)
   assert.match(await evaluate("document.querySelector('.mr-pending-changes').textContent", true), /新增：新站甲/)
+  assert.match(await evaluate("document.querySelector('.mr-subscription-copy > span').textContent", true), /检查 \d{4}/)
   assert.ok(report.sourcesDesktop.pendingCopyWidth >= report.sourcesDesktop.pendingRowWidth * 0.8)
   assert.ok(report.sourcesDesktop.pendingActionsWidth >= report.sourcesDesktop.pendingRowWidth * 0.8)
   assert.equal(report.sourcesDesktop.confirmButtons, 1)

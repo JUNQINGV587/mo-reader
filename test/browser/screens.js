@@ -30,8 +30,8 @@ const sources = [
   { id: 'local', bookSourceName: '本地导入', bookSourceUrl: 'local:' },
 ]
 const subscriptions = [
-  { id: 'sub-1', url: 'https://library.example/sources.json', sourceIds: ['src-1', 'src-2'], status: 'ready', lastSuccessAt: '2026-11-11T08:00:00.000Z' },
-  { id: 'sub-2', url: 'https://broken.example/sources.json', sourceIds: ['src-3'], status: 'error', lastSuccessAt: '2026-11-10T08:00:00.000Z', lastFailureAt: '2026-11-11T09:00:00.000Z', lastError: '源库返回的不是有效 JSON。' },
+  { id: 'sub-1', url: 'https://library.example/sources.json', sourceIds: ['src-1', 'src-2'], status: 'ready', lastCheckedAt: '2026-11-11T08:00:00.000Z', lastSuccessAt: '2026-11-11T08:00:00.000Z' },
+  { id: 'sub-2', url: 'https://broken.example/sources.json', sourceIds: ['src-3'], status: 'error', lastCheckedAt: '2026-11-11T09:00:00.000Z', lastSuccessAt: '2026-11-10T08:00:00.000Z', lastFailureAt: '2026-11-11T09:00:00.000Z', lastError: '源库返回的不是有效 JSON。' },
   { id: 'sub-3', url: 'https://slow.example/sources.json', sourceIds: ['src-4'], status: 'ready', checking: true },
   { id: 'sub-4', url: 'https://new.example/sources.json', sourceIds: ['src-1'], status: 'pending', pending: { permissions: { origins: ['https://new.example'], capabilities: [{ origin: 'https://a.example', capabilities: ['js'] }] }, changes: { added: 2, updated: 1, removed: 0, addedNames: ['新站甲', '新站乙'], updatedNames: ['17K 小说'], removedNames: [] } } },
 ]
