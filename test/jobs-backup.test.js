@@ -31,7 +31,7 @@ test('backup allowlists records and strips secrets instead of exporting them', (
     chapters: [{ id: 'c', bookId: 'b', index: 0, title: 'C', url: 'https://example.com/c', text: 'raw cache', cookie: 'drop-me' }],
     settings: { replacements: [{ type: 'text', pattern: 'x', replacement: 'y' }], autoDownloadNewChapters: true, password: 'drop-me' },
     notes: [{ id: 'n', bookId: 'b', chapterId: 'c', text: 'note', token: 'drop-me' }],
-    subscriptions: [{ id: 'sub', url: 'https://user:pass@example.com/sources.json?token=drop-me&mirror=1#frag', sourceIds: [sourceId], status: 'ready', lastCheckedAt: '2026-11-11T08:00:00.000Z', createdAt: '2026-11-11T08:00:00.000Z', runtime: { code: 'drop-me' }, token: 'drop-me' }],
+    subscriptions: [{ id: 'sub', url: 'https://user:pass@example.com/sources.json?token=drop-me&mirror=1#frag', sourceIds: [sourceId], status: 'error', allowHttp: true, lastCheckedAt: '2026-11-11T08:00:00.000Z', lastFailureAt: '2026-11-11T08:00:00.000Z', lastError: 'drop-me', createdAt: '2026-11-11T08:00:00.000Z', runtime: { code: 'drop-me' }, token: 'drop-me' }],
   })
   assert.equal(json.includes('drop-me'), false)
   assert.equal(json.includes('Authorization'), false)
@@ -39,7 +39,8 @@ test('backup allowlists records and strips secrets instead of exporting them', (
   const parsed = parseBackup(json)
   assert.equal(parsed.chapters[0].text, 'raw cache')
   assert.equal(parsed.sources[0].rules.search.headers.Accept, 'application/json')
-  assert.deepEqual(parsed.subscriptions, [{ id: 'sub', url: 'https://example.com/sources.json?mirror=1', sourceIds: [sourceId], status: 'ready', lastCheckedAt: '2026-11-11T08:00:00.000Z', createdAt: '2026-11-11T08:00:00.000Z' }])
+  assert.deepEqual(parsed.subscriptions, [{ id: 'sub', url: 'https://example.com/sources.json?mirror=1', sourceIds: [sourceId], status: 'error', allowHttp: true, lastCheckedAt: '2026-11-11T08:00:00.000Z', lastFailureAt: '2026-11-11T08:00:00.000Z', createdAt: '2026-11-11T08:00:00.000Z' }])
+  assert.equal(json.includes('lastError'), false, '运行期错误详情不进入备份')
   assert.deepEqual(parseBackup(JSON.parse(json)), parsed)
 })
 

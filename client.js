@@ -8,7 +8,7 @@ window.__ModuleLoader__.load({
     const { useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
     const PANEL_ID = 'reader';
     const REMOTE_METHODS = [
-      'state', 'importSource', 'subscribeSourceLibrary', 'removeSubscription', 'removeSource', 'setSourceEnabled', 'restoreBuiltinSources', 'search', 'discover', 'addBook', 'removeBook',
+      'state', 'importSource', 'subscribeSourceLibrary', 'refreshSubscription', 'removeSubscription', 'removeSource', 'setSourceEnabled', 'restoreBuiltinSources', 'search', 'discover', 'addBook', 'removeBook',
       'toc', 'chapter', 'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal',
       'setSettings', 'setBookSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
       'cacheBookCover', 'bookCandidates', 'applyBookMeta',
@@ -1046,7 +1046,7 @@ window.__ModuleLoader__.load({
       const skippedText = skipped ? `跳过 ${skipped} 个${first ? `（${first.slice(0, 40)}）` : ''}` : '';
       return skippedText ? `已导入 ${imported} 个书源，${skippedText}` : `已导入 ${imported} 个书源`;
     }
-    function Sources({ sources, subscriptions = [], onImport, onRemove, onToggle, onSubscribe, onUnsubscribe, busy, onRestoreBuiltin }) {
+    function Sources({ sources, subscriptions = [], onImport, onRemove, onToggle, onSubscribe, onUnsubscribe, onRefresh, checkingIds = [], busy, onRestoreBuiltin }) {
       const [draft, setDraft] = useState('');
       const [allowHttp, setAllowHttp] = useState(false);
       const [libraryText, setLibraryText] = useState('');
@@ -1082,13 +1082,21 @@ window.__ModuleLoader__.load({
                 h(Button, { kind: 'primary', icon: 'download', disabled: subscribing || !libraryText.trim(), onClick: () => onSubscribe({ url: libraryText.trim(), allowHttp: libraryHttp }) }, '订阅')),
               h('label', { className: 'mr-check' }, h('input', { type: 'checkbox', checked: libraryHttp, onChange: (e) => setLibraryHttp(e.target.checked) }), '允许明文 HTTP'),
               subscriptions.length ? h('div', { className: 'mr-subscription-list' },
-                subscriptions.map((item) => h('div', { className: 'mr-subscription-row', key: item.id },
-                  h('div', { className: 'mr-subscription-copy' },
-                    h('strong', { title: item.url }, item.url),
-                    h('span', null, `${item.sourceIds?.length || 0} 个书源${item.lastSuccessAt ? ` · ${new Date(item.lastSuccessAt).toLocaleDateString('zh-CN')} 更新` : ''}`)),
-                  h('span', { className: 'mr-subscription-actions' },
-                    h('span', { className: `mr-tag${item.status === 'partial' ? ' failed' : ''}` }, item.status === 'partial' ? '部分可用' : '已订阅'),
-                    h(Button, { kind: 'text', disabled: busy, title: '取消订阅，不删除书源', onClick: () => onUnsubscribe(item.id) }, '取消'))))) : null,
+                subscriptions.map((item) => {
+                  const checking = item.checking === true || checkingIds.includes(item.id);
+                  const when = (value) => { try { return new Date(value).toLocaleDateString('zh-CN'); } catch { return ''; } };
+                  const failed = item.status === 'error';
+                  const statusText = checking ? '检查中' : failed ? '检查失败' : item.status === 'partial' ? '部分可用' : '已订阅';
+                  const detail = `${item.sourceIds?.length || 0} 个书源 · ${item.lastSuccessAt ? `${when(item.lastSuccessAt)} 成功` : '尚未成功'}${failed && item.lastFailureAt ? ` · ${when(item.lastFailureAt)} 失败` : ''}`;
+                  return h('div', { className: 'mr-subscription-row', key: item.id, 'aria-busy': checking || undefined },
+                    h('div', { className: 'mr-subscription-copy' },
+                      h('strong', { title: item.url }, item.url),
+                      h('span', { title: failed && item.lastError ? item.lastError : detail }, detail)),
+                    h('span', { className: 'mr-subscription-actions' },
+                      h('span', { className: `mr-tag${failed || item.status === 'partial' ? ' failed' : checking ? ' checking' : ''}`, title: failed ? item.lastError : undefined }, statusText),
+                      h(Button, { kind: 'text', icon: 'refresh', disabled: busy || checking, title: '立即检查订阅更新', onClick: () => onRefresh(item.id) }, checking ? '检查中' : '刷新'),
+                      h(Button, { kind: 'text', disabled: busy || checking, title: '取消订阅，不删除书源', onClick: () => onUnsubscribe(item.id) }, '取消')));
+                })) : null,
               h('p', { className: 'mr-help' }, `${subscriptions.length} 个订阅 · 关联 ${subscribedCount} 个书源`))),
           h('section', { className: 'mr-sources-list', 'aria-label': '已配置书源列表' },
             h('div', { className: 'mr-sources-list-head' },
@@ -2895,6 +2903,7 @@ window.__ModuleLoader__.load({
       const [tab, setTab] = useState('library');
       const [loading, setLoading] = useState(true);
       const [busy, setBusy] = useState(false);
+      const [refreshingSubscriptions, setRefreshingSubscriptions] = useState([]);
       const [notice, setNotice] = useState(null);
       const [selectedSource, setSelectedSource] = useState('');
       const [results, setResults] = useState(null)
@@ -2982,6 +2991,16 @@ window.__ModuleLoader__.load({
           notify(`已订阅 ${result?.imported ?? 0} 个书源${skipped ? `，跳过 ${skipped} 个` : ''}`, skipped ? 'info' : 'success');
           return result;
         } catch { return false; }
+      };
+      const refreshSubscription = async (id) => {
+        setRefreshingSubscriptions((ids) => ids.includes(id) ? ids : [...ids, id]);
+        try {
+          const result = await run(() => call(ctx, 'refreshSubscription', { id }));
+          const changes = [result?.added ? `新增 ${result.added}` : '', result?.updated ? `更新 ${result.updated}` : '', result?.removed ? `移除 ${result.removed}` : ''].filter(Boolean);
+          notify(changes.length ? `订阅已检查：${changes.join('，')}` : '订阅已检查，没有变化', result?.removed ? 'info' : 'success');
+          return result;
+        } catch { await refresh(true); return false; }
+        finally { setRefreshingSubscriptions((ids) => ids.filter(item => item !== id)); }
       };
       const removeSubscription = (id) => run(() => call(ctx, 'removeSubscription', { id }), '已取消订阅，书源仍保留').catch(() => false);
       const toggleSource = (item) => {
@@ -3179,9 +3198,10 @@ window.__ModuleLoader__.load({
               return run(() => pending, '已暂停').catch(() => {});
             }, onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
-          !loading && tab === 'sources' ? h(Sources, { sources, subscriptions: data.subscriptions || [], busy, onImport: importSource,
+          !loading && tab === 'sources' ? h(Sources, { sources, subscriptions: data.subscriptions || [], checkingIds: [...new Set([...(data.subscriptions || []).filter(item => item.checking).map(item => item.id), ...refreshingSubscriptions])], busy, onImport: importSource,
               onRestoreBuiltin: () => run(() => call(ctx, 'restoreBuiltinSources'), '内置书源已恢复').then((result) => { if (result) setNotice({ kind: 'success', text: `已恢复 ${result.added} 个内置书源` }); }, () => {}),
               onSubscribe: subscribeLibrary,
+              onRefresh: refreshSubscription,
               onUnsubscribe: removeSubscription,
               onToggle: toggleSource,
               onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
@@ -3497,7 +3517,8 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-open-cover span{display:flex;align-items:center;justify-content:center;width:100%;height:100%;font-family:Georgia,'Noto Serif SC',serif;font-size:24px;color:#4a3d2c;background:linear-gradient(150deg,#dfcfae,#bfa986)}
 .mr-open-spine{position:absolute;left:0;top:0;bottom:0;width:5px;background:linear-gradient(90deg,rgba(0,0,0,.28),rgba(255,255,255,.12) 62%,transparent)}
 .mr-ambience{position:absolute;inset:0;z-index:0;overflow:hidden;pointer-events:none;contain:strict}.mr-ambience canvas{display:block;width:100%;height:100%}.mr-chapter-scroll,.mr-paged-view{position:relative;z-index:2}.mr-loading,.mr-error-block{position:relative;z-index:2}
-@media(max-width:880px){.mr-tools{display:none}.mr-tabbar{position:absolute;left:0;right:0;bottom:0;z-index:7;display:flex;align-items:center;justify-content:space-around;height:54px;background:var(--reader-bg);border-top:1px solid color-mix(in srgb,var(--reader-text) 10%,transparent)}.mr-tab-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;flex:1;height:100%;padding:0;border:0;background:none;color:var(--reader-muted);font:400 11px/1 'Noto Serif CJK SC',Georgia,serif;letter-spacing:.04em}.mr-tab-btn:hover:not(:disabled){color:var(--reader-text)}.mr-paged-view{padding-bottom:54px}.mr-folio{bottom:70px}.mr-page-window{width:min(var(--mr-text,672px),calc(100% - 40px))}}
+
+  @media(max-width:880px){.mr-tools{display:none}.mr-tabbar{position:absolute;left:0;right:0;bottom:0;z-index:7;display:flex;align-items:center;justify-content:space-around;height:54px;background:var(--reader-bg);border-top:1px solid color-mix(in srgb,var(--reader-text) 10%,transparent)}.mr-tab-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;flex:1;height:100%;padding:0;border:0;background:none;color:var(--reader-muted);font:400 11px/1 'Noto Serif CJK SC',Georgia,serif;letter-spacing:.04em}.mr-tab-btn:hover:not(:disabled){color:var(--reader-text)}.mr-paged-view{padding-bottom:54px}.mr-folio{bottom:70px}.mr-page-window{width:min(var(--mr-text,672px),calc(100% - 40px))}}
 @media(min-width:881px){.mr-page-window,.mr-chapter{width:min(var(--mr-text,672px),calc(100% - 200px))}}
 @media(max-width:720px){
 .mr-reader{position:fixed;inset:0;z-index:2147483000;width:100vw;height:100vh;height:100dvh;border-radius:0}
@@ -3736,7 +3757,8 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-source-side .mr-tag.failed{border-color:var(--mr-update,#a85132);color:var(--mr-update-ink,#9a452a);background:var(--mr-update-soft,#f3e4db)}
 .mr-source-side .mr-button{min-height:28px;padding:0 5px;font-size:11px}
 .mr-subscription-list{display:flex;flex-direction:column;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid var(--mr-line)}
-.mr-subscription-row{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}.mr-subscription-actions{display:flex;align-items:center;gap:4px;flex-shrink:0}
+.mr-subscription-row{display:flex;align-items:center;justify-content:space-between;gap:10px;min-width:0}.mr-subscription-actions{display:flex;align-items:center;justify-content:flex-end;gap:4px;flex-shrink:0;flex-wrap:wrap}.mr-tag.checking{border-style:dashed}
+@media(max-width:640px){.mr-subscription-row{align-items:flex-start;flex-direction:column}.mr-subscription-actions{width:100%;justify-content:space-between}}
 .mr-subscription-copy{display:flex;flex-direction:column;gap:2px;min-width:0}
 .mr-subscription-copy strong{overflow:hidden;font-size:11px;font-weight:500;text-overflow:ellipsis;white-space:nowrap}
 .mr-subscription-copy span{font-size:10px;color:var(--mr-muted)}

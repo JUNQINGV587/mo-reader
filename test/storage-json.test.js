@@ -28,11 +28,12 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
     },
     async content() { return { text: '正文', html: '<p>正文</p>' } },
   }
+  let library = [{ bookSourceName: '订阅源', bookSourceUrl: 'https://sub.example', rules: {} }]
   const service = new ReaderService(ctx, {
     engine,
     fetchRemote: async () => ({
       url: 'https://library.example/sources.json',
-      text: JSON.stringify([{ bookSourceName: '订阅源', bookSourceUrl: 'https://sub.example', rules: {} }]),
+      text: JSON.stringify(library),
     }),
   })
   service.db = await openReaderStorage(ctx)
@@ -67,6 +68,15 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   const chapter = await service.chapter({ bookId: book.id, chapterId: toc[0].id })
   assert.equal(chapter.text, '正文')
 
+  library = [
+    { bookSourceName: '订阅源新版', bookSourceUrl: 'https://sub.example', rules: {} },
+    { bookSourceName: '新增源', bookSourceUrl: 'https://new.example', rules: {} },
+  ]
+  const refreshed = await service.refreshSubscription({ id: subscribed.subscription.id })
+  assert.deepEqual({ added: refreshed.added, updated: refreshed.updated }, { added: 1, updated: 1 })
+  const newSourceId = refreshed.subscription.sourceIds.find(id => id !== subscriptionSourceId)
+  assert.ok(newSourceId)
+
   for (const table of ['sources', 'subscriptions', 'books', 'chapters']) {
     for (const [key, record] of service.db[table].entries()) {
       assert.match(key, /^[a-zA-Z0-9_-]+$/)
@@ -80,5 +90,8 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   assert.equal(service.db.chapters.get(toc[0].id).text, '正文')
   assert.equal(service.db.chapters.get(toc[0].id).url, 'https://example.com/chapter/1')
   assert.equal(service.db.subscriptions.get(subscribed.subscription.id).url, 'https://library.example/sources.json')
+  assert.equal(service.db.sources.get(subscriptionSourceId).name, '订阅源新版')
   assert.equal(service.db.sources.get(subscriptionSourceId).enabled, false)
+  assert.deepEqual(service.db.subscriptions.get(subscribed.subscription.id).sourceIds.slice().sort(), [subscriptionSourceId, newSourceId].sort())
+  assert.equal(service.db.subscriptions.get(subscribed.subscription.id).status, 'ready')
 })

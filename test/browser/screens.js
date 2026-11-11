@@ -29,7 +29,11 @@ const sources = [
   { id: 'src-5', bookSourceName: '番茄小说', bookSourceUrl: 'https://c.example.com' },
   { id: 'local', bookSourceName: '本地导入', bookSourceUrl: 'local:' },
 ]
-const subscriptions = [{ id: 'sub-1', url: 'https://library.example/sources.json', sourceIds: ['src-1', 'src-2'], status: 'ready', lastSuccessAt: '2026-11-11T08:00:00.000Z' }]
+const subscriptions = [
+  { id: 'sub-1', url: 'https://library.example/sources.json', sourceIds: ['src-1', 'src-2'], status: 'ready', lastSuccessAt: '2026-11-11T08:00:00.000Z' },
+  { id: 'sub-2', url: 'https://broken.example/sources.json', sourceIds: ['src-3'], status: 'error', lastSuccessAt: '2026-11-10T08:00:00.000Z', lastFailureAt: '2026-11-11T09:00:00.000Z', lastError: '源库返回的不是有效 JSON。' },
+  { id: 'sub-3', url: 'https://slow.example/sources.json', sourceIds: ['src-4'], status: 'ready', checking: true },
+]
 const results = [
   { name: '凡人外传', author: '忘语', sourceName: '起点中文网', bookUrl: 'https://a.example.com/book/1', kind: '连载中' },
   { name: '剑破苍穹', author: '狂飙的蜗牛', sourceName: '17K 小说', bookUrl: 'https://www.17k.com/book/2', kind: '已完结' },
@@ -41,7 +45,7 @@ const render = (screen) => root.render(shell(screen))
 
 window.screensUI = {
   discover: () => render(h(Discover, { sources, onSearch: noop, onAdd: noop, results, busy: false, failed: 1 })),
-  sources: () => render(h(Sources, { sources, subscriptions, onImport: noop, onRemove: noop, onToggle: noop, onSubscribe: async () => false, onUnsubscribe: noop, busy: false, onRestoreBuiltin: noop })),
+  sources: () => render(h(Sources, { sources, subscriptions, onImport: noop, onRemove: noop, onToggle: noop, onSubscribe: async () => false, onRefresh: (id) => { window.__refreshClicked = id; }, onUnsubscribe: noop, busy: false, onRestoreBuiltin: noop })),
   settings: () => render(h(Settings, props)),
   measure() {
     const screen = document.querySelector('.mr-screen')
@@ -60,7 +64,10 @@ window.screensUI = {
       warning: document.querySelectorAll('.mr-source-warning').length,
       sourceRows: document.querySelectorAll('.mr-source-row').length,
       subscriptionRows: document.querySelectorAll('.mr-subscription-row').length,
-      unsubscribeButtons: document.querySelectorAll('.mr-subscription-row button').length,
+      refreshButtons: document.querySelectorAll('.mr-subscription-actions [title="立即检查订阅更新"]').length,
+      checkingTags: document.querySelectorAll('.mr-subscription-actions .mr-tag.checking').length,
+      failedTags: document.querySelectorAll('.mr-subscription-actions .mr-tag.failed').length,
+      unsubscribeButtons: document.querySelectorAll('.mr-subscription-actions [title="取消订阅，不删除书源"]').length,
       sourceChips: document.querySelectorAll('.mr-source-chip').length,
       disabledRows: document.querySelectorAll('.mr-source-row.is-disabled').length,
       toggleButtons: document.querySelectorAll('.mr-source-side [aria-pressed]').length,

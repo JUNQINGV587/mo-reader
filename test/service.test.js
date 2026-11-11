@@ -5,6 +5,7 @@ import { TypertGatewayService } from '@deepseek-ai/dsh-api-gateway'
 import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol'
 import { ReaderService, REMOTE_METHODS } from '../index.js'
 import { createJob, transitionJob } from '../lib/jobs.js'
+import { stableId } from '../lib/utils.js'
 import { SourceEngine } from '../lib/source-engine.js'
 import { memoryDb, serviceFixture, source } from './helpers.js'
 
@@ -197,14 +198,33 @@ test('Service.init opens storage, recovers persisted jobs and registers hourly u
     close: async () => { closed = true },
   }
   ctx.provide('storageDomain', { open: async () => domain })
-  const service = new ReaderService(ctx, { engine: engineFixture() })
+  let subscriptionFetches = 0
+  const service = new ReaderService(ctx, {
+    engine: engineFixture(),
+    fetchRemote: async () => {
+      subscriptionFetches += 1
+      return { text: JSON.stringify([{ bookSourceName: '订阅源', bookSourceUrl: 'https://sub.example' }]) }
+    },
+  })
   await db.books.put('local-book', { id: 'local-book', sourceId: 'local', bookUrl: 'local:local-book', name: 'Local', local: true })
+  const subscriptionUrl = 'https://library.example/sources.json'
+  await db.subscriptions.put(stableId('subscription', subscriptionUrl), {
+    id: stableId('subscription', subscriptionUrl),
+    url: subscriptionUrl,
+    allowHttp: false,
+    sourceIds: [],
+    status: 'ready',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  })
   const running = transitionJob(createJob({ bookId: 'local-book', total: 0 }), 'start')
   await db.jobs.put(running.id, running)
   let intervalMs
+  let intervalCallback
   let stopIntervalCalled = false
-  ctx.interval = (_callback, ms) => {
+  ctx.interval = (callback, ms) => {
     intervalMs = ms
+    intervalCallback = callback
     return () => { stopIntervalCalled = true }
   }
   let dispose
@@ -218,7 +238,11 @@ test('Service.init opens storage, recovers persisted jobs and registers hourly u
   assert.equal(db.jobs.get(running.id).status, 'completed')
   assert.ok(db.jobs.get(running.id).recoveredAt)
   assert.equal(intervalMs, 3_600_000)
+  assert.equal(subscriptionFetches, 1, '启动时应补查订阅')
+  assert.ok([...db.sources.entries()].some(([, item]) => item.bookSourceUrl === 'https://sub.example'))
   assert.equal(service.db.sources, db.sources)
+  await intervalCallback()
+  assert.equal(subscriptionFetches, 2, '每小时应再次检查订阅')
   await dispose()
   assert.equal(closed, true)
   assert.equal(service.disposed, true)
