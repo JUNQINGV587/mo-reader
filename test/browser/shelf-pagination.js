@@ -180,6 +180,34 @@ window.shelfTest = {
     assertDesktopThemeAndWidth()
     return metrics()
   },
+  async tailLayout() {
+    window.__updateShelfBooks(books.slice(0, 5))
+    await waitFor(() => page()?.querySelectorAll('[data-book-id]').length === 4, '尾页 fixture 未加载')
+    await settled()
+    const pagerButtons = () => [...document.querySelectorAll('.mr-shelf-pager button')].filter((button) => /^\d+$/.test(button.textContent.trim()))
+    const target = pagerButtons().at(-1)
+    if (target && target.textContent.trim() !== '1') {
+      target.click()
+      await waitFor(() => document.querySelector('.mr-shelf-pager button[aria-current="page"]')?.textContent.trim() === target.textContent.trim(), '没有切到最后一页')
+      await settled()
+    }
+    const grid = page()
+    const pieces = grid.querySelectorAll('[data-book-id]').length
+    const columns = Number(getComputedStyle(grid).getPropertyValue('--shelf-columns'))
+    const expectedRows = Math.ceil(pieces / columns)
+    const trackCount = getComputedStyle(grid).gridTemplateRows.split(' ').filter(Boolean).length
+    const gridRect = grid.getBoundingClientRect()
+    const pagerRect = document.querySelector('.mr-shelf-pager').getBoundingClientRect()
+    const wallRect = document.querySelector('.mr-shelf-wall').getBoundingClientRect()
+    assert(trackCount === expectedRows, `尾页保留了空行：${pieces} 本 / ${columns} 列，${trackCount} 行，应为 ${expectedRows}`)
+    assert(pagerRect.top - gridRect.bottom >= 0 && pagerRect.top - gridRect.bottom <= 24, `尾页页码没有紧跟书籍：${gridRect.bottom}/${pagerRect.top}`)
+    assert(gridRect.height < wallRect.height, '尾页书籍区仍撑满空行')
+    const result = { pieces, columns, rows: trackCount, gap: Math.round(pagerRect.top - gridRect.bottom), gridHeight: Math.round(gridRect.height), wallHeight: Math.round(wallRect.height) }
+    window.__updateShelfBooks(books)
+    await waitFor(() => page()?.querySelectorAll('[data-book-id]').length > 4, '尾页 fixture 未恢复')
+    await settled()
+    return result
+  },
   async desktopMotion() {
     window.__setShelfReducedMotion(false)
     await settled()

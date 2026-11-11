@@ -95,6 +95,7 @@ try {
     await viewport(width, height)
     report.resizes.push(await evaluate('window.shelfTest.afterResize()', true))
   }
+  report.tailLayout = await evaluate('window.shelfTest.tailLayout()', true)
   report.motion = await evaluate('window.shelfTest.desktopMotion()', true)
   report.selection = await evaluate('window.shelfTest.pollingAndSelection()', true)
   await viewport(1280, 1200)

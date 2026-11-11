@@ -351,12 +351,21 @@ window.__ModuleLoader__.load({
         const rows = safeHeight >= 540 ? 3 : 2;
         return { mobile: true, columns: 3, rows, capacity: 3 * rows, rowHeight: 0 };
       }
-      const columns = Math.max(3, Math.min(8, Math.floor(safeWidth / 145) || 3));
       const gap = 12;
-      const tileWidth = Math.max(0, (safeWidth - gap * (columns - 1)) / columns);
-      const rowHeight = Math.max(170, tileWidth * 4 / 3 + 64);
-      const rows = Math.max(1, Math.min(3, Math.floor((safeHeight + gap) / (rowHeight + gap)) || 1));
-      return { mobile: false, columns, rows, capacity: columns * rows, rowHeight };
+      const availableHeight = Math.max(0, safeHeight - 52);
+      const widest = Math.max(3, Math.min(8, Math.floor(safeWidth / 145) || 3));
+      const narrowest = Math.max(3, Math.min(widest, Math.floor(safeWidth / 240) || 3));
+      let best = null;
+      // 同时考虑宽度和高度，避免宽屏只按宽度塞满列、把封面压得过小。
+      for (let columns = narrowest; columns <= widest; columns += 1) {
+        const tileWidth = Math.max(0, (safeWidth - 18 * (columns - 1)) / columns);
+        let rowHeight = Math.max(170, tileWidth * 4 / 3 + 64);
+        const rows = Math.max(1, Math.min(3, Math.floor((availableHeight + gap) / (rowHeight + gap)) || 1));
+        if (rows === 1) rowHeight = Math.min(rowHeight, Math.max(120, availableHeight));
+        const score = tileWidth * rows * columns;
+        if (!best || score > best.score + 1) best = { columns, rows, rowHeight, score };
+      }
+      return { mobile: false, columns: best.columns, rows: best.rows, capacity: best.columns * best.rows, rowHeight: best.rowHeight };
     }
 
     function shelfPageCount(itemCount, geometry) {
@@ -772,6 +781,7 @@ window.__ModuleLoader__.load({
       const emptyTitle = layout.count === 0 ? '窗边还空着' : normalizedQuery ? `没有找到「${query.trim()}」` : folderFilter ? '这个文件夹还空着' : '没有可展示的书';
       const emptyDetail = layout.count === 0 ? '去发现搜书，或导入本地书籍。' : normalizedQuery ? '换个书名或作者，也可以看看在线结果。' : folderFilter ? '移动书籍到这里，或返回书库。' : '全部藏书都还在，换个搜索或排序试试。';
       const pageNumbers = [...new Set([0, pageData.pageCount - 1, pageData.page - 1, pageData.page, pageData.page + 1].filter((index) => index >= 0 && index < pageData.pageCount))].sort((a, b) => a - b);
+      const renderedRows = geometry.mobile ? geometry.rows : Math.max(1, Math.min(geometry.rows, Math.ceil(pageData.items.length / geometry.columns)))
 
       return h('div', { className: `mr-shelf mr-window-shelf${reducedMotion ? ' mr-reduced' : ''}${mobileSearch ? ' mr-mobile-search-open' : ''}${selectMode ? ' mr-selecting' : ''}` },
         h('div', { className: 'mr-shelf-topbar' },
@@ -870,7 +880,7 @@ window.__ModuleLoader__.load({
                     key: geometry.mobile ? 'mobile' : pageMotion ? `desktop-${pageMotion.seq}` : 'desktop',
                     className: `mr-shelf-grid${geometry.mobile ? ' mr-mobile-track' : ''}${!geometry.mobile && !reducedMotion && pageMotion ? ` mr-page-${pageMotion.direction}` : ''}`,
                     ref: trackRef,
-                    style: { '--shelf-columns': geometry.columns, '--shelf-rows': geometry.rows },
+                    style: { '--shelf-columns': geometry.columns, '--shelf-rows': renderedRows, '--shelf-row-height': `${geometry.rowHeight}px` },
                     'data-page': pageData.page,
                     'data-page-count': pageData.pageCount,
                     'data-capacity': geometry.capacity,
@@ -3686,8 +3696,8 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-window-shelf .mr-shelf-gallery{display:flex;flex-direction:column;gap:16px;flex:1 1 auto;align-items:stretch;min-height:0}.mr-window-shelf.mr-no-hero .mr-shelf-gallery{grid-template-columns:minmax(0,1fr)}
 .mr-window-shelf .mr-shelf-hero{flex:0 0 auto;display:grid;grid-template-columns:110px minmax(0,1fr);align-items:center;gap:18px;min-width:0;padding:16px;border:1px solid var(--mr-border);border-radius:4px;background:#eee6d4;overflow:hidden}
 .mr-window-shelf .mr-shelf-hero-cover{width:110px;max-width:110px;justify-self:center}.mr-window-shelf .mr-shelf-hero-cover .mr-shelf-cover{aspect-ratio:3/4}.mr-window-shelf .mr-shelf-hero-info{align-self:center}.mr-window-shelf .mr-shelf-hero-title{font-size:22px;white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.mr-window-shelf .mr-shelf-hero-by{white-space:normal}.mr-window-shelf .mr-shelf-cta{margin-top:12px;min-height:36px;padding:0 14px}
-.mr-shelf-wall{position:relative;flex:1 1 auto;min-width:0;min-height:0;display:grid;grid-template-rows:minmax(0,1fr) auto}
-.mr-window-shelf .mr-shelf-grid:not(.mr-mobile-track){min-height:0;display:grid;grid-template-columns:repeat(var(--shelf-columns),minmax(0,1fr));grid-template-rows:repeat(var(--shelf-rows),minmax(0,1fr));gap:12px 18px;align-content:stretch}
+.mr-shelf-wall{position:relative;flex:1 1 auto;min-width:0;min-height:0;display:grid;grid-template-rows:auto auto;align-content:center;row-gap:16px}
+.mr-window-shelf .mr-shelf-grid:not(.mr-mobile-track){min-height:0;display:grid;grid-template-columns:repeat(var(--shelf-columns),minmax(0,1fr));grid-template-rows:repeat(var(--shelf-rows),var(--shelf-row-height,minmax(0,1fr)));gap:12px 18px;align-content:center}
 @keyframes mrShelfPageNext{from{opacity:0;transform:translateX(26px)}to{opacity:1;transform:translateX(0)}}
 @keyframes mrShelfPagePrev{from{opacity:0;transform:translateX(-26px)}to{opacity:1;transform:translateX(0)}}
 .mr-window-shelf .mr-shelf-grid.mr-page-next{animation:mrShelfPageNext .22s cubic-bezier(.2,.7,.2,1) both}
