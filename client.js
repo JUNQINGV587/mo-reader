@@ -1102,11 +1102,13 @@ window.__ModuleLoader__.load({
             sources.length ? sources.map((source) => {
               const id = source.id || source.bookSourceUrl;
               const name = source.bookSourceName || source.name || '书源';
+              const unsupportedLabels = { login: '登录', captcha: '验证码', payment: '付费', webview: '内置网页' };
+              const unsupported = (Array.isArray(source.unsupported) ? source.unsupported : []).map((item) => unsupportedLabels[item] || item);
               return h('article', { className: 'mr-source-row', key: id },
                 h('span', { className: 'mr-source-icon', 'aria-hidden': true }, name.slice(0, 1)),
                 h('div', null, h('h3', null, name), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl)),
                 h('div', { className: 'mr-source-side' },
-                  h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || '' }, source.lastError ? '解析失败 · 需更新规则' : source.builtin ? '内置 · 可用' : (source.compatibility || '基础规则')),
+                  h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || (unsupported.length ? `不支持：${unsupported.join('、')}` : '') }, source.lastError ? '解析失败 · 需更新规则' : unsupported.length ? `不支持 · ${unsupported.join('/')}` : source.builtin ? '内置 · 可用' : (source.compatibility || '基础规则')),
                   source.builtin ? null : h(Button, { kind: 'text danger', onClick: () => onRemove(source), disabled: busy }, '移除')));
             }) : h(Empty, { icon: 'source', title: '暂无书源', detail: '导入后即可搜索和追更。' }))));
     }

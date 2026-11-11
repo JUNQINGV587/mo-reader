@@ -5,6 +5,7 @@ import { TypertGatewayService } from '@deepseek-ai/dsh-api-gateway'
 import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol'
 import { ReaderService, REMOTE_METHODS } from '../index.js'
 import { createJob, transitionJob } from '../lib/jobs.js'
+import { SourceEngine } from '../lib/source-engine.js'
 import { memoryDb, serviceFixture, source } from './helpers.js'
 
 function engineFixture() {
@@ -91,6 +92,56 @@ test('host core loop: source, shelf, toc, sanitized chapter, progress, notes and
   assert.equal((await service.state()).notes.length, 0)
   await service.removeBook({ bookId: book.id })
   assert.equal((await service.state()).books.length, 0)
+})
+
+test('service full chain runs an XPath source through search, toc, content and download', async () => {
+  const engine = new SourceEngine({
+    fetch: async (url) => {
+      if (url.includes('/search')) return {
+        url,
+        headers: { 'content-type': 'text/html' },
+        text: '<div class="book"><span class="name">XPath 书</span><span class="author">作者</span><a href="/book/x">详情</a></div>',
+      }
+      if (url.includes('/chapter/')) return {
+        url,
+        headers: { 'content-type': 'text/html' },
+        text: '<div id="content"><p>第一段</p><p>第二段</p></div>',
+      }
+      return {
+        url,
+        headers: { 'content-type': 'text/html' },
+        text: '<h1>XPath 书</h1><span class="author">作者</span><ul><li class="chapter"><a href="/chapter/x1">第一章</a></li></ul>',
+      }
+    },
+  })
+  const { service, db } = await serviceFixture(engine)
+  const xpathSource = await service.importSource({
+    text: JSON.stringify({
+      bookSourceName: 'XPath 样本',
+      bookSourceUrl: 'https://example.com',
+      rules: {
+        search: {
+          url: '/search?q={{key}}', bookList: '//div[@class="book"]', name: '//span[@class="name"]/text()',
+          author: '//span[@class="author"]/text()', bookUrl: '//a/@href',
+        },
+        bookInfo: { name: '//h1/text()', author: '//span[@class="author"]/text()' },
+        toc: { chapterList: '//li[@class="chapter"]', chapterName: '//a/text()', chapterUrl: '//a/@href' },
+        content: { content: '@xpath://div[@id="content"]/p/text()' },
+      },
+    }),
+  })
+  const found = await service.search({ sourceId: xpathSource.id, query: 'XPath' })
+  assert.equal(found.items[0].name, 'XPath 书')
+  const book = await service.addBook({ sourceId: xpathSource.id, bookUrl: found.items[0].bookUrl })
+  assert.equal(book.name, 'XPath 书')
+  const toc = await service.toc({ bookId: book.id })
+  assert.equal(toc[0].title, '第一章')
+  const chapter = await service.chapter({ bookId: book.id, chapterId: toc[0].id })
+  assert.equal(chapter.text, '第一段\n第二段')
+  const job = await service.download({ bookId: book.id })
+  await service.runningJobs.get(job.id)
+  assert.equal(db.chapters.get(toc[0].id).text, '第一段\n第二段')
+  assert.equal((await service.state()).books[0].download.status, 'completed')
 })
 
 test('download persists queued state before execution, caches content and completes', async () => {

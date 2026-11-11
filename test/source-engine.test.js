@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { SourceEngine } from '../lib/source-engine.js'
+import { extractOne, normalizeSource, responseDocument } from '../lib/rules.js'
 
 const source = {
   id: 'https://example.com', name: 'Example', bookSourceUrl: 'https://example.com', allowHttp: false,
@@ -120,6 +121,134 @@ test('source engine runs safe JS fields in search and content', async () => {
   assert.equal(content.text.includes('bad()'), false)
   const scriptedToc = { ...jsSource, rules: { ...jsSource.rules, toc: { url: '/toc', list: '$.items[*]', chapterName: '@js:document.name', chapterUrl: '@js:document.url' } } }
   assert.equal((await engine.toc(scriptedToc, { id: 'a', name: 'JS 书', bookUrl: found.items[0].bookUrl })).length, 1)
+})
+
+test('source engine runs a representative XPath source through search, toc and content', async () => {
+  const engine = new SourceEngine({
+    fetch: async (url) => {
+      if (url.includes('/search')) return {
+        url,
+        headers: { 'content-type': 'text/html' },
+        text: '<div class="book"><span class="name">XPath 书</span><span class="author">作者</span><a href="/book/x">详情</a></div>',
+      }
+      if (url.includes('/toc') || url.includes('/book/x')) return {
+        url,
+        headers: { 'content-type': 'text/html' },
+        text: '<ul><li class="chapter"><a href="/chapter/x1">第一章</a></li></ul>',
+      }
+      return {
+        url,
+        headers: { 'content-type': 'text/html' },
+        text: '<div id="content"><p>第一段</p><p>第二段</p><script>bad()</script></div>',
+      }
+    },
+  })
+  const xpathSource = {
+    ...source,
+    rules: {
+      search: {
+        url: '/search', bookList: '//div[@class="book"]', name: '//span[@class="name"]/text()',
+        author: '//span[@class="author"]/text()', bookUrl: '//a/@href',
+      },
+      bookInfo: {},
+      toc: { chapterList: '//li[@class="chapter"]', chapterName: '//a/text()', chapterUrl: '//a/@href' },
+      content: { content: '@xpath://div[@id="content"]/p/text()' },
+    },
+  }
+  const found = await engine.search(xpathSource, { query: 'x' })
+  assert.equal(found.items[0].name, 'XPath 书')
+  assert.equal(found.items[0].bookUrl, 'https://example.com/book/x')
+  const book = { id: 'xpath-book', name: 'XPath 书', bookUrl: found.items[0].bookUrl }
+  const chapters = await engine.toc(xpathSource, book)
+  assert.equal(chapters[0].title, '第一章')
+  const content = await engine.content(xpathSource, book, chapters[0])
+  assert.equal(content.text, '第一段\n第二段')
+  assert.equal(content.text.includes('bad()'), false)
+
+  assert.equal(extractOne(responseDocument('<a id="anchor">x</a>'), '//a/@id'), 'anchor')
+  const unsupported = { ...xpathSource, rules: { ...xpathSource.rules, search: { ...xpathSource.rules.search, bookList: '//div/following-sibling::div' } } }
+  await assert.rejects(engine.search(unsupported, { query: 'x' }), /XPath|unsupported/)
+})
+
+test('source engine sends JSON POST bodies and accepts Legado JSONPath without a leading dollar', async () => {
+  const calls = []
+  const engine = new SourceEngine({
+    fetch: async (url, config) => {
+      calls.push({ url, config })
+      return { url, headers: { 'content-type': 'application/json' }, text: '{"data":[{"name":"JSON 书","url":"/book/json"}]}' }
+    },
+  })
+  const jsonSource = {
+    ...source,
+    rules: {
+      search: {
+        url: '/api/search', method: 'POST', body: '{"q":"{{key}}","page":{{page}}}',
+        headers: { 'Content-Type': 'application/json' }, bookList: 'data[*]', name: 'name', bookUrl: 'url',
+      },
+      bookInfo: {}, toc: {}, content: {},
+    },
+  }
+  const result = await engine.search(jsonSource, { query: 'a"b\\c', page: 2 })
+  assert.equal(calls[0].config.method, 'POST')
+  assert.equal(calls[0].config.jsonBody, true)
+  assert.equal(calls[0].config.headers['Content-Type'], 'application/json')
+  assert.deepEqual(JSON.parse(calls[0].config.body), { q: 'a"b\\c', page: 2 })
+  assert.equal(result.items[0].bookUrl, 'https://example.com/book/json')
+})
+
+test('source engine detects repeated toc and content pagination instead of fetching forever', async () => {
+  const engine = new SourceEngine({
+    maxTocPages: 3,
+    maxContentPages: 3,
+    fetch: async (url) => ({
+      url,
+      headers: { 'content-type': 'text/html' },
+      text: url.includes('/chapter')
+        ? '<div id="content">同一段正文</div>'
+        : '<div class="chapter"><a href="/chapter/1">第一章</a></div>',
+    }),
+  })
+  const loopingToc = {
+    ...source,
+    rules: {
+      ...source.rules,
+      toc: { url: '/toc', chapterList: '.chapter', chapterName: 'a', chapterUrl: 'a@href', nextPage: 'https://example.com/toc' },
+    },
+  }
+  await assert.rejects(engine.toc(loopingToc, { id: 'loop', name: '循环', bookUrl: 'https://example.com/book/loop' }), (error) => error.code === 'reader/pagination-loop')
+
+  const loopingContent = {
+    ...source,
+    rules: {
+      ...source.rules,
+      content: { url: '/chapter', content: '#content', nextPage: 'https://example.com/chapter' },
+    },
+  }
+  await assert.rejects(
+    engine.content(loopingContent, { id: 'loop', name: '循环', bookUrl: 'https://example.com/book/loop' }, { id: 'c', title: '第一章', url: 'https://example.com/chapter/1' }),
+    (error) => error.code === 'reader/pagination-loop',
+  )
+})
+
+test('normalization marks unsupported login, captcha, payment and WebView capabilities', async () => {
+  const normalized = normalizeSource({
+    bookSourceName: '需要登录的源', bookSourceUrl: 'https://example.com',
+    loginUrl: '<js>login()</js>', captcha: true, payUrl: 'https://example.com/pay',
+    rules: { search: { url: '/search', bookList: '.book' } },
+  })
+  assert.deepEqual(normalized.unsupported, ['captcha', 'login', 'payment'])
+  assert.throws(() => normalizeSource({
+    bookSourceName: '网页源', bookSourceUrl: 'https://example.com',
+    rules: { content: { content: 'webView://chapter' } },
+  }), /WebView|webview/)
+  const blocked = normalizeSource({
+    bookSourceName: '需要登录的源', bookSourceUrl: 'https://example.com', loginUrl: '<js>login()</js>',
+    rules: { search: { url: '/search', bookList: '.book' } },
+  })
+  let calls = 0
+  const engine = new SourceEngine({ fetch: async () => { calls += 1; throw new Error('must not fetch') } })
+  await assert.rejects(engine.search(blocked, { query: 'x' }), /登录|unsupported/)
+  assert.equal(calls, 0)
 })
 
 test('source engine supports JSONPath search and empty discovery', async () => {
