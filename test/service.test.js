@@ -208,11 +208,13 @@ test('Service.init opens storage, recovers persisted jobs and registers hourly u
   })
   await db.books.put('local-book', { id: 'local-book', sourceId: 'local', bookUrl: 'local:local-book', name: 'Local', local: true })
   const subscriptionUrl = 'https://library.example/sources.json'
+  const subscriptionSourceId = stableId('source', 'https://sub.example')
+  await db.sources.put(subscriptionSourceId, { id: subscriptionSourceId, name: '旧订阅源', bookSourceUrl: 'https://sub.example', enabled: true, rules: {} })
   await db.subscriptions.put(stableId('subscription', subscriptionUrl), {
     id: stableId('subscription', subscriptionUrl),
     url: subscriptionUrl,
     allowHttp: false,
-    sourceIds: [],
+    sourceIds: [subscriptionSourceId],
     status: 'ready',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -239,7 +241,7 @@ test('Service.init opens storage, recovers persisted jobs and registers hourly u
   assert.ok(db.jobs.get(running.id).recoveredAt)
   assert.equal(intervalMs, 3_600_000)
   assert.equal(subscriptionFetches, 1, '启动时应补查订阅')
-  assert.ok([...db.sources.entries()].some(([, item]) => item.bookSourceUrl === 'https://sub.example'))
+  assert.equal(db.sources.get(subscriptionSourceId).name, '订阅源')
   assert.equal(service.db.sources, db.sources)
   await intervalCallback()
   assert.equal(subscriptionFetches, 2, '每小时应再次检查订阅')

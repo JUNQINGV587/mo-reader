@@ -49,3 +49,22 @@ test('backup import rejects secrets and malformed references', () => {
   assert.throws(() => parseBackup('{}'), /格式或版本/)
   assert.throws(() => parseBackup(undefined), /data 必须/)
 })
+
+test('backup never carries an unconfirmed candidate snapshot', () => {
+  const json = createBackup({
+    sources: [],
+    books: [],
+    chapters: [],
+    settings: {},
+    notes: [],
+    subscriptions: [{
+      id: 'sub', url: 'https://example.com/sources.json', sourceIds: [], status: 'pending',
+      pending: { candidates: [{ name: '候选', bookSourceUrl: 'https://new.example', rules: {} }], permissions: { origins: ['https://new.example'], capabilities: ['js'] } },
+    }],
+  })
+  assert.equal(json.includes('候选'), false)
+  assert.equal(json.includes('pending'), false)
+  const parsed = parseBackup(json)
+  assert.equal(parsed.subscriptions[0].status, 'ready')
+  assert.equal(parsed.subscriptions[0].pending, undefined)
+})

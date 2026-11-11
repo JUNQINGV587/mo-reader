@@ -70,7 +70,7 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
 
   library = [
     { bookSourceName: '订阅源新版', bookSourceUrl: 'https://sub.example', rules: {} },
-    { bookSourceName: '新增源', bookSourceUrl: 'https://new.example', rules: {} },
+    { bookSourceName: '新增源', bookSourceUrl: 'https://sub.example/extra', rules: {} },
   ]
   const refreshed = await service.refreshSubscription({ id: subscribed.subscription.id })
   assert.deepEqual({ added: refreshed.added, updated: refreshed.updated }, { added: 1, updated: 1 })
@@ -94,4 +94,26 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   assert.equal(service.db.sources.get(subscriptionSourceId).enabled, false)
   assert.deepEqual(service.db.subscriptions.get(subscribed.subscription.id).sourceIds.slice().sort(), [subscriptionSourceId, newSourceId].sort())
   assert.equal(service.db.subscriptions.get(subscribed.subscription.id).status, 'ready')
+
+  library = [
+    { bookSourceName: '订阅源新版', bookSourceUrl: 'https://sub.example', rules: {} },
+    { bookSourceName: '新站候选', bookSourceUrl: 'https://pending.example', rules: {} },
+  ]
+  const pending = await service.refreshSubscription({ id: subscribed.subscription.id })
+  assert.equal(pending.pending, true)
+  assert.equal(service.db.sources.get(subscriptionSourceId).name, '订阅源新版')
+  assert.equal([...service.db.sources.entries()].map(([, source]) => source).some(source => source.bookSourceUrl === 'https://pending.example'), false)
+
+  await service.db.domain.close()
+  service.db = await openReaderStorage(ctx)
+  const persisted = service.db.subscriptions.get(subscribed.subscription.id)
+  assert.equal(persisted.status, 'pending')
+  assert.equal(persisted.pending.candidates.some(source => source.bookSourceUrl === 'https://pending.example'), true)
+  assert.equal([...service.db.sources.entries()].map(([, source]) => source).some(source => source.bookSourceUrl === 'https://pending.example'), false)
+
+  await service.confirmSubscriptionUpdate({ id: subscribed.subscription.id })
+  const confirmed = service.db.subscriptions.get(subscribed.subscription.id)
+  assert.equal(confirmed.status, 'ready')
+  assert.equal(confirmed.pending, undefined)
+  assert.equal([...service.db.sources.entries()].map(([, source]) => source).some(source => source.bookSourceUrl === 'https://pending.example'), true)
 })

@@ -14,14 +14,14 @@ import { assertSettingKeys, normalizeReaderPrefs, normalizeSettings } from './li
 import { normalizeSource } from './lib/rules.js'
 import { BUILTIN_SOURCES } from './lib/builtin-sources.js'
 import { SourceEngine } from './lib/source-engine.js'
-import { parseSourceLibrary, planSourceRefresh } from './lib/subscription-refresh.js'
+import { parseSourceLibrary, permissionExpansion, planSourceRefresh } from './lib/subscription-refresh.js'
 import { DEFAULT_SETTINGS, entries, openReaderStorage } from './lib/storage.js'
 import { base64ToBuffer, clone, id, MAX_ARCHIVE_BYTES, MAX_TEXT_BYTES, now, pageNumber, requiredString, stableId, textToBuffer } from './lib/utils.js'
 
 const COVER_MAX_BYTES = 2 * 1024 * 1024
 
 export const REMOTE_METHODS = Object.freeze([
-  'state', 'importSource', 'subscribeSourceLibrary', 'refreshSubscription', 'removeSubscription', 'restoreBuiltinSources', 'removeSource', 'setSourceEnabled', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
+  'state', 'importSource', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'restoreBuiltinSources', 'removeSource', 'setSourceEnabled', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter',
   'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
   'exportBackup', 'importBackup', 'fetchCover', 'cacheBookCover', 'bookCandidates', 'applyBookMeta',
   'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead', 'exportNotes',
@@ -41,6 +41,7 @@ export class ReaderService extends TypertRemoteService {
     this.fetchRemote = options.fetchRemote ?? fetchRemote
     this.runningJobs = new Map()
     this.subscriptionRefreshes = new Map()
+    this.subscriptionMutations = new Map()
     this.coverCache = new Map()
     this.disposed = false
     const service = this
@@ -137,6 +138,37 @@ export class ReaderService extends TypertRemoteService {
     return { ...clone(source), enabled: source.enabled !== false }
   }
 
+  withSubscriptionLock(id, operation) {
+    const previous = this.subscriptionMutations.get(id) ?? Promise.resolve()
+    const next = previous.catch(() => {}).then(operation)
+    this.subscriptionMutations.set(id, next)
+    return next.finally(() => {
+      if (this.subscriptionMutations.get(id) === next) this.subscriptionMutations.delete(id)
+    })
+  }
+
+  async withSubscriptionLocks(ids, operation) {
+    const unique = [...new Set(ids)].sort()
+    const run = async (index) => {
+      if (index >= unique.length) return operation()
+      return this.withSubscriptionLock(unique[index], () => run(index + 1))
+    }
+    return run(0)
+  }
+
+  async subscriptionMutation(id, operation) {
+    const running = this.subscriptionRefreshes.get(id)
+    if (running) await running.catch(() => {})
+    return this.withSubscriptionLock(id, operation)
+  }
+
+  subscriptionView(subscription) {
+    const { pending, ...rest } = subscription
+    const view = { ...clone(rest), checking: this.subscriptionRefreshes.has(subscription.id) }
+    if (pending) view.pending = { createdAt: pending.createdAt, permissions: clone(pending.permissions), changes: clone(pending.changes) }
+    return view
+  }
+
   async saveSource(source) {
     const previous = this.db.sources.get(source.id)
     const next = {
@@ -188,10 +220,7 @@ export class ReaderService extends TypertRemoteService {
     this.assertReady()
     return {
       sources: [importedSource(), ...entries(this.db.sources)].map(source => this.sourceView(source)),
-      subscriptions: entries(this.db.subscriptions).map(subscription => ({
-        ...clone(subscription),
-        checking: this.subscriptionRefreshes.has(subscription.id),
-      })),
+      subscriptions: entries(this.db.subscriptions).map(subscription => this.subscriptionView(subscription)),
       books: entries(this.db.books).map(book => this.bookView(book)),
       folders: entries(this.db.folders).map(clone),
       jobs: entries(this.db.jobs).map(jobView),
@@ -241,16 +270,26 @@ export class ReaderService extends TypertRemoteService {
     const source = this.source(args.id, { allowDisabled: true })
     if (source.builtin) throw new ReaderError('reader/unsupported-source', '内置书源不能删除，可以关闭。')
     if (entries(this.db.books).some(book => book.sourceId === source.id)) throw new ReaderError('reader/source-in-use', '请先从书架移除该书源的书籍。')
-    await this.db.sources.delete(source.id)
-    for (const subscription of entries(this.db.subscriptions)) {
-      if (!subscription.sourceIds?.includes(source.id)) continue
-      await this.db.subscriptions.put(subscription.id, {
-        ...subscription,
-        sourceIds: subscription.sourceIds.filter(id => id !== source.id),
-        updatedAt: now(),
-      })
-    }
-    return { removed: true, id: source.id }
+    const affected = entries(this.db.subscriptions).filter(subscription => subscription.sourceIds?.includes(source.id))
+    return this.withSubscriptionLocks(affected.map(subscription => subscription.id), async () => {
+      for (const original of affected) {
+        const subscription = this.db.subscriptions.get(original.id) ?? original
+        if (!subscription.sourceIds?.includes(source.id)) continue
+        const pendingInvalid = subscription.pending?.candidates?.some(candidate => candidate.id === source.id)
+        const next = {
+          ...subscription,
+          sourceIds: subscription.sourceIds.filter(id => id !== source.id),
+          updatedAt: now(),
+        }
+        if (pendingInvalid) {
+          delete next.pending
+          next.status = 'ready'
+        }
+        await this.db.subscriptions.put(subscription.id, next)
+      }
+      await this.db.sources.delete(source.id)
+      return { removed: true, id: source.id }
+    })
   }
 
   async setSourceEnabled(args) {
@@ -304,6 +343,7 @@ export class ReaderService extends TypertRemoteService {
       ...(skipped.length ? { lastFailureAt: timestamp } : {}),
       createdAt: previous?.createdAt ?? timestamp,
       updatedAt: timestamp,
+      pending: undefined,
       ...(skipped.length ? { lastError: `${skipped.length} 个书源未通过校验` } : { lastError: undefined }),
     }
     await this.db.subscriptions.put(id, subscription)
@@ -338,18 +378,91 @@ export class ReaderService extends TypertRemoteService {
   runSubscriptionRefresh(subscription) {
     const running = this.subscriptionRefreshes.get(subscription.id)
     if (running) return running
-    const task = this.performSubscriptionRefresh(subscription).finally(() => {
+    const task = this.withSubscriptionLock(subscription.id, () => this.performSubscriptionRefresh(subscription)).finally(() => {
       if (this.subscriptionRefreshes.get(subscription.id) === task) this.subscriptionRefreshes.delete(subscription.id)
     })
     this.subscriptionRefreshes.set(subscription.id, task)
     return task
   }
 
-  async performSubscriptionRefresh(subscription) {
-    const checkedAt = now()
-    const allowHttp = subscription.allowHttp === true
+  buildSubscriptionPlan(subscription, candidates) {
+    const allSubscriptions = entries(this.db.subscriptions)
+    const otherOwned = new Set(allSubscriptions
+      .filter(item => item.id !== subscription.id)
+      .flatMap(item => item.sourceIds ?? []))
+    const affected = new Set([...(subscription.sourceIds ?? []), ...candidates.map(source => source.id)])
+    const existing = new Map([...affected].map(sourceId => [sourceId, this.db.sources.get(sourceId)]))
+    return { plan: planSourceRefresh(subscription, candidates, existing, otherOwned), affected }
+  }
+
+  subscriptionAllowHttp(subscription) {
+    return subscription.allowHttp === true
       || subscription.url.startsWith('http://')
       || (subscription.sourceIds ?? []).some(sourceId => this.db.sources.get(sourceId)?.bookSourceUrl?.startsWith('http://'))
+  }
+
+  async applySubscriptionPlan(subscription, candidates, checkedAt, allowHttp = this.subscriptionAllowHttp(subscription)) {
+    const { plan } = this.buildSubscriptionPlan(subscription, candidates)
+    const snapshotIds = new Set(subscription.sourceIds ?? [])
+    const changedIds = new Set([...plan.writes.map(item => item.source.id), ...plan.deletes])
+    const backups = new Map([...changedIds].map(sourceId => [sourceId, this.db.sources.get(sourceId) ? clone(this.db.sources.get(sourceId)) : undefined]))
+    try {
+      for (const item of plan.writes) await this.db.sources.put(item.source.id, item.source)
+      for (const sourceId of plan.deletes) await this.db.sources.delete(sourceId)
+      const succeededAt = now()
+      const latest = this.db.subscriptions.get(subscription.id) ?? subscription
+      const addedDuringRefresh = (latest.sourceIds ?? []).filter(sourceId => !snapshotIds.has(sourceId))
+      const next = {
+        ...latest,
+        sourceIds: [...new Set([...plan.candidateIds, ...addedDuringRefresh])],
+        allowHttp: allowHttp || latest.allowHttp === true || latest.url.startsWith('http://'),
+        status: 'ready',
+        lastCheckedAt: checkedAt,
+        lastSuccessAt: succeededAt,
+        lastFailureAt: undefined,
+        lastError: undefined,
+        updatedAt: succeededAt,
+      }
+      delete next.pending
+      await this.db.subscriptions.put(subscription.id, next)
+      return {
+        added: plan.added,
+        updated: plan.updated,
+        removed: plan.removed,
+        unchanged: plan.unchanged,
+        subscription: clone(next),
+      }
+    } catch (error) {
+      let rollbackFailed = false
+      for (const [sourceId, previous] of backups) {
+        try {
+          if (previous) await this.db.sources.put(sourceId, previous)
+          else await this.db.sources.delete(sourceId)
+        } catch {
+          rollbackFailed = true
+        }
+      }
+      const latest = this.db.subscriptions.get(subscription.id) ?? subscription
+      try {
+        await this.db.subscriptions.put(subscription.id, latest)
+      } catch {
+        rollbackFailed = true
+      }
+      throw new ReaderError('reader/refresh-failed', rollbackFailed ? '订阅更新写入失败，旧版回滚未完成。' : '订阅更新写入失败，已保留旧版。', undefined, { cause: error })
+    }
+  }
+
+  async performSubscriptionRefresh(subscription) {
+    if (subscription.pending) {
+      return {
+        pending: true,
+        permissions: clone(subscription.pending.permissions),
+        changes: clone(subscription.pending.changes),
+        subscription: clone(subscription),
+      }
+    }
+    const checkedAt = now()
+    const allowHttp = this.subscriptionAllowHttp(subscription)
     try {
       const response = await this.fetchRemote(subscription.url, { allowHttp, maxBytes: 2 * 1024 * 1024 })
       let raw
@@ -359,53 +472,41 @@ export class ReaderService extends TypertRemoteService {
         throw new ReaderError('reader/invalid-source', '源库地址返回的不是有效 JSON。', undefined, { cause: error })
       }
       const candidates = parseSourceLibrary(raw, { allowHttp })
-      const allSubscriptions = entries(this.db.subscriptions)
-      const otherOwned = new Set(allSubscriptions
-        .filter(item => item.id !== subscription.id)
-        .flatMap(item => item.sourceIds ?? []))
-      const affected = new Set([...(subscription.sourceIds ?? []), ...candidates.map(source => source.id)])
-      const existing = new Map([...affected].map(sourceId => [sourceId, this.db.sources.get(sourceId)]))
-      const plan = planSourceRefresh(subscription, candidates, existing, otherOwned)
-      const snapshotIds = new Set(subscription.sourceIds ?? [])
-      const backups = new Map([...affected].map(sourceId => [sourceId, this.db.sources.get(sourceId) ? clone(this.db.sources.get(sourceId)) : undefined]))
-      try {
-        for (const item of plan.writes) await this.db.sources.put(item.source.id, item.source)
-        for (const sourceId of plan.deletes) await this.db.sources.delete(sourceId)
-        const succeededAt = now()
+      const activeSources = (subscription.sourceIds ?? []).map(sourceId => this.db.sources.get(sourceId)).filter(Boolean)
+      const expansion = permissionExpansion(activeSources, candidates)
+      if (expansion) {
+        const { plan } = this.buildSubscriptionPlan(subscription, candidates)
         const latest = this.db.subscriptions.get(subscription.id) ?? subscription
-        const addedDuringRefresh = (latest.sourceIds ?? []).filter(sourceId => !snapshotIds.has(sourceId))
+        const pending = {
+          createdAt: checkedAt,
+          candidates: candidates.map(clone),
+          permissions: expansion,
+          changes: {
+            added: plan.added,
+            updated: plan.updated,
+            removed: plan.removed,
+            addedNames: plan.writes.filter(item => item.action === 'add').map(item => item.source.name),
+            updatedNames: plan.writes.filter(item => item.action === 'update').map(item => item.source.name),
+            removedNames: plan.deletes.map(sourceId => this.db.sources.get(sourceId)?.name).filter(Boolean),
+          },
+        }
         const next = {
           ...latest,
-          sourceIds: [...new Set([...plan.candidateIds, ...addedDuringRefresh])],
-          allowHttp: allowHttp || latest.allowHttp === true || latest.url.startsWith('http://'),
-          status: 'ready',
+          status: 'pending',
+          pending,
           lastCheckedAt: checkedAt,
-          lastSuccessAt: succeededAt,
           lastError: undefined,
-          updatedAt: succeededAt,
+          updatedAt: checkedAt,
         }
         await this.db.subscriptions.put(subscription.id, next)
-        return {
-          added: plan.added,
-          updated: plan.updated,
-          removed: plan.removed,
-          unchanged: plan.unchanged,
-          subscription: clone(next),
-        }
-      } catch (error) {
-        for (const [sourceId, previous] of backups) {
-          if (previous) await this.db.sources.put(sourceId, previous)
-          else await this.db.sources.delete(sourceId)
-        }
-        const latest = this.db.subscriptions.get(subscription.id) ?? subscription
-        await this.db.subscriptions.put(subscription.id, latest)
-        throw new ReaderError('reader/refresh-failed', '订阅更新写入失败，已保留旧版。', undefined, { cause: error })
+        return { pending: true, permissions: clone(expansion), changes: clone(pending.changes), subscription: clone(next) }
       }
+      return await this.applySubscriptionPlan(subscription, candidates, checkedAt, allowHttp)
     } catch (error) {
       const current = this.db.subscriptions.get(subscription.id) ?? subscription
       await this.db.subscriptions.put(subscription.id, {
         ...current,
-        status: 'error',
+        status: current.pending ? 'pending' : 'error',
         lastCheckedAt: checkedAt,
         lastFailureAt: checkedAt,
         lastError: String(error?.message || error).slice(0, 200),
@@ -415,16 +516,54 @@ export class ReaderService extends TypertRemoteService {
     }
   }
 
+  async confirmSubscriptionUpdate(args) {
+    args ??= {}
+    this.assertReady()
+    const id = requiredString(args.id, 'id')
+    return this.subscriptionMutation(id, async () => {
+      const subscription = this.db.subscriptions.get(id)
+      if (!subscription?.pending) throw new ReaderError('reader/not-found', '没有等待确认的订阅更新。')
+      try {
+        const result = await this.applySubscriptionPlan(subscription, subscription.pending.candidates, now())
+        return { ...result, confirmed: true }
+      } catch (error) {
+        const current = this.db.subscriptions.get(id) ?? subscription
+        await this.db.subscriptions.put(id, {
+          ...current,
+          status: 'pending',
+          lastFailureAt: now(),
+          lastError: String(error?.message || error).slice(0, 200),
+          updatedAt: now(),
+        })
+        throw error
+      }
+    })
+  }
+
+  async rejectSubscriptionUpdate(args) {
+    args ??= {}
+    this.assertReady()
+    const id = requiredString(args.id, 'id')
+    return this.subscriptionMutation(id, async () => {
+      const subscription = this.db.subscriptions.get(id)
+      if (!subscription?.pending) throw new ReaderError('reader/not-found', '没有等待确认的订阅更新。')
+      const { pending: _pending, ...rest } = subscription
+      const next = { ...rest, status: 'ready', lastError: undefined, updatedAt: now() }
+      await this.db.subscriptions.put(id, next)
+      return { rejected: true, subscription: clone(next) }
+    })
+  }
+
   async removeSubscription(args) {
     args ??= {}
     this.assertReady()
     const id = requiredString(args.id, 'id')
-    const running = this.subscriptionRefreshes.get(id)
-    if (running) await running.catch(() => {})
-    const subscription = this.db.subscriptions.get(id)
-    if (!subscription) throw new ReaderError('reader/not-found', '未找到这个订阅。')
-    await this.db.subscriptions.delete(id)
-    return { removed: true, id, subscription: clone(subscription) }
+    return this.subscriptionMutation(id, async () => {
+      const subscription = this.db.subscriptions.get(id)
+      if (!subscription) throw new ReaderError('reader/not-found', '未找到这个订阅。')
+      await this.db.subscriptions.delete(id)
+      return { removed: true, id, subscription: clone(subscription) }
+    })
   }
 
   async markSourceStatus(sourceId, error) {

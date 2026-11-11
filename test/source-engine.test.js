@@ -54,6 +54,18 @@ test('source engine blocks host escape from JS rules', async () => {
   await assert.rejects(engine.bookInfo(throughFetch, 'https://example.com/book/a'), /JS|script|generation|沙箱/i)
 })
 
+test('source engine blocks local filesystem access from JS rules', async () => {
+  const engine = new SourceEngine({
+    fetch: async url => ({ url, headers: { 'content-type': 'text/html' }, text: '<h1>safe</h1>' }),
+  })
+  const hostile = {
+    ...source,
+    rules: { ...source.rules, bookInfo: { name: '<js>require("node:fs").readFileSync("/etc/hostname", "utf8")</js>' } },
+  }
+  await assert.rejects(engine.bookInfo(hostile, 'https://example.com/book/a'), /JS|script|require|not defined|沙箱/i)
+})
+
+
 test('source engine does not expose the host fetch function through sandbox globals', async () => {
   const engine = new SourceEngine({
     fetch: async url => ({ url, headers: { 'content-type': 'text/html' }, text: '<h1>safe</h1>' }),

@@ -8,7 +8,7 @@ window.__ModuleLoader__.load({
     const { useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
     const PANEL_ID = 'reader';
     const REMOTE_METHODS = [
-      'state', 'importSource', 'subscribeSourceLibrary', 'refreshSubscription', 'removeSubscription', 'removeSource', 'setSourceEnabled', 'restoreBuiltinSources', 'search', 'discover', 'addBook', 'removeBook',
+      'state', 'importSource', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'removeSource', 'setSourceEnabled', 'restoreBuiltinSources', 'search', 'discover', 'addBook', 'removeBook',
       'toc', 'chapter', 'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal',
       'setSettings', 'setBookSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
       'cacheBookCover', 'bookCandidates', 'applyBookMeta',
@@ -1046,7 +1046,7 @@ window.__ModuleLoader__.load({
       const skippedText = skipped ? `跳过 ${skipped} 个${first ? `（${first.slice(0, 40)}）` : ''}` : '';
       return skippedText ? `已导入 ${imported} 个书源，${skippedText}` : `已导入 ${imported} 个书源`;
     }
-    function Sources({ sources, subscriptions = [], onImport, onRemove, onToggle, onSubscribe, onUnsubscribe, onRefresh, checkingIds = [], busy, onRestoreBuiltin }) {
+    function Sources({ sources, subscriptions = [], onImport, onRemove, onToggle, onSubscribe, onUnsubscribe, onRefresh, onConfirmUpdate, onRejectUpdate, checkingIds = [], busy, onRestoreBuiltin }) {
       const [draft, setDraft] = useState('');
       const [allowHttp, setAllowHttp] = useState(false);
       const [libraryText, setLibraryText] = useState('');
@@ -1083,19 +1083,52 @@ window.__ModuleLoader__.load({
               h('label', { className: 'mr-check' }, h('input', { type: 'checkbox', checked: libraryHttp, onChange: (e) => setLibraryHttp(e.target.checked) }), '允许明文 HTTP'),
               subscriptions.length ? h('div', { className: 'mr-subscription-list' },
                 subscriptions.map((item) => {
-                  const checking = item.checking === true || checkingIds.includes(item.id);
+                  const pending = item.status === 'pending' && item.pending ? item.pending : null;
+                  const isPending = item.status === 'pending';
+                  const checking = !isPending && (item.checking === true || checkingIds.includes(item.id));
                   const when = (value) => { try { return new Date(value).toLocaleDateString('zh-CN'); } catch { return ''; } };
                   const failed = item.status === 'error';
-                  const statusText = checking ? '检查中' : failed ? '检查失败' : item.status === 'partial' ? '部分可用' : '已订阅';
-                  const detail = `${item.sourceIds?.length || 0} 个书源 · ${item.lastSuccessAt ? `${when(item.lastSuccessAt)} 成功` : '尚未成功'}${failed && item.lastFailureAt ? ` · ${when(item.lastFailureAt)} 失败` : ''}`;
-                  return h('div', { className: 'mr-subscription-row', key: item.id, 'aria-busy': checking || undefined },
+                  const statusText = isPending ? '待确认' : checking ? '检查中' : failed ? '检查失败' : item.status === 'partial' ? '部分可用' : '已订阅';
+                  const changes = pending?.changes || {};
+                  const changeText = `新增 ${changes.added || 0} · 更新 ${changes.updated || 0} · 移除 ${changes.removed || 0}`;
+                  const capabilityLabels = { js: '脚本', http: '明文 HTTP', post: 'POST' };
+                  const originLabel = (value) => { try { return new URL(value).host; } catch { return value; } };
+                  const permissions = [
+                    ...(pending?.permissions?.origins || []).map((origin) => `新网站 ${origin}`),
+                    ...(pending?.permissions?.capabilities || []).flatMap((item) => (item.capabilities || []).map((capability) => `${originLabel(item.origin)} 新增${capabilityLabels[capability] || capability}`)),
+                  ];
+                  const permissionText = permissions.join('、');
+                  const shortList = (names = []) => {
+                    const unique = [...new Set(names.filter(Boolean))];
+                    return unique.length > 3 ? `${unique.slice(0, 3).join('、')} 等 ${unique.length} 个` : unique.join('、');
+                  };
+                  const changeNames = [
+                    changes.addedNames?.length ? `新增：${shortList(changes.addedNames)}` : '',
+                    changes.updatedNames?.length ? `更新：${shortList(changes.updatedNames)}` : '',
+                    changes.removedNames?.length ? `移除：${shortList(changes.removedNames)}` : '',
+                  ].filter(Boolean).join(' · ');
+                  const detail = isPending
+                    ? `${item.sourceIds?.length || 0} 个在用书源 · ${changeText}`
+                    : `${item.sourceIds?.length || 0} 个书源 · ${item.lastSuccessAt ? `${when(item.lastSuccessAt)} 成功` : '尚未成功'}${failed && item.lastFailureAt ? ` · ${when(item.lastFailureAt)} 失败` : ''}`;
+                  return h('div', { className: `mr-subscription-row${isPending ? ' is-pending' : ''}`, key: item.id, 'aria-busy': checking || undefined },
                     h('div', { className: 'mr-subscription-copy' },
                       h('strong', { title: item.url }, item.url),
-                      h('span', { title: failed && item.lastError ? item.lastError : detail }, detail)),
+                      h('span', { title: failed && item.lastError ? item.lastError : detail }, detail),
+                      isPending ? h('div', { className: 'mr-subscription-pending' },
+                        h('span', { className: 'mr-pending-permissions', title: permissionText || '来源规则有变化' }, permissionText || '来源规则有变化'),
+                        changeNames ? h('span', { className: 'mr-pending-changes', title: changeNames }, changeNames) : null) : null),
                     h('span', { className: 'mr-subscription-actions' },
-                      h('span', { className: `mr-tag${failed || item.status === 'partial' ? ' failed' : checking ? ' checking' : ''}`, title: failed ? item.lastError : undefined }, statusText),
-                      h(Button, { kind: 'text', icon: 'refresh', disabled: busy || checking, title: '立即检查订阅更新', onClick: () => onRefresh(item.id) }, checking ? '检查中' : '刷新'),
-                      h(Button, { kind: 'text', disabled: busy || checking, title: '取消订阅，不删除书源', onClick: () => onUnsubscribe(item.id) }, '取消')));
+                      h('span', { className: `mr-tag${failed || item.status === 'partial' ? ' failed' : checking ? ' checking' : isPending ? ' pending' : ''}`, title: failed ? item.lastError : undefined }, statusText),
+                      isPending
+                        ? [
+                            h(Button, { key: 'confirm', kind: 'primary', disabled: busy || !pending, title: '应用已获取并等待确认的更新', onClick: () => onConfirmUpdate(item.id) }, '确认更新'),
+                            h(Button, { key: 'reject', kind: 'text danger', disabled: busy, title: '放弃这次候选更新，继续使用旧版', onClick: () => onRejectUpdate(item.id) }, '拒绝'),
+                            h(Button, { key: 'unsubscribe', kind: 'text', disabled: busy, title: '取消订阅，不删除书源', onClick: () => onUnsubscribe(item.id) }, '取消'),
+                          ]
+                        : [
+                            h(Button, { key: 'refresh', kind: 'text', icon: 'refresh', disabled: busy || checking, title: '立即检查订阅更新', onClick: () => onRefresh(item.id) }, checking ? '检查中' : '刷新'),
+                            h(Button, { key: 'unsubscribe', kind: 'text', disabled: busy || checking, title: '取消订阅，不删除书源', onClick: () => onUnsubscribe(item.id) }, '取消'),
+                          ]));
                 })) : null,
               h('p', { className: 'mr-help' }, `${subscriptions.length} 个订阅 · 关联 ${subscribedCount} 个书源`))),
           h('section', { className: 'mr-sources-list', 'aria-label': '已配置书源列表' },
@@ -2996,12 +3029,18 @@ window.__ModuleLoader__.load({
         setRefreshingSubscriptions((ids) => ids.includes(id) ? ids : [...ids, id]);
         try {
           const result = await run(() => call(ctx, 'refreshSubscription', { id }));
+          if (result?.pending) {
+            notify('订阅包含新增网站或能力，等待确认后才会更新', 'info');
+            return result;
+          }
           const changes = [result?.added ? `新增 ${result.added}` : '', result?.updated ? `更新 ${result.updated}` : '', result?.removed ? `移除 ${result.removed}` : ''].filter(Boolean);
           notify(changes.length ? `订阅已检查：${changes.join('，')}` : '订阅已检查，没有变化', result?.removed ? 'info' : 'success');
           return result;
         } catch { await refresh(true); return false; }
         finally { setRefreshingSubscriptions((ids) => ids.filter(item => item !== id)); }
       };
+      const confirmSubscriptionUpdate = (id) => run(() => call(ctx, 'confirmSubscriptionUpdate', { id }), '订阅更新已确认').catch(() => false);
+      const rejectSubscriptionUpdate = (id) => run(() => call(ctx, 'rejectSubscriptionUpdate', { id }), '已拒绝本次更新，继续使用旧版').catch(() => false);
       const removeSubscription = (id) => run(() => call(ctx, 'removeSubscription', { id }), '已取消订阅，书源仍保留').catch(() => false);
       const toggleSource = (item) => {
         const enabling = item.enabled === false;
@@ -3202,6 +3241,8 @@ window.__ModuleLoader__.load({
               onRestoreBuiltin: () => run(() => call(ctx, 'restoreBuiltinSources'), '内置书源已恢复').then((result) => { if (result) setNotice({ kind: 'success', text: `已恢复 ${result.added} 个内置书源` }); }, () => {}),
               onSubscribe: subscribeLibrary,
               onRefresh: refreshSubscription,
+              onConfirmUpdate: confirmSubscriptionUpdate,
+              onRejectUpdate: rejectSubscriptionUpdate,
               onUnsubscribe: removeSubscription,
               onToggle: toggleSource,
               onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
@@ -3762,6 +3803,12 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-subscription-copy{display:flex;flex-direction:column;gap:2px;min-width:0}
 .mr-subscription-copy strong{overflow:hidden;font-size:11px;font-weight:500;text-overflow:ellipsis;white-space:nowrap}
 .mr-subscription-copy span{font-size:10px;color:var(--mr-muted)}
+.mr-tag.pending{border-color:color-mix(in srgb,var(--mr-accent) 42%,var(--mr-border));color:var(--mr-accent);border-style:dashed}
+.mr-subscription-row.is-pending{align-items:flex-start;flex-direction:column;padding:9px 8px;margin:0 -8px;border-radius:8px;background:color-mix(in srgb,var(--mr-accent) 5%,transparent)}.mr-subscription-row.is-pending .mr-subscription-copy,.mr-subscription-row.is-pending .mr-subscription-actions{width:100%}.mr-subscription-row.is-pending .mr-subscription-actions{justify-content:flex-start;gap:8px;margin-top:2px}
+.mr-subscription-pending{display:flex;flex-direction:column;gap:2px;margin-top:4px;min-width:0}
+.mr-pending-permissions{max-width:310px;line-height:1.5;white-space:normal;overflow-wrap:anywhere;color:var(--mr-body)!important}
+.mr-pending-changes{font-size:9px!important}
+@media(max-width:640px){.mr-pending-permissions{max-width:100%}.mr-subscription-actions .mr-btn{font-size:11px}}
 .mr-source-row.is-disabled .mr-source-icon,.mr-source-row.is-disabled h3,.mr-source-row.is-disabled p{opacity:.5}
 .mr-settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
 .mr-settings-grid .mr-panel{margin:0;min-width:0}
