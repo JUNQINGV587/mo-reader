@@ -137,6 +137,35 @@ test('proxy forwards range and source headers without exposing a URL parameter',
   assert.equal(direct.status, 400)
 })
 
+test('proxy rewrites HLS playlists through signed same-origin URLs', async (t) => {
+  const { service } = await serviceFixture()
+  const source = { id: 'source-hls', name: 'HLS源', bookSourceUrl: 'https://source.example', allowHttp: false, enabled: true, contentType: 'video', rules: {} }
+  const book = { id: 'book-hls', sourceId: source.id, contentType: 'video', name: 'HLS书' }
+  const chapter = { id: 'chapter-hls', bookId: book.id, index: 0, title: '第一集', contentType: 'video', mediaUrl: 'https://media.example/master.m3u8' }
+  await service.db.sources.put(source.id, source)
+  await service.db.books.put(book.id, book)
+  await service.db.chapters.put(chapter.id, chapter)
+  service.streamHeaders.set(chapter.id, { Referer: 'https://source.example/watch' })
+  const calls = []
+  service.fetchRemote = async (url) => {
+    calls.push(url)
+    if (url.endsWith('.m3u8')) {
+      return { status: 200, url, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, text: '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n#EXTINF:4,\nseg1.ts\n' }
+    }
+    return { status: 200, url, headers: { 'content-type': 'application/octet-stream' }, buffer: Buffer.from('key') }
+  }
+  const response = await proxyResponse(service, new Request('http://reader.local/api/reader/proxy?bookId=book-hls&chapterId=chapter-hls'))
+  assert.equal(response.status, 200)
+  const playlist = await response.text()
+  assert.match(playlist, /URI="\/api\/reader\/proxy\?bookId=book-hls&chapterId=chapter-hls&part=/)
+  const part = playlist.match(/URI="([^"]+)"/)[1].replaceAll('&amp;', '&')
+  const key = await proxyResponse(service, new Request(`http://reader.local${part}`))
+  assert.equal(key.status, 200)
+  assert.equal(calls.at(-1), 'https://media.example/key.bin')
+  const tampered = part.replace(/part=[^&]+/, 'part=bad')
+  assert.equal((await proxyResponse(service, new Request(`http://reader.local${tampered}`))).status, 400)
+})
+
 test('service exposes media stats, list and retention', async (t) => {
   const root = await tempRoot(t)
   const store = await new MediaStore({ root }).init()
@@ -221,4 +250,52 @@ test('removing a book can preserve retained records', async (t) => {
   await store.removeBook('book-a', { includeRetained: false })
   assert.equal(store.records.has(retained.id), true)
   assert.equal(store.records.has(temporary.id), false)
+})
+
+test('comic image proxy uses the chapter image and source headers', async () => {
+  const { service } = await serviceFixture()
+  const source = { id: 'source-comic', name: '漫画源', bookSourceUrl: 'https://source.example', allowHttp: false, enabled: true, contentType: 'comic', rules: {} }
+  const book = { id: 'book-comic', sourceId: source.id, contentType: 'comic', name: '漫画书' }
+  const chapter = { id: 'chapter-comic', bookId: book.id, index: 0, title: '第一话', contentType: 'comic', images: ['https://img.example/1.jpg'] }
+  await service.db.sources.put(source.id, source)
+  await service.db.books.put(book.id, book)
+  await service.db.chapters.put(chapter.id, chapter)
+  service.streamHeaders.set(chapter.id, { Referer: 'https://source.example/view' })
+  let seen
+  service.fetchRemote = async (url, options) => {
+    seen = { url, headers: options.headers }
+    return { status: 200, url, headers: { 'content-type': 'image/jpeg', 'content-length': '3' }, buffer: Buffer.from('img') }
+  }
+  const response = await proxyResponse(service, new Request('http://reader.local/api/reader/proxy?bookId=book-comic&chapterId=chapter-comic&image=0'))
+  assert.equal(response.status, 200)
+  assert.equal(response.headers.get('content-type'), 'image/jpeg')
+  assert.equal(await response.text(), 'img')
+  assert.equal(seen.url, 'https://img.example/1.jpg')
+  assert.equal(seen.headers.Referer, 'https://source.example/view')
+})
+
+test('proxy rejects DRM playlists with a readable error', async (t) => {
+  const { service } = await serviceFixture()
+  const source = { id: 'source-drm', name: 'DRM源', bookSourceUrl: 'https://source.example', allowHttp: false, enabled: true, contentType: 'video', rules: {} }
+  const book = { id: 'book-drm', sourceId: source.id, contentType: 'video', name: 'DRM书' }
+  const chapter = { id: 'chapter-drm', bookId: book.id, index: 0, title: '第一集', contentType: 'video', mediaUrl: 'https://media.example/drm.m3u8' }
+  await service.db.sources.put(source.id, source)
+  await service.db.books.put(book.id, book)
+  await service.db.chapters.put(chapter.id, chapter)
+  service.fetchRemote = async (url) => ({ status: 200, url, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, text: '#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI="key"\n#EXTINF:4,\nseg.ts\n' })
+  const response = await proxyResponse(service, new Request('http://reader.local/api/reader/proxy?bookId=book-drm&chapterId=chapter-drm'))
+  assert.equal(response.status, 415)
+  assert.match(await response.text(), /DRM|SAMPLE-AES/)
+})
+
+test('retaining a chapter keeps every media asset in that chapter', async (t) => {
+  const { store } = await readyStore(t)
+  const one = await store.put({ bookId: 'book-r', chapterId: 'c-r', contentType: 'video/mp2t', data: Buffer.from('1') })
+  const two = await store.put({ bookId: 'book-r', chapterId: 'c-r', asset: 'segment-00001', contentType: 'video/mp2t', data: Buffer.from('2') })
+  const { service, db } = await serviceFixture({}, { mediaStore: store })
+  await db.books.put('book-r', { id: 'book-r', name: '书', local: true, contentType: 'video' })
+  const updated = await service.setChapterRetained({ bookId: 'book-r', chapterId: 'c-r', retained: true })
+  assert.equal(updated.length, 2)
+  assert.equal(store.records.get(one.id).retained, true)
+  assert.equal(store.records.get(two.id).retained, true)
 })

@@ -52,6 +52,7 @@
     "@deepseek-ai/dsh-storage-domain": "0.2.2-alpha.3",
     "@deepseek-ai/dsh-typert-protocol": "0.2.2-alpha.3",
     "cheerio": "^1.1.2",
+    "hls.js": "^1.7.4",
     "iconv-lite": "^0.6.3",
     "jsonpath-plus": "^10.3.0",
     "jszip": "^3.10.1",

@@ -11,7 +11,7 @@ const require = (id) => {
   if (id === 'zod') return { z }
   throw new Error(`unexpected require: ${id}`)
 }
-const { Discover, Sources, Settings, ShelfBoard, ReaderNav, SHELF_CATEGORIES, booksForShelfCategory, WebsiteShelf, readerStyle } = registration.factory(require).__test
+const { Discover, Sources, Settings, ShelfBoard, ReaderNav, SHELF_CATEGORIES, booksForShelfCategory, WebsiteShelf, MediaReader, MediaDownloadSheet, MediaAudioDock, mediaChapterSource, mediaStartSeconds, mediaProgressPayload, readerStyle } = registration.factory(require).__test
 const style = document.createElement('style')
 style.textContent = readerStyle
 document.head.append(style)
@@ -64,6 +64,139 @@ function CategorySwitchScreen() {
     h('section', { className: 'mr-content' },
       h(ShelfBoard, { books: booksForShelfCategory(categoryBooks, tab), category, reducedMotion: true, onOpen: noop, onCheck: noop })))
 }
+
+
+const mediaToc = [
+  { id: 'media-c1', title: '第一话 山门', downloaded: false },
+  { id: 'media-c2', title: '第二话 夜行', downloaded: true },
+  { id: 'media-c3', title: '第三话 风起', downloaded: false },
+]
+const image = (seed) => `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="320" height="460"><rect width="320" height="460" fill="${seed}"/><text x="160" y="220" text-anchor="middle" fill="#fff" font-size="24">漫画页</text></svg>`)}`
+const comicPages = [image('#5d705f'), image('#986b4f'), image('#72618a')]
+const comicBook = { id: 'media-comic', name: '山海图', author: '绘者', contentType: 'comic', readerPrefs: { comicMode: 'scroll' }, progress: { chapterId: 'media-c1', offset: 0, percent: 0 } }
+const audioBook = { id: 'media-audio', name: '夜航船', author: '讲述者', contentType: 'audio', progress: { chapterId: 'media-c1', offset: 18, percent: 10 } }
+const videoBook = { id: 'media-video', name: '风起长林', author: '影像', contentType: 'video', sourceHome: 'https://source.example', progress: { chapterId: 'media-c1', offset: 0, percent: 0 } }
+const mediaCtx = (payloadFor) => ({ remote: { reader: {
+  toc: async () => mediaToc.map(item => ({ ...item })),
+  chapter: async ({ chapterId }) => ({ ...mediaToc.find(item => item.id === chapterId), ...payloadFor(chapterId) }),
+  saveProgress: async (args) => { window.__mediaProgress = args; return args },
+  setBookSettings: async (args) => { window.__mediaSettings = args; return args },
+  download: async () => ({ id: 'media-job', status: 'queued' }),
+  pauseJob: async () => ({ id: 'media-job', status: 'paused' }),
+  resumeJob: async () => { window.__mediaJobAction = 'resume'; return { id: 'media-job', status: 'running' } },
+  cancelJob: async () => ({ id: 'media-job', status: 'cancelled' }),
+  cancelDownloadChapters: async (args) => { window.__mediaCancelOne = args; return {} },
+  mediaCacheStats: async () => ({ usedBytes: 12 * 1024 ** 2, mediaCount: 1 }),
+  listMediaCache: async () => [{ id: 'media-c2-file', chapterId: 'media-c2', retained: true, size: 12 * 1024 ** 2 }],
+  setChapterRetained: async (args) => { window.__mediaRetain = args; return [] },
+} } })
+const comicCtx = mediaCtx((id) => ({ images: id === 'media-c2' ? [] : comicPages }))
+const audioCtx = mediaCtx(() => ({ mediaUrl: 'https://media.example/audio.mp3' }))
+const videoCtx = mediaCtx((id) => id === 'media-c3' ? {} : ({ mediaUrl: 'https://media.example/video.mp4' }))
+const hlsCtx = mediaCtx(() => ({ mediaUrl: 'https://media.example/video.m3u8' }))
+
+function MediaComicScreen() {
+  return h(MediaReader, {
+    ctx: comicCtx,
+    book: comicBook,
+    settings: { ...settings, mediaQuotaBytes: 50 * 1024 ** 3 },
+    jobs: [],
+    onClose: noop,
+    notify: (message) => { window.__mediaNotice = message },
+  })
+}
+function MediaAudioScreen() {
+  return h(MediaReader, {
+    ctx: audioCtx,
+    book: audioBook,
+    settings: { ...settings, mediaQuotaBytes: 50 * 1024 ** 3 },
+    jobs: [],
+    onClose: noop,
+    notify: noop,
+  })
+}
+function MediaVideoScreen() {
+  return h(MediaReader, {
+    ctx: videoCtx,
+    book: videoBook,
+    settings: { ...settings, mediaQuotaBytes: 50 * 1024 ** 3 },
+    jobs: [],
+    onClose: noop,
+    notify: noop,
+  })
+}
+function MediaPausedScreen() {
+  return h(MediaReader, {
+    ctx: comicCtx,
+    book: comicBook,
+    settings: { ...settings, mediaQuotaBytes: 50 * 1024 ** 3 },
+    jobs: [{ id: 'media-job', bookId: 'media-comic', status: 'paused', state: 'paused', total: 2, done: 1, chapterIds: ['media-c1', 'media-c3'], failedReasons: { 'media-c3': '网络断开' } }],
+    onClose: noop,
+    notify: noop,
+  })
+}
+function MediaHlsScreen() {
+  return h(MediaReader, {
+    ctx: hlsCtx,
+    book: videoBook,
+    settings: { ...settings, mediaQuotaBytes: 50 * 1024 ** 3 },
+    jobs: [],
+    onClose: noop,
+    notify: noop,
+  })
+}
+
+function MediaAudioFlowScreen() {
+  const [track, setTrack] = React.useState({ bookId: audioBook.id, bookName: audioBook.name, chapterId: 'media-c1', chapterTitle: '第一话 山门', url: 'https://media.example/audio.mp3' })
+  return h('div', { className: 'mr-root' },
+    h(MediaReader, {
+      ctx: audioCtx,
+      book: audioBook,
+      settings: { ...settings, mediaQuotaBytes: 50 * 1024 ** 3 },
+      jobs: [],
+      onClose: noop,
+      notify: noop,
+      audioTrack: track,
+      audioPlaying: true,
+      audioTime: 0,
+      audioDuration: 0,
+      onAudioPlay: (next, start) => { setTrack(next); window.__audioTrack = next; window.__audioStart = start },
+      onAudioToggle: noop,
+      onAudioSeek: noop,
+    }),
+    h('div', { id: 'audio-state' }, track?.chapterId || ''))
+}
+
+function MediaDockScreen() {
+  return h('div', { className: 'mr-root' }, h(MediaAudioDock, {
+    track: { bookId: audioBook.id, bookName: audioBook.name, chapterId: 'media-c1', chapterTitle: '第一话 山门' },
+    playing: true,
+    time: 18,
+    duration: 120,
+    onToggle: noop,
+    onSeek: noop,
+    onClose: noop,
+    onPrev: () => { window.__dockPrev = true },
+    onNext: () => { window.__dockNext = true },
+  }))
+}
+function MediaDownloadFixture() {
+  const [selected, setSelected] = React.useState(mediaToc.map(item => item.id))
+  const job = { id: 'media-job', bookId: comicBook.id, status: 'paused', state: 'paused', total: 3, done: 1, failedReasons: { 'media-c3': '网络断开' } }
+  return h('div', { className: 'mr-root mr-reader' }, h(MediaDownloadSheet, {
+    book: comicBook,
+    toc: mediaToc,
+    job,
+    selected,
+    setSelected,
+    onClose: noop,
+    onStart: () => { window.__mediaDownloadStarted = selected.slice() },
+    onJobAction: (action) => { window.__mediaJobAction = action },
+    onCancelOne: (id) => { window.__mediaCancelOne = id },
+    quota: 50 * 1024 ** 3,
+  }))
+}
+
 window.screensUI = {
   nav: () => root.render(h('div', { className: 'mr-root' }, h(ReaderNav, { tab: 'novel', onTab: noop }), h('section', { className: 'mr-content' }, h('h1', null, '小说书架')))),
   categoryShelf: () => render(h(ShelfBoard, { books: booksForShelfCategory(categoryBooks, 'novel'), category: SHELF_CATEGORIES[0], reducedMotion: true, onOpen: noop, onCheck: noop })),
@@ -74,6 +207,14 @@ window.screensUI = {
   discover: () => render(h(Discover, { sources: discoverySources, onSearch: noop, onAdd: noop, results, busy: false, failed: 1 })),
   sources: () => render(h(Sources, { sources, subscriptions, onImport: noop, onRemove: noop, onToggle: noop, onSubscribe: async () => false, onRefresh: (id) => { window.__refreshClicked = id; }, onConfirmUpdate: (id) => { window.__confirmClicked = id; }, onRejectUpdate: (id) => { window.__rejectClicked = id; }, onUnsubscribe: noop, busy: false, onRestoreBuiltin: noop })),
   settings: () => render(h(Settings, props)),
+  mediaComic: () => root.render(h(MediaComicScreen)),
+  mediaAudio: () => root.render(h(MediaAudioScreen)),
+  mediaAudioFlow: () => root.render(h(MediaAudioFlowScreen)),
+  mediaVideo: () => root.render(h(MediaVideoScreen)),
+  mediaHls: () => root.render(h(MediaHlsScreen)),
+  mediaPaused: () => root.render(h(MediaPausedScreen)),
+  mediaDock: () => root.render(h(MediaDockScreen)),
+  mediaDownload: () => root.render(h(MediaDownloadFixture)),
   measure() {
     const screen = document.querySelector('.mr-screen')
     const layout = document.querySelector('.mr-discover-layout, .mr-sources-layout, .mr-settings-grid')
@@ -118,7 +259,20 @@ window.screensUI = {
       panels: document.querySelectorAll('.mr-settings-grid .mr-panel').length,
       panelWidth: panel ? Math.round(panel.getBoundingClientRect().width) : 0,
       onlineHeight: online ? Math.round(online.getBoundingClientRect().height) : 0,
+      mediaImages: document.querySelectorAll('.mr-comic img').length,
+      mediaVisibleImages: [...document.querySelectorAll('.mr-comic img')].filter(node => getComputedStyle(node).display !== 'none').length,
+      mediaPaged: !!document.querySelector('.mr-comic.paged'),
+      mediaAudio: !!document.querySelector('.mr-audio-stage'),
+      mediaVideo: !!document.querySelector('.mr-video-stage video'),
+      mediaError: document.querySelector('.mr-media-error')?.textContent || '',
+      downloadRows: document.querySelectorAll('.mr-download-row').length,
+      downloadReady: document.querySelectorAll('.mr-download-row.is-ready').length,
+      downloadFailed: document.querySelectorAll('.mr-download-row.is-failed').length,
+      downloadSheet: !!document.querySelector('.mr-download-sheet'),
     }
   },
 }
+window.__mediaChapterSource = mediaChapterSource
+window.__mediaStartSeconds = mediaStartSeconds
+window.__mediaProgressPayload = mediaProgressPayload
 window.screensReady = true

@@ -253,7 +253,7 @@ test('Service.init opens storage, recovers persisted jobs and registers hourly u
     return disposer
   }
   await service[Service.init]()
-  assert.deepEqual(routes.map(route => route.path), ['/api/reader/media', '/api/reader/proxy'])
+  assert.deepEqual(routes.map(route => route.path), ['/api/reader/media', '/api/reader/proxy', '/api/reader/hls.js'])
   rejection = 401
   const denied = { statusCode: 0, headers: {}, setHeader(key, value) { this.headers[key] = value }, end() { this.ended = true } }
   await routes[0].handler({ method: 'GET', url: '/api/reader/media?id=missing', headers: {} }, denied)

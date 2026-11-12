@@ -16,12 +16,13 @@ test('settings defaults carry mode/flipStyle and validate both enums', () => {
   assert.throws(() => normalizeSettings({ flipStyle: 'spin' }), /flipStyle/)
 })
 
-test('readerPrefs only accepts the three per-book keys', () => {
+test('readerPrefs accepts the four per-book keys', () => {
   assert.deepEqual(normalizeReaderPrefs({}), {})
   assert.deepEqual(normalizeReaderPrefs({ mode: 'scroll', flipStyle: 'fade', ambience: 'off' }), { mode: 'scroll', flipStyle: 'fade', ambience: 'off' })
   assert.throws(() => normalizeReaderPrefs({ fontSize: 22 }), /readerPrefs/)
   assert.throws(() => normalizeReaderPrefs({ mode: 'page' }), /readerPrefs\.mode/)
   assert.throws(() => normalizeReaderPrefs({ ambience: 'dim' }), /readerPrefs\.ambience/)
+  assert.throws(() => normalizeReaderPrefs({ comicMode: 'flip' }), /readerPrefs\.comicMode/)
 })
 
 test('setBookSettings writes, merges, clears a key and clears all overrides', async () => {
@@ -33,12 +34,12 @@ test('setBookSettings writes, merges, clears a key and clears all overrides', as
   assert.deepEqual(first.readerPrefs, { mode: 'scroll' })
   assert.equal(db.books.get(book.id).readerPrefs.mode, 'scroll')
 
-  const merged = await service.setBookSettings({ bookId: book.id, flipStyle: 'curl', ambience: 'paper' })
-  assert.deepEqual(merged.readerPrefs, { mode: 'scroll', flipStyle: 'flip', ambience: 'paper' })
-  assert.deepEqual((await service.state()).books[0].readerPrefs, { mode: 'scroll', flipStyle: 'flip', ambience: 'paper' })
+  const merged = await service.setBookSettings({ bookId: book.id, flipStyle: 'curl', ambience: 'paper', comicMode: 'paged' })
+  assert.deepEqual(merged.readerPrefs, { mode: 'scroll', flipStyle: 'flip', ambience: 'paper', comicMode: 'paged' })
+  assert.deepEqual((await service.state()).books[0].readerPrefs, { mode: 'scroll', flipStyle: 'flip', ambience: 'paper', comicMode: 'paged' })
 
   const dropped = await service.setBookSettings({ bookId: book.id, mode: null })
-  assert.deepEqual(dropped.readerPrefs, { flipStyle: 'flip', ambience: 'paper' })
+  assert.deepEqual(dropped.readerPrefs, { flipStyle: 'flip', ambience: 'paper', comicMode: 'paged' })
 
   const cleared = await service.setBookSettings({ bookId: book.id, clear: true })
   assert.equal(cleared.readerPrefs, null)

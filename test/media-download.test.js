@@ -544,3 +544,117 @@ test('a transient direct-download failure preserves the partial file for retry',
   const record = reopened.list({ bookId: book.id }).find(item => item.id === offline.mediaId)
   assert.equal(await fs.readFile((await reopened.filePath(record)).path, 'utf8'), 'abcdef')
 })
+
+test('cancelling one chapter of a paused media job removes it and resumes only the rest', async () => {
+  const { store } = await tempStore()
+  const media = Buffer.from('0123456789ab')
+  const fetchRemote = async (url, options = {}) => {
+    const match = /^bytes=(\d+)-(\d+)$/.exec(options.headers?.Range ?? '')
+    if (!match) throw new Error(`missing range for ${url}`)
+    const start = Number(match[1])
+    const end = Number(match[2])
+    return {
+      url,
+      status: 206,
+      headers: {
+        'content-type': 'video/mp4',
+        'content-range': `bytes ${start}-${end}/${media.length}`,
+        'content-length': String(end - start + 1),
+      },
+      buffer: media.subarray(start, end + 1),
+    }
+  }
+  let paused = false
+  const contentCalls = []
+  let service
+  const engine = {
+    bookInfo: async () => ({ name: '视频书', author: '作者' }),
+    toc: async () => [
+      { id: 'c1', title: '第一集', url: 'https://media.example/ch1' },
+      { id: 'c2', title: '第二集', url: 'https://media.example/ch2' },
+      { id: 'c3', title: '第三集', url: 'https://media.example/ch3' },
+    ],
+    content: async (source, book, chapter) => {
+      contentCalls.push(chapter.id)
+      if (chapter.id === 'c2' && !paused) {
+        paused = true
+        await service.pauseJob({ bookId: book.id })
+      }
+      return { contentType: 'video', mediaUrl: `https://media.example/${chapter.id}.mp4`, headers: {} }
+    },
+  }
+  const fixture = await serviceFixture(engine, { fetchRemote, mediaStore: store })
+  service = fixture.service
+  await fixture.db.sources.put('src1', {
+    id: 'src1', name: '视频源', bookSourceUrl: 'https://media.example', contentType: 'video', allowHttp: false,
+    rules: { toc: { chapterList: 'a', chapterName: 'a', chapterUrl: 'a@href' }, content: { content: 'video' } },
+  })
+  const added = await service.addBook({ sourceId: 'src1', bookUrl: 'https://media.example/book' })
+  const job = await service.download({ bookId: added.id })
+  await service.runningJobs.get(job.id)
+  assert.equal(fixture.db.jobs.get(job.id).status, 'paused')
+  assert.ok(fixture.db.chapters.get('c1').offline)
+  assert.equal(fixture.db.chapters.get('c2').offline, undefined)
+
+  const next = await service.cancelDownloadChapters({ bookId: added.id, chapterIds: ['c2'] })
+  assert.deepEqual(fixture.db.jobs.get(next.id).chapterIds, ['c1', 'c3'])
+  assert.equal(next.total, 2)
+  await service.resumeJob({ bookId: added.id })
+  await service.runningJobs.get(job.id)
+  const final = fixture.db.jobs.get(job.id)
+  assert.equal(final.status, 'completed')
+  assert.equal(contentCalls.filter(chapterId => chapterId === 'c2').length, 1)
+  assert.ok(fixture.db.chapters.get('c3').offline)
+  assert.equal(store.list({ bookId: added.id }).some(record => record.chapterId === 'c2'), false)
+})
+
+test('cancelling a paused job keeps completed chapters offline and removes unfinished parts', async () => {
+  const { store } = await tempStore()
+  const media = Buffer.from('0123456789ab')
+  const fetchRemote = async (url, options = {}) => {
+    const match = /^bytes=(\d+)-(\d+)$/.exec(options.headers?.Range ?? '')
+    if (!match) throw new Error(`missing range for ${url}`)
+    const start = Number(match[1])
+    const end = Number(match[2])
+    return {
+      url,
+      status: 206,
+      headers: { 'content-type': 'video/mp4', 'content-range': `bytes ${start}-${end}/${media.length}`, 'content-length': String(end - start + 1) },
+      buffer: media.subarray(start, end + 1),
+    }
+  }
+  let paused = false
+  let service
+  const engine = {
+    bookInfo: async () => ({ name: '视频书', author: '作者' }),
+    toc: async () => [
+      { id: 'c1', title: '第一集', url: 'https://media.example/ch1' },
+      { id: 'c2', title: '第二集', url: 'https://media.example/ch2' },
+    ],
+    content: async (source, book, chapter) => {
+      if (chapter.id === 'c2' && !paused) {
+        paused = true
+        await service.pauseJob({ bookId: book.id })
+      }
+      return { contentType: 'video', mediaUrl: `https://media.example/${chapter.id}.mp4`, headers: {} }
+    },
+  }
+  const fixture = await serviceFixture(engine, { fetchRemote, mediaStore: store })
+  service = fixture.service
+  await fixture.db.sources.put('src1', {
+    id: 'src1', name: '视频源', bookSourceUrl: 'https://media.example', contentType: 'video', allowHttp: false,
+    rules: { toc: { chapterList: 'a', chapterName: 'a', chapterUrl: 'a@href' }, content: { content: 'video' } },
+  })
+  const added = await service.addBook({ sourceId: 'src1', bookUrl: 'https://media.example/book' })
+  const job = await service.download({ bookId: added.id })
+  await service.runningJobs.get(job.id)
+  assert.equal(fixture.db.jobs.get(job.id).status, 'paused')
+  assert.ok(fixture.db.chapters.get('c1').offline)
+
+  await service.cancelJob({ jobId: job.id })
+  assert.equal(fixture.db.jobs.get(job.id).status, 'cancelled')
+  assert.ok(fixture.db.chapters.get('c1').offline)
+  assert.equal(fixture.db.chapters.get('c2').offline, undefined)
+  assert.equal(store.list({ bookId: added.id }).some(record => record.chapterId === 'c1'), true)
+  assert.equal(store.list({ bookId: added.id }).some(record => record.chapterId === 'c2'), false)
+})
