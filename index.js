@@ -59,6 +59,7 @@ export class ReaderService extends TypertRemoteService {
     this.downloadLocks = new Map()
     this.subscriptionMutations = new Map()
     this.coverCache = new Map()
+    this.streamHeaders = new Map()
     this.media = options.mediaStore ?? null
     this.mediaRoot = options.mediaRoot
     this.disposed = false
@@ -758,7 +759,7 @@ export class ReaderService extends TypertRemoteService {
       const next = { ...chapter, bookId: book.id, index: chapter.index ?? position, contentType: bookType }
       if (!cached) return next
       const preserved = {}
-      for (const key of ['text', 'html', 'images', 'mediaUrl', 'headers', 'offline', 'downloadedAt']) {
+      for (const key of ['text', 'html', 'images', 'mediaUrl', 'offline', 'downloadedAt']) {
         if (cached[key] !== undefined) preserved[key] = cached[key]
       }
       return { ...next, ...preserved }
@@ -794,13 +795,18 @@ export class ReaderService extends TypertRemoteService {
     if ((contentType === 'novel' ? !hasChapterPayload(chapter, contentType) : !offline)) {
       if (book.local) throw new ReaderError('reader/not-found', 'Local chapter cache is missing.')
       const content = await this.engine.content(this.source(book.sourceId), book, chapter)
+      const headers = content.headers && typeof content.headers === 'object' ? clone(content.headers) : {}
+      if (Object.keys(headers).length) this.streamHeaders.set(chapter.id, headers)
       chapter = { ...chapter, ...content, downloadedAt: now() }
+      delete chapter.headers
       if (contentType !== 'novel') delete chapter.offline
       await this.db.chapters.put(chapter.id, chapter)
     }
     const view = this.chapterView(chapter)
     if (contentType === 'novel') return { ...view, text: applyReplacements(chapter.text, this.db.settings.get().replacements) }
-    for (const key of ['images', 'mediaUrl', 'headers']) if (chapter[key] !== undefined) view[key] = clone(chapter[key])
+    for (const key of ['images', 'mediaUrl']) if (chapter[key] !== undefined) view[key] = clone(chapter[key])
+    const headers = this.streamHeaders.get(chapter.id)
+    if (headers) view.headers = clone(headers)
     return view
   }
 
@@ -983,6 +989,8 @@ export class ReaderService extends TypertRemoteService {
                 if (offline.paused) return
                 content = { ...content, offline }
               }
+              if (content?.headers && typeof content.headers === 'object' && Object.keys(content.headers).length) this.streamHeaders.set(chapter.id, clone(content.headers))
+              else this.streamHeaders.delete(chapter.id)
               const stored = { ...chapter, ...content, downloadedAt: now() }
               delete stored.headers
               await this.db.chapters.put(chapter.id, stored)

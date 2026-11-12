@@ -160,6 +160,7 @@ test('service download caches offline HLS and reports retry when a chapter fails
   const chapterView = await service.chapter({ bookId: added.id, chapterId: 'c1' })
   assert.equal(chapterView.downloaded, true)
   assert.equal(chapterView.offline.playlistId, db.chapters.get('c1').offline.playlistId)
+  assert.equal(db.chapters.get('c1').headers, undefined)
   assert.equal((await service.state()).books[0].download.done, 1)
   const backup = await service.exportBackup()
   assert.equal(backup.includes('offline'), false)
@@ -474,8 +475,11 @@ test('HLS fMP4 init segments are stored and referenced by the local playlist', a
   const offline = await downloadMediaChapter({ store, book, chapter, fetchRemote, payload: { mediaUrl: 'https://media.example/media.m3u8', headers: {} } })
   assert.ok(offline.initId)
   const playlist = await fs.readFile((await store.filePath(store.record(offline.playlistId))).path)
+  assert.match(playlist.toString('utf8'), /#EXT-X-VERSION:6/)
   assert.match(playlist.toString('utf8'), /#EXT-X-MAP:URI="\/api\/reader\/media\?id=/)
   assert.ok(store.has(offline.initId))
+  assert.equal(store.record(offline.initId).contentType, 'video/mp4')
+  assert.equal(store.record(offline.segments[0]).contentType, 'video/iso.segment')
 })
 
 test('evicted media is no longer reported as downloaded and chapter re-fetches metadata', async () => {
@@ -507,6 +511,8 @@ test('evicted media is no longer reported as downloaded and chapter re-fetches m
   assert.equal(chapter.downloaded, false)
   assert.equal(chapter.offline, undefined)
   assert.equal(chapter.mediaUrl, 'https://media.example/master.m3u8')
+  assert.deepEqual(chapter.headers, { referer: 'https://media.example' })
+  assert.equal(db.chapters.get(first.id).headers, undefined)
 })
 
 test('a transient direct-download failure preserves the partial file for retry', async () => {

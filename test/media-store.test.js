@@ -117,10 +117,11 @@ test('proxy forwards range and source headers without exposing a URL parameter',
   const { service } = await serviceFixture()
   const source = { id: 'source-video', name: '视频源', bookSourceUrl: 'https://source.example', allowHttp: false, enabled: true, contentType: 'video', rules: {} }
   const book = { id: 'book-video', sourceId: source.id, contentType: 'video', name: '视频书' }
-  const chapter = { id: 'chapter-video', bookId: book.id, index: 0, title: '第一集', contentType: 'video', mediaUrl: 'https://media.example/video.mp4', headers: { Referer: 'https://source.example/watch' } }
+  const chapter = { id: 'chapter-video', bookId: book.id, index: 0, title: '第一集', contentType: 'video', mediaUrl: 'https://media.example/video.mp4' }
   await service.db.sources.put(source.id, source)
   await service.db.books.put(book.id, book)
   await service.db.chapters.put(chapter.id, chapter)
+  service.streamHeaders.set(chapter.id, { Referer: 'https://source.example/watch' })
   let captured
   service.fetchRemote = async (url, options) => {
     captured = { url, options }
