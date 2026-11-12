@@ -4,6 +4,10 @@ import { DEFAULT_SETTINGS, normalizeSettings } from '../lib/settings.js'
 
 test('desktop reading measure defaults to 960 while preserving explicit choices', () => {
   assert.equal(DEFAULT_SETTINGS.measureWidth, 960)
+  assert.equal(DEFAULT_SETTINGS.mediaQuotaBytes, 50 * 1024 ** 3)
+  assert.equal(normalizeSettings({ mediaQuotaBytes: 2 * 1024 ** 3 }).mediaQuotaBytes, 2 * 1024 ** 3)
+  assert.throws(() => normalizeSettings({ mediaQuotaBytes: 1 }), /mediaQuotaBytes/)
+  assert.throws(() => normalizeSettings({ mediaQuotaBytes: 2 * 1024 ** 3 + 0.5 }), /mediaQuotaBytes/)
   assert.equal(normalizeSettings().measureWidth, 960)
   assert.equal(normalizeSettings({ measureWidth: 800 }).measureWidth, 800)
 })

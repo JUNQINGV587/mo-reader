@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { TypertGatewayService } from '@deepseek-ai/dsh-api-gateway'
 import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol'
@@ -188,7 +191,9 @@ test('local TXT/EPUB API and settings validation need no network', async () => {
   await assert.rejects(() => service.importSource({ text: '{bad json' }), /有效 JSON/)
 })
 
-test('Service.init opens storage, recovers persisted jobs and registers hourly updates', async () => {
+test('Service.init opens storage, recovers persisted jobs and registers hourly updates', async (t) => {
+  const mediaRoot = await mkdtemp(join(tmpdir(), 'reader-media-'))
+  t.after(() => rm(mediaRoot, { recursive: true, force: true }))
   const ctx = new Context()
   const db = memoryDb()
   let closed = false
@@ -198,9 +203,20 @@ test('Service.init opens storage, recovers persisted jobs and registers hourly u
     close: async () => { closed = true },
   }
   ctx.provide('storageDomain', { open: async () => domain })
+  const routes = []
+  const disposedRoutes = []
+  ctx.provide('webServer', {
+    register(route) {
+      routes.push(route)
+      return () => disposedRoutes.push(route.path)
+    },
+  })
+  let rejection
+  ctx.provide('connection', { requestRejection: () => rejection })
   let subscriptionFetches = 0
   const service = new ReaderService(ctx, {
     engine: engineFixture(),
+    mediaRoot,
     fetchRemote: async () => {
       subscriptionFetches += 1
       return { text: JSON.stringify([{ bookSourceName: '订阅源', bookSourceUrl: 'https://sub.example' }]) }
@@ -232,10 +248,17 @@ test('Service.init opens storage, recovers persisted jobs and registers hourly u
   let dispose
   const effect = ctx.effect.bind(ctx)
   ctx.effect = (body, label) => {
-    dispose = effect(body, label)
-    return dispose
+    const disposer = effect(body, label)
+    if (label === 'reader: close storage and jobs') dispose = disposer
+    return disposer
   }
   await service[Service.init]()
+  assert.deepEqual(routes.map(route => route.path), ['/api/reader/media', '/api/reader/proxy'])
+  rejection = 401
+  const denied = { statusCode: 0, headers: {}, setHeader(key, value) { this.headers[key] = value }, end() { this.ended = true } }
+  await routes[0].handler({ method: 'GET', url: '/api/reader/media?id=missing', headers: {} }, denied)
+  assert.equal(denied.statusCode, 401)
+  assert.equal(denied.ended, true)
   await Promise.allSettled([...service.runningJobs.values()])
   assert.equal(db.jobs.get(running.id).status, 'completed')
   assert.ok(db.jobs.get(running.id).recoveredAt)

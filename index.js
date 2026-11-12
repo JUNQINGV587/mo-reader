@@ -4,6 +4,8 @@ import { createBackup, parseBackup } from './lib/backup.js'
 import { hasChapterPayload, normalizeBookContentType, normalizeSourceContentType } from './lib/content-types.js'
 import { ReaderError } from './lib/errors.js'
 import { fetchRemote } from './lib/http.js'
+import { MediaStore, DEFAULT_MEDIA_QUOTA } from './lib/media-store.js'
+import { mediaResponse, proxyResponse, sendWebResponse } from './lib/media-http.js'
 import { importEpub, importedSource, importTxt, exportEpub } from './lib/importers.js'
 import { ACTIVE_JOBS, createJob, jobView, transitionJob } from './lib/jobs.js'
 
@@ -27,6 +29,7 @@ export const REMOTE_METHODS = Object.freeze([
   'exportBackup', 'importBackup', 'fetchCover', 'cacheBookCover', 'bookCandidates', 'applyBookMeta',
   'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead', 'exportNotes',
   'aiSummarize', 'aiTranslate', 'aiAsk',
+  'mediaCacheStats', 'listMediaCache', 'setMediaRetained', 'removeMediaCache',
 ])
 
 function assertObject(value, label = 'arguments') {
@@ -44,6 +47,8 @@ export class ReaderService extends TypertRemoteService {
     this.subscriptionRefreshes = new Map()
     this.subscriptionMutations = new Map()
     this.coverCache = new Map()
+    this.media = options.mediaStore ?? null
+    this.mediaRoot = options.mediaRoot
     this.disposed = false
     const service = this
     for (const name of REMOTE_METHODS) {
@@ -58,15 +63,21 @@ export class ReaderService extends TypertRemoteService {
 
   async [Service.init]() {
     this.db = await openReaderStorage(this.ctx)
+    const settings = this.db.settings.get()
+    this.media ??= new MediaStore({ root: this.mediaRoot, quotaBytes: settings.mediaQuotaBytes ?? DEFAULT_MEDIA_QUOTA })
+    await this.media.init()
     await this.seedBuiltinSources()
+    this.mediaRouteDisposers = []
     this.ctx.effect(() => async () => {
       this.disposed = true
       for (const job of entries(this.db.jobs)) {
         if (ACTIVE_JOBS.has(job.status)) await this.db.jobs.put(job.id, transitionJob(job, 'cancel'))
       }
       await Promise.allSettled([...this.runningJobs.values(), ...this.subscriptionRefreshes.values()])
+      await this.media.queue.catch(() => {})
       await this.db.domain.close()
     }, 'reader: close storage and jobs')
+    this.ctx.inject(['webServer', 'connection'], scope => this.registerMediaRoutes(scope))
     this.stopUpdates = this.ctx.interval(
       () => this.runMaintenance().catch(error => this.log('warn', 'Scheduled maintenance failed', error)),
       3_600_000,
@@ -80,6 +91,53 @@ export class ReaderService extends TypertRemoteService {
       this.log('warn', 'Startup maintenance failed', error)
     }
     for (const job of entries(this.db.jobs)) if (job.status === 'queued') this.scheduleJob(job.id)
+  }
+
+  registerMediaRoutes(scope) {
+    const guarded = (handler, methods) => async (req, res) => {
+      const rejection = scope.connection.requestRejection(req)
+      if (rejection !== undefined) {
+        res.statusCode = rejection
+        res.end()
+        return
+      }
+      if (!methods.includes(req.method)) {
+        res.statusCode = 405
+        res.setHeader('allow', methods.join(', '))
+        res.end()
+        return
+      }
+      try {
+        const request = new Request(new URL(req.url, 'http://reader.local'), { method: req.method, headers: req.headers })
+        await sendWebResponse(await handler(request), res)
+      } catch (error) {
+        if (res.headersSent) res.destroy(error)
+        else {
+          res.statusCode = 500
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+          res.end(JSON.stringify({ error: 'reader/media-error', message: error?.message ?? '媒体请求失败。' }))
+        }
+      }
+    }
+    let disposed = false
+    const dispose = () => {
+      if (disposed) return
+      disposed = true
+      for (const unregister of this.mediaRouteDisposers.splice(0)) unregister()
+    }
+    this.mediaRouteDisposers.push(
+      scope.webServer.register({
+        kind: 'exact',
+        path: '/api/reader/media',
+        handler: guarded(req => mediaResponse(this.media, req), ['GET', 'HEAD']),
+      }),
+      scope.webServer.register({
+        kind: 'exact',
+        path: '/api/reader/proxy',
+        handler: guarded(req => proxyResponse(this, req), ['GET']),
+      }),
+    )
+    scope.effect(() => dispose)
   }
 
   async runMaintenance() {
@@ -645,6 +703,7 @@ export class ReaderService extends TypertRemoteService {
       await this.db.jobs.delete(job.id)
     }
     await this.db.chapters.deleteMany(this.chapters(book.id).map(chapter => chapter.id))
+    await this.media?.removeBook(book.id)
     await this.db.notes.deleteMany(entries(this.db.notes).filter(note => note.bookId === book.id).map(note => note.id))
     await this.db.books.delete(book.id)
     return { removed: true, id: book.id }
@@ -1019,7 +1078,14 @@ export class ReaderService extends TypertRemoteService {
     assertSettingKeys(partial)
     const settings = normalizeSettings(partial, this.db.settings.get())
     if (typeof settings.autoDownloadNewChapters !== 'boolean') throw new ReaderError('reader/invalid-settings', 'autoDownloadNewChapters must be boolean.')
-    await this.db.settings.set(settings)
+    const previousQuota = this.db.settings.get().mediaQuotaBytes
+    await this.media?.setQuotaBytes(settings.mediaQuotaBytes)
+    try {
+      await this.db.settings.set(settings)
+    } catch (error) {
+      await this.media?.setQuotaBytes(previousQuota)
+      throw error
+    }
     return clone(settings)
   }
 
@@ -1242,6 +1308,40 @@ export class ReaderService extends TypertRemoteService {
     for (const note of backup.notes) await this.db.notes.put(note.id, note)
     await this.db.settings.set({ ...DEFAULT_SETTINGS, ...backup.settings })
     return this.state()
+  }
+
+  mediaEntryView(record) {
+    return {
+      ...clone(record),
+      url: `/api/reader/media?id=${encodeURIComponent(record.id)}`,
+    }
+  }
+
+  async mediaCacheStats(args) {
+    args ??= {}
+    this.assertReady()
+    return { ...this.media.stats(), entries: this.media.list().length }
+  }
+
+  async listMediaCache(args) {
+    args ??= {}
+    this.assertReady()
+    const bookId = args.bookId === undefined ? undefined : requiredString(args.bookId, 'bookId')
+    return this.media.list({ bookId }).map(record => this.mediaEntryView(record))
+  }
+
+  async setMediaRetained(args) {
+    args ??= {}
+    this.assertReady()
+    const record = await this.media.setRetained(requiredString(args.id, 'id'), args.retained)
+    return this.mediaEntryView(record)
+  }
+
+  async removeMediaCache(args) {
+    args ??= {}
+    this.assertReady()
+    const removed = await this.media.remove(requiredString(args.id, 'id'))
+    return { removed }
   }
 
   // AI 助手：摘要、翻译、问答
