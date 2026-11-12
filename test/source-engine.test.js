@@ -31,7 +31,7 @@ test('source engine executes GET/POST form configuration and CSS rules without r
   assert.equal(calls[0].config.form, 'q=%E4%B8%89%20%E4%BD%93&p=2')
   assert.equal(calls[0].config.charset, 'utf-8')
   assert.deepEqual(result.items[0], {
-    name: '书 A', author: '作者', bookUrl: 'https://example.com/book/a', coverUrl: 'https://example.com/a.jpg', intro: '',
+    name: '书 A', author: '作者', bookUrl: 'https://example.com/book/a', coverUrl: 'https://example.com/a.jpg', intro: '', contentType: 'novel',
   })
   const book = { id: 'b', bookUrl: 'https://example.com/book/a' }
   const chapters = await engine.toc(source, book)

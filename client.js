@@ -46,6 +46,24 @@ window.__ModuleLoader__.load({
       reducedMotion: 'system',
     };
 
+    const SHELF_CATEGORIES = [
+      { id: 'novel', label: '小说', icon: 'book', unit: '本', blurb: '长篇与短篇，都在这一排。', empty: '去发现搜书，或导入本地书籍。' },
+      { id: 'comic', label: '漫画', icon: 'comic', unit: '本', blurb: '画格连载，按章往下读。', empty: '导入漫画书源后，作品会出现在这里。' },
+      { id: 'audio', label: '音频', icon: 'audio', unit: '本', blurb: '听书与播客，戴上耳机继续。', empty: '导入音频书源后，作品会出现在这里。' },
+      { id: 'video', label: '视频', icon: 'video', unit: '本', blurb: '影视与课程，按集播放。', empty: '导入视频书源后，作品会出现在这里。' },
+      { id: 'website', label: '网页', icon: 'web', unit: '个', blurb: '网站入口，点击在浏览器打开。', empty: '在书源里添加网站源，启用后会出现在这里。' },
+    ];
+    const SHELF_CATEGORY_IDS = new Set(SHELF_CATEGORIES.map((item) => item.id));
+    const BOOK_CONTENT_TYPES = new Set(['novel', 'comic', 'audio', 'video']);
+    function bookContentType(book) {
+      const value = book?.contentType;
+      return BOOK_CONTENT_TYPES.has(value) ? value : 'novel';
+    }
+    function booksForShelfCategory(books, categoryId) {
+      if (!SHELF_CATEGORY_IDS.has(categoryId) || categoryId === 'website') return [];
+      return (books || []).filter((book) => bookContentType(book) === categoryId);
+    }
+
     function prefersReducedMotion() {
       try { return window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true; }
       catch { return false; }
@@ -156,6 +174,10 @@ window.__ModuleLoader__.load({
         up: 'M12 19V6m-6 6 6-6 6 6',
         moon: 'M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z',
         chart: 'M4 19V11M10 19V5M16 19v-5M21 19V8',
+        comic: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
+        audio: 'M4 14v-2a8 8 0 0 1 16 0v2M4 14h3v6H5a1 1 0 0 1-1-1zm3 6h2v-6H4v5a1 1 0 0 0 1 1h2zm13-6h-3v6h2a1 1 0 0 0 1-1z',
+        video: 'M4 5h16v14H4zM10 9l6 3-6 3z',
+        web: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3 12h18M12 3c3.2 3.2 3.2 14.8 0 18M12 3c-3.2 3.2-3.2 14.8 0 18',
       };
       return h('svg', {
         className: 'mr-glyph', width: size, height: size, viewBox: '0 0 24 24',
@@ -344,28 +366,34 @@ window.__ModuleLoader__.load({
       return JSON.stringify([String(query).trim().toLowerCase(), filter, sortBy, folder || null]);
     }
 
-    function shelfPageGeometry({ width = 0, height = 0, mobile = false } = {}) {
+    function shelfPageGeometry({ width = 0, height = 0, mobile = false, count = 0 } = {}) {
       const safeWidth = Math.max(0, Number(width) || 0);
       const safeHeight = Math.max(0, Number(height) || 0);
       if (mobile) {
         const rows = safeHeight >= 540 ? 3 : 2;
-        return { mobile: true, columns: 3, rows, capacity: 3 * rows, rowHeight: 0 };
+        return { mobile: true, columns: 3, rows, capacity: 3 * rows, rowHeight: 0, height: safeHeight };
       }
       const gap = 12;
       const availableHeight = Math.max(0, safeHeight - 52);
       const widest = Math.max(3, Math.min(8, Math.floor(safeWidth / 145) || 3));
       const narrowest = Math.max(3, Math.min(widest, Math.floor(safeWidth / 240) || 3));
       let best = null;
-      // 同时考虑宽度和高度，避免宽屏只按宽度塞满列、把封面压得过小。
+      const itemCount = Math.max(0, Number(count) || 0);
+      // 先保证当前书库能在一页放下；放不下时优先更大的容量，再选更大的封面。
       for (let columns = narrowest; columns <= widest; columns += 1) {
         const tileWidth = Math.max(0, (safeWidth - 18 * (columns - 1)) / columns);
         let rowHeight = Math.max(170, tileWidth * 4 / 3 + 64);
         const rows = Math.max(1, Math.min(3, Math.floor((availableHeight + gap) / (rowHeight + gap)) || 1));
         if (rows === 1) rowHeight = Math.min(rowHeight, Math.max(120, availableHeight));
-        const score = tileWidth * rows * columns;
-        if (!best || score > best.score + 1) best = { columns, rows, rowHeight, score };
+        const candidate = { columns, rows, rowHeight, tileWidth, capacity: columns * rows, fits: itemCount > 0 && columns * rows >= itemCount };
+        const prefer = !best
+          || (candidate.fits && !best.fits)
+          || (candidate.fits === best.fits && (candidate.fits
+            ? candidate.tileWidth > best.tileWidth + 0.5
+            : candidate.capacity > best.capacity || (candidate.capacity === best.capacity && candidate.tileWidth > best.tileWidth + 0.5)));
+        if (prefer) best = candidate;
       }
-      return { mobile: false, columns: best.columns, rows: best.rows, capacity: best.columns * best.rows, rowHeight: best.rowHeight };
+      return { mobile: false, columns: best.columns, rows: best.rows, capacity: best.capacity, rowHeight: best.rowHeight, height: safeHeight };
     }
 
     function shelfPageCount(itemCount, geometry) {
@@ -454,7 +482,7 @@ window.__ModuleLoader__.load({
         h('span', { className: 'mr-dl-label' }, badge.label));
     }
 
-    function ShelfBoard({ books, folders = [], reducedMotion = false, onOpen, onCheck, busy = false, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead }) {
+    function ShelfBoard({ books, category, folders = [], reducedMotion = false, onOpen, onCheck, busy = false, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead, onStats }) {
       const [query, setQuery] = useState('');
       const [selectMode, setSelectMode] = useState(false);
       const [selected, setSelected] = useState(new Set());
@@ -466,10 +494,12 @@ window.__ModuleLoader__.load({
       const [mobileSearch, setMobileSearch] = useState(false);
       const [page, setPage] = useState(0);
       const [pageMotion, setPageMotion] = useState(null);
+      const [glanceOffset, setGlanceOffset] = useState(0);
       const [geometry, setGeometry] = useState(() => shelfPageGeometry({
         width: window.innerWidth,
         height: window.innerHeight,
         mobile: window.matchMedia?.('(max-width: 760px)').matches || window.innerWidth <= 760,
+        count: books.length,
       }));
       const searchRef = useRef(null);
       const wallRef = useRef(null);
@@ -558,9 +588,10 @@ window.__ModuleLoader__.load({
             width: rect.width,
             height: Math.max(0, rect.height - pagerHeight),
             mobile,
+            count: gridBooksRef.current.length,
           });
           const previous = geometryRef.current;
-          const changed = previous.mobile !== next.mobile || previous.columns !== next.columns || previous.rows !== next.rows;
+          const changed = previous.mobile !== next.mobile || previous.columns !== next.columns || previous.rows !== next.rows || previous.rowHeight !== next.rowHeight || previous.height !== next.height;
           if (!changed) return;
           if (previous.capacity !== next.capacity || previous.mobile !== next.mobile) {
             const anchorId = anchorRef.current || paginateShelf(gridBooksRef.current, pageRef.current, previous).anchorId;
@@ -579,7 +610,7 @@ window.__ModuleLoader__.load({
           observer?.disconnect();
           window.removeEventListener('resize', measure);
         };
-      }, []);
+      }, [gridBooks.length]);
 
       const previousResultKeyRef = useRef(resultKey);
       useLayoutEffect(() => {
@@ -778,10 +809,25 @@ window.__ModuleLoader__.load({
         const name = window.prompt('重命名文件夹', folder.name);
         if (name) onRenameFolder?.(folder.id, name);
       };
-      const emptyTitle = layout.count === 0 ? '窗边还空着' : normalizedQuery ? `没有找到「${query.trim()}」` : folderFilter ? '这个文件夹还空着' : '没有可展示的书';
-      const emptyDetail = layout.count === 0 ? '去发现搜书，或导入本地书籍。' : normalizedQuery ? '换个书名或作者，也可以看看在线结果。' : folderFilter ? '移动书籍到这里，或返回书库。' : '全部藏书都还在，换个搜索或排序试试。';
+      const categoryLabel = category?.label || '图书';
+      const emptyTitle = layout.count === 0 ? `${categoryLabel}书架还空着` : normalizedQuery ? `没有找到「${query.trim()}」` : folderFilter ? '这个文件夹还空着' : '没有可展示的书';
+      const emptyDetail = layout.count === 0 ? (category?.empty || '去发现搜书，或导入本地书籍。') : normalizedQuery ? '换个书名或作者，也可以看看在线结果。' : folderFilter ? '移动书籍到这里，或返回书库。' : '全部藏书都还在，换个搜索或排序试试。';
       const pageNumbers = [...new Set([0, pageData.pageCount - 1, pageData.page - 1, pageData.page, pageData.page + 1].filter((index) => index >= 0 && index < pageData.pageCount))].sort((a, b) => a - b);
-      const renderedRows = geometry.mobile ? geometry.rows : Math.max(1, Math.min(geometry.rows, Math.ceil(pageData.items.length / geometry.columns)))
+      const renderedRows = geometry.mobile ? geometry.rows : Math.max(1, Math.min(geometry.rows, Math.ceil(pageData.items.length / geometry.columns)));
+      const resumeBook = layout.books.find((book) => shelfFilterMatches(book, 'reading')) || null;
+      const glancePool = gridBooks.length ? gridBooks : layout.books;
+      const glanceBook = resumeBook || (glancePool.length ? glancePool[glanceOffset % glancePool.length] : null);
+      const resumeProgress = resumeBook?.lastRead || resumeBook?.progress || null;
+      const resumePercent = Math.max(0, Math.min(100, Number(resumeProgress?.percent) || 0));
+      const gridHeight = renderedRows * geometry.rowHeight + Math.max(0, renderedRows - 1) * 12;
+      const spareHeight = Math.max(0, Number(geometry.height) || 0) - gridHeight - 48;
+      const showGlance = !geometry.mobile && !selectMode && Boolean(glanceBook) && spareHeight >= 96;
+      const downloadedCount = layout.books.filter((book) => shelfFilterMatches(book, 'downloaded')).length;
+      const readingCount = layout.books.filter((book) => shelfFilterMatches(book, 'reading')).length;
+      const pickRandomBook = () => {
+        if (!glancePool.length) return;
+        onOpen?.(glancePool[Math.floor(Math.random() * glancePool.length)]);
+      };
 
       return h('div', { className: `mr-shelf mr-window-shelf${reducedMotion ? ' mr-reduced' : ''}${mobileSearch ? ' mr-mobile-search-open' : ''}${selectMode ? ' mr-selecting' : ''}` },
         h('div', { className: 'mr-shelf-topbar' },
@@ -834,6 +880,12 @@ window.__ModuleLoader__.load({
             onClick: onCheck,
           }, h(Glyph, { name: 'refresh', size: 18 })),
           h('div', { className: 'mr-shelf-status' }, h('span', { className: 'dot' }), h('span', null, '本机保存'))),
+        h('header', { className: 'mr-shelf-head' },
+          h('div', { className: 'mr-shelf-head-copy' },
+            h('div', { className: 'kicker' }, `窗边 · ${categoryLabel}`, h('span', { className: 'tag' }, `${layout.count} ${category?.unit || '本'}`)),
+            h('h1', null, `${categoryLabel}书架`),
+            h('p', { className: 'mr-shelf-head-blurb' }, category?.blurb || '本机保存的书，都在这一排。')),
+          onStats ? h('div', { className: 'mr-shelf-head-actions' }, h(Button, { kind: 'text', icon: 'chart', onClick: onStats }, '阅读统计')) : null),
         folders.length > 0 && !selectMode ? h('div', { className: 'mr-shelf-folder-bar' },
           h('button', { className: `mr-folder-chip${!folderFilter ? ' active' : ''}`, onClick: () => setFolderFilter(null) }, '书库'),
           folders.map((folder) => h('button', {
@@ -869,10 +921,21 @@ window.__ModuleLoader__.load({
             h(Button, { kind: 'text', onClick: () => setFolderSheet(false) }, '取消'))) : null,
         shareBook ? h(ShareCard, { book: shareBook, onClose: () => setShareBook(null) }) : null,
         h('div', { className: 'mr-shelf-gallery' },
-          h('section', { className: 'mr-shelf-wall', ref: wallRef, 'aria-label': '书架书籍' },
+          h('section', { className: `mr-shelf-wall${showGlance ? ' has-glance' : ''}`, ref: wallRef, 'aria-label': '书架书籍' },
+            showGlance ? h('section', { className: 'mr-shelf-glance', 'aria-label': '阅读建议' },
+              h('span', { className: 'mr-shelf-glance-mark', 'aria-hidden': 'true' }, h(Glyph, { name: 'book', size: 20 })),
+              h('div', { className: 'mr-shelf-glance-copy' },
+                h('span', { className: 'mr-shelf-glance-kicker' }, resumeBook ? '接着上次 · 窗边' : '今日推荐 · 窗边'),
+                h('strong', null, String(glanceBook?.name || glanceBook?.title || '未命名')),
+                h('small', null, resumeBook
+                  ? [glanceBook.author, resumePercent > 0 ? `已读 ${Math.round(resumePercent)}%` : '从上次停下的地方继续'].filter(Boolean).join(' · ')
+                  : [glanceBook.author, `选自${categoryLabel}书架`].filter(Boolean).join(' · '))),
+              h('div', { className: 'mr-shelf-glance-actions' },
+                h(Button, { kind: 'primary', disabled: !onOpen, onClick: () => onOpen?.(glanceBook) }, resumeBook ? '继续阅读' : '翻开'),
+                !resumeBook && glancePool.length > 1 ? h(Button, { kind: 'text', onClick: () => setGlanceOffset((value) => value + 1) }, '换一本') : null)) : null,
             gridBooks.length === 0
               ? h('div', { className: 'mr-shelf-empty' },
-                  h('div', { className: 'mr-shelf-empty-icon' }, h(Glyph, { name: 'book', size: 24 })),
+                  h('div', { className: 'mr-shelf-empty-icon' }, h(Glyph, { name: category?.icon || 'book', size: 24 })),
                   h('h3', null, emptyTitle),
                   h('p', null, emptyDetail),
                   normalizedQuery ? h(Button, { kind: 'secondary', onClick: clearSearch }, '清空搜索') : null)
@@ -900,12 +963,20 @@ window.__ModuleLoader__.load({
                         'data-mobile-page': pageIndex,
                       }, entry.items.map((book, index) => renderBook(book, pageIndex * geometry.capacity + index))))
                     : pageData.items.map((book, index) => renderBook(book, pageData.start + index))),
-          !geometry.mobile && gridBooks.length > 0 ? h('nav', { className: 'mr-shelf-pager', 'aria-label': '书架页码' },
-            h('button', { type: 'button', 'aria-label': '上一页', disabled: pageData.page === 0, onClick: () => setCurrentPage(pageData.page - 1) }, '←'),
-            pageNumbers.map((number, index) => h(React.Fragment, { key: number },
-              index > 0 && number - pageNumbers[index - 1] > 1 ? h('span', { className: 'mr-shelf-page-gap', 'aria-hidden': 'true' }, '…') : null,
-              h('button', { type: 'button', className: number === pageData.page ? 'active' : '', 'aria-label': `第 ${number + 1} 页`, 'aria-current': number === pageData.page ? 'page' : undefined, onClick: () => setCurrentPage(number) }, number + 1))),
-            h('button', { type: 'button', 'aria-label': '下一页', disabled: pageData.page >= pageData.pageCount - 1, onClick: () => setCurrentPage(pageData.page + 1) }, '→')) : null)),
+          !geometry.mobile && gridBooks.length > 0 ? h('div', { className: 'mr-shelf-foot' },
+            h('div', { className: 'mr-shelf-stats', 'aria-label': '书架统计' },
+              h('span', null, h('strong', null, layout.count), ' 本藏书'),
+              h('span', null, h('strong', null, downloadedCount), ' 本已下载'),
+              h('span', null, readingCount ? h(React.Fragment, null, h('strong', null, readingCount), ' 本在读') : '尚未开卷')),
+            h('div', { className: 'mr-shelf-foot-actions' },
+              h('button', { className: 'mr-shelf-random', type: 'button', title: '随机翻开一本', onClick: pickRandomBook },
+                h(Glyph, { name: 'refresh', size: 14 }), h('span', null, '随机一本')),
+              h('nav', { className: 'mr-shelf-pager', 'aria-label': '书架页码' },
+                h('button', { type: 'button', 'aria-label': '上一页', disabled: pageData.page === 0, onClick: () => setCurrentPage(pageData.page - 1) }, '←'),
+                pageNumbers.map((number, index) => h(React.Fragment, { key: number },
+                  index > 0 && number - pageNumbers[index - 1] > 1 ? h('span', { className: 'mr-shelf-page-gap', 'aria-hidden': 'true' }, '…') : null,
+                  h('button', { type: 'button', className: number === pageData.page ? 'active' : '', 'aria-label': `第 ${number + 1} 页`, 'aria-current': number === pageData.page ? 'page' : undefined, onClick: () => setCurrentPage(number) }, number + 1))),
+                h('button', { type: 'button', 'aria-label': '下一页', disabled: pageData.page >= pageData.pageCount - 1, onClick: () => setCurrentPage(pageData.page + 1) }, '→')))) : null)),
         normalizedQuery ? h('section', { className: 'mr-shelf-online', 'aria-label': '在线搜索结果' },
           h('div', { className: 'mr-shelf-online-head' },
             h('h2', null, '在线'),
@@ -926,16 +997,16 @@ window.__ModuleLoader__.load({
 
     }
 
-    function Library({ books, folders = [], onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality, ambience, reducedMotion = false, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead }) {
+    function Library({ books, category, folders = [], onOpen, onDownload, onRemove, onCheck, busy, view = 'shelf', onView, ctx, theme, quality, ambience, reducedMotion = false, onToggleDownload, online = null, onlineBusy = false, onlineFailed = 0, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead, onStats }) {
       const viewToggle = h('div', { className: 'mr-view-toggle', role: 'group', 'aria-label': '书架视图' },
         h('button', { className: view === 'shelf' ? 'active' : '', onClick: () => onView('shelf') }, '书架'),
         h('button', { className: view === 'list' ? 'active' : '', onClick: () => onView('list') }, '列表'));
       const checkButton = h(Button, { icon: 'refresh', onClick: onCheck, disabled: busy }, '补查');
       const actions = h(React.Fragment, null, viewToggle, checkButton);
-      if (view === 'shelf') return h(ShelfBoard, { key: 'shelf', books, folders, reducedMotion, onOpen, onCheck, busy, onToggleDownload, online, onlineBusy, onlineFailed, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead });
+      if (view === 'shelf') return h(ShelfBoard, { key: 'shelf', books, category, folders, reducedMotion, onStats, onOpen, onCheck, busy, onToggleDownload, online, onlineBusy, onlineFailed, onSearchOnline, onAddOnline, onCreateFolder, onRenameFolder, onRemoveFolder, onMoveToFolder, onBatchDelete, onBatchDownload, onExport, onMarkRead });
       return h(React.Fragment, null,
         h('div', { className: 'mr-section-head' },
-          h('div', null, h('h2', null, '我的书架'), h('p', null, `${books.length} 本 · 本机保存`)),
+          h('div', null, h('h2', null, `${category?.label || ''}书架`), h('p', null, `${books.length} ${category?.unit || '本'} · 本机保存`)),
           h('div', { className: 'mr-section-actions' }, actions)),
         h('div', { className: 'mr-book-grid' }, books.map((book) => {
           const id = book.id || book.bookId;
@@ -1339,7 +1410,7 @@ window.__ModuleLoader__.load({
         ));
     }
 
-    function Settings({ settings, onSettings, onLocal, onExport, onImport, busy, onExportNotes, onUploadFont }) {
+    function Settings({ settings, onSettings, onLocal, onExport, onImport, busy, onExportNotes, onUploadFont, onStats }) {
       const [replacementText, setReplacementText] = useState(() => (settings.replacements || []).map((rule) => `${rule.pattern || rule.from || ''}=>${rule.replacement || rule.to || ''}`).join('\n'));
       const localRef = useRef(null);
       const backupRef = useRef(null);
@@ -1359,7 +1430,7 @@ window.__ModuleLoader__.load({
           kicker: 'MO READ · 窗边 / 设置',
           title: '设置',
           sub: '排版、净化与本机数据',
-          aside: h('span', { className: 'mr-screen-note' }, '本机保存 · 不上传'),
+          aside: h(React.Fragment, null, h('span', { className: 'mr-screen-note' }, '本机保存 · 不上传'), onStats ? h(Button, { kind: 'text', icon: 'chart', onClick: onStats }, '阅读统计') : null),
         }),
         h('div', { className: 'mr-settings-grid' },
         h('section', { className: 'mr-panel' }, h('h3', null, '动画'),
@@ -2941,9 +3012,20 @@ window.__ModuleLoader__.load({
           h('footer', { className: 'mr-meta-foot' }, h('button', { type: 'button', className: 'mr-meta-skip', onClick: onClose }, '跳过'))))
     }
 
+    function ReaderNav({ tab, onTab }) {
+      const nav = [
+        ...SHELF_CATEGORIES.map((category) => [category.id, category.label, category.icon]),
+        ['discover', '发现', 'compass'], ['sources', '书源', 'source'], ['settings', '设置', 'settings'],
+      ];
+      return h('nav', { className: 'mr-nav', 'aria-label': '墨读' },
+        h('div', { className: 'mr-brand', title: '墨读', 'aria-label': '墨读' }, h(ReaderIcon, { size: 26 })),
+        h('div', { className: 'mr-nav-items' }, nav.map(([id, label, icon]) => h('button', { key: id, className: tab === id ? 'active' : '', 'data-tab': id, onClick: () => onTab(id) }, h(Glyph, { name: icon }), h('span', null, label)))),
+        h('div', { className: 'mr-local' }, h('span', null), '本机保存'));
+    }
+
     function ReaderApp({ ctx }) {
       const [data, setData] = useState({ sources: [], subscriptions: [], books: [], jobs: [], notes: [], folders: [], settings: DEFAULT_SETTINGS });
-      const [tab, setTab] = useState('library');
+      const [tab, setTab] = useState('novel');
       const [loading, setLoading] = useState(true);
       const [busy, setBusy] = useState(false);
       const [refreshingSubscriptions, setRefreshingSubscriptions] = useState([]);
@@ -2972,6 +3054,8 @@ window.__ModuleLoader__.load({
         return job ? { ...book, sourceFailed, downloadStatus: job.status, download: job } : { ...book, sourceFailed };
       });
       const notes = data.notes || [];
+      const activeCategory = SHELF_CATEGORIES.find((category) => category.id === tab) || null;
+      const categoryBooks = activeCategory ? booksForShelfCategory(books, activeCategory.id) : [];
       const activeBook = reading ? books.find((book) => (book.id || book.bookId) === (reading.id || reading.bookId)) || reading : null;
       const notify = (text, kind = 'info') => setNotice({ text, kind });
 
@@ -3180,7 +3264,7 @@ window.__ModuleLoader__.load({
             args.base64 = btoa(binary);
           }
           const imported = await call(ctx, 'importLocal', args);
-          await refresh(true); notify('书籍已导入', 'success'); setTab('library');
+          await refresh(true); notify('书籍已导入', 'success'); setTab('novel');
           if (imported && !String(imported.author || '').trim()) void openMetaSheet(imported);
         } catch (cause) { notify(cause.message || String(cause), 'error'); }
         finally { setBusy(false); }
@@ -3207,22 +3291,16 @@ window.__ModuleLoader__.load({
         setOpening({ ...detail, book, theme: settings.readerTheme || 'paper' });
         setReading(book);
       };
-      const nav = [
-        ['library', '书架', 'shelf'], ['discover', '发现', 'compass'], ['sources', '书源', 'source'], ['stats', '统计', 'chart'], ['settings', '设置', 'settings'],
-      ];
       if (activeBook) return h(React.Fragment, null, h('style', null, css),
         h(ReaderView, { ctx, book: activeBook, settings, notes, notice, onDismissNotice: () => setNotice(null), deferMs: opening ? 200 : 0, onSettings: updateSettings, onBookSettings: (partial) => updateBookSettings(activeBook.id || activeBook.bookId, partial), onClose: () => { setOpening(null); setReading(null); refresh(true); }, onSaveNote: saveNote, onDeleteNote: (note) => run(() => call(ctx, 'deleteNote', { id: note.id })).catch(() => {}), notify }),
         opening ? h(OpenTransition, { key: opening.bookId || 'open', data: opening, onDone: () => setOpening(null) }) : null);
 
       return h(React.Fragment, null, h('style', null, css), h(MetaSheet, { state: metaSheet, onClose: () => setMetaSheet(null), onPick: applyMetaCandidate }), h('div', { className: 'mr-root' },
-        h('nav', { className: 'mr-nav', 'aria-label': '墨读' },
-          h('div', { className: 'mr-brand', title: '墨读', 'aria-label': '墨读' }, h(ReaderIcon, { size: 26 })),
-          h('div', { className: 'mr-nav-items' }, nav.map(([id, label, icon]) => h('button', { key: id, className: tab === id ? 'active' : '', onClick: () => setTab(id) }, h(Glyph, { name: icon }), h('span', null, label)))),
-          h('div', { className: 'mr-local' }, h('span', null), '本机保存')),
+        h(ReaderNav, { tab, onTab: setTab }),
         h('section', { className: 'mr-content' },
           h(Notice, { notice, onClose: () => setNotice(null) }),
           loading ? h('div', { className: 'mr-loading' }, '正在打开墨读…') : null,
-          !loading && tab === 'library' ? h(Library, { books, folders: data.folders || [], busy, view: shelfView, onView: setShelfView, ctx, online: shelfOnline, onlineBusy: shelfOnlineBusy, onlineFailed: shelfOnlineFailed, onSearchOnline: searchShelfOnline, onAddOnline: (item) => addBook(item), theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: motionOff, onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}),
+          !loading && activeCategory ? h(Library, { books: categoryBooks, category: activeCategory, folders: data.folders || [], busy, view: shelfView, onView: setShelfView, ctx, online: shelfOnline, onlineBusy: shelfOnlineBusy, onlineFailed: shelfOnlineFailed, onSearchOnline: searchShelfOnline, onAddOnline: (item) => addBook(item), theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: motionOff, onStats: () => setTab('stats'), onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}),
             onCreateFolder: (name) => run(() => call(ctx, 'createFolder', { name }), '文件夹已创建').catch(() => {}),
             onRenameFolder: (folderId, name) => run(() => call(ctx, 'renameFolder', { folderId, name }), '已重命名').catch(() => {}),
             onRemoveFolder: (folderId) => run(() => call(ctx, 'removeFolder', { folderId }), '文件夹已删除').catch(() => {}),
@@ -3257,7 +3335,7 @@ window.__ModuleLoader__.load({
               onToggle: toggleSource,
               onRemove: (source) => run(() => call(ctx, 'removeSource', { id: source.id || source.bookSourceUrl }), '书源已移除').catch(() => {}) }) : null,
           !loading && tab === 'stats' ? h(Stats) : null,
-          !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy,
+          !loading && tab === 'settings' ? h(Settings, { settings, onSettings: updateSettings, onLocal: localImport, onExport: exportBackup, onImport: importBackup, busy, onStats: () => setTab('stats'),
             onExportNotes: () => run(() => call(ctx, 'exportNotes'), '导出完成').then(r => { if (r?.text) { const blob = new Blob([r.text], { type: 'text/markdown;charset=utf-8' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = '墨读笔记.md'; a.click(); URL.revokeObjectURL(a.href); } }, () => {}),
             onUploadFont: (file) => { const reader = new FileReader(); reader.onload = (e) => { const fontFamily = `custom-${Date.now()}`; const style = document.createElement('style'); style.textContent = `@font-face{font-family:'${fontFamily}';src:url('${e.target.result}')}`; document.head.appendChild(style); updateSettings({ fontFamily }); setNotice({ kind: 'success', text: '字体已应用' }); }; reader.readAsDataURL(file); },
           }) : null)));
@@ -3334,7 +3412,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-shelf-head-copy{min-width:0}
 .mr-shelf-head .kicker{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.14em;color:var(--mr-muted);margin-bottom:8px}
 .mr-shelf-head .kicker .tag{border:1px solid var(--mr-border);color:var(--mr-muted);padding:1px 6px;font-size:11px;border-radius:2px;letter-spacing:.08em}
-.mr-shelf-head h1{font:400 32px/1.2 var(--mr-serif);margin:0;color:var(--mr-text);letter-spacing:-.4px}
+.mr-shelf-head h1{font:400 32px/1.2 var(--mr-serif);margin:0;color:var(--mr-text);letter-spacing:-.4px}.mr-shelf-head-blurb{margin:7px 0 0;color:var(--mr-muted);font-size:12px;line-height:1.5}
 .mr-shelf-head-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .mr-shelf-gallery{display:grid;grid-template-columns:320px 1fr;gap:28px;align-items:stretch}
 .mr-tag.failed{background:color-mix(in srgb, #a8422f 18%, transparent);color:#a8422f;border-color:color-mix(in srgb, #a8422f 35%, transparent)}
@@ -3582,7 +3660,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-reader-top-copy span{font:400 10px/1.3 var(--mr-serif);color:var(--reader-muted)}
 .mr-reader .mr-tabbar{padding-bottom:env(safe-area-inset-bottom,0px);height:calc(54px + env(safe-area-inset-bottom,0px))}
 .mr-reader .mr-paged-view{padding-bottom:calc(54px + env(safe-area-inset-bottom,0px))}
-.mr-shelf-search .kbd{display:none}.mr-root{flex-direction:column;padding-left:0}.mr-section-actions{width:100%;justify-content:space-between}.mr-reader{padding-left:0}.mr-page-window{width:calc(100% - 32px)}.mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-content{order:1;padding:20px 14px}.mr-section-head{flex-wrap:wrap;margin-bottom:18px}.mr-section-head h2{font-size:22px;white-space:nowrap}.mr-book-grid{grid-template-columns:1fr;gap:10px}.mr-book-open{padding:13px}.mr-book-actions{position:relative}.mr-searchbar{flex-wrap:wrap}.mr-searchbar select{max-width:none;width:100%}.mr-searchbar input{flex:1}.mr-result{align-items:flex-start;padding:12px;gap:10px}.mr-result .mr-button{align-self:center;padding-inline:9px}.mr-result-info .mr-intro{-webkit-line-clamp:1}.mr-source-row{flex-wrap:wrap}.mr-source-row .mr-tag{display:none}.mr-panel{padding:16px}.mr-notice{top:-12px}.mr-chapter{width:calc(100% - 40px);padding:64px 0 84px}.mr-chapter-title{font-size:25px}.mr-chapter-no{letter-spacing:.42em;text-indent:.42em}.mr-drawer{left:0;right:0;width:auto}.mr-chapter-meta{letter-spacing:.04em}.mr-modal{padding:0}.mr-set-label{width:56px}}
+.mr-shelf-search .kbd{display:none}.mr-root{flex-direction:column;padding-left:0}.mr-section-actions{width:100%;justify-content:space-between}.mr-reader{padding-left:0}.mr-page-window{width:calc(100% - 32px)}.mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0;overflow:visible}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-content{order:1;padding:20px 14px}.mr-section-head{flex-wrap:wrap;margin-bottom:18px}.mr-section-head h2{font-size:22px;white-space:nowrap}.mr-book-grid{grid-template-columns:1fr;gap:10px}.mr-book-open{padding:13px}.mr-book-actions{position:relative}.mr-searchbar{flex-wrap:wrap}.mr-searchbar select{max-width:none;width:100%}.mr-searchbar input{flex:1}.mr-result{align-items:flex-start;padding:12px;gap:10px}.mr-result .mr-button{align-self:center;padding-inline:9px}.mr-result-info .mr-intro{-webkit-line-clamp:1}.mr-source-row{flex-wrap:wrap}.mr-source-row .mr-tag{display:none}.mr-panel{padding:16px}.mr-notice{top:-12px}.mr-chapter{width:calc(100% - 40px);padding:64px 0 84px}.mr-chapter-title{font-size:25px}.mr-chapter-no{letter-spacing:.42em;text-indent:.42em}.mr-drawer{left:0;right:0;width:auto}.mr-chapter-meta{letter-spacing:.04em}.mr-modal{padding:0}.mr-set-label{width:56px}}
 /* 平板适配（721-1024px） */
 @media(min-width:721px) and (max-width:1024px){
   .mr-nav{width:140px;flex:0 0 140px;padding:20px 10px 14px}
@@ -3681,9 +3759,9 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-ai-result p{margin:0;font-size:14px;line-height:1.8;white-space:pre-wrap}
 /* 窗边书架：共用外壳与真实数据分页。 */
 .mr-root{--mr-accent:#6b4a2d;--mr-accent-hover:#543921;--mr-on-accent:#fffaf0;--mr-paper:#f6f0e1;--mr-card:#fbf7ec;--mr-sunken:#e9e1d0;--mr-text:#29261f;--mr-body:#29261f;--mr-muted:#766e60;--mr-border:#d5ccb8;--mr-line:#d5ccb8;--mr-ink:#211c16;background:var(--mr-paper)}
-.mr-nav{width:84px;flex:0 0 84px;padding:16px 8px 12px;border-right:1px solid var(--mr-border);background:#e7e0cf}
-.mr-brand{justify-content:center;padding:0 0 24px}.mr-brand>div{display:none}.mr-brand svg{color:var(--mr-accent)}
-.mr-nav-items{gap:7px}.mr-nav-items button{min-height:50px;flex-direction:column;justify-content:center;gap:4px;padding:5px 0;border-left:0;border-radius:10px;font-size:10px;text-align:center}.mr-nav-items button.active{border-left:0;background:#f6f0e1;color:var(--mr-accent)}
+.mr-nav{width:108px;flex:0 0 108px;padding:18px 10px 14px;border-right:1px solid var(--mr-border);background:#e7e0cf}
+.mr-brand{justify-content:center;padding:0 0 22px}.mr-brand>div{display:none}.mr-brand svg{width:26px;height:26px;color:var(--mr-accent)}
+.mr-nav-items{gap:8px;min-height:0;overflow-y:auto;scrollbar-width:none}.mr-nav-items::-webkit-scrollbar{display:none}.mr-nav-items button{min-height:58px;flex-direction:column;justify-content:center;gap:5px;padding:6px 0;border-left:0;border-radius:11px;font-size:11px;text-align:center}.mr-nav-items button svg{width:22px;height:22px}.mr-nav-items button.active{border-left:0;background:#f6f0e1;color:var(--mr-accent)}
 .mr-local{justify-content:center;padding:10px 0;font-size:0}.mr-content{background:var(--mr-paper)}
 .mr-content>.mr-window-shelf{max-width:none;height:100%;min-height:0}
 .mr-window-shelf{display:flex;flex-direction:column;gap:0;min-height:0;color:var(--mr-text)}
@@ -3697,11 +3775,30 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-window-shelf .mr-shelf-hero{flex:0 0 auto;display:grid;grid-template-columns:110px minmax(0,1fr);align-items:center;gap:18px;min-width:0;padding:16px;border:1px solid var(--mr-border);border-radius:4px;background:#eee6d4;overflow:hidden}
 .mr-window-shelf .mr-shelf-hero-cover{width:110px;max-width:110px;justify-self:center}.mr-window-shelf .mr-shelf-hero-cover .mr-shelf-cover{aspect-ratio:3/4}.mr-window-shelf .mr-shelf-hero-info{align-self:center}.mr-window-shelf .mr-shelf-hero-title{font-size:22px;white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}.mr-window-shelf .mr-shelf-hero-by{white-space:normal}.mr-window-shelf .mr-shelf-cta{margin-top:12px;min-height:36px;padding:0 14px}
 .mr-shelf-wall{position:relative;flex:1 1 auto;min-width:0;min-height:0;display:grid;grid-template-rows:auto auto;align-content:center;row-gap:16px}
+.mr-shelf-wall.has-glance{grid-template-rows:auto auto auto;align-content:center;row-gap:16px}
 .mr-window-shelf .mr-shelf-grid:not(.mr-mobile-track){min-height:0;display:grid;grid-template-columns:repeat(var(--shelf-columns),minmax(0,1fr));grid-template-rows:repeat(var(--shelf-rows),var(--shelf-row-height,minmax(0,1fr)));gap:12px 18px;align-content:center}
+.mr-shelf-glance{position:relative;display:flex;align-items:center;gap:16px;min-height:84px;padding:14px 18px 14px 20px;border:1px solid var(--mr-border);border-radius:4px;background:color-mix(in srgb,var(--mr-accent) 5%,var(--mr-card));overflow:hidden}
+.mr-shelf-glance::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--mr-accent)}
+.mr-shelf-glance-mark{display:grid;place-items:center;flex:0 0 42px;height:52px;border:1px solid color-mix(in srgb,var(--mr-accent) 42%,var(--mr-border));border-radius:2px;color:var(--mr-accent);background:color-mix(in srgb,var(--mr-accent) 7%,transparent)}
+.mr-shelf-glance-copy{min-width:0;display:flex;flex-direction:column;gap:3px}
+.mr-shelf-glance-kicker{font-size:10px;letter-spacing:.15em;color:var(--mr-accent);font-weight:600}
+.mr-shelf-glance-copy strong{font:400 20px/1.35 var(--mr-serif);color:var(--mr-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mr-shelf-glance-copy small{font-size:11px;color:var(--mr-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mr-shelf-glance-actions{display:flex;align-items:center;gap:4px;margin-left:auto;flex:0 0 auto}
+.mr-shelf-glance-actions .mr-button{min-height:34px;padding:0 14px;font-size:12px}
+.mr-shelf-foot{display:flex;align-items:center;justify-content:space-between;gap:20px;min-height:32px;min-width:0}
+.mr-shelf-stats{display:flex;align-items:center;gap:14px;min-width:0;color:var(--mr-muted);font-size:11px;white-space:nowrap}
+.mr-shelf-stats span{display:inline-flex;align-items:baseline;gap:3px}
+.mr-shelf-stats strong{font:600 15px/1 var(--mr-serif);color:var(--mr-text);letter-spacing:.02em}
+.mr-shelf-foot-actions{display:flex;align-items:center;gap:10px;margin-left:auto;min-width:0}
+.mr-shelf-random{display:inline-flex;align-items:center;gap:5px;height:28px;padding:0 9px;border:1px solid var(--mr-border);border-radius:5px;background:transparent;color:var(--mr-muted);font-size:11px;cursor:pointer}
+.mr-shelf-random:hover{border-color:var(--mr-accent);color:var(--mr-accent)}
+.mr-shelf-foot .mr-shelf-pager{padding-top:0}
 @keyframes mrShelfPageNext{from{opacity:0;transform:translateX(26px)}to{opacity:1;transform:translateX(0)}}
 @keyframes mrShelfPagePrev{from{opacity:0;transform:translateX(-26px)}to{opacity:1;transform:translateX(0)}}
 .mr-window-shelf .mr-shelf-grid.mr-page-next{animation:mrShelfPageNext .22s cubic-bezier(.2,.7,.2,1) both}
 .mr-window-shelf .mr-shelf-grid.mr-page-prev{animation:mrShelfPagePrev .22s cubic-bezier(.2,.7,.2,1) both}
+@media(max-width:720px){.mr-window-shelf .mr-shelf-head{margin:0 0 6px;gap:6px;align-items:center}.mr-window-shelf .mr-shelf-head h1{font-size:22px}.mr-window-shelf .mr-shelf-head .kicker{margin-bottom:3px}.mr-window-shelf .mr-shelf-head-blurb{display:none}.mr-window-shelf .mr-shelf-head-actions{display:none}}
 @media(prefers-reduced-motion:reduce){.mr-window-shelf .mr-shelf-grid.mr-page-next,.mr-window-shelf .mr-shelf-grid.mr-page-prev{animation:none}}
 .mr-window-shelf .mr-shelf-piece{--shelf-cap-space:47px;height:100%;min-height:0;display:flex;flex-direction:column;justify-content:center;gap:7px;container-type:size;opacity:1;animation:none;border-radius:3px}.mr-window-shelf .mr-shelf-visual{position:relative;display:flex;justify-content:center;align-items:center;width:100%;min-height:0}.mr-window-shelf .mr-shelf-cover-frame{position:relative;display:block;flex:0 0 auto;width:min(100cqw,calc((100cqh - var(--shelf-cap-space)) * .6667));aspect-ratio:2/3}.mr-window-shelf .mr-shelf-cover{width:100%;height:100%;min-height:0;aspect-ratio:2/3;border-radius:3px;box-shadow:0 5px 12px rgba(62,48,31,.16)}.mr-window-shelf .mr-shelf-piece:hover .mr-shelf-cover{transform:translateY(-2px)}.mr-window-shelf .mr-shelf-cap{flex:0 0 40px;width:min(100cqw,calc((100cqh - var(--shelf-cap-space)) * .6667));align-self:center}.mr-window-shelf .mr-shelf-cap strong{font-size:13px;line-height:1.35}.mr-window-shelf .mr-shelf-cap small{font-size:10px;margin-top:3px}.mr-window-shelf .mr-shelf-fallback-title{font-size:15px}
 .mr-shelf-pager{display:flex;flex:0 0 auto;align-items:center;justify-content:flex-end;gap:3px;padding-top:8px}.mr-shelf-pager button{min-width:28px;height:28px;padding:0 6px;border:0;border-radius:5px;background:transparent;color:var(--mr-muted);font-size:11px}.mr-shelf-pager button:hover:not(:disabled){background:var(--mr-sunken);color:var(--mr-text)}.mr-shelf-pager button[aria-current=page]{background:var(--mr-accent);color:var(--mr-on-accent)}.mr-shelf-pager button:focus-visible{outline:2px solid var(--mr-accent);outline-offset:1px}
@@ -3710,7 +3807,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-shelf-mobile-search-toggle{display:none;min-width:36px;height:36px;padding:0;border:1px solid var(--mr-border);border-radius:9px;background:var(--mr-card);color:var(--mr-text);align-items:center;justify-content:center}
 @media(max-width:720px){
   .mr-root{position:fixed;inset:0;z-index:2147483000;height:100dvh;box-sizing:border-box;padding-top:env(safe-area-inset-top);background:var(--mr-paper)}
-  .mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-nav-items button.active{background:#f6f0e1}
+  .mr-nav{width:100%;flex:0 0 58px;order:2;padding:0 8px;border-right:0;border-top:1px solid var(--mr-border)}.mr-brand,.mr-local{display:none}.mr-nav-items{height:100%;flex-direction:row;justify-content:space-around;gap:0;overflow:visible}.mr-nav-items button{min-width:0;min-height:56px;flex:1;flex-direction:column;justify-content:center;gap:2px;padding:3px 4px;font-size:10px;border-radius:8px}.mr-nav-items button.active{background:#f6f0e1}
   .mr-content{padding:14px 12px 84px}.mr-content>.mr-window-shelf{min-height:100%;height:auto}
   .mr-window-shelf .mr-shelf-topbar{position:static;width:100%;justify-content:flex-end;min-height:36px;margin:0 0 10px}.mr-window-shelf .mr-shelf-status{display:none}.mr-shelf-mobile-search-toggle{display:inline-flex}.mr-window-shelf .mr-shelf-back{width:36px;height:36px}.mr-window-shelf .mr-shelf-refresh{width:36px;height:36px;background:var(--mr-paper)}.mr-window-shelf.mr-mobile-search-open .mr-shelf-refresh{display:none}.mr-window-shelf.mr-mobile-search-open .mr-shelf-back{display:none}.mr-window-shelf .mr-shelf-search{display:flex;flex:0 0 auto;min-width:0;height:36px;padding:0 6px}.mr-window-shelf .mr-shelf-search:not(.mr-search-open){height:36px;padding:0;border:0;background:transparent}.mr-window-shelf .mr-shelf-search:not(.mr-search-open) .mr-shelf-mobile-search-toggle{border:1px solid var(--mr-border);background:var(--mr-paper)}.mr-window-shelf.mr-mobile-search-open .mr-shelf-topbar{position:static;width:100%;justify-content:flex-end;min-height:36px;margin:0 0 10px}.mr-window-shelf.mr-mobile-search-open .mr-shelf-head{display:flex}.mr-window-shelf.mr-mobile-search-open .mr-shelf-search{display:flex;flex:1;height:36px;padding:0 4px;border:0;border-bottom:1px solid var(--mr-border);border-radius:0;background:transparent}.mr-window-shelf.mr-mobile-search-open .mr-shelf-search input{background:transparent}.mr-window-shelf.mr-mobile-search-open .mr-shelf-search:focus-within{box-shadow:none}.mr-window-shelf .mr-shelf-search.mr-search-open .mr-shelf-mobile-search-toggle{min-width:28px;height:32px;border:0;background:transparent}.mr-window-shelf .mr-shelf-search:not(.mr-search-open) input{display:none}.mr-window-shelf .mr-shelf-search input{width:100%;min-width:0;height:100%;box-sizing:border-box;font-size:16px;line-height:normal}.mr-window-shelf .mr-shelf-search .kbd{display:none}
   .mr-window-shelf .mr-shelf-head{align-items:flex-start;margin-bottom:8px;gap:8px}.mr-window-shelf .mr-shelf-head h1{font-size:25px}.mr-window-shelf .mr-shelf-head .kicker{display:none}.mr-window-shelf .mr-shelf-head-actions{justify-content:flex-start;gap:6px;width:100%}.mr-window-shelf .mr-sort-select{max-width:88px;min-height:36px;padding:0 4px;font-size:12px}.mr-window-shelf .mr-view-toggle{height:36px;padding:2px}.mr-window-shelf .mr-view-toggle button{min-height:30px;padding:0 8px;font-size:12px}.mr-window-shelf .mr-shelf-head-actions .mr-button{min-height:36px;padding:0 9px;font-size:12px;white-space:nowrap}
@@ -3864,7 +3961,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 
     return {
       inject: ['slots', 'layout', 'remote'],
-      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, shelfPagination, ShelfBoard, scrollMotion, Stats, Settings, Discover, Sources, ReaderView, readerStyle: css } } : {}),
+      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, shelfPagination, ShelfBoard, ReaderNav, SHELF_CATEGORIES, bookContentType, booksForShelfCategory, scrollMotion, Stats, Settings, Discover, Sources, ReaderView, readerStyle: css } } : {}),
       async apply(ctx) {
         const unmount = await ctx.remote.$mount(readerContribution);
         const ui = ctx.inject(['remote.reader'], (inner) => {

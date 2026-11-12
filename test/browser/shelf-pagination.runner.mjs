@@ -90,11 +90,28 @@ try {
   await cdp('Page.navigate', { url })
   await waitFor(() => evaluate('document.readyState === "complete" && !!window.shelfReady'), '书架回归页面未初始化')
   const report = { desktop: await evaluate('window.shelfTest.desktopStart()', true), resizes: [] }
-  assert.ok(report.desktop.navWidth >= 84, `桌面导航栏宽度不足：${report.desktop.navWidth}`)
+  assert.ok(report.desktop.navWidth >= 108, `桌面导航栏宽度不足：${report.desktop.navWidth}`)
   for (const [width, height] of [[1638, 901], [1920, 1080], [1050, 720], [1440, 900], [920, 640], [1280, 800]]) {
     await viewport(width, height)
     report.resizes.push(await evaluate('window.shelfTest.afterResize()', true))
   }
+  await viewport(1112, 1134)
+  await delay(320)
+  report.narrowDesktop = await evaluate(`(() => {
+    const books = [...document.querySelectorAll('[data-book-id]')]
+    const foot = document.querySelector('.mr-shelf-foot')
+    const grid = document.querySelector('.mr-shelf-grid')
+    const last = books.at(-1)
+    return {
+      books: books.length,
+      columns: getComputedStyle(grid).gridTemplateColumns.split(' ').length,
+      rowHeight: grid.firstElementChild ? grid.firstElementChild.getBoundingClientRect().height : 0,
+      lastBottom: last ? Math.round(last.getBoundingClientRect().bottom) : 0,
+      footTop: foot ? Math.round(foot.getBoundingClientRect().top) : 0,
+      wallHeight: Math.round(document.querySelector('.mr-shelf-wall').getBoundingClientRect().height),
+    }
+  })()`)
+  assert.ok(report.narrowDesktop.lastBottom <= report.narrowDesktop.footTop, `窄桌面书卡压住底栏：${JSON.stringify(report.narrowDesktop)}`)
   report.tailLayout = await evaluate('window.shelfTest.tailLayout()', true)
   report.motion = await evaluate('window.shelfTest.desktopMotion()', true)
   report.selection = await evaluate('window.shelfTest.pollingAndSelection()', true)

@@ -38,6 +38,9 @@ test('basic source normalization accepts XPath and rejects unsupported syntax an
   assert.throws(() => selectAll(responseDocument('<div/>'), '@xpath://div/following-sibling::div'), /XPath|unsupported/)
   assert.throws(() => normalizeSource({ ...base, ruleSearch: { ...base.ruleSearch, headers: { Cookie: 'secret' } } }), /not allowed|must not contain secrets/)
   assert.throws(() => normalizeSource({ ...base, token: 'secret' }), /must not contain secrets/)
+  assert.equal(normalizeSource({ ...base, bookSourceType: 4 }).contentType, 'video')
+  assert.throws(() => normalizeSource({ ...base, bookSourceType: 3 }), /类型 3|网络文件/)
+  assert.throws(() => normalizeSource({ sourceName: '采集源', sourceUrl: 'https://example.com' }), /采集源|bookSourceUrl/)
   assert.throws(() => normalizeSource({ ...base, ruleSearch: { ...base.ruleSearch, headers: { 'X-Api-Key': 'secret' } } }), /not allowed|must not contain secrets/)
 })
 

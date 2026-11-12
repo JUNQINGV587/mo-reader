@@ -1,6 +1,7 @@
 import { Service } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { createBackup, parseBackup } from './lib/backup.js'
+import { normalizeBookContentType } from './lib/content-types.js'
 import { ReaderError } from './lib/errors.js'
 import { fetchRemote } from './lib/http.js'
 import { importEpub, importedSource, importTxt, exportEpub } from './lib/importers.js'
@@ -135,7 +136,7 @@ export class ReaderService extends TypertRemoteService {
   }
 
   sourceView(source) {
-    return { ...clone(source), enabled: source.enabled !== false }
+    return { ...clone(source), enabled: source.enabled !== false, contentType: normalizeBookContentType(source.contentType) }
   }
 
   withSubscriptionLock(id, operation) {
@@ -209,6 +210,7 @@ export class ReaderService extends TypertRemoteService {
     const status = book.download?.status === 'completed' && downloaded < chapters.length ? 'partial' : book.download?.status ?? (downloaded ? 'partial' : 'none')
     return {
       ...clone(book),
+      contentType: normalizeBookContentType(book.contentType),
       unread: Math.max(0, readIndex < 0 ? chapters.length : chapters.length - readIndex - 1),
       lastRead: clone(book.progress ?? null),
       readerPrefs: book.readerPrefs && Object.keys(book.readerPrefs).length ? clone(book.readerPrefs) : null,
@@ -616,6 +618,7 @@ export class ReaderService extends TypertRemoteService {
       sourceId: source.id,
       bookUrl,
       name: String(info.name).trim(),
+      contentType: normalizeBookContentType(source.contentType),
       local: false,
       addedAt: previous?.addedAt ?? timestamp,
       updatedAt: timestamp,

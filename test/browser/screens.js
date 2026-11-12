@@ -11,7 +11,7 @@ const require = (id) => {
   if (id === 'zod') return { z }
   throw new Error(`unexpected require: ${id}`)
 }
-const { Discover, Sources, Settings, readerStyle } = registration.factory(require).__test
+const { Discover, Sources, Settings, ShelfBoard, ReaderNav, SHELF_CATEGORIES, booksForShelfCategory, readerStyle } = registration.factory(require).__test
 const style = document.createElement('style')
 style.textContent = readerStyle
 document.head.append(style)
@@ -44,7 +44,23 @@ const props = { settings, onSettings: noop, onLocal: noop, onExport: noop, onImp
 const shell = (screen) => h('div', { className: 'mr-root' }, h('section', { className: 'mr-content' }, screen))
 const render = (screen) => root.render(shell(screen))
 
+const categoryBooks = [
+  { id: 'novel-1', name: '小说一', author: '作者', contentType: 'novel', createdAt: '2026-01-01', unreadCount: 2 },
+  { id: 'comic-1', name: '漫画一', author: '作者', contentType: 'comic', createdAt: '2026-01-02', unreadCount: 4 },
+]
+function CategorySwitchScreen() {
+  const [tab, setTab] = React.useState('novel')
+  const category = SHELF_CATEGORIES.find(item => item.id === tab)
+  return h('div', { className: 'mr-root' },
+    h(ReaderNav, { tab, onTab: setTab }),
+    h('section', { className: 'mr-content' },
+      h(ShelfBoard, { books: booksForShelfCategory(categoryBooks, tab), category, reducedMotion: true, onOpen: noop, onCheck: noop })))
+}
 window.screensUI = {
+  nav: () => root.render(h('div', { className: 'mr-root' }, h(ReaderNav, { tab: 'novel', onTab: noop }), h('section', { className: 'mr-content' }, h('h1', null, '小说书架')))),
+  categoryShelf: () => render(h(ShelfBoard, { books: booksForShelfCategory(categoryBooks, 'novel'), category: SHELF_CATEGORIES[0], reducedMotion: true, onOpen: noop, onCheck: noop })),
+  emptyShelf: () => render(h(ShelfBoard, { books: booksForShelfCategory(categoryBooks, 'audio'), category: SHELF_CATEGORIES[2], reducedMotion: true, onOpen: noop, onCheck: noop })),
+  categorySwitch: () => root.render(h(CategorySwitchScreen)),
   discover: () => render(h(Discover, { sources, onSearch: noop, onAdd: noop, results, busy: false, failed: 1 })),
   sources: () => render(h(Sources, { sources, subscriptions, onImport: noop, onRemove: noop, onToggle: noop, onSubscribe: async () => false, onRefresh: (id) => { window.__refreshClicked = id; }, onConfirmUpdate: (id) => { window.__confirmClicked = id; }, onRejectUpdate: (id) => { window.__rejectClicked = id; }, onUnsubscribe: noop, busy: false, onRestoreBuiltin: noop })),
   settings: () => render(h(Settings, props)),
@@ -57,7 +73,13 @@ window.screensUI = {
       vw: innerWidth,
       overflow: document.documentElement.scrollWidth,
       screenWidth: screen ? Math.round(screen.getBoundingClientRect().width) : 0,
-      head: document.querySelector('.mr-screen-head h1')?.textContent || '',
+      head: document.querySelector('.mr-screen-head h1, .mr-shelf-head h1')?.textContent || '',
+      navButtons: document.querySelectorAll('.mr-nav-items button').length,
+      navLabels: [...document.querySelectorAll('.mr-nav-items button')].map((button) => button.textContent).join(','),
+      navActive: document.querySelector('.mr-nav-items button.active')?.dataset.tab || '',
+      navWidth: Math.round(document.querySelector('.mr-nav')?.getBoundingClientRect().width || 0),
+      shelfCount: document.querySelector('.mr-shelf-head .tag')?.textContent || '',
+      shelfEmpty: document.querySelector('.mr-shelf-empty h3')?.textContent || '',
       layout: layout ? getComputedStyle(layout).gridTemplateColumns : '',
       display: layout ? getComputedStyle(layout).display : '',
       columns: layout && getComputedStyle(layout).display === 'grid' ? getComputedStyle(layout).gridTemplateColumns.split(' ').filter(Boolean).length : 0,

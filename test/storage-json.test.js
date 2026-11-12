@@ -46,12 +46,14 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   const imported = await service.importSource({ text: JSON.stringify({
     bookSourceName: 'HTTPS 源',
     bookSourceUrl: 'https://example.com',
+    bookSourceType: 4,
     ruleBookInfo: { name: 'h1' },
     ruleToc: { chapterList: '.chapter', chapterName: 'a', chapterUrl: 'a@href' },
     ruleContent: { content: '#content' },
   }) })
   assert.match(imported.id, /^[a-zA-Z0-9_-]+$/)
   assert.equal(imported.bookSourceUrl, 'https://example.com')
+  assert.equal(imported.contentType, 'video')
   assert.equal(service.source(imported.id).bookSourceUrl, 'https://example.com')
   const subscribed = await service.subscribeSourceLibrary({ url: 'https://library.example/sources.json' })
   assert.equal(subscribed.imported, 1)
@@ -62,6 +64,7 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   assert.match(book.id, /^[a-zA-Z0-9_-]+$/)
   assert.equal(book.bookUrl, 'https://example.com/book/1')
   assert.equal(book.sourceId, imported.id)
+  assert.equal(book.contentType, 'video')
   const toc = await service.toc({ bookId: book.id })
   assert.match(toc[0].id, /^[a-zA-Z0-9_-]+$/)
   assert.equal(toc[0].url, 'https://example.com/chapter/1')
@@ -86,7 +89,9 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   await service.db.domain.close()
   service.db = await openReaderStorage(ctx)
   assert.equal(service.db.sources.get(imported.id).bookSourceUrl, 'https://example.com')
+  assert.equal(service.db.sources.get(imported.id).contentType, 'video')
   assert.equal(service.db.books.get(book.id).bookUrl, 'https://example.com/book/1')
+  assert.equal(service.db.books.get(book.id).contentType, 'video')
   assert.equal(service.db.chapters.get(toc[0].id).text, '正文')
   assert.equal(service.db.chapters.get(toc[0].id).url, 'https://example.com/chapter/1')
   assert.equal(service.db.subscriptions.get(subscribed.subscription.id).url, 'https://library.example/sources.json')
