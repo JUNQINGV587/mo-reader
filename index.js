@@ -1,7 +1,7 @@
 import { Service } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { createBackup, parseBackup } from './lib/backup.js'
-import { normalizeBookContentType, normalizeSourceContentType } from './lib/content-types.js'
+import { hasChapterPayload, normalizeBookContentType, normalizeSourceContentType } from './lib/content-types.js'
 import { ReaderError } from './lib/errors.js'
 import { fetchRemote } from './lib/http.js'
 import { importEpub, importedSource, importTxt, exportEpub } from './lib/importers.js'
@@ -198,14 +198,16 @@ export class ReaderService extends TypertRemoteService {
       index: chapter.index,
       title: chapter.title,
       url: chapter.url,
-      downloaded: typeof chapter.text === 'string',
+      contentType: chapter.contentType,
+      downloaded: hasChapterPayload(chapter, chapter.contentType),
       downloadedAt: chapter.downloadedAt,
     }
   }
 
   bookView(book) {
     const chapters = this.chapters(book.id)
-    const downloaded = chapters.filter(chapter => typeof chapter.text === 'string').length
+    const contentType = normalizeBookContentType(book.contentType)
+    const downloaded = chapters.filter(chapter => hasChapterPayload(chapter, contentType)).length
     const readIndex = book.progress ? chapters.findIndex(chapter => chapter.id === book.progress.chapterId) : -1
     const status = book.download?.status === 'completed' && downloaded < chapters.length ? 'partial' : book.download?.status ?? (downloaded ? 'partial' : 'none')
     return {
@@ -650,9 +652,16 @@ export class ReaderService extends TypertRemoteService {
 
   async syncToc(book, fresh) {
     const old = new Map(this.chapters(book.id).map(chapter => [chapter.id, chapter]))
+    const bookType = normalizeBookContentType(book.contentType)
     const chapters = fresh.map(chapter => {
       const cached = old.get(chapter.id)
-      return cached ? { ...chapter, text: cached.text, html: cached.html, downloadedAt: cached.downloadedAt } : chapter
+      const next = { ...chapter, contentType: bookType }
+      if (!cached) return next
+      const preserved = {}
+      for (const key of ['text', 'html', 'images', 'mediaUrl', 'headers', 'downloadedAt']) {
+        if (cached[key] !== undefined) preserved[key] = cached[key]
+      }
+      return { ...next, ...preserved }
     })
     const freshIds = new Set(chapters.map(chapter => chapter.id))
     await this.db.chapters.deleteMany([...old.keys()].filter(chapterId => !freshIds.has(chapterId)))
@@ -680,13 +689,17 @@ export class ReaderService extends TypertRemoteService {
     const chapterId = requiredString(args.chapterId, 'chapterId')
     let chapter = this.db.chapters.get(chapterId)
     if (!chapter || chapter.bookId !== book.id) throw new ReaderError('reader/not-found', `Chapter ${chapterId} not found in this book.`)
-    if (typeof chapter.text !== 'string') {
+    const contentType = normalizeBookContentType(book.contentType)
+    if (!hasChapterPayload(chapter, contentType)) {
       if (book.local) throw new ReaderError('reader/not-found', 'Local chapter cache is missing.')
       const content = await this.engine.content(this.source(book.sourceId), book, chapter)
-      chapter = { ...chapter, text: content.text, html: content.html, downloadedAt: now() }
+      chapter = { ...chapter, ...content, downloadedAt: now() }
       await this.db.chapters.put(chapter.id, chapter)
     }
-    return { ...this.chapterView(chapter), text: applyReplacements(chapter.text, this.db.settings.get().replacements), downloaded: true }
+    const view = { ...this.chapterView(chapter), downloaded: true }
+    if (contentType === 'novel') return { ...view, text: applyReplacements(chapter.text, this.db.settings.get().replacements) }
+    for (const key of ['images', 'mediaUrl', 'headers']) if (chapter[key] !== undefined) view[key] = clone(chapter[key])
+    return view
   }
 
   async saveProgress(args) {
@@ -795,7 +808,7 @@ export class ReaderService extends TypertRemoteService {
       for (const chapter of chapters) {
         job = this.db.jobs.get(jobId)
         if (!job || job.status !== 'running' || this.disposed) return
-        if (typeof chapter.text !== 'string') {
+        if (!hasChapterPayload(chapter, book.contentType)) {
           let content = null
           let lastError = null
           for (let attempt = 1; attempt <= MAX_CHAPTER_ATTEMPTS; attempt += 1) {

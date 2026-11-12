@@ -26,7 +26,10 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
       const url = 'https://example.com/chapter/1'
       return [{ id: chapterId(book.id, url), bookId: book.id, index: 0, title: '第一章', url }]
     },
-    async content() { return { text: '正文', html: '<p>正文</p>' } },
+    async content(source) {
+      if (source.contentType === 'video') return { contentType: 'video', mediaUrl: 'https://cdn.example/chapter.m3u8', headers: { Referer: 'https://example.com' } }
+      return { contentType: 'novel', text: '正文', html: '<p>正文</p>' }
+    },
   }
   let library = [{ bookSourceName: '订阅源', bookSourceUrl: 'https://sub.example', rules: {} }]
   const service = new ReaderService(ctx, {
@@ -73,7 +76,20 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   assert.match(toc[0].id, /^[a-zA-Z0-9_-]+$/)
   assert.equal(toc[0].url, 'https://example.com/chapter/1')
   const chapter = await service.chapter({ bookId: book.id, chapterId: toc[0].id })
-  assert.equal(chapter.text, '正文')
+  assert.equal(chapter.mediaUrl, 'https://cdn.example/chapter.m3u8')
+
+  const novelSource = await service.importSource({ text: JSON.stringify({
+    bookSourceName: '文字源',
+    bookSourceUrl: 'https://novel.example',
+    bookSourceType: 0,
+    ruleBookInfo: { name: 'h1' },
+    ruleToc: { chapterList: '.chapter', chapterName: 'a', chapterUrl: 'a@href' },
+    ruleContent: { content: '#content' },
+  }) })
+  const novelBook = await service.addBook({ sourceId: novelSource.id, bookUrl: 'https://novel.example/book/1' })
+  const novelToc = await service.toc({ bookId: novelBook.id })
+  const novelChapter = await service.chapter({ bookId: novelBook.id, chapterId: novelToc[0].id })
+  assert.equal(novelChapter.text, '正文')
 
   library = [
     { bookSourceName: '订阅源新版', bookSourceUrl: 'https://sub.example', rules: {} },
@@ -99,8 +115,9 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   assert.equal(service.db.sources.get(website.id).searchUrl, 'https://search.example/find?q={{key}}')
   assert.equal(service.db.books.get(book.id).bookUrl, 'https://example.com/book/1')
   assert.equal(service.db.books.get(book.id).contentType, 'video')
-  assert.equal(service.db.chapters.get(toc[0].id).text, '正文')
+  assert.equal(service.db.chapters.get(toc[0].id).mediaUrl, 'https://cdn.example/chapter.m3u8')
   assert.equal(service.db.chapters.get(toc[0].id).url, 'https://example.com/chapter/1')
+  assert.equal(service.db.chapters.get(novelToc[0].id).text, '正文')
   assert.equal(service.db.subscriptions.get(subscribed.subscription.id).url, 'https://library.example/sources.json')
   assert.equal(service.db.sources.get(subscriptionSourceId).name, '订阅源新版')
   assert.equal(service.db.sources.get(subscriptionSourceId).enabled, false)
