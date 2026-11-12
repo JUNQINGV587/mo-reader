@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { MediaStore } from '../lib/media-store.js'
+import { ReaderError } from '../lib/errors.js'
 import { mediaResponse, proxyResponse } from '../lib/media-http.js'
 import { serviceFixture } from './helpers.js'
 
@@ -135,6 +136,20 @@ test('proxy forwards range and source headers without exposing a URL parameter',
   assert.equal(captured.options.headers.range, 'bytes=0-1')
   const direct = await proxyResponse(service, new Request('http://reader.local/api/reader/proxy?url=https://evil.example/x.mp4'))
   assert.equal(direct.status, 400)
+})
+
+test('proxy exposes a readable login error instead of a generic media failure', async (t) => {
+  const { service } = await serviceFixture()
+  const source = { id: 'source-auth', name: '登录源', bookSourceUrl: 'https://source.example', allowHttp: false, enabled: true, contentType: 'video', rules: {} }
+  const book = { id: 'book-auth', sourceId: source.id, contentType: 'video', name: '登录视频' }
+  const chapter = { id: 'chapter-auth', bookId: book.id, index: 0, title: '第一集', contentType: 'video', mediaUrl: 'https://media.example/auth.mp4' }
+  await service.db.sources.put(source.id, source)
+  await service.db.books.put(book.id, book)
+  await service.db.chapters.put(chapter.id, chapter)
+  service.fetchRemote = async () => { throw new ReaderError('reader/auth-required', '需要登录或源站拒绝访问；请在外部浏览器打开书源主页完成登录后重试。', { status: 401 }) }
+  const response = await proxyResponse(service, new Request('http://reader.local/api/reader/proxy?bookId=book-auth&chapterId=chapter-auth'))
+  assert.equal(response.status, 401)
+  assert.match((await response.json()).message, /需要登录/)
 })
 
 test('proxy rewrites HLS playlists through signed same-origin URLs', async (t) => {
