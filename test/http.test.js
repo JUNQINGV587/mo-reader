@@ -28,3 +28,13 @@ test('fetchRemote decodes gzip responses and caps decompressed size', async () =
   assert.deepEqual(JSON.parse(result.text), [{ bookSourceName: '压缩源', bookSourceUrl: 'https://source.example' }])
   await assert.rejects(fetchRemote('https://source.example/library.json', { ...options, maxBytes: 10 }), /too-large|超过/)
 })
+
+test('fetchRemote turns 401 and 403 into a readable login error', async () => {
+  for (const status of [401, 403]) {
+    const requestOnce = async () => ({ status, headers: { 'content-type': 'text/plain' }, buffer: Buffer.from('denied') })
+    await assert.rejects(
+      fetchRemote('https://media.example/protected.m3u8', { resolvePublic: async () => '93.184.216.34', requestOnce }),
+      (error) => error.code === 'reader/auth-required' && /需要登录/.test(error.message),
+    )
+  }
+})
