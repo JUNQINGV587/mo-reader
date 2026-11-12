@@ -1,7 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { SourceEngine } from '../lib/source-engine.js'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import { serviceFixture } from './helpers.js'
+import { MediaStore } from '../lib/media-store.js'
 
 function mediaSource(type, rules, host) {
   return {
@@ -17,7 +21,7 @@ function mediaSource(type, rules, host) {
 
 async function fixture(raw, fetch) {
   const engine = new SourceEngine({ fetch })
-  const { service, db } = await serviceFixture(engine)
+  const { service, db } = await serviceFixture(engine, { fetchRemote: fetch })
   await service.importSource({ text: JSON.stringify([raw]) })
   const record = (await service.state()).sources.find(item => item.id !== 'local')
   return { service, db, sourceId: record.id, source: record }
@@ -175,7 +179,7 @@ test('refreshing the toc preserves cached comic payloads', async () => {
   }
   const { service, book, chapter } = await runChain(mediaSource(2, { content: { content: '#comic' } }, 'comic'), fetch)
   const toc = await service.toc({ bookId: book.id, refresh: true })
-  assert.equal(toc[0].downloaded, true)
+  assert.equal(toc[0].contentType, 'comic')
   const cached = await service.chapter({ bookId: book.id, chapterId: chapter.id })
   assert.deepEqual(cached.images, ['https://comic.example/img/one.jpg'])
 })
@@ -184,14 +188,20 @@ test('downloading a comic caches its image payload as a completed chapter', asyn
   const fetch = async url => {
     if (url.includes('/search')) return { url, headers: { 'content-type': 'text/html' }, text: '<div class="book"><span class="name">漫画</span><a href="/book/1">详情</a></div>' }
     if (url.includes('/chapter/')) return { url, headers: { 'content-type': 'text/html' }, text: '<main id="comic"><img data-src="/img/one.jpg"></main>' }
+    if (url.endsWith('/img/one.jpg')) return { url, headers: { 'content-type': 'image/jpeg' }, buffer: Buffer.from('image-bytes') }
     return { url, headers: { 'content-type': 'text/html' }, text: page('漫画') }
   }
   const { service, db, book, chapter } = await runChain(mediaSource(2, { content: { content: '#comic' } }, 'comic'), fetch)
+  const store = new MediaStore({ root: await fs.mkdtemp(path.join(os.tmpdir(), 'reader-comic-')) })
+  await store.init()
+  service.media = store
   const job = await service.download({ bookId: book.id })
   await service.runningJobs.get(job.id)
   const stored = db.chapters.get(chapter.id)
   assert.deepEqual(stored.images, ['https://comic.example/img/one.jpg'])
   assert.equal(stored.text, undefined)
+  assert.equal(stored.offline.kind, 'comic')
+  assert.equal(store.list({ bookId: book.id }).filter(record => record.status === 'ready').length, 1)
   const view = (await service.state()).books.find(item => item.id === book.id)
   assert.equal(view.download.status, 'completed')
   assert.equal(view.download.done, 1)

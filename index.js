@@ -5,6 +5,7 @@ import { hasChapterPayload, normalizeBookContentType, normalizeSourceContentType
 import { ReaderError } from './lib/errors.js'
 import { fetchRemote } from './lib/http.js'
 import { MediaStore, DEFAULT_MEDIA_QUOTA } from './lib/media-store.js'
+import { downloadMediaChapter } from './lib/media-download.js'
 import { mediaResponse, proxyResponse, sendWebResponse } from './lib/media-http.js'
 import { importEpub, importedSource, importTxt, exportEpub } from './lib/importers.js'
 import { ACTIVE_JOBS, createJob, jobView, transitionJob } from './lib/jobs.js'
@@ -32,6 +33,16 @@ export const REMOTE_METHODS = Object.freeze([
   'mediaCacheStats', 'listMediaCache', 'setMediaRetained', 'removeMediaCache',
 ])
 
+function hasOfflinePayload(chapter, contentType) {
+  const offline = chapter?.offline
+  if (!offline || typeof offline !== 'object') return false
+  if (contentType === 'comic') return Array.isArray(offline.images) && offline.images.length > 0
+  if (contentType === 'audio' || contentType === 'video') {
+    return typeof offline.playlistId === 'string' || typeof offline.mediaId === 'string'
+  }
+  return false
+}
+
 function assertObject(value, label = 'arguments') {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ReaderError('reader/invalid-input', `${label} must be an object.`)
 }
@@ -45,6 +56,7 @@ export class ReaderService extends TypertRemoteService {
     this.fetchRemote = options.fetchRemote ?? fetchRemote
     this.runningJobs = new Map()
     this.subscriptionRefreshes = new Map()
+    this.downloadLocks = new Map()
     this.subscriptionMutations = new Map()
     this.coverCache = new Map()
     this.media = options.mediaStore ?? null
@@ -70,9 +82,6 @@ export class ReaderService extends TypertRemoteService {
     this.mediaRouteDisposers = []
     this.ctx.effect(() => async () => {
       this.disposed = true
-      for (const job of entries(this.db.jobs)) {
-        if (ACTIVE_JOBS.has(job.status)) await this.db.jobs.put(job.id, transitionJob(job, 'cancel'))
-      }
       await Promise.allSettled([...this.runningJobs.values(), ...this.subscriptionRefreshes.values()])
       await this.media.queue.catch(() => {})
       await this.db.domain.close()
@@ -249,7 +258,36 @@ export class ReaderService extends TypertRemoteService {
     return entries(this.db.chapters).filter(chapter => chapter.bookId === bookId).sort((a, b) => a.index - b.index)
   }
 
+  async clearBrokenOffline(bookId) {
+    const book = this.db.books.get(bookId)
+    if (!book) return
+    for (const chapter of this.chapters(bookId)) {
+      if (!chapter.offline) continue
+      if (await this.offlineReady(book, chapter)) continue
+      const next = { ...chapter }
+      delete next.offline
+      await this.db.chapters.put(next.id, next)
+    }
+  }
+
+  offlineRecordReady(chapter, contentType) {
+    if (!hasOfflinePayload(chapter, contentType)) return false
+    const offline = chapter.offline
+    const ids = offline.kind === 'comic'
+      ? [...(offline.images ?? [])]
+      : offline.kind === 'hls'
+        ? [offline.playlistId, ...(offline.segments ?? []), ...(offline.initId ? [offline.initId] : [])]
+        : [offline.mediaId]
+    return ids.length > 0 && ids.filter(Boolean).every(id => this.media?.has(id))
+  }
+
+  async offlineReady(book, chapter) {
+    return this.offlineRecordReady(chapter, book.contentType)
+  }
+
   chapterView(chapter) {
+    const contentType = normalizeBookContentType(chapter.contentType)
+    const offline = contentType === 'novel' ? false : this.offlineRecordReady(chapter, contentType)
     return {
       id: chapter.id,
       bookId: chapter.bookId,
@@ -257,15 +295,18 @@ export class ReaderService extends TypertRemoteService {
       title: chapter.title,
       url: chapter.url,
       contentType: chapter.contentType,
-      downloaded: hasChapterPayload(chapter, chapter.contentType),
+      downloaded: contentType === 'novel' ? hasChapterPayload(chapter, contentType) : offline,
       downloadedAt: chapter.downloadedAt,
+      ...(offline ? { offline: clone(chapter.offline) } : {}),
     }
   }
 
   bookView(book) {
     const chapters = this.chapters(book.id)
     const contentType = normalizeBookContentType(book.contentType)
-    const downloaded = chapters.filter(chapter => hasChapterPayload(chapter, contentType)).length
+    const downloaded = chapters.filter(chapter => contentType === 'novel'
+      ? hasChapterPayload(chapter, contentType)
+      : this.offlineRecordReady(chapter, contentType)).length
     const readIndex = book.progress ? chapters.findIndex(chapter => chapter.id === book.progress.chapterId) : -1
     const status = book.download?.status === 'completed' && downloaded < chapters.length ? 'partial' : book.download?.status ?? (downloaded ? 'partial' : 'none')
     return {
@@ -712,12 +753,12 @@ export class ReaderService extends TypertRemoteService {
   async syncToc(book, fresh) {
     const old = new Map(this.chapters(book.id).map(chapter => [chapter.id, chapter]))
     const bookType = normalizeBookContentType(book.contentType)
-    const chapters = fresh.map(chapter => {
+    const chapters = fresh.map((chapter, position) => {
       const cached = old.get(chapter.id)
-      const next = { ...chapter, contentType: bookType }
+      const next = { ...chapter, bookId: book.id, index: chapter.index ?? position, contentType: bookType }
       if (!cached) return next
       const preserved = {}
-      for (const key of ['text', 'html', 'images', 'mediaUrl', 'headers', 'downloadedAt']) {
+      for (const key of ['text', 'html', 'images', 'mediaUrl', 'headers', 'offline', 'downloadedAt']) {
         if (cached[key] !== undefined) preserved[key] = cached[key]
       }
       return { ...next, ...preserved }
@@ -749,13 +790,15 @@ export class ReaderService extends TypertRemoteService {
     let chapter = this.db.chapters.get(chapterId)
     if (!chapter || chapter.bookId !== book.id) throw new ReaderError('reader/not-found', `Chapter ${chapterId} not found in this book.`)
     const contentType = normalizeBookContentType(book.contentType)
-    if (!hasChapterPayload(chapter, contentType)) {
+    const offline = contentType === 'novel' ? false : await this.offlineReady(book, chapter)
+    if ((contentType === 'novel' ? !hasChapterPayload(chapter, contentType) : !offline)) {
       if (book.local) throw new ReaderError('reader/not-found', 'Local chapter cache is missing.')
       const content = await this.engine.content(this.source(book.sourceId), book, chapter)
       chapter = { ...chapter, ...content, downloadedAt: now() }
+      if (contentType !== 'novel') delete chapter.offline
       await this.db.chapters.put(chapter.id, chapter)
     }
-    const view = { ...this.chapterView(chapter), downloaded: true }
+    const view = this.chapterView(chapter)
     if (contentType === 'novel') return { ...view, text: applyReplacements(chapter.text, this.db.settings.get().replacements) }
     for (const key of ['images', 'mediaUrl', 'headers']) if (chapter[key] !== undefined) view[key] = clone(chapter[key])
     return view
@@ -789,7 +832,7 @@ export class ReaderService extends TypertRemoteService {
     if (!job) throw new ReaderError('reader/not-found', 'No active download for this book.')
     const paused = transitionJob(job, 'pause')
     await this.db.jobs.put(paused.id, paused)
-    await this.db.books.put(book.id, { ...this.book(book.id), download: { status: 'paused', jobId: paused.id, auto: true }, updatedAt: now() })
+    await this.db.books.put(book.id, { ...this.book(book.id), download: { ...this.book(book.id).download, status: 'paused', jobId: paused.id }, updatedAt: now() })
     return jobView(paused)
   }
 
@@ -801,7 +844,7 @@ export class ReaderService extends TypertRemoteService {
     if (!job || job.status !== 'paused') throw new ReaderError('reader/not-found', 'No paused download for this book.')
     const resumed = transitionJob(job, 'resume')
     await this.db.jobs.put(resumed.id, resumed)
-    await this.db.books.put(book.id, { ...this.book(book.id), download: { status: 'queued', jobId: resumed.id, auto: true }, updatedAt: now() })
+    await this.db.books.put(book.id, { ...this.book(book.id), download: { ...this.book(book.id).download, status: 'queued', jobId: resumed.id }, updatedAt: now() })
     this.scheduleJob(resumed.id)
     return jobView(resumed)
   }
@@ -811,12 +854,44 @@ export class ReaderService extends TypertRemoteService {
     this.assertReady()
     const book = this.book(args.bookId)
     if (!book.local) this.source(book.sourceId)
-    const existing = entries(this.db.jobs).find(job => job.bookId === book.id && job.type === 'download' && ACTIVE_JOBS.has(job.status))
+    const pending = this.downloadLocks.get(book.id)
+    if (pending) {
+      const jobId = await pending
+      const job = jobId ? this.db.jobs.get(jobId) : null
+      if (!job) throw new ReaderError('reader/busy', '这本书的下载正在启动，请稍后重试。')
+      return jobView(job)
+    }
+    let release
+    this.downloadLocks.set(book.id, new Promise(resolve => { release = resolve }))
+    let result
+    try {
+      result = await this.beginDownload(book, args)
+      release(result.id)
+      return result
+    } catch (error) {
+      release(null)
+      throw error
+    } finally {
+      this.downloadLocks.delete(book.id)
+    }
+  }
+
+  async beginDownload(book, args) {
+    const existing = this.activeJobFor(book.id)
     if (existing) return jobView(existing)
-    const total = this.chapters(book.id).length
-    const job = createJob({ bookId: book.id, total })
+    const cachedChapters = this.chapters(book.id)
+    let chapterIds
+    if (args.chapterIds !== undefined) {
+      if (!Array.isArray(args.chapterIds) || !args.chapterIds.length || args.chapterIds.length > 10000) throw new ReaderError('reader/invalid-input', 'chapterIds 必须是非空数组。')
+      chapterIds = [...new Set(args.chapterIds.map(chapterId => requiredString(chapterId, 'chapterId', 256)))]
+      const known = new Set(cachedChapters.map(chapter => chapter.id))
+      if (chapterIds.some(chapterId => !known.has(chapterId))) throw new ReaderError('reader/not-found', '下载章节不属于这本书。')
+    }
+    const total = chapterIds?.length ?? cachedChapters.length
+    const job = { ...createJob({ bookId: book.id, total }), ...(chapterIds ? { chapterIds } : {}) }
+    const auto = normalizeBookContentType(book.contentType) === 'novel'
     await this.db.jobs.put(job.id, job)
-    await this.db.books.put(book.id, { ...book, download: { status: 'queued', jobId: job.id, auto: true }, updatedAt: now() })
+    await this.db.books.put(book.id, { ...book, download: { status: 'queued', jobId: job.id, auto }, updatedAt: now() })
     this.scheduleJob(job.id)
     return jobView(job)
   }
@@ -858,45 +933,98 @@ export class ReaderService extends TypertRemoteService {
       job = transitionJob(job, 'start')
       await this.db.jobs.put(job.id, job)
       if (job.type !== 'download') throw new ReaderError('reader/job-state', `Unknown job type ${job.type}.`)
-      const book = this.book(job.bookId)
-      const chapters = book.local ? this.chapters(book.id) : await this.syncToc(book, await this.engine.toc(this.source(book.sourceId), book))
+      const storedBook = this.book(job.bookId)
+      const book = { ...storedBook, contentType: normalizeBookContentType(storedBook.contentType) }
+      const allChapters = book.local ? this.chapters(book.id) : await this.syncToc(book, await this.engine.toc(this.source(book.sourceId), book))
+      const selected = job.chapterIds ? new Set(job.chapterIds) : null
+      const chapters = selected ? allChapters.filter(chapter => selected.has(chapter.id)) : allChapters
       job = this.db.jobs.get(jobId)
       if (!job || job.status !== 'running') return
-      job = { ...job, total: chapters.length, updatedAt: now() }
+      job = { ...job, total: chapters.length, done: 0, failedChapters: [], failedReasons: {}, updatedAt: now() }
       await this.db.jobs.put(job.id, job)
+      const mediaType = book.contentType !== 'novel'
+      const allowHttp = book.local ? false : this.source(book.sourceId).allowHttp === true
       for (const chapter of chapters) {
         job = this.db.jobs.get(jobId)
         if (!job || job.status !== 'running' || this.disposed) return
-        if (!hasChapterPayload(chapter, book.contentType)) {
-          let content = null
+        const needsPayload = !hasChapterPayload(chapter, book.contentType)
+        const needsOffline = mediaType && !(await this.offlineReady(book, chapter))
+        if (needsPayload || needsOffline) {
+          let content = needsPayload ? null : Object.fromEntries(['text', 'html', 'images', 'mediaUrl', 'headers'].filter(key => chapter[key] !== undefined).map(key => [key, chapter[key]]))
           let lastError = null
-          for (let attempt = 1; attempt <= MAX_CHAPTER_ATTEMPTS; attempt += 1) {
-            try { content = await this.engine.content(this.source(book.sourceId), book, chapter); lastError = null; break }
-            catch (error) {
-              lastError = error
-              if (this.disposed) return
-              const status = error && error.details && error.details.status
-              if (attempt < MAX_CHAPTER_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, (status === 429 ? 1500 : 400) * attempt))
+          if (needsPayload) {
+            for (let attempt = 1; attempt <= MAX_CHAPTER_ATTEMPTS; attempt += 1) {
+              try { content = await this.engine.content(this.source(book.sourceId), book, chapter); lastError = null; break }
+              catch (error) {
+                lastError = error
+                if (this.disposed) return
+                const status = error && error.details && error.details.status
+                if (attempt < MAX_CHAPTER_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, (status === 429 ? 1500 : 400) * attempt))
+              }
             }
           }
           job = this.db.jobs.get(jobId)
           if (!job || job.status !== 'running' || this.disposed) return
-          if (content) await this.db.chapters.put(chapter.id, { ...chapter, ...content, downloadedAt: now() })
-          else {
+          if (content) {
+            try {
+              if (mediaType && needsOffline) {
+                const offline = await downloadMediaChapter({
+                  store: this.media,
+                  book,
+                  chapter,
+                  payload: content,
+                  fetchRemote: this.fetchRemote,
+                  allowHttp,
+                  isRunning: async () => {
+                    const current = this.db.jobs.get(jobId)
+                    return current?.status === 'running' && !this.disposed
+                  },
+                })
+                if (offline.paused) return
+                content = { ...content, offline }
+              }
+              const stored = { ...chapter, ...content, downloadedAt: now() }
+              delete stored.headers
+              await this.db.chapters.put(chapter.id, stored)
+            } catch (error) {
+              lastError = error
+              this.log('warn', `Chapter ${chapter.id} media download failed`, error)
+              if (error?.code === 'reader/media-quota') {
+                await this.media.removeBook(book.id, { includeRetained: false }).catch(cleanupError => this.log('warn', `Book ${book.id} media cleanup failed`, cleanupError))
+                await this.clearBrokenOffline(book.id)
+                throw error
+              }
+              const current = this.db.jobs.get(jobId)
+              job = {
+                ...current,
+                failedChapters: [...(current?.failedChapters || []), chapter.id],
+                failedReasons: { ...(current?.failedReasons || {}), [chapter.id]: error.message },
+              }
+              await this.db.jobs.put(job.id, job)
+            }
+          } else {
             this.log('warn', `Chapter ${chapter.id} skipped`, lastError)
-            job = { ...job, failedChapters: [...(job.failedChapters || []), chapter.id] }
+            job = {
+              ...job,
+              failedChapters: [...(job.failedChapters || []), chapter.id],
+              failedReasons: { ...(job.failedReasons || {}), [chapter.id]: lastError?.message ?? '章节内容无法解析' },
+            }
             await this.db.jobs.put(job.id, job)
           }
         }
-        job = transitionJob(this.db.jobs.get(jobId), 'chapter')
+        job = this.db.jobs.get(jobId)
+        if (!job || job.status !== 'running' || this.disposed) return
+        job = transitionJob(job, 'chapter')
         await this.db.jobs.put(job.id, job)
         if (!book.local) await new Promise(resolve => setTimeout(resolve, 200))
       }
       job = this.db.jobs.get(jobId)
       if (!job || job.status !== 'running') return
+      const failed = job.failedChapters?.length ?? 0
       await this.db.jobs.put(jobId, transitionJob(job, 'complete'))
       const latestBook = this.book(book.id)
-      await this.db.books.put(book.id, { ...latestBook, download: { status: 'completed', jobId, auto: true }, updatedAt: now() })
+      const status = mediaType && failed ? 'partial' : 'completed'
+      await this.db.books.put(book.id, { ...latestBook, download: { ...latestBook.download, status, jobId }, updatedAt: now() })
     } catch (error) {
       const job = this.db.jobs.get(jobId)
       if (job && ACTIVE_JOBS.has(job.status)) await this.db.jobs.put(jobId, transitionJob(job, 'fail', { error: error.message }))
@@ -914,6 +1042,20 @@ export class ReaderService extends TypertRemoteService {
     if (!job) throw new ReaderError('reader/not-found', `Job ${jobId} not found.`)
     const next = transitionJob(job, 'cancel')
     await this.db.jobs.put(jobId, next)
+    if (this.media) {
+      const chapterIds = job.chapterIds ? new Set(job.chapterIds) : new Set(this.chapters(job.bookId).map(chapter => chapter.id))
+      for (const chapterId of chapterIds) await this.media.removeChapter(job.bookId, chapterId, { includeRetained: false })
+      const book = this.db.books.get(job.bookId)
+      if (book) {
+        for (const chapter of this.chapters(job.bookId)) {
+          if (!chapter.offline || !chapterIds.has(chapter.id)) continue
+          if (await this.offlineReady(book, chapter)) continue
+          const next = { ...chapter }
+          delete next.offline
+          await this.db.chapters.put(next.id, next)
+        }
+      }
+    }
     const book = this.db.books.get(job.bookId)
     if (book) await this.db.books.put(book.id, { ...book, download: { ...book.download, status: 'cancelled', jobId }, updatedAt: now() })
     return jobView(next)
@@ -936,7 +1078,7 @@ export class ReaderService extends TypertRemoteService {
         const added = chapters.filter(chapter => !before.has(chapter.id))
         if (added.length) {
           result.updated += 1
-          if (original.download?.auto && this.db.settings.get().autoDownloadNewChapters) await this.download({ bookId: original.id })
+          if (original.download?.auto && normalizeBookContentType(original.contentType) === 'novel' && this.db.settings.get().autoDownloadNewChapters) await this.download({ bookId: original.id })
         }
       } catch (error) {
         result.errors.push({ bookId: original.id, message: error.message })

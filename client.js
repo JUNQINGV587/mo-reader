@@ -474,10 +474,11 @@ window.__ModuleLoader__.load({
       const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((done / total) * 100))) : 0;
       const label = status === 'queued' ? '排队'
         : status === 'paused' || status === 'cancelled' ? '已暂停'
+        : status === 'partial' ? '部分失败'
         : status === 'failed' ? '失败'
         : status === 'completed' ? '已下载'
         : `${pct}%`;
-      const kind = status === 'completed' ? 'done' : status === 'failed' ? 'failed' : status === 'paused' || status === 'cancelled' ? 'paused' : status === 'queued' ? 'queued' : 'running';
+      const kind = status === 'completed' ? 'done' : status === 'failed' || status === 'partial' ? 'failed' : status === 'paused' || status === 'cancelled' ? 'paused' : status === 'queued' ? 'queued' : 'running';
       return { label, kind, status };
     }
 
@@ -3361,7 +3362,7 @@ window.__ModuleLoader__.load({
             onToggleDownload: (book) => {
               const status = book.downloadStatus || book.download?.status;
               const bookId = book.id || book.bookId;
-              if (status === 'failed' || status === 'completed') return run(() => call(ctx, 'download', { bookId }), status === 'failed' ? '重新下载' : '重新检查').catch(() => {});
+              if (status === 'failed' || status === 'partial' || status === 'completed') return run(() => call(ctx, 'download', { bookId }), status === 'completed' ? '重新检查' : '重新下载').catch(() => {});
               const paused = status === 'paused' || status === 'cancelled';
               if (paused) {
                 const pending = call(ctx, 'resumeJob', { bookId }).catch(() => call(ctx, 'download', { bookId }));

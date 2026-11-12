@@ -211,3 +211,13 @@ test('removing a book clears its cached media', async (t) => {
   assert.equal(store.records.has(record.id), false)
   assert.equal(store.stats().mediaCount, 0)
 })
+
+test('removing a book can preserve retained records', async (t) => {
+  const { store } = await readyStore(t)
+  const retained = await store.put({ bookId: 'book-a', chapterId: 'keep', contentType: 'video/mp4', data: Buffer.from('keep') })
+  const temporary = await store.put({ bookId: 'book-a', chapterId: 'drop', contentType: 'video/mp4', data: Buffer.from('drop') })
+  await store.setRetained(retained.id, true)
+  await store.removeBook('book-a', { includeRetained: false })
+  assert.equal(store.records.has(retained.id), true)
+  assert.equal(store.records.has(temporary.id), false)
+})
