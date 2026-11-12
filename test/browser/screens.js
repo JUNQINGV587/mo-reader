@@ -11,7 +11,7 @@ const require = (id) => {
   if (id === 'zod') return { z }
   throw new Error(`unexpected require: ${id}`)
 }
-const { Discover, Sources, Settings, ShelfBoard, ReaderNav, SHELF_CATEGORIES, booksForShelfCategory, readerStyle } = registration.factory(require).__test
+const { Discover, Sources, Settings, ShelfBoard, ReaderNav, SHELF_CATEGORIES, booksForShelfCategory, WebsiteShelf, readerStyle } = registration.factory(require).__test
 const style = document.createElement('style')
 style.textContent = readerStyle
 document.head.append(style)
@@ -29,6 +29,14 @@ const sources = [
   { id: 'src-5', bookSourceName: '番茄小说', bookSourceUrl: 'https://c.example.com' },
   { id: 'local', bookSourceName: '本地导入', bookSourceUrl: 'local:' },
 ]
+const websites = [
+  { id: 'web-1', contentType: 'website', name: '示例站点', homeUrl: 'https://site.example/home', searchUrl: 'https://site.example/search?q={{key}}', enabled: true },
+  { id: 'web-2', contentType: 'website', name: '停用站点', homeUrl: 'https://disabled.example', enabled: false },
+  { id: 'web-3', contentType: 'website', name: '仅首页站点', homeUrl: 'https://home.example', enabled: true },
+]
+const discoverySources = [...sources, ...websites]
+window.__openedWebsites = []
+window.open = (url, target, features) => { window.__openedWebsites.push({ url, target, features }); return {} }
 const subscriptions = [
   { id: 'sub-1', url: 'https://library.example/sources.json', sourceIds: ['src-1', 'src-2'], status: 'ready', lastCheckedAt: '2026-11-11T08:00:00.000Z', lastSuccessAt: '2026-11-11T08:00:00.000Z' },
   { id: 'sub-2', url: 'https://broken.example/sources.json', sourceIds: ['src-3'], status: 'error', lastCheckedAt: '2026-11-11T09:00:00.000Z', lastSuccessAt: '2026-11-10T08:00:00.000Z', lastFailureAt: '2026-11-11T09:00:00.000Z', lastError: '源库返回的不是有效 JSON。' },
@@ -61,7 +69,9 @@ window.screensUI = {
   categoryShelf: () => render(h(ShelfBoard, { books: booksForShelfCategory(categoryBooks, 'novel'), category: SHELF_CATEGORIES[0], reducedMotion: true, onOpen: noop, onCheck: noop })),
   emptyShelf: () => render(h(ShelfBoard, { books: booksForShelfCategory(categoryBooks, 'audio'), category: SHELF_CATEGORIES[2], reducedMotion: true, onOpen: noop, onCheck: noop })),
   categorySwitch: () => root.render(h(CategorySwitchScreen)),
-  discover: () => render(h(Discover, { sources, onSearch: noop, onAdd: noop, results, busy: false, failed: 1 })),
+  websiteShelf: () => render(h(WebsiteShelf, { sources: websites })),
+  websiteEmpty: () => render(h(WebsiteShelf, { sources: [websites[1]] })),
+  discover: () => render(h(Discover, { sources: discoverySources, onSearch: noop, onAdd: noop, results, busy: false, failed: 1 })),
   sources: () => render(h(Sources, { sources, subscriptions, onImport: noop, onRemove: noop, onToggle: noop, onSubscribe: async () => false, onRefresh: (id) => { window.__refreshClicked = id; }, onConfirmUpdate: (id) => { window.__confirmClicked = id; }, onRejectUpdate: (id) => { window.__rejectClicked = id; }, onUnsubscribe: noop, busy: false, onRestoreBuiltin: noop })),
   settings: () => render(h(Settings, props)),
   measure() {
@@ -78,8 +88,12 @@ window.screensUI = {
       navLabels: [...document.querySelectorAll('.mr-nav-items button')].map((button) => button.textContent).join(','),
       navActive: document.querySelector('.mr-nav-items button.active')?.dataset.tab || '',
       navWidth: Math.round(document.querySelector('.mr-nav')?.getBoundingClientRect().width || 0),
-      shelfCount: document.querySelector('.mr-shelf-head .tag')?.textContent || '',
+      shelfCount: document.querySelector('.mr-shelf-head .tag, .mr-screen-count')?.textContent || '',
       shelfEmpty: document.querySelector('.mr-shelf-empty h3')?.textContent || '',
+      websiteCount: document.querySelector('.mr-website-screen .mr-screen-stat')?.textContent || '',
+      websiteCards: document.querySelectorAll('.mr-website-card').length,
+      websiteNames: [...document.querySelectorAll('.mr-website-card h2')].map(node => node.textContent).join(','),
+      siteResults: document.querySelectorAll('.mr-site-result').length,
       layout: layout ? getComputedStyle(layout).gridTemplateColumns : '',
       display: layout ? getComputedStyle(layout).display : '',
       columns: layout && getComputedStyle(layout).display === 'grid' ? getComputedStyle(layout).gridTemplateColumns.split(' ').filter(Boolean).length : 0,

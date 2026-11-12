@@ -1,7 +1,7 @@
 import { Service } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { createBackup, parseBackup } from './lib/backup.js'
-import { normalizeBookContentType } from './lib/content-types.js'
+import { normalizeBookContentType, normalizeSourceContentType } from './lib/content-types.js'
 import { ReaderError } from './lib/errors.js'
 import { fetchRemote } from './lib/http.js'
 import { importEpub, importedSource, importTxt, exportEpub } from './lib/importers.js'
@@ -136,7 +136,7 @@ export class ReaderService extends TypertRemoteService {
   }
 
   sourceView(source) {
-    return { ...clone(source), enabled: source.enabled !== false, contentType: normalizeBookContentType(source.contentType) }
+    return { ...clone(source), enabled: source.enabled !== false, contentType: normalizeSourceContentType(source.contentType) }
   }
 
   withSubscriptionLock(id, operation) {

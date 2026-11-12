@@ -63,6 +63,24 @@ window.__ModuleLoader__.load({
       if (!SHELF_CATEGORY_IDS.has(categoryId) || categoryId === 'website') return [];
       return (books || []).filter((book) => bookContentType(book) === categoryId);
     }
+    function enabledWebsiteSources(sources) {
+      return (sources || []).filter((source) => source?.contentType === 'website' && source.enabled !== false);
+    }
+    function websiteTarget(source, query = '') {
+      const term = String(query || '').trim();
+      const template = term && source?.searchUrl ? source.searchUrl : source?.homeUrl;
+      return template ? template.replace(/\{\{\s*key\s*\}\}/g, encodeURIComponent(term)) : null;
+    }
+    function openExternalWebsite(source, query = '') {
+      const url = websiteTarget(source, query);
+      if (!url) return null;
+      window.open(url, '_blank', 'noopener');
+      return url;
+    }
+    function websiteHost(source) {
+      try { return new URL(source.homeUrl).hostname; }
+      catch { return source.homeUrl; }
+    }
 
     function prefersReducedMotion() {
       try { return window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true; }
@@ -1051,6 +1069,25 @@ window.__ModuleLoader__.load({
         aside ? h('div', { className: 'mr-screen-aside' }, aside) : null);
     }
 
+    function WebsiteShelf({ sources }) {
+      const sites = enabledWebsiteSources(sources);
+      return h('div', { className: 'mr-screen mr-website-screen' },
+        h(ScreenHead, { kicker: '窗边 · 网页', title: '网页书架', sub: '常用站点，点开就去。', aside: h('div', { className: 'mr-screen-stat' }, h('b', null, sites.length), h('span', null, '个网站')) }),
+        sites.length ? h('div', { className: 'mr-website-grid' }, sites.map((source) => {
+          const host = websiteHost(source);
+          return h('article', { key: source.id, className: 'mr-website-card', role: 'link', tabIndex: 0, onClick: () => openExternalWebsite(source), onKeyDown: (event) => { if (event.key === 'Enter') { event.preventDefault(); openExternalWebsite(source); } } },
+            h('div', { className: 'mr-website-mark' }, h(Glyph, { name: 'web', size: 24 })),
+            h('div', { className: 'mr-website-copy' },
+              h('h2', null, source.name),
+              h('p', null, host),
+              h('span', { className: 'mr-website-kind' }, source.searchUrl ? '可站内搜索' : '仅打开首页')),
+            h(Button, { kind: 'primary', className: 'mr-website-open', onClick: (event) => { event.stopPropagation(); openExternalWebsite(source); } }, '打开网站'));
+        })) : h('div', { className: 'mr-shelf-empty mr-website-empty' },
+          h('div', { className: 'mr-shelf-empty-icon' }, h(Glyph, { name: 'web', size: 30 })),
+          h('h3', null, '网页书架还空着'),
+          h('p', null, SHELF_CATEGORIES.find((category) => category.id === 'website').empty)));
+    }
+
     function Discover({ sources, onSearch, onAdd, results, busy, failed }) {
       const [query, setQuery] = useState('');
       const [lastQuery, setLastQuery] = useState('');
@@ -1062,13 +1099,15 @@ window.__ModuleLoader__.load({
         setQuery(term);
         setLastQuery(term);
         setRecent(rememberSearch(term));
-        onSearch(term);
+        if (searchableSources.length) onSearch(term);
       };
-      const searchableSources = sources.filter((source) => source.id !== 'local' && source.enabled !== false);
+      const searchableSources = sources.filter((source) => source.id !== 'local' && source.contentType !== 'website' && source.enabled !== false);
+      const siteSources = enabledWebsiteSources(sources);
       const sourceNames = [...new Set(searchableSources.map((source) => source.bookSourceName || source.name).filter(Boolean))];
       const allResults = results || [];
       const visible = sourceFilter ? allResults.filter((book) => book.sourceName === sourceFilter) : allResults;
       const searched = !!lastQuery;
+      const siteResults = searched ? siteSources : [];
       return h('div', { className: 'mr-screen mr-discover-screen' },
         h(ScreenHead, {
           kicker: 'MO READ · 窗边 / 发现',
@@ -1076,7 +1115,7 @@ window.__ModuleLoader__.load({
           sub: `搜索全部 ${searchableSources.length} 个书源 · 按书名或作者`,
           aside: h('div', { className: 'mr-screen-stat' }, h('b', null, searchableSources.length), h('span', null, '个书源')),
         }),
-        !searchableSources.length ? h(Empty, { icon: 'source', title: '先导入书源', detail: '支持 URL、文件或粘贴 JSON。' }) : h('div', { className: 'mr-discover-layout' },
+        !searchableSources.length && !siteSources.length ? h(Empty, { icon: 'source', title: '先导入书源', detail: '支持 URL、文件或粘贴 JSON。' }) : h('div', { className: 'mr-discover-layout' },
           h('section', { className: 'mr-search-panel', 'aria-label': '搜索与书源筛选' },
             h('p', { className: 'mr-card-kicker' }, 'SEARCH · 书源'),
             h('h2', null, '搜一本书'),
@@ -1094,11 +1133,11 @@ window.__ModuleLoader__.load({
           h('section', { className: 'mr-results-panel', 'aria-label': '搜索结果', 'aria-live': 'polite' },
             h('div', { className: 'mr-results-head' },
               h('h2', null, searched ? `搜「${lastQuery}」` : '搜索结果'),
-              h('span', null, searched ? `${visible.length} 本${sourceFilter ? ` · ${sourceFilter}` : ''}` : '输入书名或作者')),
+              h('span', null, searched ? `${visible.length} 本${sourceFilter ? ` · ${sourceFilter}` : ''}${siteResults.length ? ` · ${siteResults.length} 个站点` : ''}` : '输入书名或作者')),
             busy ? h('div', { className: 'mr-discovery-state' }, h('span', { className: 'mr-spinner', 'aria-hidden': true }), h('h3', null, '正在查找'), h('p', null, '同时搜索所有可用书源…'))
               : failed ? h('div', { className: 'mr-source-warning' }, h(Glyph, { name: 'source', size: 18 }), h('p', null, `${failed} 个书源没响应，已跳过；其余结果仍在下方。`))
                 : null,
-            !busy && searched && visible.length === 0 ? h('div', { className: 'mr-discovery-state' },
+            !busy && searched && visible.length === 0 && !siteResults.length ? h('div', { className: 'mr-discovery-state' },
               h('div', { className: 'mr-discovery-icon' }, h(Glyph, { name: 'search', size: 24 })),
               h('h3', null, '没有找到'),
               h('p', null, sourceFilter ? `${sourceFilter} 里没有匹配结果，换个书源或关键词。` : '换个关键词或检查书源。')) : null,
@@ -1106,6 +1145,15 @@ window.__ModuleLoader__.load({
               h('div', { className: 'mr-discovery-icon' }, h(Glyph, { name: 'search', size: 24 })),
               h('h3', null, '搜一本书'),
               h('p', null, '输入书名或作者，也可以从左侧最近搜索开始。')) : null,
+            !busy && siteResults.length ? h('div', { className: 'mr-site-results', 'aria-label': '站点结果' },
+              h('div', { className: 'mr-site-results-head' }, '站点结果'),
+              siteResults.map((source) => {
+                const host = websiteHost(source);
+                return h('button', { type: 'button', className: 'mr-site-result', key: source.id, onClick: () => openExternalWebsite(source, lastQuery) },
+                  h(Glyph, { name: 'web', size: 18 }),
+                  h('span', null, h('b', null, source.name), h('small', null, source.searchUrl ? `${host} · 站内搜索` : `${host} · 打开首页`)),
+                  h(Glyph, { name: 'right', size: 15 }));
+              })) : null,
             h('div', { className: 'mr-discovery-results' }, visible.map((book, index) => {
               const name = book.name || book.title || '未命名';
               return h('article', { className: 'mr-discovery-result', key: `${book.bookUrl || book.url || name}-${index}` },
@@ -1227,7 +1275,7 @@ window.__ModuleLoader__.load({
                 h('span', { className: 'mr-source-icon', 'aria-hidden': true }, name.slice(0, 1)),
                 h('div', null, h('h3', null, name), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl)),
                 h('div', { className: 'mr-source-side' },
-                  h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || (unsupported.length ? `不支持：${unsupported.join('、')}` : '') }, local ? '本机导入' : disabled ? '已停用' : source.lastError ? '解析失败 · 需更新规则' : unsupported.length ? `不支持 · ${unsupported.join('/')}` : source.builtin ? '内置 · 可用' : (source.compatibility || '基础规则')),
+                  h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || (unsupported.length ? `不支持：${unsupported.join('、')}` : '') }, local ? '本机导入' : source.contentType === 'website' ? (disabled ? '网站 · 已停用' : '网站入口') : disabled ? '已停用' : source.lastError ? '解析失败 · 需更新规则' : unsupported.length ? `不支持 · ${unsupported.join('/')}` : source.builtin ? '内置 · 可用' : (source.compatibility || '基础规则')),
                   local ? null : h(Button, { kind: 'text', onClick: () => onToggle(source), disabled: busy, 'aria-pressed': !disabled }, disabled ? '启用' : '停用'),
                   source.builtin || local ? null : h(Button, { kind: 'text danger', onClick: () => onRemove(source), disabled: busy }, '移除')));
             }) : h(Empty, { icon: 'source', title: '暂无书源', detail: '导入后即可搜索和追更。' }))));
@@ -3145,7 +3193,7 @@ window.__ModuleLoader__.load({
         const keyword = String(query || '').trim();
         if (!keyword) return;
         setBusy(true); setResults(null); setSearchFailed(0);
-        const targets = sources.filter((source) => source.enabled !== false);
+        const targets = sources.filter((source) => source.id !== 'local' && source.contentType !== 'website' && source.enabled !== false);
         const settled = await Promise.allSettled(targets.map((source) => {
           const sourceId = source.id || source.bookSourceUrl;
           return withTimeout(call(ctx, 'search', { sourceId, query: keyword, page: 1 }), 15_000)
@@ -3300,7 +3348,8 @@ window.__ModuleLoader__.load({
         h('section', { className: 'mr-content' },
           h(Notice, { notice, onClose: () => setNotice(null) }),
           loading ? h('div', { className: 'mr-loading' }, '正在打开墨读…') : null,
-          !loading && activeCategory ? h(Library, { books: categoryBooks, category: activeCategory, folders: data.folders || [], busy, view: shelfView, onView: setShelfView, ctx, online: shelfOnline, onlineBusy: shelfOnlineBusy, onlineFailed: shelfOnlineFailed, onSearchOnline: searchShelfOnline, onAddOnline: (item) => addBook(item), theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: motionOff, onStats: () => setTab('stats'), onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}),
+          !loading && activeCategory?.id === 'website' ? h(WebsiteShelf, { sources }) : null,
+          !loading && activeCategory && activeCategory.id !== 'website' ? h(Library, { books: categoryBooks, category: activeCategory, folders: data.folders || [], busy, view: shelfView, onView: setShelfView, ctx, online: shelfOnline, onlineBusy: shelfOnlineBusy, onlineFailed: shelfOnlineFailed, onSearchOnline: searchShelfOnline, onAddOnline: (item) => addBook(item), theme: settings.readerTheme || 'paper', quality: settings.motionQuality || 'auto', ambience: settings.ambience || 'full', reducedMotion: motionOff, onStats: () => setTab('stats'), onOpen: openBook, onDownload: (book) => run(() => call(ctx, 'download', { bookId: book.id || book.bookId }), '下载已开始').catch(() => {}),
             onCreateFolder: (name) => run(() => call(ctx, 'createFolder', { name }), '文件夹已创建').catch(() => {}),
             onRenameFolder: (folderId, name) => run(() => call(ctx, 'renameFolder', { folderId, name }), '已重命名').catch(() => {}),
             onRemoveFolder: (folderId) => run(() => call(ctx, 'removeFolder', { folderId }), '文件夹已删除').catch(() => {}),
@@ -3884,6 +3933,13 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-discovery-result-copy h3{margin:0;overflow:hidden;font:400 16px/1.4 var(--mr-serif);text-overflow:ellipsis;white-space:nowrap}
 .mr-discovery-result-copy p{margin:3px 0 0;overflow:hidden;font-size:11px;line-height:1.5;color:var(--mr-muted);text-overflow:ellipsis;white-space:nowrap}
 .mr-discovery-source{display:inline-block;margin-top:5px;padding:2px 6px;border:1px solid var(--mr-border);font-size:10px;line-height:1.4;color:var(--mr-muted)}
+.mr-website-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}
+.mr-website-card{display:grid;grid-template-columns:44px minmax(0,1fr);gap:12px;padding:20px;border:1px solid var(--mr-border);background:var(--mr-paper);border-radius:var(--mr-radius);cursor:pointer}
+.mr-website-mark{width:44px;height:44px;display:grid;place-items:center;background:var(--mr-sunken);color:var(--mr-accent)}
+.mr-website-copy{min-width:0}.mr-website-copy h2{margin:0;font:400 20px/1.4 var(--mr-serif);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mr-website-copy p{margin:4px 0 8px;font-size:11px;color:var(--mr-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mr-website-kind{font-size:10px;color:var(--mr-muted)}
+.mr-website-open{grid-column:2;justify-self:start;min-height:34px;padding:0 12px;font-size:11px}
+.mr-site-results{margin:0 0 8px;border-bottom:1px solid var(--mr-line)}.mr-site-results-head{padding:8px 0;font-size:11px;font-weight:600;letter-spacing:.12em;color:var(--mr-muted)}
+.mr-site-result{display:flex;align-items:center;gap:11px;width:100%;padding:12px 0;border:0;border-top:1px solid var(--mr-line);background:transparent;color:var(--mr-text);text-align:left;cursor:pointer}.mr-site-result>span{flex:1;min-width:0}.mr-site-result b,.mr-site-result small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mr-site-result b{font:400 15px/1.5 var(--mr-serif)}.mr-site-result small{margin-top:2px;font-size:10px;color:var(--mr-muted)}.mr-site-result>svg:first-child{color:var(--mr-accent);flex:none}.mr-site-result>svg:last-child{color:var(--mr-muted);flex:none}
 .mr-discovery-result .mr-button{flex:none;min-height:34px;padding:0 10px;font-size:11px}
 .mr-sources-layout{display:grid;grid-template-columns:370px minmax(0,1fr);gap:22px;align-items:start}
 .mr-sources-left{display:flex;flex-direction:column;gap:16px}
@@ -3929,6 +3985,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
   .mr-source-chips{gap:6px}.mr-source-chip{min-height:32px}
   .mr-results-head{align-items:flex-start;flex-direction:column;gap:3px}.mr-results-head>span{text-align:left}
   .mr-discovery-result{gap:10px;padding:11px 0}.mr-discovery-result .mr-cover{width:42px;height:56px;flex-basis:42px}.mr-discovery-result .mr-button{min-height:40px;padding:0 8px}
+  .mr-website-grid{grid-template-columns:1fr;gap:10px}.mr-website-card{padding:14px}
   .mr-discovery-state{min-height:240px;padding:24px 14px}
   .mr-sources-left{display:flex;flex-direction:column;gap:12px}.mr-window-card{padding:15px}
   .mr-online-row{flex-direction:column;align-items:stretch}.mr-online-row input{flex:none;width:100%;height:38px}.mr-online-row .mr-button{width:100%}
@@ -3961,7 +4018,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 
     return {
       inject: ['slots', 'layout', 'remote'],
-      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, shelfPagination, ShelfBoard, ReaderNav, SHELF_CATEGORIES, bookContentType, booksForShelfCategory, scrollMotion, Stats, Settings, Discover, Sources, ReaderView, readerStyle: css } } : {}),
+      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, shelfPagination, ShelfBoard, ReaderNav, SHELF_CATEGORIES, bookContentType, booksForShelfCategory, WebsiteShelf, enabledWebsiteSources, websiteTarget, scrollMotion, Stats, Settings, Discover, Sources, ReaderView, readerStyle: css } } : {}),
       async apply(ctx) {
         const unmount = await ctx.remote.$mount(readerContribution);
         const ui = ctx.inject(['remote.reader'], (inner) => {

@@ -55,6 +55,10 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   assert.equal(imported.bookSourceUrl, 'https://example.com')
   assert.equal(imported.contentType, 'video')
   assert.equal(service.source(imported.id).bookSourceUrl, 'https://example.com')
+  const website = await service.importSource({ text: JSON.stringify({
+    contentType: 'website', name: '站点入口', homeUrl: 'https://site.example/home', searchUrl: 'https://search.example/find?q={{key}}',
+  }) })
+  assert.equal(website.contentType, 'website')
   const subscribed = await service.subscribeSourceLibrary({ url: 'https://library.example/sources.json' })
   assert.equal(subscribed.imported, 1)
   const subscriptionSourceId = subscribed.subscription.sourceIds[0]
@@ -90,6 +94,9 @@ test('real storageDomain JSON backend accepts source/book/chapter IDs derived fr
   service.db = await openReaderStorage(ctx)
   assert.equal(service.db.sources.get(imported.id).bookSourceUrl, 'https://example.com')
   assert.equal(service.db.sources.get(imported.id).contentType, 'video')
+  assert.equal(service.db.sources.get(website.id).contentType, 'website')
+  assert.equal(service.db.sources.get(website.id).homeUrl, 'https://site.example/home')
+  assert.equal(service.db.sources.get(website.id).searchUrl, 'https://search.example/find?q={{key}}')
   assert.equal(service.db.books.get(book.id).bookUrl, 'https://example.com/book/1')
   assert.equal(service.db.books.get(book.id).contentType, 'video')
   assert.equal(service.db.chapters.get(toc[0].id).text, '正文')
