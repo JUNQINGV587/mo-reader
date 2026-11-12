@@ -75,11 +75,11 @@ test('settings returns every non-stats panel', async () => {
   const grid = children[1]
   assert.equal(grid.args[1].className, 'mr-settings-grid')
   const panels = grid.args.slice(2)
-  assert.equal(panels.length, 12, 'stats is no longer inside settings')
+  assert.equal(panels.length, 13, 'stats is no longer inside settings; media cache quota is')
   const headings = panels.map((panel) => panel.args[2].args[2])
   assert.ok(!headings.includes('阅读统计'), 'settings still contains reading stats')
   assert.deepEqual(headings, [
-    '动画', '默认排版', '替换净化', '本地书籍', '备份恢复', '分期说明',
+    '动画', '默认排版', '替换净化', '媒体缓存', '本地书籍', '备份恢复', '支持范围',
     '笔记导出', '夜间定时', '听书定时', '阅读目标', '自定义字体', '快捷键',
   ])
 })

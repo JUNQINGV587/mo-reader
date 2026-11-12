@@ -47,8 +47,8 @@ const results = [
   { name: '凡人外传', author: '忘语', sourceName: '起点中文网', bookUrl: 'https://a.example.com/book/1', kind: '连载中' },
   { name: '剑破苍穹', author: '狂飙的蜗牛', sourceName: '17K 小说', bookUrl: 'https://www.17k.com/book/2', kind: '已完结' },
 ]
-const settings = { replacements: [], mode: 'scroll', flipStyle: 'slide', animations: true, motionQuality: 'auto', ambience: 'full', reducedMotion: 'system', fontSize: 19, lineHeight: 1.9, readerTheme: 'paper' }
-const props = { settings, onSettings: noop, onLocal: noop, onExport: noop, onImport: noop, busy: false, onExportNotes: noop, onUploadFont: noop }
+const settings = { replacements: [], mode: 'scroll', flipStyle: 'slide', animations: true, motionQuality: 'auto', ambience: 'full', reducedMotion: 'system', fontSize: 19, lineHeight: 1.9, readerTheme: 'paper', mediaQuotaBytes: 50 * 1024 ** 3 }
+const props = { settings, onSettings: (value) => { window.__settingsUpdate = value }, onLocal: noop, onExport: noop, onImport: noop, busy: false, onExportNotes: noop, onUploadFont: noop }
 const shell = (screen) => h('div', { className: 'mr-root' }, h('section', { className: 'mr-content' }, screen))
 const render = (screen) => root.render(shell(screen))
 
@@ -257,6 +257,7 @@ window.screensUI = {
       disabledRows: document.querySelectorAll('.mr-source-row.is-disabled').length,
       toggleButtons: document.querySelectorAll('.mr-source-side [aria-pressed]').length,
       panels: document.querySelectorAll('.mr-settings-grid .mr-panel').length,
+      mediaQuotaValue: document.querySelector('[aria-label="媒体缓存上限GB"]')?.value || '',
       panelWidth: panel ? Math.round(panel.getBoundingClientRect().width) : 0,
       onlineHeight: online ? Math.round(online.getBoundingClientRect().height) : 0,
       mediaImages: document.querySelectorAll('.mr-comic img').length,

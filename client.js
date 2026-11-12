@@ -1541,12 +1541,17 @@ window.__ModuleLoader__.load({
 
     function Settings({ settings, onSettings, onLocal, onExport, onImport, busy, onExportNotes, onUploadFont, onStats }) {
       const [replacementText, setReplacementText] = useState(() => (settings.replacements || []).map((rule) => `${rule.pattern || rule.from || ''}=>${rule.replacement || rule.to || ''}`).join('\n'));
+      const [quotaGb, setQuotaGb] = useState(() => String(Math.round((settings.mediaQuotaBytes || 50 * 1024 ** 3) / 1024 ** 3)));
+      const quotaValid = Number.isInteger(Number(quotaGb)) && Number(quotaGb) >= 1 && Number(quotaGb) <= 500;
       const localRef = useRef(null);
       const backupRef = useRef(null);
       const fontRef = useRef(null);
       useEffect(() => {
         setReplacementText((settings.replacements || []).map((rule) => `${rule.pattern || rule.from || ''}=>${rule.replacement || rule.to || ''}`).join('\n'));
       }, [settings.replacements]);
+      useEffect(() => {
+        setQuotaGb(String(Math.round((settings.mediaQuotaBytes || 50 * 1024 ** 3) / 1024 ** 3)));
+      }, [settings.mediaQuotaBytes]);
       const saveReplacements = () => {
         const replacements = replacementText.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
           const at = line.indexOf('=>');
@@ -1596,6 +1601,11 @@ window.__ModuleLoader__.load({
         h('section', { className: 'mr-panel' }, h('h3', null, '替换净化'), h('p', { className: 'mr-help' }, '每行一条：匹配=>替换；支持正则。'),
           h('textarea', { rows: 5, value: replacementText, onChange: (e) => setReplacementText(e.target.value), placeholder: '广告词=>' }),
           h(Button, { onClick: saveReplacements, disabled: busy }, '保存规则')),
+        h('section', { className: 'mr-panel' }, h('h3', null, '媒体缓存'),
+          h('p', { className: 'mr-help' }, '下载的漫画、音频和视频保存在 DSH 服务端；超出上限时按整部作品淘汰最久未看内容。'),
+          h('div', { className: 'mr-setting-row' }, h('span', null, '上限（GB）'),
+            h('input', { type: 'number', min: 1, max: 500, step: 1, value: quotaGb, onChange: (e) => setQuotaGb(e.target.value), 'aria-label': '媒体缓存上限GB' }),
+            h(Button, { onClick: () => onSettings({ mediaQuotaBytes: Number(quotaGb) * 1024 ** 3 }), disabled: busy || !quotaValid }, '保存'))),
         h('section', { className: 'mr-panel' }, h('h3', null, '本地书籍'), h('p', { className: 'mr-help' }, '导入 TXT 或 EPUB，内容仅保存在本机。'),
           h(Button, { icon: 'upload', onClick: () => localRef.current?.click(), disabled: busy }, '导入书籍'),
           h('input', { ref: localRef, type: 'file', accept: '.txt,.epub,text/plain,application/epub+zip', hidden: true, onChange: (e) => { const file = e.target.files?.[0]; if (file) onLocal(file); e.target.value = ''; } })),
@@ -1604,7 +1614,7 @@ window.__ModuleLoader__.load({
             h(Button, { icon: 'download', onClick: onExport, disabled: busy }, '导出'),
             h(Button, { icon: 'upload', onClick: () => backupRef.current?.click(), disabled: busy }, '恢复'),
             h('input', { ref: backupRef, type: 'file', accept: '.json,application/json', hidden: true, onChange: async (e) => { const file = e.target.files?.[0]; if (file) onImport(file); e.target.value = ''; } }))),
-        h('section', { className: 'mr-panel mr-roadmap' }, h('h3', null, '分期说明'), h('p', null, '当前为文字核心版。高兼容脚本、AI 与多媒体将在后续阶段提供。')),
+        h('section', { className: 'mr-panel mr-roadmap' }, h('h3', null, '支持范围'), h('p', null, '文字、漫画、音频、视频和网站入口；网站通过外部浏览器打开，登录与 DRM 媒体按书源提示处理。')),
         h('section', { className: 'mr-panel' }, h('h3', null, '笔记导出'),
           h('p', { className: 'mr-help' }, '把划线和笔记导出为 Markdown。'),
           h(Button, { icon: 'download', onClick: () => onExportNotes?.(), disabled: busy }, '导出笔记')),
