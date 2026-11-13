@@ -41,7 +41,7 @@ npm ci --ignore-scripts
 
 ## 书源与本地书籍
 
-「书源」页面支持粘贴 JSON、导入 JSON 文件，或订阅一个公开源库地址。订阅、来源关系和启停状态保存在本机，重新打开后继续使用。
+「书源」页面支持粘贴 JSON、导入 JSON 文件，或订阅一个公开的**书源库**地址。订阅、来源关系和启停状态保存在本机，重新打开后继续使用。这里的订阅是书源合集，不是 Legado 的 RSS 订阅源；`sourceName/sourceUrl/ruleArticles` 这类 RSS JSON 目前不会导入。
 
 书源规则支持：
 

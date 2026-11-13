@@ -41,6 +41,10 @@ test('basic source normalization accepts XPath and rejects unsupported syntax an
   assert.equal(normalizeSource({ ...base, bookSourceType: 4 }).contentType, 'video')
   assert.throws(() => normalizeSource({ ...base, bookSourceType: 3 }), /类型 3|网络文件/)
   assert.throws(() => normalizeSource({ sourceName: '采集源', sourceUrl: 'https://example.com' }), /采集源|bookSourceUrl/)
+  assert.throws(
+    () => normalizeSource({ sourceName: '69仓库', sourceUrl: 'https://example.com#', type: 0, ruleArticles: '.item', ruleContent: '<js>result</js>' }),
+    error => error.code === 'reader/unsupported-source' && /Legado 订阅源（RSS）/.test(error.message),
+  )
   assert.throws(() => normalizeSource({ ...base, ruleSearch: { ...base.ruleSearch, headers: { 'X-Api-Key': 'secret' } } }), /not allowed|must not contain secrets/)
 })
 

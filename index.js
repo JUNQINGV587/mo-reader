@@ -367,7 +367,7 @@ export class ReaderService extends TypertRemoteService {
           skipped.push({ index, reason: error?.message || String(error) })
         }
       })
-      if (!imported.length) throw new ReaderError('reader/invalid-source', '这批书源都不符合规则，一个也没有导入。', undefined, { cause: skipped.length ? new Error(skipped[0].reason) : undefined })
+      if (!imported.length) throw new ReaderError('reader/invalid-source', skipped.length ? `这批书源都不符合规则，一个也没有导入：${skipped[0].reason}` : '这批书源都不符合规则，一个也没有导入。', undefined, { cause: skipped.length ? new Error(skipped[0].reason) : undefined })
       for (const source of imported) await this.saveSource(source)
       return { imported: imported.length, skipped, total: raw.length, names: imported.map(item => item.name) }
     }
@@ -438,7 +438,7 @@ export class ReaderService extends TypertRemoteService {
       }
     })
     if (!imported.length) {
-      throw new ReaderError('reader/invalid-source', '源库里的书源都不符合规则，一个也没有导入。', undefined, { cause: skipped.length ? new Error(skipped[0].reason) : undefined })
+      throw new ReaderError('reader/invalid-source', skipped.length ? `源库里的书源都不符合规则，一个也没有导入：${skipped[0].reason}` : '源库里的书源都不符合规则，一个也没有导入。', undefined, { cause: skipped.length ? new Error(skipped[0].reason) : undefined })
     }
     for (const source of imported) await this.saveSource(source)
     const timestamp = now()

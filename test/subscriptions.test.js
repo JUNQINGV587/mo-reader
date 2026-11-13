@@ -19,6 +19,17 @@ test('unsubscribing removes only the subscription record and keeps imported sour
   assert.ok(state.sources.some(source => source.name === '源甲'), '取消订阅不能删除书源')
 })
 
+test('reports a Legado RSS source instead of a generic empty import', async () => {
+  const rss = { sourceName: '69仓库', sourceUrl: 'https://example.com#', type: 0, ruleArticles: '.item', ruleContent: '<js>result</js>' }
+  const { service } = await serviceFixture({}, {
+    fetchRemote: async () => ({ text: JSON.stringify([rss]) }),
+  })
+  await assert.rejects(
+    service.subscribeSourceLibrary({ url: 'https://lib.example/rss.json' }),
+    error => error.code === 'reader/invalid-source' && /Legado 订阅源（RSS）/.test(error.message),
+  )
+})
+
 test('manual refresh atomically adds, updates and removes unowned sources without touching books', async () => {
   let library = [
     librarySource('源甲', 'https://a.example'),
