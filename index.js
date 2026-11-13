@@ -17,6 +17,7 @@ const MAX_CHAPTER_ATTEMPTS = 2
 import { applyReplacements } from './lib/replacements.js'
 import { assertSettingKeys, normalizeReaderPrefs, normalizeSettings } from './lib/settings.js'
 import { normalizeSource } from './lib/rules.js'
+import { categoryPageUrl, detectRssSource, normalizeRssSource, rssImportSummary } from './lib/rss-source.js'
 import { BUILTIN_SOURCES } from './lib/builtin-sources.js'
 import { SourceEngine } from './lib/source-engine.js'
 import { parseSourceLibrary, permissionExpansion, planSourceRefresh } from './lib/subscription-refresh.js'
@@ -26,7 +27,7 @@ import { base64ToBuffer, clone, id, MAX_ARCHIVE_BYTES, MAX_TEXT_BYTES, now, page
 const COVER_MAX_BYTES = 2 * 1024 * 1024
 
 export const REMOTE_METHODS = Object.freeze([
-  'state', 'importSource', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'restoreBuiltinSources', 'removeSource', 'setSourceEnabled', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter', 'cancelDownloadChapters',
+  'state', 'importSource', 'addSubscriptions', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'restoreBuiltinSources', 'removeSource', 'setSourceEnabled', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter', 'cancelDownloadChapters',
   'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
   'exportBackup', 'importBackup', 'fetchCover', 'cacheBookCover', 'bookCandidates', 'applyBookMeta',
   'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead', 'exportNotes',
@@ -357,23 +358,92 @@ export class ReaderService extends TypertRemoteService {
     } catch (error) {
       throw new ReaderError('reader/invalid-source', '书源不是有效 JSON。', undefined, { cause: error })
     }
+    const allowHttp = args.allowHttp === true
     if (Array.isArray(raw)) {
       const imported = []
+      const rss = []
       const skipped = []
       raw.forEach((item, index) => {
         try {
-          imported.push(normalizeSource(item, { allowHttp: args.allowHttp === true }))
+          if (detectRssSource(item)) rss.push(normalizeRssSource(item, { allowHttp }))
+          else imported.push(normalizeSource(item, { allowHttp }))
         } catch (error) {
           skipped.push({ index, reason: error?.message || String(error) })
         }
       })
-      if (!imported.length) throw new ReaderError('reader/invalid-source', skipped.length ? `这批书源都不符合规则，一个也没有导入：${skipped[0].reason}` : '这批书源都不符合规则，一个也没有导入。', undefined, { cause: skipped.length ? new Error(skipped[0].reason) : undefined })
-      for (const source of imported) await this.saveSource(source)
-      return { imported: imported.length, skipped, total: raw.length, names: imported.map(item => item.name) }
+      if (!imported.length && !rss.length) throw new ReaderError('reader/invalid-source', skipped.length ? `这批书源都不符合规则，一个也没有导入：${skipped[0].reason}` : '这批书源都不符合规则，一个也没有导入。', undefined, { cause: skipped.length ? new Error(skipped[0].reason) : undefined })
+      for (const source of [...imported, ...rss]) await this.saveSource(source)
+      return {
+        imported: imported.length,
+        skipped,
+        total: raw.length,
+        names: imported.map(item => item.name),
+        ...(rss.length ? { rss: rss.map(rssImportSummary) } : {}),
+      }
     }
-    const source = normalizeSource(raw, { allowHttp: args.allowHttp === true })
+    if (detectRssSource(raw)) {
+      const saved = await this.saveSource(normalizeRssSource(raw, { allowHttp }))
+      return { ...rssImportSummary(saved), imported: 0, skipped: [], total: 1, names: [] }
+    }
+    const source = normalizeSource(raw, { allowHttp })
     const saved = await this.saveSource(source)
     return { imported: 1, skipped: [], total: 1, names: [source.name], ...clone(saved) }
+  }
+
+  async addSubscriptions(args) {
+    args ??= {}
+    this.assertReady()
+    assertObject(args)
+    const source = this.source(requiredString(args.sourceId, 'sourceId'))
+    if (source.kind !== 'rss') throw new ReaderError('reader/invalid-source', '这个书源不是订阅源。')
+    if (!Array.isArray(args.categories)) throw new ReaderError('reader/invalid-input', 'categories must be an array of category URLs.')
+    const requested = [...new Set(args.categories.map(value => String(value)))]
+    const byUrl = new Map((source.categories || []).map(category => [category.url, category]))
+    const categories = requested.map(url => byUrl.get(url)).filter(Boolean)
+    const missing = requested.filter(url => !byUrl.has(url))
+    const prepared = categories.map(category => {
+      let bookUrl
+      try { bookUrl = categoryPageUrl(category.url, source.bookSourceUrl) } catch {
+        throw new ReaderError('reader/invalid-source', `订阅源分类地址无效：${String(category.url).slice(0, 60)}`)
+      }
+      return { category, bookId: stableId('book', source.id, category.url), bookUrl }
+    })
+    const added = []
+    let updated = 0
+    const timestamp = now()
+    for (const { category, bookId, bookUrl } of prepared) {
+      const subscription = {
+        sourceId: source.id,
+        sourceName: source.name,
+        categoryName: category.name,
+        sortUrl: category.url,
+        anchorUrl: null,
+      }
+      const existing = this.db.books.get(bookId)
+      if (existing) {
+        await this.db.books.put(bookId, { ...existing, sourceId: source.id, bookUrl, name: category.name, contentType: 'subscription', subscription, updatedAt: timestamp })
+        updated += 1
+        continue
+      }
+      const book = {
+        id: bookId,
+        sourceId: source.id,
+        bookUrl,
+        name: category.name,
+        author: '',
+        contentType: 'subscription',
+        local: false,
+        subscription,
+        addedAt: timestamp,
+        progress: null,
+        download: { status: 'none', auto: false },
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }
+      await this.db.books.put(bookId, book)
+      added.push(book)
+    }
+    return { added: added.length, updated, requested: requested.length, missing, books: added.map(book => this.bookView(book)) }
   }
 
   async removeSource(args) {
@@ -867,6 +937,7 @@ export class ReaderService extends TypertRemoteService {
     args ??= {}
     this.assertReady()
     const book = this.book(args.bookId)
+    if (normalizeBookContentType(book.contentType) === 'subscription') throw new ReaderError('reader/invalid-input', '订阅还没有条目，暂不支持整本下载。')
     if (!book.local) this.source(book.sourceId)
     const pending = this.downloadLocks.get(book.id)
     if (pending) {
@@ -1138,6 +1209,11 @@ export class ReaderService extends TypertRemoteService {
     const result = { checked: 0, skipped: 0, updated: 0, errors: [] }
     for (const original of entries(this.db.books).filter(book => !book.local)) {
       try {
+        // 订阅条目的拉取与追更由后续票接入；现在不能按书源目录去抓。
+        if (normalizeBookContentType(original.contentType) === 'subscription') {
+          result.skipped += 1
+          continue
+        }
         const source = this.source(original.sourceId, { allowDisabled: true })
         if (source.enabled === false) {
           result.skipped += 1
@@ -1451,6 +1527,9 @@ export class ReaderService extends TypertRemoteService {
     this.assertReady()
     const bookIds = Array.isArray(args.bookIds) ? args.bookIds : [args.bookId]
     if (!bookIds.length) throw new ReaderError('reader/invalid-input', 'No books selected.')
+    if (bookIds.some(bookId => normalizeBookContentType(this.db.books.get(bookId)?.contentType) === 'subscription')) {
+      throw new ReaderError('reader/invalid-input', '订阅暂不支持下载，请先取消勾选订阅。')
+    }
     const queued = []
     for (const bookId of bookIds) {
       const book = this.db.books.get(bookId)

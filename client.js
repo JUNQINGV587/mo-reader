@@ -8,7 +8,7 @@ window.__ModuleLoader__.load({
     const { useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
     const PANEL_ID = 'reader';
     const REMOTE_METHODS = [
-      'state', 'importSource', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'removeSource', 'setSourceEnabled', 'restoreBuiltinSources', 'search', 'discover', 'addBook', 'removeBook',
+      'state', 'importSource', 'addSubscriptions', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'removeSource', 'setSourceEnabled', 'restoreBuiltinSources', 'search', 'discover', 'addBook', 'removeBook',
       'toc', 'chapter', 'saveProgress', 'download', 'cancelJob', 'cancelDownloadChapters', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'mediaCacheStats', 'listMediaCache', 'setChapterRetained',
       'setSettings', 'setBookSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
       'cacheBookCover', 'bookCandidates', 'applyBookMeta',
@@ -52,9 +52,10 @@ window.__ModuleLoader__.load({
       { id: 'audio', label: '音频', icon: 'audio', unit: '本', blurb: '听书与播客，戴上耳机继续。', empty: '导入音频书源后，作品会出现在这里。' },
       { id: 'video', label: '视频', icon: 'video', unit: '本', blurb: '影视与课程，按集播放。', empty: '导入视频书源后，作品会出现在这里。' },
       { id: 'website', label: '网页', icon: 'web', unit: '个', blurb: '网站入口，点击在浏览器打开。', empty: '在书源里添加网站源，启用后会出现在这里。' },
+      { id: 'subscription', label: '订阅', icon: 'rss', unit: '份', blurb: '订阅源的最新条目，按时间倒序。', empty: '在书源里导入 Legado 订阅源，勾选分类后会出现在这里。' },
     ];
     const SHELF_CATEGORY_IDS = new Set(SHELF_CATEGORIES.map((item) => item.id));
-    const BOOK_CONTENT_TYPES = new Set(['novel', 'comic', 'audio', 'video']);
+    const BOOK_CONTENT_TYPES = new Set(['novel', 'comic', 'audio', 'video', 'subscription']);
     function bookContentType(book) {
       const value = book?.contentType;
       return BOOK_CONTENT_TYPES.has(value) ? value : 'novel';
@@ -276,6 +277,7 @@ window.__ModuleLoader__.load({
         audio: 'M4 14v-2a8 8 0 0 1 16 0v2M4 14h3v6H5a1 1 0 0 1-1-1zm3 6h2v-6H4v5a1 1 0 0 0 1 1h2zm13-6h-3v6h2a1 1 0 0 0 1-1z',
         video: 'M4 5h16v14H4zM10 9l6 3-6 3z',
         web: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3 12h18M12 3c3.2 3.2 3.2 14.8 0 18M12 3c-3.2 3.2-3.2 14.8 0 18',
+        rss: 'M5 5a14 14 0 0 1 14 14M5 12a7 7 0 0 1 7 7M6 19h.01',
       };
       return h('svg', {
         className: 'mr-glyph', width: size, height: size, viewBox: '0 0 24 24',
@@ -443,7 +445,7 @@ window.__ModuleLoader__.load({
     function shelfSortBooks(books, sortBy = 'recent') {
       const result = [...(Array.isArray(books) ? books : [])];
       if (sortBy === 'recent') result.sort((a, b) => shelfTimestamp(b.lastReadAt || b.updatedAt) - shelfTimestamp(a.lastReadAt || a.updatedAt));
-      else if (sortBy === 'added') result.sort((a, b) => shelfTimestamp(b.createdAt) - shelfTimestamp(a.createdAt));
+      else if (sortBy === 'added') result.sort((a, b) => shelfTimestamp(b.addedAt || b.createdAt) - shelfTimestamp(a.addedAt || a.createdAt));
       else if (sortBy === 'name') result.sort((a, b) => String(a.name || a.title || '').localeCompare(String(b.name || b.title || '')));
       else if (sortBy === 'progress') result.sort((a, b) => Number((b.lastRead || b.progress)?.percent || 0) - Number((a.lastRead || a.progress)?.percent || 0));
       return result;
@@ -824,11 +826,12 @@ window.__ModuleLoader__.load({
         const name = String(book.name || book.title || '未命名');
         const variant = (index % 7) + 2;
         const isSelected = selected.has(id);
+        const byline = book.author || book.subscription?.sourceName || '';
         return h('button', {
           key: `book-${id}`,
           className: `mr-shelf-piece mr-shelf-book${isSelected ? ' mr-selected' : ''}`,
           type: 'button',
-          'aria-label': `${name}${book.author ? `，${book.author}` : ''}`,
+          'aria-label': `${name}${byline ? `，${byline}` : ''}`,
           'aria-pressed': selectMode ? isSelected : undefined,
           'data-book-id': id,
           title: name,
@@ -855,7 +858,7 @@ window.__ModuleLoader__.load({
             Number(book.unread || book.unreadCount || 0) > 0 ? h('span', { className: 'mr-new-badge' }, `+${Number(book.unread || book.unreadCount)} 章`) : null)),
         h('span', { className: 'mr-shelf-cap' },
           h('strong', null, name.replace(/\.(?:txt|epub|md|pdf)$/i, '')),
-          book.author ? h('small', null, book.author) : null));
+          byline ? h('small', null, byline) : null));
       };
       const onTrackScroll = () => {
         if (!geometry.mobile || !trackRef.current) return;
@@ -923,6 +926,7 @@ window.__ModuleLoader__.load({
       const showGlance = !geometry.mobile && !selectMode && Boolean(glanceBook) && spareHeight >= 96;
       const downloadedCount = layout.books.filter((book) => shelfFilterMatches(book, 'downloaded')).length;
       const readingCount = layout.books.filter((book) => shelfFilterMatches(book, 'reading')).length;
+      const subscriptionSelected = Array.from(selected).some((id) => layout.books.some((book) => book.id === id && bookContentType(book) === 'subscription'));
       const pickRandomBook = () => {
         if (!glancePool.length) return;
         onOpen?.(glancePool[Math.floor(Math.random() * glancePool.length)]);
@@ -1003,7 +1007,7 @@ window.__ModuleLoader__.load({
             h('button', { className: 'mr-select-close', type: 'button', 'aria-label': '取消', title: '退出多选', onClick: exitSelect }, h(Glyph, { name: 'close', size: 18 }))),
           h('div', { className: 'mr-select-actions' },
             h(Button, { icon: 'folder', disabled: selectionBusy || !selected.size, onClick: () => setFolderSheet(true) }, h('span', null, '移动')),
-            h(Button, { icon: 'download', disabled: selectionBusy || !selected.size, onClick: () => runSelectionAction(() => onBatchDownload?.(Array.from(selected))) }, h('span', null, '下载')),
+            h(Button, { icon: 'download', disabled: selectionBusy || !selected.size || subscriptionSelected, title: subscriptionSelected ? '订阅暂不支持下载' : '下载', onClick: () => runSelectionAction(() => onBatchDownload?.(Array.from(selected))) }, h('span', null, '下载')),
             h(Button, { icon: 'upload', disabled: selectionBusy || !selected.size, onClick: () => runSelectionAction(() => onExport?.(Array.from(selected))) }, h('span', null, '导出')),
             h(Button, { icon: 'check', disabled: selectionBusy || !selected.size, onClick: () => runSelectionAction(() => onMarkRead?.(Array.from(selected))) }, h('span', null, '已读')),
             h(Button, { icon: 'trash', kind: 'mr-select-delete', disabled: selectionBusy || !selected.size, onClick: () => { if (window.confirm(`删除 ${selected.size} 本书？`)) runSelectionAction(() => onBatchDelete?.(Array.from(selected))); } }, h('span', null, '删除')))) : null,
@@ -1118,10 +1122,10 @@ window.__ModuleLoader__.load({
               h(DownloadBadge, { book, onToggle: onToggleDownload }),
               h('div', { className: 'mr-book-info' },
                 h('div', { className: 'mr-book-title-row' }, h('h3', { title: name }, name), unread > 0 ? h('span', { className: 'mr-badge' }, `${unread} 章`) : null),
-                h('p', null, book.author || (book.sourceType === 'local' ? '本地书籍' : '未知作者')),
-                h('small', null, book.sourceFailed ? '源失效' : (book.latestChapter || book.lastChapter || (job === 'running' ? '下载中' : '尚未读'))))),
+                h('p', null, book.author || book.subscription?.sourceName || (book.sourceType === 'local' ? '本地书籍' : '未知作者')),
+                h('small', null, book.sourceFailed ? '源失效' : (book.latestChapter || book.lastChapter || (book.contentType === 'subscription' ? '还没有条目' : job === 'running' ? '下载中' : '尚未读'))))),
             h('div', { className: 'mr-book-actions' },
-              h(Button, { kind: 'text', icon: 'download', title: '整本下载', onClick: () => onDownload(book), disabled: busy || job === 'running' || job === 'queued' }, job === 'completed' ? '已下载' : job === 'queued' ? '排队' : '下载'),
+              bookContentType(book) === 'subscription' ? null : h(Button, { kind: 'text', icon: 'download', title: '整本下载', onClick: () => onDownload(book), disabled: busy || job === 'running' || job === 'queued' }, job === 'completed' ? '已下载' : job === 'queued' ? '排队' : '下载'),
               h(Button, { kind: 'text danger', icon: 'trash', title: '移出书架', onClick: () => onRemove(book), disabled: busy }, '移除')));
         })));
     }
@@ -1182,7 +1186,7 @@ window.__ModuleLoader__.load({
         setRecent(rememberSearch(term));
         if (searchableSources.length) onSearch(term);
       };
-      const searchableSources = sources.filter((source) => source.id !== 'local' && source.contentType !== 'website' && source.enabled !== false);
+      const searchableSources = sources.filter((source) => source.id !== 'local' && source.contentType !== 'website' && source.kind !== 'rss' && source.enabled !== false);
       const siteSources = enabledWebsiteSources(sources);
       const sourceNames = [...new Set(searchableSources.map((source) => source.bookSourceName || source.name).filter(Boolean))];
       const allResults = results || [];
@@ -1249,22 +1253,55 @@ window.__ModuleLoader__.load({
 
     function importSummary(result) {
       if (!result || typeof result !== 'object') return '书源已导入';
-      const imported = Number(result.imported || 0);
+      const rss = Array.isArray(result.rss) ? result.rss : result.kind === 'rss' ? [result] : [];
+      const imported = result.kind === 'rss' ? 0 : Number(result.imported || 0);
       const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
-      if (!imported) return '这批书源都不符合规则，一个也没有导入';
       const first = Array.isArray(result.skipped) && result.skipped[0]?.reason ? String(result.skipped[0].reason).replace(/^source\./, '') : '';
       const skippedText = skipped ? `跳过 ${skipped} 个${first ? `（${first.slice(0, 40)}）` : ''}` : '';
-      return skippedText ? `已导入 ${imported} 个书源，${skippedText}` : `已导入 ${imported} 个书源`;
+      const rssText = rss.length
+        ? `${rss.length > 1 ? `${rss.length} 个订阅源` : `订阅源「${rss[0].name}」`}，共 ${rss.reduce((count, item) => count + (item.categories?.length || 0), 0)} 个分类，请在下方勾选`
+        : '';
+      if (!imported && !rss.length) return '这批书源都不符合规则，一个也没有导入';
+      if (!imported) return rssText;
+      return [`已导入 ${imported} 个书源`, rssText, skippedText].filter(Boolean).join('；');
     }
-    function Sources({ sources, subscriptions = [], onImport, onRemove, onToggle, onSubscribe, onUnsubscribe, onRefresh, onConfirmUpdate, onRejectUpdate, checkingIds = [], busy, onRestoreBuiltin }) {
+    function Sources({ sources, subscriptions = [], onImport, onAddSubscriptions, onRemove, onToggle, onSubscribe, onUnsubscribe, onRefresh, onConfirmUpdate, onRejectUpdate, checkingIds = [], busy, onRestoreBuiltin }) {
       const [draft, setDraft] = useState('');
       const [allowHttp, setAllowHttp] = useState(false);
       const [libraryText, setLibraryText] = useState('');
       const [libraryHttp, setLibraryHttp] = useState(false);
+      const [rssImports, setRssImports] = useState([]);
+      const [rssPicked, setRssPicked] = useState({});
       const fileRef = useRef(null);
       const subscribing = busy;
       const available = sources.filter((source) => source.enabled !== false && !source.lastError).length;
       const subscribedCount = subscriptions.reduce((count, item) => count + (item.sourceIds?.length || 0), 0);
+      const pickedFor = (sourceId) => rssPicked[sourceId] || [];
+      const toggleRssCategory = (sourceId, url) => setRssPicked((current) => {
+        const picked = current[sourceId] || [];
+        return { ...current, [sourceId]: picked.includes(url) ? picked.filter((item) => item !== url) : [...picked, url] };
+      });
+      const pickAllRssCategories = (sourceId, urls) => setRssPicked((current) => ({ ...current, [sourceId]: urls }));
+      const dismissRssImport = (sourceId) => {
+        setRssImports((current) => current.filter((item) => item.sourceId !== sourceId));
+        setRssPicked((current) => { const next = { ...current }; delete next[sourceId]; return next; });
+      };
+      const openRssSource = (source) => {
+        const fresh = {
+          sourceId: source.id,
+          name: source.name || source.bookSourceName || '订阅源',
+          categories: Array.isArray(source.categories) ? source.categories : [],
+          unsupported: Array.isArray(source.unsupported) ? source.unsupported : [],
+        };
+        setRssImports((current) => [...current.filter((entry) => entry.sourceId !== source.id), fresh]);
+        setRssPicked((current) => ({ ...current, [source.id]: [] }));
+      };
+      const confirmRssImport = (item) => {
+        const urls = pickedFor(item.sourceId);
+        if (!urls.length || busy || !onAddSubscriptions) return;
+        onAddSubscriptions(item.sourceId, urls).then((result) => { if (result) dismissRssImport(item.sourceId); }, () => {});
+      };
+      const rssCapabilityLabels = { cookie: 'Cookie', login: '登录', 'inject-js': '注入脚本' };
       return h('div', { className: 'mr-screen mr-sources-screen' },
         h(ScreenHead, {
           kicker: 'MO READ · 窗边 / 书源',
@@ -1280,10 +1317,39 @@ window.__ModuleLoader__.load({
               h('textarea', { value: draft, onChange: (e) => setDraft(e.target.value), placeholder: '粘贴书源 JSON，或填写公开 URL', rows: 5, 'aria-label': '书源 JSON 或 URL' }),
               h('label', { className: 'mr-check' }, h('input', { type: 'checkbox', checked: allowHttp, onChange: (e) => setAllowHttp(e.target.checked) }), '允许明文 HTTP'),
               h('div', { className: 'mr-inline-actions' },
-                h(Button, { kind: 'primary', icon: 'plus', disabled: busy || !draft.trim(), onClick: () => onImport(draft, allowHttp).then(() => setDraft('')) }, '导入'),
+                h(Button, { kind: 'primary', icon: 'plus', disabled: busy || !draft.trim(), onClick: () => onImport(draft, allowHttp).then((result) => {
+                  setDraft('');
+                  const list = Array.isArray(result?.rss) ? result.rss : result?.kind === 'rss' ? [result] : [];
+                  if (!list.length) return;
+                  setRssImports((current) => {
+                    const next = [...current];
+                    for (const item of list) if (!next.some((existing) => existing.sourceId === item.sourceId)) next.unshift(item);
+                    return next;
+                  });
+                }, () => {}) }, '导入'),
                 h(Button, { icon: 'upload', onClick: () => fileRef.current?.click(), disabled: busy }, '选文件'),
                 h(Button, { icon: 'refresh', onClick: () => onRestoreBuiltin(), disabled: busy }, '恢复内置'),
                 h('input', { ref: fileRef, type: 'file', accept: '.json,application/json', hidden: true, onChange: async (e) => { const file = e.target.files?.[0]; if (file) setDraft(await file.text()); e.target.value = ''; } }))),
+            rssImports.map((item) => {
+              const picked = pickedFor(item.sourceId);
+              return h('section', { className: 'mr-window-card mr-rss-import', key: item.sourceId, 'aria-labelledby': `rss-import-${item.sourceId}` },
+                h('h2', { id: `rss-import-${item.sourceId}` }, '订阅源已识别'),
+                h('p', { className: 'mr-help' }, `「${item.name}」是 Legado 订阅源，不是书源。勾选的分类会各生成一张作品卡。`),
+                item.unsupported?.length ? h('p', { className: 'mr-source-warning' },
+                  h(Glyph, { name: 'warning', size: 16 }),
+                  h('span', null, `不支持 ${item.unsupported.map((value) => rssCapabilityLabels[value] || value).join('、')}，导入时会丢弃。`)) : null,
+                h('div', { className: 'mr-rss-head' },
+                  h('span', null, `${item.categories.length} 个分类 · 已选 ${picked.length}`),
+                  h('div', null,
+                    h(Button, { kind: 'text', disabled: busy, onClick: () => pickAllRssCategories(item.sourceId, item.categories.map((category) => category.url)) }, '全选'),
+                    h(Button, { kind: 'text', disabled: busy, onClick: () => pickAllRssCategories(item.sourceId, []) }, '全不选'))),
+                h('div', { className: 'mr-rss-list' }, item.categories.map((category) => h('label', { className: 'mr-rss-row', key: category.url },
+                  h('input', { type: 'checkbox', checked: picked.includes(category.url), onChange: () => toggleRssCategory(item.sourceId, category.url) }),
+                  h('span', null, h('strong', null, category.name), h('small', { title: category.url }, category.url))))),
+                h('div', { className: 'mr-inline-actions' },
+                  h(Button, { kind: 'primary', icon: 'plus', disabled: busy || !picked.length, onClick: () => confirmRssImport(item) }, picked.length ? `加入书架（${picked.length}）` : '加入书架'),
+                  h(Button, { kind: 'text', disabled: busy, onClick: () => dismissRssImport(item.sourceId) }, '取消')));
+            }),
             h('section', { className: 'mr-window-card', 'aria-labelledby': 'source-library-title' },
               h('h2', { id: 'source-library-title' }, '订阅书源库'),
               h('p', { className: 'mr-help' }, '这里订阅的是书源合集，不是 Legado 的 RSS 订阅源。地址与启停状态保存在本机。'),
@@ -1350,13 +1416,14 @@ window.__ModuleLoader__.load({
               const name = source.bookSourceName || source.name || '书源';
               const disabled = source.enabled === false;
               const local = source.id === 'local' || source.bookSourceUrl === 'local:';
-              const unsupportedLabels = { login: '登录', captcha: '验证码', payment: '付费', webview: '内置网页' };
+              const unsupportedLabels = { login: '登录', captcha: '验证码', payment: '付费', webview: '内置网页', cookie: 'Cookie', 'inject-js': '注入脚本' };
               const unsupported = (Array.isArray(source.unsupported) ? source.unsupported : []).map((item) => unsupportedLabels[item] || item);
               return h('article', { className: `mr-source-row${disabled ? ' is-disabled' : ''}`, key: id },
                 h('span', { className: 'mr-source-icon', 'aria-hidden': true }, name.slice(0, 1)),
-                h('div', null, h('h3', null, name), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl)),
+                h('div', null, h('h3', null, name), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl), source.kind === 'rss' && unsupported.length ? h('p', { className: 'mr-source-unsupported' }, `导入时丢弃：${unsupported.join('、')}`) : null),
                 h('div', { className: 'mr-source-side' },
-                  h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || (unsupported.length ? `不支持：${unsupported.join('、')}` : '') }, local ? '本机导入' : source.contentType === 'website' ? (disabled ? '网站 · 已停用' : '网站入口') : disabled ? '已停用' : source.lastError ? '解析失败 · 需更新规则' : unsupported.length ? `不支持 · ${unsupported.join('/')}` : source.builtin ? '内置 · 可用' : (source.compatibility || '基础规则')),
+                  h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || (unsupported.length ? `不支持：${unsupported.join('、')}` : '') }, local ? '本机导入' : source.kind === 'rss' ? (disabled ? '订阅源 · 已停用' : '订阅源') : source.contentType === 'website' ? (disabled ? '网站 · 已停用' : '网站入口') : disabled ? '已停用' : source.lastError ? '解析失败 · 需更新规则' : unsupported.length ? `不支持 · ${unsupported.join('/')}` : source.builtin ? '内置 · 可用' : (source.compatibility || '基础规则')),
+                  source.kind === 'rss' && source.categories?.length ? h(Button, { kind: 'text', onClick: () => openRssSource(source), disabled: busy }, '分类') : null,
                   local ? null : h(Button, { kind: 'text', onClick: () => onToggle(source), disabled: busy, 'aria-pressed': !disabled }, disabled ? '启用' : '停用'),
                   source.builtin || local ? null : h(Button, { kind: 'text danger', onClick: () => onRemove(source), disabled: busy }, '移除')));
             }) : h(Empty, { icon: 'source', title: '暂无书源', detail: '导入后即可搜索和追更。' }))));
@@ -3670,10 +3737,17 @@ window.__ModuleLoader__.load({
       };
       const importSource = (draft, allowHttp) => {
         const value = draft.trim();
-        const pending = run(() => call(ctx, 'importSource', /^https?:\/\//i.test(value) ? { url: value, allowHttp } : { text: value, allowHttp }), '书源已导入');
+        const pending = run(() => call(ctx, 'importSource', /^https?:\/\//i.test(value) ? { url: value, allowHttp } : { text: value, allowHttp }), null);
         pending.then((result) => { if (result) setNotice({ kind: 'info', text: importSummary(result) }); }, () => {});
         return pending;
       };
+      const addSubscriptions = (sourceId, categories) => run(() => call(ctx, 'addSubscriptions', { sourceId, categories }), null).then((result) => {
+        const parts = [];
+        if (result?.added) parts.push(`已加入 ${result.added} 份订阅`);
+        if (result?.missing?.length) parts.push(`${result.missing.length} 个分类已不在源里`);
+        notify(parts.join('；') || '这些分类已经在书架里', result?.added ? 'success' : 'info');
+        return result;
+      });
       const subscribeLibrary = async (payload) => {
         try {
           const result = await run(() => call(ctx, 'subscribeSourceLibrary', payload));
@@ -3708,7 +3782,7 @@ window.__ModuleLoader__.load({
         const keyword = String(query || '').trim();
         if (!keyword) return;
         setBusy(true); setResults(null); setSearchFailed(0);
-        const targets = sources.filter((source) => source.id !== 'local' && source.contentType !== 'website' && source.enabled !== false);
+        const targets = sources.filter((source) => source.id !== 'local' && source.contentType !== 'website' && source.kind !== 'rss' && source.enabled !== false);
         const settled = await Promise.allSettled(targets.map((source) => {
           const sourceId = source.id || source.bookSourceUrl;
           return withTimeout(call(ctx, 'search', { sourceId, query: keyword, page: 1 }), 15_000)
@@ -3734,7 +3808,7 @@ window.__ModuleLoader__.load({
         if (!text) { setShelfOnline(null); setShelfOnlineFailed(0); setShelfOnlineBusy(false); return }
         const ticket = ++shelfSearchTicket.current
         setShelfOnlineBusy(true)
-        const targets = sources.filter((source) => source.enabled !== false)
+        const targets = sources.filter((source) => source.enabled !== false && source.kind !== 'rss')
         const settled = await Promise.allSettled(targets.map((source) => {
           const sourceId = source.id || source.bookSourceUrl
           return withTimeout(call(ctx, 'search', { sourceId, query: text, page: 1 }), 15_000)
@@ -3961,6 +4035,7 @@ window.__ModuleLoader__.load({
         onError: () => { setAudioPlaying(false); notify('音频加载失败：地址可能已失效，或浏览器不支持该格式', 'error'); },
       });
       const openBook = (book, detail) => {
+        if (bookContentType(book) === 'subscription') { notify('这份订阅还没有条目。', 'info'); return; }
         if (!detail?.rect || !detail?.panel || motionOff) { setOpening(null); setReading(book); return; }
         setOpening({ ...detail, book, theme: settings.readerTheme || 'paper' });
         setReading(book);
@@ -4005,7 +4080,7 @@ window.__ModuleLoader__.load({
               return run(() => pending, '已暂停').catch(() => {});
             }, onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
-          !loading && tab === 'sources' ? h(Sources, { sources, subscriptions: data.subscriptions || [], checkingIds: [...new Set([...(data.subscriptions || []).filter(item => item.checking).map(item => item.id), ...refreshingSubscriptions])], busy, onImport: importSource,
+          !loading && tab === 'sources' ? h(Sources, { sources, subscriptions: data.subscriptions || [], checkingIds: [...new Set([...(data.subscriptions || []).filter(item => item.checking).map(item => item.id), ...refreshingSubscriptions])], busy, onImport: importSource, onAddSubscriptions: addSubscriptions,
               onRestoreBuiltin: () => run(() => call(ctx, 'restoreBuiltinSources'), '内置书源已恢复').then((result) => { if (result) setNotice({ kind: 'success', text: `已恢复 ${result.added} 个内置书源` }); }, () => {}),
               onSubscribe: subscribeLibrary,
               onRefresh: refreshSubscription,
@@ -4583,6 +4658,18 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-sources-list-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding-bottom:10px;border-bottom:1px solid var(--mr-border)}
 .mr-sources-list-head h2{margin:0;font:400 22px/1.3 var(--mr-serif)}
 .mr-sources-list-head span{font-size:11px;color:var(--mr-muted)}
+.mr-rss-import{margin-bottom:16px}
+.mr-rss-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:10px 0 6px}
+.mr-rss-head>span{font-size:11px;color:var(--mr-muted)}
+.mr-rss-head>div{display:flex;gap:6px}
+.mr-rss-list{max-height:260px;overflow:auto;border-top:1px solid var(--mr-line);border-bottom:1px solid var(--mr-line)}
+.mr-rss-row{display:flex;align-items:center;gap:10px;padding:8px 2px;border-bottom:1px solid var(--mr-line);cursor:pointer}
+.mr-rss-row:last-child{border-bottom:0}
+.mr-rss-row input{flex:none;width:15px;height:15px;padding:0}
+.mr-rss-row span{display:flex;flex-direction:column;min-width:0}
+.mr-rss-row strong{font-size:12px;font-weight:500;line-height:1.4}
+.mr-rss-row small{overflow:hidden;font-size:10px;color:var(--mr-muted);text-overflow:ellipsis;white-space:nowrap}
+.mr-source-unsupported{margin-top:2px;overflow:visible;color:var(--mr-update,#a85132);font-size:10px;line-height:1.5;text-overflow:clip;white-space:normal}
 .mr-source-row{display:grid;grid-template-columns:30px minmax(0,1fr) auto;align-items:center;gap:12px;padding:13px 0;border-bottom:1px solid var(--mr-line);background:transparent;border-radius:0}
 .mr-source-row h3{margin:0;font:400 15px/1.4 var(--mr-serif)}
 .mr-source-row p{margin:2px 0 0;overflow:hidden;font-size:11px;color:var(--mr-muted);text-overflow:ellipsis;white-space:nowrap}
