@@ -349,6 +349,21 @@ test('adding POST to an existing origin is treated as an expansion', async () =>
 })
 
 
+test('a URL template expression on an existing origin is treated as a JS expansion', async () => {
+  let library = [{ ...librarySource('源甲', 'https://a.example'), rules: { search: { list: 'li' } } }]
+  const { service } = await serviceFixture({}, {
+    fetchRemote: async () => ({ text: JSON.stringify(library) }),
+  })
+  const subscribed = await service.subscribeSourceLibrary({ url: 'https://lib.example/sources.json' })
+  library = [{ ...librarySource('源甲', 'https://a.example'), rules: { search: { list: 'li', url: '/search?p={{page}}' } } }]
+  const simple = await service.refreshSubscription({ id: subscribed.subscription.id })
+  assert.equal(simple.pending, undefined, '简单变量不算新增 JS 能力')
+  library = [{ ...librarySource('源甲', 'https://a.example'), rules: { search: { list: 'li', url: '/search?p={{page*2}}' } } }]
+  const result = await service.refreshSubscription({ id: subscribed.subscription.id })
+  assert.equal(result.pending, true)
+  assert.deepEqual(result.permissions.capabilities, [{ origin: 'https://a.example', capabilities: ['js'] }])
+})
+
 test('a pending subscription does not fetch again until it is confirmed or rejected', async () => {
   let library = [librarySource('源甲', 'https://a.example')]
   let fetches = 0
