@@ -3319,7 +3319,7 @@ window.__ModuleLoader__.load({
               book.contentType === 'audio' ? [renderAudio(source)] :
               book.contentType === 'video' ? [renderVideo(source)] :
               lines.map((line, key) => h('p', { key }, line))),
-          !lines.length && book.contentType !== 'audio' && book.contentType !== 'video' ? h(Empty, { key: 'empty', title: '本章无正文', detail: '可尝试刷新目录。' }) : null,
+          !lines.length && book.contentType !== 'audio' && book.contentType !== 'video' ? h(Empty, { key: 'empty', title: '本章无正文', detail: book.contentType === 'subscription' ? '这条订阅没有正文内容，稍后重试或换一条。' : '可尝试刷新目录。' }) : null,
           showEnd
             ? h('div', { key: 'end', className: 'mr-chapter-end' }, index + 1 < toc.length
               ? h(Button, { kind: 'primary soft', onClick: () => openChapter(index + 1) }, '下一章')
@@ -4035,13 +4035,12 @@ window.__ModuleLoader__.load({
         onError: () => { setAudioPlaying(false); notify('音频加载失败：地址可能已失效，或浏览器不支持该格式', 'error'); },
       });
       const openBook = (book, detail) => {
-        if (bookContentType(book) === 'subscription') { notify('这份订阅还没有条目。', 'info'); return; }
         if (!detail?.rect || !detail?.panel || motionOff) { setOpening(null); setReading(book); return; }
         setOpening({ ...detail, book, theme: settings.readerTheme || 'paper' });
         setReading(book);
       };
       if (activeBook) return h(React.Fragment, null, h('style', null, css), audioElement,
-        bookContentType(activeBook) === 'novel'
+        bookContentType(activeBook) === 'novel' || bookContentType(activeBook) === 'subscription'
           ? h(ReaderView, { ctx, book: activeBook, settings, notes, notice, onDismissNotice: () => setNotice(null), deferMs: opening ? 200 : 0, onSettings: updateSettings, onBookSettings: (partial) => updateBookSettings(activeBook.id || activeBook.bookId, partial), onClose: () => { setOpening(null); setReading(null); refresh(true); }, onSaveNote: saveNote, onDeleteNote: (note) => run(() => call(ctx, 'deleteNote', { id: note.id })).catch(() => {}), notify })
           : h(MediaReader, { ctx, book: activeBook, settings, notify, jobs: data.jobs || [], onClose: () => { setOpening(null); setReading(null); refresh(true); }, onRefresh: () => refresh(true), audioTrack, audioPlaying, audioTime, audioDuration, onAudioPlay: startAudio, onAudioToggle: toggleAudio, onAudioSeek: seekAudio }),
         audioTrack ? h(MediaAudioDock, { track: audioTrack, playing: audioPlaying, time: audioTime, duration: audioDuration, onToggle: toggleAudio, onSeek: seekAudio, onClose: closeAudio, onPrev: audioIndex > 0 ? () => playQueuedAudio(audioIndex - 1) : null, onNext: audioIndex >= 0 && audioIndex < audioQueue.length - 1 ? () => playQueuedAudio(audioIndex + 1) : null }) : null,

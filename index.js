@@ -1,7 +1,7 @@
 import { Service } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { createBackup, parseBackup } from './lib/backup.js'
-import { hasChapterPayload, normalizeBookContentType, normalizeSourceContentType } from './lib/content-types.js'
+import { hasChapterPayload, isTextContentType, normalizeBookContentType, normalizeSourceContentType } from './lib/content-types.js'
 import { ReaderError } from './lib/errors.js'
 import { fetchRemote } from './lib/http.js'
 import { MediaStore, DEFAULT_MEDIA_QUOTA } from './lib/media-store.js'
@@ -295,7 +295,8 @@ export class ReaderService extends TypertRemoteService {
 
   chapterView(chapter) {
     const contentType = normalizeBookContentType(chapter.contentType)
-    const offline = contentType === 'novel' ? false : this.offlineRecordReady(chapter, contentType)
+    const textType = isTextContentType(contentType)
+    const offline = textType ? false : this.offlineRecordReady(chapter, contentType)
     return {
       id: chapter.id,
       bookId: chapter.bookId,
@@ -303,8 +304,10 @@ export class ReaderService extends TypertRemoteService {
       title: chapter.title,
       url: chapter.url,
       contentType: chapter.contentType,
-      downloaded: contentType === 'novel' ? hasChapterPayload(chapter, contentType) : offline,
+      downloaded: textType ? hasChapterPayload(chapter, contentType) : offline,
       downloadedAt: chapter.downloadedAt,
+      ...(chapter.coverUrl ? { coverUrl: chapter.coverUrl } : {}),
+      ...(chapter.publishedAt ? { publishedAt: chapter.publishedAt } : {}),
       ...(offline ? { offline: clone(chapter.offline) } : {}),
     }
   }
@@ -313,7 +316,8 @@ export class ReaderService extends TypertRemoteService {
     const chapters = this.chapters(book.id)
     const source = this.db.sources.get(book.sourceId)
     const contentType = normalizeBookContentType(book.contentType)
-    const downloaded = chapters.filter(chapter => contentType === 'novel'
+    const textType = isTextContentType(contentType)
+    const downloaded = chapters.filter(chapter => textType
       ? hasChapterPayload(chapter, contentType)
       : this.offlineRecordReady(chapter, contentType)).length
     const readIndex = book.progress ? chapters.findIndex(chapter => chapter.id === book.progress.chapterId) : -1
@@ -850,6 +854,31 @@ export class ReaderService extends TypertRemoteService {
     return chapters
   }
 
+  // 订阅条目只增不删：刷新时保留已有条目与阅读顺序，只补齐新链接。
+  // 失败时调用方不会走到这里，旧目录自然留在库里。
+  async syncSubscriptionToc(book, fresh) {
+    const old = this.chapters(book.id)
+    const oldByUrl = new Map(old.map(chapter => [chapter.url, chapter]))
+    const freshUrls = new Set()
+    const merged = fresh.map(chapter => {
+      freshUrls.add(chapter.url)
+      const cached = oldByUrl.get(chapter.url)
+      if (!cached) return { ...chapter, bookId: book.id, contentType: 'subscription' }
+      return { ...cached, ...chapter, id: cached.id, index: cached.index, bookId: book.id, contentType: 'subscription' }
+    })
+    for (const cached of old) if (!freshUrls.has(cached.url)) merged.push(cached)
+    const chapters = merged.map((chapter, index) => ({ ...chapter, index }))
+    for (const chapter of chapters) await this.db.chapters.put(chapter.id, chapter)
+    const latest = this.db.books.get(book.id) ?? book
+    await this.db.books.put(book.id, {
+      ...latest,
+      latestChapter: fresh[0]?.title ?? latest.latestChapter,
+      lastCheckedAt: now(),
+      updatedAt: now(),
+    })
+    return chapters
+  }
+
   async toc(args) {
     args ??= {}
     this.assertReady()
@@ -857,7 +886,12 @@ export class ReaderService extends TypertRemoteService {
     const cached = this.chapters(book.id)
     if (cached.length && args.refresh !== true) return cached.map(chapter => this.chapterView(chapter))
     if (book.local) return cached.map(chapter => this.chapterView(chapter))
-    const fresh = await this.engine.toc(this.source(book.sourceId), book)
+    const source = this.source(book.sourceId)
+    if (normalizeBookContentType(book.contentType) === 'subscription') {
+      const fresh = await this.engine.subscriptionToc(source, book)
+      return (await this.syncSubscriptionToc(book, fresh)).map(chapter => this.chapterView(chapter))
+    }
+    const fresh = await this.engine.toc(source, book)
     return (await this.syncToc(book, fresh)).map(chapter => this.chapterView(chapter))
   }
 
@@ -869,19 +903,23 @@ export class ReaderService extends TypertRemoteService {
     let chapter = this.db.chapters.get(chapterId)
     if (!chapter || chapter.bookId !== book.id) throw new ReaderError('reader/not-found', `Chapter ${chapterId} not found in this book.`)
     const contentType = normalizeBookContentType(book.contentType)
-    const offline = contentType === 'novel' ? false : await this.offlineReady(book, chapter)
-    if ((contentType === 'novel' ? !hasChapterPayload(chapter, contentType) : !offline)) {
+    const textType = isTextContentType(contentType)
+    const offline = textType ? false : await this.offlineReady(book, chapter)
+    if (textType ? !hasChapterPayload(chapter, contentType) : !offline) {
       if (book.local) throw new ReaderError('reader/not-found', 'Local chapter cache is missing.')
-      const content = await this.engine.content(this.source(book.sourceId), book, chapter)
+      const source = this.source(book.sourceId)
+      const content = contentType === 'subscription'
+        ? await this.engine.subscriptionContent(source, book, chapter)
+        : await this.engine.content(source, book, chapter)
       const headers = content.headers && typeof content.headers === 'object' ? clone(content.headers) : {}
       if (Object.keys(headers).length) this.streamHeaders.set(chapter.id, headers)
       chapter = { ...chapter, ...content, downloadedAt: now() }
       delete chapter.headers
-      if (contentType !== 'novel') delete chapter.offline
+      if (!textType) delete chapter.offline
       await this.db.chapters.put(chapter.id, chapter)
     }
     const view = this.chapterView(chapter)
-    if (contentType === 'novel') return { ...view, text: applyReplacements(chapter.text, this.db.settings.get().replacements) }
+    if (textType) return { ...view, text: applyReplacements(chapter.text, this.db.settings.get().replacements) }
     for (const key of ['images', 'mediaUrl']) if (chapter[key] !== undefined) view[key] = clone(chapter[key])
     const headers = this.streamHeaders.get(chapter.id)
     if (headers) view.headers = clone(headers)
