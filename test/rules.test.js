@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { isPrivateAddress, parseRemoteUrl } from '../lib/http.js'
-import { applyReplacements, normalizeReplacements } from '../lib/replacements.js'
+import { applyReplacements, applyReplacementsToBlocks, normalizeReplacements } from '../lib/replacements.js'
 import { extractOne, mapList, normalizeSource, renderTemplate, responseDocument, selectAll } from '../lib/rules.js'
 
 test('URL templates encode key, page and book values', () => {
@@ -66,6 +66,22 @@ test('global text and regex replacements apply only to returned content', () => 
   ])
   assert.equal(applyReplacements('垃圾正文 广告 12 disabled', rules), '正文 [removed] disabled')
   assert.throws(() => normalizeReplacements([{ type: 'regex', pattern: '[' }]), /合法正则/)
+})
+
+test('block replacements touch text and list items but keep code indentation', () => {
+  const rules = [{ type: 'text', pattern: '垃圾', replacement: '' }]
+  const blocks = [
+    { type: 'paragraph', text: ' 垃圾正文 ' },
+    { type: 'list', ordered: true, items: ['垃圾一', '二'] },
+    { type: 'code', text: '  const value = 1\n' },
+    { type: 'image', url: 'https://example.com/a.png' },
+  ]
+  assert.deepEqual(applyReplacementsToBlocks(blocks, rules), [
+    { type: 'paragraph', text: '正文' },
+    { type: 'list', ordered: true, items: ['一', '二'] },
+    { type: 'code', text: '  const value = 1\n' },
+    { type: 'image', url: 'https://example.com/a.png' },
+  ])
 })
 
 test('URL templates keep `{{!name}}` verbatim for whole-URL variables', () => {

@@ -14,7 +14,7 @@ import { ACTIVE_JOBS, createJob, jobView, transitionJob } from './lib/jobs.js'
 const MAX_PARALLEL_JOBS = 4
 const MAX_PER_SOURCE_JOBS = 2
 const MAX_CHAPTER_ATTEMPTS = 2
-import { applyReplacements } from './lib/replacements.js'
+import { applyReplacements, applyReplacementsToBlocks } from './lib/replacements.js'
 import { assertSettingKeys, normalizeReaderPrefs, normalizeSettings } from './lib/settings.js'
 import { normalizeSource } from './lib/rules.js'
 import { categoryPageUrl, detectRssSource, normalizeRssSource, rssImportSummary } from './lib/rss-source.js'
@@ -841,7 +841,7 @@ export class ReaderService extends TypertRemoteService {
       const next = { ...chapter, bookId: book.id, index: chapter.index ?? position, contentType: bookType }
       if (!cached) return next
       const preserved = {}
-      for (const key of ['text', 'html', 'images', 'mediaUrl', 'offline', 'downloadedAt']) {
+      for (const key of ['text', 'html', 'blocks', 'payloadVersion', 'images', 'mediaUrl', 'offline', 'downloadedAt']) {
         if (cached[key] !== undefined) preserved[key] = cached[key]
       }
       return { ...next, ...preserved }
@@ -907,19 +907,32 @@ export class ReaderService extends TypertRemoteService {
     const offline = textType ? false : await this.offlineReady(book, chapter)
     if (textType ? !hasChapterPayload(chapter, contentType) : !offline) {
       if (book.local) throw new ReaderError('reader/not-found', 'Local chapter cache is missing.')
-      const source = this.source(book.sourceId)
-      const content = contentType === 'subscription'
-        ? await this.engine.subscriptionContent(source, book, chapter)
-        : await this.engine.content(source, book, chapter)
-      const headers = content.headers && typeof content.headers === 'object' ? clone(content.headers) : {}
-      if (Object.keys(headers).length) this.streamHeaders.set(chapter.id, headers)
-      chapter = { ...chapter, ...content, downloadedAt: now() }
-      delete chapter.headers
-      if (!textType) delete chapter.offline
-      await this.db.chapters.put(chapter.id, chapter)
+      let content = null
+      try {
+        const source = this.source(book.sourceId)
+        content = contentType === 'subscription'
+          ? await this.engine.subscriptionContent(source, book, chapter)
+          : await this.engine.content(source, book, chapter)
+      } catch (error) {
+        // 旧订阅条目只有文本时，重取失败不应把已经能读的正文变成错误；下次打开再试。
+        const canReadCached = contentType === 'subscription' && typeof chapter.text === 'string' && chapter.text.trim().length > 0
+        if (!canReadCached) throw error
+      }
+      if (content) {
+        const headers = content.headers && typeof content.headers === 'object' ? clone(content.headers) : {}
+        if (Object.keys(headers).length) this.streamHeaders.set(chapter.id, headers)
+        chapter = { ...chapter, ...content, downloadedAt: now() }
+        delete chapter.headers
+        if (!textType) delete chapter.offline
+        await this.db.chapters.put(chapter.id, chapter)
+      }
     }
     const view = this.chapterView(chapter)
-    if (textType) return { ...view, text: applyReplacements(chapter.text, this.db.settings.get().replacements) }
+    if (textType) {
+      const replacements = this.db.settings.get().replacements
+      const blocks = applyReplacementsToBlocks(chapter.blocks, replacements)
+      return { ...view, text: applyReplacements(chapter.text ?? '', replacements), ...(Array.isArray(blocks) ? { blocks } : {}) }
+    }
     for (const key of ['images', 'mediaUrl']) if (chapter[key] !== undefined) view[key] = clone(chapter[key])
     const headers = this.streamHeaders.get(chapter.id)
     if (headers) view.headers = clone(headers)

@@ -37,7 +37,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --test test/*.test.js",
-    "test:browser": "node test/browser/scroll-restore.runner.mjs && node test/browser/shelf-pagination.runner.mjs && node test/browser/screens.runner.mjs"
+    "test:browser": "node test/browser/scroll-restore.runner.mjs && node test/browser/shelf-pagination.runner.mjs && node test/browser/blocks.runner.mjs && node test/browser/screens.runner.mjs"
   },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },

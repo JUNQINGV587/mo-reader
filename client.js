@@ -2191,6 +2191,7 @@ window.__ModuleLoader__.load({
       const tocActiveRef = useRef(null);
       const veilTimer = useRef(null);
       const measureRef = useRef(null);
+      const imageMeasureRef = useRef(0);
       const requestRef = useRef(0);
       const speechGeneration = useRef(0);
       const saveTimer = useRef(null);
@@ -2493,6 +2494,22 @@ window.__ModuleLoader__.load({
         const item = list[index];
         return item && (item.id || item.chapterId || item.url || item.chapterUrl || String(index));
       };
+      const CHAPTER_CACHE_VERSION = 2;
+      const cacheChapterPayload = (cacheKey, value, id) => {
+        if (!value?.text && !(Array.isArray(value?.blocks) && value.blocks.length)) return;
+        try {
+          const payload = JSON.stringify({
+            version: CHAPTER_CACHE_VERSION,
+            id: value.id || id,
+            text: value.text || '',
+            blocks: Array.isArray(value.blocks) ? value.blocks : undefined,
+            timestamp: Date.now(),
+          });
+          // 图文块可能很大；超过 256KB 就不进本地缓存，避免把 localStorage 配额吃满。
+          if (payload.length > 256 * 1024) return;
+          localStorage.setItem(cacheKey, payload);
+        } catch {}
+      };
       const fetchChapterEntry = async (index, list = toc) => {
         const id = chapterSourceId(index, list);
         if (!id) return null;
@@ -2501,18 +2518,17 @@ window.__ModuleLoader__.load({
         try {
           const cached = localStorage.getItem(cacheKey);
           if (cached) {
-            const { text, timestamp } = JSON.parse(cached);
-            // 缓存 7 天有效
-            if (Date.now() - timestamp < 7 * 24 * 3600 * 1000) {
-              return { index, chapter: { text, cached: true } };
+            const payload = JSON.parse(cached);
+            const { id: cachedId, text, blocks, timestamp, version } = payload;
+            const staleSubscription = book.contentType === 'subscription' && version !== CHAPTER_CACHE_VERSION;
+            // 缓存 7 天有效；旧版订阅缓存没有图文块，交给服务端重取。
+            if (!staleSubscription && Date.now() - timestamp < 7 * 24 * 3600 * 1000) {
+              return { index, chapter: { id: cachedId || id, text, ...(Array.isArray(blocks) ? { blocks } : {}), cached: true } };
             }
           }
         } catch {}
         const value = await call(ctx, 'chapter', { bookId, chapterId: id });
-        // 写入缓存
-        if (value?.text) {
-          try { localStorage.setItem(cacheKey, JSON.stringify({ text: value.text, timestamp: Date.now() })); } catch {}
-        }
+        cacheChapterPayload(cacheKey, value, id);
         return { index, chapter: value || {} };
       };
       // 预加载：当前章加载后，后台预取下一章
@@ -2523,11 +2539,7 @@ window.__ModuleLoader__.load({
         if (!id) return;
         const cacheKey = `mo-reader:chapter:${bookId}:${id}`;
         try { if (localStorage.getItem(cacheKey)) return; } catch {}
-        call(ctx, 'chapter', { bookId, chapterId: id }).then(value => {
-          if (value?.text) {
-            try { localStorage.setItem(cacheKey, JSON.stringify({ text: value.text, timestamp: Date.now() })); } catch {}
-          }
-        }).catch(() => {});
+        call(ctx, 'chapter', { bookId, chapterId: id }).then(value => cacheChapterPayload(cacheKey, value, id)).catch(() => {});
       };
       const nodeTop = (node) => {
         const el = scrollRef.current;
@@ -3296,10 +3308,53 @@ window.__ModuleLoader__.load({
       const onPagedPointerUp = (event) => endPagedDrag(event, false);
       const onPagedPointerCancel = (event) => endPagedDrag(event, true);
       const bookLabel = String(book.title || book.name || '').trim().replace(/\.(txt|epub|md)$/i, '');
+      const blockPlainText = (block) => {
+        if (!block || typeof block !== 'object') return '';
+        if (block.type === 'image') return '';
+        if (block.type === 'list') return Array.isArray(block.items) ? block.items.join('') : '';
+        return String(block.text || '');
+      };
+      // Images arrive after pagination is measured; re-measure once they settle so
+      // the final page count includes their height instead of clipping the tail.
+      const remeasureAfterImage = () => {
+        if (mode !== 'paged' || imageMeasureRef.current) return;
+        imageMeasureRef.current = requestAnimationFrame(() => {
+          imageMeasureRef.current = 0;
+          measureRef.current?.(progressRef.current.percent, progressRef.current.offset || null);
+        });
+      };
+      const renderBlocks = (blocks, source) => blocks.map((block, key) => {
+        const text = String(block.text || '');
+        if (block.type === 'heading') {
+          const level = Math.min(6, Math.max(1, Number(block.level) || 2));
+          return h(`h${level}`, { key, className: 'mr-block-heading' }, text);
+        }
+        if (block.type === 'quote') {
+          return text ? h('blockquote', { key, className: 'mr-block-quote' }, text) : null;
+        }
+        if (block.type === 'code') {
+          return h('pre', { key, className: 'mr-block-code' }, h('code', { className: block.lang ? `language-${block.lang}` : undefined }, text));
+        }
+        if (block.type === 'list') {
+          const items = Array.isArray(block.items) ? block.items.map((item) => String(item || '')).filter(Boolean) : [];
+          return items.length ? h(block.ordered ? 'ol' : 'ul', { key, className: 'mr-block-list' }, items.map((item, itemKey) => h('li', { key: itemKey }, item))) : null;
+        }
+        if (block.type === 'image') {
+          const alt = typeof block.alt === 'string' ? block.alt : '';
+          const chapterId = source.id || '';
+          const src = mediaProxyUrl(book.id || book.bookId, chapterId, `block=${key}`);
+          return src ? h('figure', { key, className: 'mr-block-image' },
+            h('img', { src, alt, loading: mode === 'paged' ? 'eager' : 'lazy', decoding: 'async', onLoad: remeasureAfterImage }),
+            alt ? h('figcaption', null, alt) : null) : null;
+        }
+        return text ? h('p', { key }, text) : null;
+      });
       const chapterNodesFor = (entry, options = {}) => {
         const index = entry.index;
         const source = entry.chapter || {};
         const lines = String(source.content || source.text || '').split(/\n+/).map((line) => line.trim()).filter(Boolean);
+        const blocks = book.contentType === 'subscription' && Array.isArray(source.blocks) ? source.blocks : [];
+        const hasBlocks = blocks.some((block) => block && typeof block === 'object' && typeof block.type === 'string');
         const heading = source.name || source.title || toc[index]?.name || toc[index]?.title || '正文';
         const rawHeading = String(heading || '').trim();
         const prefixed = bookLabel && (rawHeading === bookLabel || rawHeading.startsWith(`${bookLabel}/`) || rawHeading.startsWith(`${bookLabel}·`));
@@ -3307,7 +3362,9 @@ window.__ModuleLoader__.load({
         const titleMatch = rawTitle.match(/^(第[〇零一二三四五六七八九十百千万两\d]+[章节回卷])[\s　]*([\s\S]*)$/);
         const chapterNo = titleMatch ? titleMatch[1] : '';
         const chapterTitle = titleMatch ? titleMatch[2].trim() : rawTitle;
-        const chars = lines.reduce((sum, line) => sum + line.replace(/\s/g, '').length, 0);
+        const chars = hasBlocks
+          ? blocks.reduce((sum, block) => sum + blockPlainText(block).replace(/\s/g, '').length, 0)
+          : lines.reduce((sum, line) => sum + line.replace(/\s/g, '').length, 0);
         const meta = [bookLabel, chars ? `${chars} 字` : ''].filter(Boolean).join(' · ');
         const showEnd = options.withEnd === true;
         return [
@@ -3318,8 +3375,9 @@ window.__ModuleLoader__.load({
           ...(book.contentType === 'comic' ? renderComic(lines) :
               book.contentType === 'audio' ? [renderAudio(source)] :
               book.contentType === 'video' ? [renderVideo(source)] :
+              hasBlocks ? renderBlocks(blocks, source) :
               lines.map((line, key) => h('p', { key }, line))),
-          !lines.length && book.contentType !== 'audio' && book.contentType !== 'video' ? h(Empty, { key: 'empty', title: '本章无正文', detail: book.contentType === 'subscription' ? '这条订阅没有正文内容，稍后重试或换一条。' : '可尝试刷新目录。' }) : null,
+          !hasBlocks && !lines.length && book.contentType !== 'audio' && book.contentType !== 'video' ? h(Empty, { key: 'empty', title: '本章无正文', detail: book.contentType === 'subscription' ? '这条订阅没有正文内容，稍后重试或换一条。' : '可尝试刷新目录。' }) : null,
           showEnd
             ? h('div', { key: 'end', className: 'mr-chapter-end' }, index + 1 < toc.length
               ? h(Button, { kind: 'primary soft', onClick: () => openChapter(index + 1) }, '下一章')
@@ -4330,6 +4388,17 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-chapter-meta{display:flex;align-items:center;gap:12px;margin:22px 0 34px;font-size:12px;letter-spacing:.08em;color:var(--reader-muted)}
 .mr-chapter-meta i{display:block;width:28px;height:1px;background:var(--reader-accent);opacity:.5}
 .mr-chapter p{margin:0 0 .82em;text-align:justify;text-justify:inter-ideograph;overflow-wrap:anywhere;letter-spacing:.012em}
+.mr-block-heading{font-weight:600;line-height:1.45;letter-spacing:.01em;margin:1.5em 0 .65em}
+.mr-block-heading:first-child{margin-top:0}
+.mr-chapter h2.mr-block-heading{font-size:1.3em}.mr-chapter h3.mr-block-heading{font-size:1.15em}.mr-chapter h4.mr-block-heading,.mr-chapter h5.mr-block-heading,.mr-chapter h6.mr-block-heading{font-size:1em}
+.mr-block-quote{margin:1.1em 0;padding:.15em 0 .15em 1em;border-left:3px solid color-mix(in srgb,var(--reader-accent) 55%,transparent);color:var(--reader-muted);font-style:italic}
+.mr-block-code{margin:1.1em 0;padding:14px 16px;border-radius:8px;background:color-mix(in srgb,var(--reader-text) 6%,var(--reader-bg));overflow-x:auto;font-size:.82em;line-height:1.65;white-space:pre;tab-size:2;break-inside:avoid;page-break-inside:avoid}
+.mr-block-code code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.mr-block-list{margin:.9em 0;padding-left:1.5em}
+.mr-block-list li{margin:.3em 0;line-height:1.75}
+.mr-block-image{margin:1.3em 0;display:flex;flex-direction:column;align-items:center;gap:8px;break-inside:avoid;page-break-inside:avoid}
+.mr-block-image img{display:block;max-width:100%;height:auto;border-radius:8px}
+.mr-block-image figcaption{font-size:.78em;line-height:1.6;color:var(--reader-muted);text-align:center}
 .mr-chapter-end{display:flex;align-items:center;justify-content:center;gap:14px;padding:34px 0 6px;color:var(--reader-muted);font-size:12px}
 .mr-chapter-scroll .mr-chapter{padding:36px 0 28px}
 .mr-chapter-scroll .mr-chapter + .mr-chapter{margin-top:24px}
