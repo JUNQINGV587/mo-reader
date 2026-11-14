@@ -3,7 +3,7 @@ import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { createBackup, parseBackup } from './lib/backup.js'
 import { hasChapterPayload, isMediaPayloadType, isTextContentType, normalizeBookContentType, normalizeSourceContentType } from './lib/content-types.js'
 import { ReaderError } from './lib/errors.js'
-import { fetchRemote } from './lib/http.js'
+import { fetchRemote, parseRemoteUrl } from './lib/http.js'
 import { MediaStore, DEFAULT_MEDIA_QUOTA } from './lib/media-store.js'
 import { downloadMediaChapter } from './lib/media-download.js'
 import { mediaResponse, proxyResponse, sendWebResponse } from './lib/media-http.js'
@@ -19,17 +19,17 @@ import { assertSettingKeys, normalizeReaderPrefs, normalizeSettings } from './li
 import { normalizeSource } from './lib/rules.js'
 import { categoryPageUrl, detectRssSource, normalizeRssSource, rssImportSummary } from './lib/rss-source.js'
 import { ATOM_UNSUPPORTED_MESSAGE, MAX_FEED_BYTES, feedKind, normalizeFeedSource, parseRssFeed } from './lib/rss-feed.js'
-import { SUBSCRIPTION_ENTRY_LIMIT, decideSubscriptionAdditions, mergeSubscriptionChapters, pruneSubscriptionChapters } from './lib/subscription-follow.js'
+import { SUBSCRIPTION_ENTRY_LIMIT, decideSubscriptionAdditions, insertSubscriptionEntry, mergeSubscriptionChapters, pruneSubscriptionChapters } from './lib/subscription-follow.js'
 import { BUILTIN_SOURCES } from './lib/builtin-sources.js'
 import { SourceEngine } from './lib/source-engine.js'
 import { parseSourceLibrary, permissionExpansion, planSourceRefresh } from './lib/subscription-refresh.js'
 import { DEFAULT_SETTINGS, entries, openReaderStorage } from './lib/storage.js'
-import { base64ToBuffer, clone, id, MAX_ARCHIVE_BYTES, MAX_TEXT_BYTES, now, pageNumber, requiredString, stableId, textToBuffer } from './lib/utils.js'
+import { base64ToBuffer, chapterId, clone, id, MAX_ARCHIVE_BYTES, MAX_TEXT_BYTES, now, pageNumber, requiredString, stableId, textToBuffer } from './lib/utils.js'
 
 const COVER_MAX_BYTES = 2 * 1024 * 1024
 
 export const REMOTE_METHODS = Object.freeze([
-  'state', 'importSource', 'addSubscriptions', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'restoreBuiltinSources', 'removeSource', 'setSourceEnabled', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter', 'cancelDownloadChapters',
+  'state', 'importSource', 'addSubscriptions', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'restoreBuiltinSources', 'removeSource', 'setSourceEnabled', 'search', 'searchSubscription', 'openSubscriptionEntry', 'discover', 'addBook', 'removeBook', 'toc', 'chapter', 'cancelDownloadChapters',
   'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
   'exportBackup', 'importBackup', 'fetchCover', 'cacheBookCover', 'bookCandidates', 'applyBookMeta',
   'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markChapterRead', 'markBookRead', 'exportNotes',
@@ -343,7 +343,7 @@ export class ReaderService extends TypertRemoteService {
       ...clone(book),
       contentType: normalizeBookContentType(book.contentType),
       latestChapter: book.latestChapter ?? (contentType === 'subscription' ? chapters[0]?.title : chapters.at(-1)?.title),
-      ...(contentType === 'subscription' ? { latestEntryAt: chapters[0]?.publishedAt ?? null } : {}),
+      ...(contentType === 'subscription' ? { latestEntryAt: chapters[0]?.publishedAt ?? null, searchable: Boolean(source?.searchUrl) } : {}),
       unread,
       lastRead: clone(book.progress ?? null),
       sourceHome: /^https?:/i.test(String(source?.bookSourceUrl ?? '')) ? source.bookSourceUrl : null,
@@ -831,6 +831,68 @@ export class ReaderService extends TypertRemoteService {
       await this.markSourceStatus(source.id, error)
       throw error
     }
+  }
+
+
+  async searchSubscription(args) {
+    args ??= {}
+    this.assertReady()
+    assertObject(args)
+    const book = this.book(requiredString(args.bookId, 'bookId'))
+    if (normalizeBookContentType(book.contentType) !== 'subscription') {
+      throw new ReaderError('reader/invalid-input', '只有订阅作品可以搜索条目。')
+    }
+    const source = this.source(book.sourceId)
+    const query = requiredString(args.query, 'query', 500)
+    const page = pageNumber(args.page)
+    try {
+      const list = await this.engine.subscriptionSearch(source, book, { query, page })
+      await this.markSourceStatus(source.id, null)
+      return list
+    } catch (error) {
+      await this.markSourceStatus(source.id, error)
+      throw error
+    }
+  }
+
+  // 搜索结果不是书：点开时把它作为一条订阅条目写进当前作品，之后走普通条目阅读链路。
+  async openSubscriptionEntry(args) {
+    args ??= {}
+    this.assertReady()
+    assertObject(args)
+    const book = this.book(requiredString(args.bookId, 'bookId'))
+    if (normalizeBookContentType(book.contentType) !== 'subscription') {
+      throw new ReaderError('reader/invalid-input', '只有订阅作品可以加入条目。')
+    }
+    const source = this.source(book.sourceId)
+    const url = parseRemoteUrl(requiredString(args.url, 'url', 4096), { allowHttp: source.allowHttp }).href
+    const title = String(args.title ?? '').trim().slice(0, 500) || url
+    const metadata = { title }
+    if (typeof args.publishedAt === 'string' && args.publishedAt.trim()) metadata.publishedAt = args.publishedAt.trim()
+    if (typeof args.description === 'string' && args.description.length) metadata.description = args.description.slice(0, 20000)
+    if (typeof args.coverUrl === 'string' && args.coverUrl.trim()) {
+      try { metadata.coverUrl = parseRemoteUrl(args.coverUrl.trim(), { allowHttp: source.allowHttp }).href } catch {}
+    }
+    const current = this.chapters(book.id)
+    const id = chapterId(book.id, url)
+    const previous = current.find(chapter => chapter.id === id)
+    if (previous) {
+      const next = { ...previous, ...metadata, id: previous.id, index: previous.index, bookId: book.id, url: previous.url }
+      await this.db.chapters.put(next.id, next)
+      return this.chapterView(next)
+    }
+    const inserted = insertSubscriptionEntry({
+      chapters: current,
+      entry: { id, bookId: book.id, index: 0, url, contentType: 'subscription', ...metadata },
+    })
+    for (const chapter of inserted.chapters) await this.db.chapters.put(chapter.id, chapter)
+    const latest = this.db.books.get(book.id) ?? book
+    await this.db.books.put(book.id, {
+      ...latest,
+      latestChapter: inserted.chapters[0]?.title ?? latest.latestChapter,
+      updatedAt: now(),
+    })
+    return this.chapterView(inserted.entry)
   }
 
   async discover(args) {

@@ -9,7 +9,7 @@ window.__ModuleLoader__.load({
     const PANEL_ID = 'reader';
     const REMOTE_METHODS = [
       'state', 'importSource', 'addSubscriptions', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'removeSource', 'setSourceEnabled', 'restoreBuiltinSources', 'search', 'discover', 'addBook', 'removeBook',
-      'toc', 'chapter', 'saveProgress', 'download', 'cancelJob', 'cancelDownloadChapters', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'mediaCacheStats', 'listMediaCache', 'setChapterRetained',
+      'toc', 'chapter', 'searchSubscription', 'openSubscriptionEntry', 'saveProgress', 'download', 'cancelJob', 'cancelDownloadChapters', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'mediaCacheStats', 'listMediaCache', 'setChapterRetained',
       'setSettings', 'setBookSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
       'cacheBookCover', 'bookCandidates', 'applyBookMeta',
       'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markChapterRead', 'markBookRead', 'exportNotes',
@@ -2302,6 +2302,10 @@ window.__ModuleLoader__.load({
       const [scrollChapters, setScrollChapters] = useState([]);
       const [scrollError, setScrollError] = useState(null);
       const [downloadingChapterId, setDownloadingChapterId] = useState('');
+      const [tocQuery, setTocQuery] = useState('');
+      const [tocResults, setTocResults] = useState(null);
+      const [tocSearching, setTocSearching] = useState(false);
+      const [tocSearchError, setTocSearchError] = useState('');
       const downloadPollRef = useRef(null);
       const scrollChaptersRef = useRef([]);
       const chapterIndexRef = useRef(-1);
@@ -2732,23 +2736,23 @@ window.__ModuleLoader__.load({
           scrollAppendRef.current = false;
         }
       };
-      const openChapter = async (index, restore = false, atPercent = null) => {
-        if (!toc[index]) return;
+      const openChapter = async (index, restore = false, atPercent = null, list = toc) => {
+        if (!list[index]) return;
         const requestId = ++requestRef.current;
         flushProgress();
         setLoading(true); setError(''); setDrawer(''); setFailedIndex(index); setScrollError(null);
         stopSpeech();
-        const item = toc[index];
-        const id = chapterSourceId(index);
+        const item = list[index];
+        const id = chapterSourceId(index, list);
         const saved = atPercent != null
           ? Math.max(0, Math.min(100, Number(atPercent) || 0))
           : restore ? Number(book.lastRead?.percent || book.progress?.percent || book.percent || 0) : 0;
         const savedOffset = atPercent != null ? 0 : restore ? Number(book.lastRead?.offset || book.progress?.offset || 0) : 0;
         try {
           if (mode === 'scroll') {
-            const list = await loadScrollWindow(index, toc, { restore: { index, percent: saved } });
+            const loaded = await loadScrollWindow(index, list, { restore: { index, percent: saved } });
             if (requestId !== requestRef.current) return;
-            if (!list.some((entry) => entry.index === index)) throw new Error('章节未加载');
+            if (!loaded.some((entry) => entry.index === index)) throw new Error('章节未加载');
             progressRef.current = { bookId, chapterId: id, percent: saved, offset: savedOffset };
             pendingPercentRef.current = saved;
             pendingOffsetRef.current = savedOffset > 0 ? savedOffset : null;
@@ -2794,6 +2798,42 @@ window.__ModuleLoader__.load({
           })
           .catch(() => { if (bookIdRef.current === markingBookId) markedReadRef.current.delete(id); });
       }, [tracksUnread, chapterIndex, toc, bookId, ctx]);
+
+      const searchToc = async () => {
+        const query = tocQuery.trim();
+        if (!query || tocSearching) return;
+        setTocSearching(true);
+        setTocSearchError('');
+        try {
+          const result = await call(ctx, 'searchSubscription', { bookId, query });
+          setTocResults(Array.isArray(result?.items) ? result.items : []);
+        } catch (cause) {
+          setTocSearchError(cause?.message || String(cause));
+          setTocResults([]);
+        } finally {
+          setTocSearching(false);
+        }
+      };
+      const openSearchResult = async (item) => {
+        if (!item?.url) return;
+        setTocSearchError('');
+        try {
+          const opened = await call(ctx, 'openSubscriptionEntry', {
+            bookId, title: item.title, url: item.url, coverUrl: item.coverUrl,
+            publishedAt: item.publishedAt, description: item.description,
+          });
+          const list = await call(ctx, 'toc', { bookId });
+          const next = Array.isArray(list) ? list : toc;
+          setToc(next);
+          setTocQuery('');
+          setTocResults(null);
+          const index = next.findIndex((entry) => (opened?.id && entry.id === opened.id) || (item.url && entry.url === item.url));
+          onRefresh?.();
+          if (index >= 0) await openChapter(index, false, null, next);
+        } catch (cause) {
+          setTocSearchError(cause?.message || String(cause));
+        }
+      };
 
       const markAllSubscriptionRead = async () => {
         if (!tracksUnread) return;
@@ -3833,6 +3873,34 @@ window.__ModuleLoader__.load({
               tracksUnread && toc.some((item) => !item.readAt) ? h(Button, { kind: 'text', onClick: markAllSubscriptionRead }, '全部已读') : null,
               h('span', { className: 'mr-drawer-count' }, `${toc.length} ${bookUnit(book)}`),
               h(Button, { kind: 'icon', icon: 'close', onClick: () => setDrawer('') }))),
+          isSubscription && book.searchable ? h('div', { className: 'mr-toc-search' },
+            h('div', { className: 'mr-toc-search-row' },
+              h('input', {
+                type: 'search', value: tocQuery, placeholder: '搜索这个订阅的条目', 'aria-label': '搜索订阅条目',
+                onChange: (event) => {
+                  const value = event.target.value;
+                  setTocQuery(value);
+                  if (!value) { setTocResults(null); setTocSearchError(''); }
+                },
+                onKeyDown: (event) => { if (event.key === 'Enter') { event.preventDefault(); searchToc(); } },
+              }),
+              h(Button, { kind: 'primary', disabled: tocSearching || !tocQuery.trim(), onClick: searchToc }, tocSearching ? '搜索中' : '搜索')),
+            tocSearchError ? h('p', { className: 'mr-toc-search-error', role: 'alert' }, tocSearchError) : null,
+            tocResults ? (tocResults.length
+              ? h('div', { className: 'mr-toc-results' }, tocResults.map((item, index) => {
+                const title = item.title || item.name || '未命名条目';
+                const date = formatShortDate(item.publishedAt);
+                return h('button', {
+                  key: item.url || index, type: 'button', className: 'mr-toc-result',
+                  onClick: () => openSearchResult(item),
+                },
+                item.coverUrl ? h('span', { className: 'mr-toc-cover' },
+                  h('img', { src: item.coverUrl, alt: '', loading: 'lazy', onError: (event) => { event.currentTarget.parentNode.style.display = 'none'; } })) : null,
+                h('span', { className: 'mr-toc-result-main' },
+                  h('span', { className: 'mr-toc-result-label' }, title),
+                  date ? h('span', { className: 'mr-toc-result-date' }, date) : null));
+              }))
+              : h('p', { className: 'mr-toc-search-empty' }, '没有找到条目')) : null) : null,
           h('div', { className: 'mr-toc' }, toc.map((item, index) => {
             const title = item.name || item.title || `第 ${index + 1} 章`;
             const unread = tracksUnread && !item.readAt;
@@ -4665,6 +4733,20 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-drawer{position:absolute;top:0;right:0;bottom:0;width:min(368px,90%);z-index:9;display:flex;flex-direction:column;background:var(--reader-bg);border-left:1px solid color-mix(in srgb,var(--reader-text) 12%,transparent);box-shadow:-20px 0 44px color-mix(in srgb,var(--reader-text) 12%,transparent)}
 .mr-drawer-head{height:52px;flex:0 0 52px;padding:0 8px 0 22px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid color-mix(in srgb,var(--reader-text) 10%,transparent)}
 .mr-drawer-head h2{font-size:14px;font-weight:600;letter-spacing:.22em;text-indent:.22em;color:var(--reader-text)}
+.mr-toc-search{padding:10px 18px 8px;border-bottom:1px solid color-mix(in srgb,var(--reader-text) 10%,transparent)}
+.mr-toc-search-row{display:flex;align-items:center;gap:8px}
+.mr-toc-search-row input{flex:1;min-width:0;height:34px;padding:0 10px;border:1px solid color-mix(in srgb,var(--reader-text) 18%,transparent);border-radius:8px;background:transparent;color:var(--reader-text);font:inherit;font-size:13px}
+.mr-toc-search-row input::placeholder{color:var(--reader-muted)}
+.mr-toc-search-row input:focus-visible{outline:2px solid var(--reader-accent);outline-offset:1px}
+.mr-toc-search-row .mr-button{flex:none;min-height:34px;padding:0 12px}
+.mr-toc-search-error{margin:8px 0 0;font-size:12px;line-height:1.5;color:var(--reader-accent)}
+.mr-toc-search-empty{margin:8px 0 0;font-size:12px;line-height:1.5;color:var(--reader-muted)}
+.mr-toc-results{max-height:42vh;overflow-y:auto;overscroll-behavior:contain;margin-top:8px;border-top:1px solid color-mix(in srgb,var(--reader-text) 10%,transparent)}
+.mr-toc-result{display:flex;align-items:center;gap:10px;width:100%;padding:8px 0;border:0;background:transparent;color:var(--reader-text);font-size:13px;line-height:1.5;text-align:left;cursor:pointer}
+.mr-toc-result:hover{color:var(--reader-accent)}
+.mr-toc-result-main{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
+.mr-toc-result-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mr-toc-result-date{font-size:11px;font-weight:400;line-height:1.4;color:var(--reader-muted)}
 .mr-toc{overflow-y:auto;overscroll-behavior:contain;padding:6px 0 24px}
 .mr-toc button{position:relative;display:flex;align-items:center;gap:10px;width:100%;min-height:44px;padding:8px 22px;border:0;border-radius:0;background:transparent;color:var(--reader-text);font-size:13px;line-height:1.55;text-align:left;opacity:.74;transition:background .15s ease,opacity .15s ease}
 .mr-toc-cover{flex:none;width:36px;height:36px;border-radius:6px;overflow:hidden;background:color-mix(in srgb,var(--reader-text) 8%,transparent)}

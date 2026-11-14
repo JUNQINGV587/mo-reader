@@ -25,6 +25,7 @@ function rssSample() {
     loginUrl: 'https://rss.example/login',
     injectJs: 'document.body.dataset.injected = "1"',
     sortUrl: Array.from({ length: CATEGORY_COUNT }, (_, index) => categoryLine(index + 1)).join('\n'),
+    searchUrl: '/search/page/{{page}}/wd/{{key}}.html',
     ruleArticles: '.item',
     ruleTitle: 'a@title',
     ruleLink: 'a@href',
@@ -49,6 +50,7 @@ test('imports a Legado RSS source with its categories and drops unsupported capa
   assert.equal(result.categories.length, CATEGORY_COUNT)
   assert.deepEqual(result.categories[0], { name: '分类01', url: 'https://rss.example/list/1/page/{{page}}.html' })
   assert.equal(result.categories.at(-1).name, '分类30')
+  assert.equal(result.searchable, true)
   assert.deepEqual([...result.unsupported].sort(), ['cookie', 'inject-js', 'login'])
 
   const sources = [...db.sources.entries()]
@@ -57,6 +59,7 @@ test('imports a Legado RSS source with its categories and drops unsupported capa
   assert.equal(source.kind, 'rss')
   assert.equal(source.contentType, 'subscription')
   assert.equal(source.bookSourceUrl, 'https://rss.example')
+  assert.equal(source.searchUrl, 'https://rss.example/search/page/{{page}}/wd/{{key}}.html')
   assert.equal(source.bookSourceName, undefined)
   for (const key of ['header', 'loginUrl', 'injectJs', 'enabledCookieJar']) {
     assert.equal(key in source, false, `落库的订阅源不能包含 ${key}`)
@@ -80,6 +83,32 @@ test('credentials in RSS headers are reported as dropped and never stored', asyn
   assert.deepEqual([...result.unsupported].sort(), ['credentials'])
   const source = (await service.state()).sources.find((item) => item.id === result.sourceId)
   assert.deepEqual(source.headers, {})
+})
+
+test('a source without searchUrl has no search entry', async () => {
+  const { service } = await serviceFixture()
+  const sample = { ...rssSample() }
+  delete sample.searchUrl
+  const result = await service.importSource({ text: JSON.stringify(sample) })
+  assert.equal(result.searchable, false)
+  const source = (await service.state()).sources.find((item) => item.id === result.sourceId)
+  assert.equal('searchUrl' in source, false)
+})
+
+test('a script-generated searchUrl is refused', async () => {
+  const { service } = await serviceFixture()
+  await assert.rejects(
+    service.importSource({ text: JSON.stringify({ ...rssSample(), searchUrl: '@js:source.bookSourceUrl + "/search"' }) }),
+    (error) => error.code === 'reader/unsupported-source' && /搜索/.test(error.message),
+  )
+})
+
+test('a searchUrl pointing at a private address is refused', async () => {
+  const { service } = await serviceFixture()
+  await assert.rejects(
+    service.importSource({ text: JSON.stringify({ ...rssSample(), searchUrl: 'https://127.0.0.1/search?q={{key}}' }) }),
+    (error) => error.code === 'reader/ssrf-blocked' && /搜索地址不可用/.test(error.message),
+  )
 })
 
 test('importing the same RSS source twice keeps one source record', async () => {
@@ -234,6 +263,7 @@ test('backups keep RSS sources and subscription books across a restore', async (
   const state = await fresh.service.importBackup({ data: backup })
   const source = state.sources.find(item => item.kind === 'rss')
   assert.equal(source.categories.length, CATEGORY_COUNT)
+  assert.equal(source.searchUrl, 'https://rss.example/search/page/{{page}}/wd/{{key}}.html')
   const book = state.books.find(item => item.contentType === 'subscription')
   assert.equal(book.subscription.sourceName, '示例订阅')
   assert.equal(book.subscription.categoryName, '分类03')

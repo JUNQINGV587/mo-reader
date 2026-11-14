@@ -144,6 +144,61 @@ window.blocksTest = (async () => {
     await waitFor(() => String(host.querySelector('.mr-video-player video')?.getAttribute('src')).includes('/api/reader/media?id=local-1'), '下载后播放器未切到本地地址')
     check('下载后走本地缓存', String(host.querySelector('.mr-video-player video')?.getAttribute('src')).includes('/api/reader/media?id=local-1'))
 
+    // 订阅搜索：目录里的搜索框只对有 searchUrl 的订阅出现，点结果加入目录并直接打开。
+    const searchCalls = []
+    let searchOpened = false
+    const searchCtx = { remote: { reader: {
+      toc: async () => searchOpened
+        ? [{ id: 'search-1', name: '搜索结果' }, { id: 'entry-0', name: '第一篇' }]
+        : [{ id: 'entry-0', name: '第一篇' }],
+      chapter: async (args) => args.chapterId === 'search-1'
+        ? { id: 'search-1', name: '搜索结果', contentType: 'subscription', text: '搜索结果正文' }
+        : { id: 'entry-0', name: '第一篇', contentType: 'subscription', text: '第一篇正文' },
+      searchSubscription: async (args) => {
+        searchCalls.push(args)
+        return { items: [{ title: '搜到的条目', url: 'https://rss.example/post/9', publishedAt: '2026-11-14 09:00' }], page: 1, hasMore: false }
+      },
+      openSubscriptionEntry: async (args) => {
+        searchOpened = true
+        searchCalls.push(args)
+        return { id: 'search-1', title: args.title, url: args.url }
+      },
+      saveProgress: async () => ({}),
+    } } }
+    const searchBook = {
+      id: 'search-book', title: '搜索回归', contentType: 'subscription', searchable: true,
+      readBaselineAt: '2026-01-01T00:00:00.000Z',
+      readerPrefs: { mode: 'scroll', ambience: 'off' },
+      lastRead: { chapterId: 'entry-0', percent: 0, offset: 0 },
+    }
+    root.render(React.createElement(window.__readerTest.ReaderView, {
+      key: 'search-book', ctx: searchCtx, book: searchBook, settings, notes: [], onClose() {},
+    }))
+    await waitFor(() => /第一篇正文/.test(host.textContent || '') && !host.querySelector('.mr-drawer-left'), '搜索回归正文未加载')
+    ;[...host.querySelectorAll('button')].find((node) => node.getAttribute('aria-label') === '目录').click()
+    await waitFor(() => host.querySelector('.mr-toc-search input'), '有 searchUrl 的订阅没有出现搜索框')
+    const tocSearchInput = host.querySelector('.mr-toc-search input')
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(tocSearchInput, '麻豆')
+    tocSearchInput.dispatchEvent(new Event('input', { bubbles: true }))
+    host.querySelector('.mr-toc-search-row button').click()
+    await waitFor(() => host.querySelector('.mr-toc-result'), '搜索结果没有显示')
+    check('搜索只提交当前订阅', searchCalls[0]?.bookId === 'search-book' && searchCalls[0]?.query === '麻豆')
+    check('搜索结果显示标题与日期', /搜到的条目/.test(host.querySelector('.mr-toc-result-label')?.textContent || '') && /11-14$/.test(host.querySelector('.mr-toc-result-date')?.textContent || ''))
+    host.querySelector('.mr-toc-result').click()
+    await waitFor(() => /搜索结果正文/.test(host.textContent || ''), '点搜索结果后没有打开正文')
+    check('点搜索结果后关闭目录', !host.querySelector('.mr-drawer-left'))
+    ;[...host.querySelectorAll('button')].find((node) => node.getAttribute('aria-label') === '目录').click()
+    await waitFor(() => [...host.querySelectorAll('.mr-toc-label')].some((node) => node.textContent === '搜索结果'), '搜索结果没有写入目录')
+    check('搜索结果写入目录', [...host.querySelectorAll('.mr-toc-label')].some((node) => node.textContent === '搜索结果'))
+    root.render(React.createElement(window.__readerTest.ReaderView, {
+      key: 'search-book-off', ctx: searchCtx, book: { ...searchBook, searchable: false }, settings, notes: [], onClose() {},
+    }))
+    await waitFor(() => !host.querySelector('.mr-drawer-left'), '切换无搜索订阅后目录仍开着')
+    await waitFor(() => [...host.querySelectorAll('button')].some((node) => node.getAttribute('aria-label') === '目录'), '无搜索订阅目录入口未渲染')
+    ;[...host.querySelectorAll('button')].find((node) => node.getAttribute('aria-label') === '目录').click()
+    await waitFor(() => host.querySelector('.mr-toc'), '无搜索订阅目录未渲染')
+    check('没有 searchUrl 不显示搜索框', !host.querySelector('.mr-toc-search'))
+
     // 导入订阅源：分类默认不选、可全选/全不选，勾选后按分类加入书架。
     const addedCalls = []
     const sourceCtx = {
