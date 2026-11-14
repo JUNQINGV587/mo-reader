@@ -44,6 +44,41 @@ test('backup allowlists records and strips secrets instead of exporting them', (
   assert.deepEqual(parseBackup(JSON.parse(json)), parsed)
 })
 
+test('backup scrubs credentials from subscription header values but keeps ordinary headers', () => {
+  const token = 'header-token-must-not-leak'
+  const json = createBackup({
+    sources: [{
+      id: 'rss-source-id',
+      name: '订阅源',
+      bookSourceUrl: 'https://feed.example/rss.xml',
+      kind: 'rss',
+      categories: [{ name: '分类', url: 'https://feed.example/rss.xml' }],
+      headers: {
+        'user-agent': 'ExampleFeed/1.0',
+        referer: 'https://feed.example/post/1?token=' + token + '&lang=zh#player',
+        accept: 'application/json',
+        cookie: 'session=' + token,
+        authorization: 'Bearer ' + token,
+        'x-preview': 'Bearer ' + token,
+        'x-scheme': 'Token ' + token,
+      },
+      rules: {},
+    }],
+    books: [],
+    chapters: [],
+    settings: {},
+    notes: [],
+  })
+  assert.equal(json.includes(token), false)
+  assert.equal(JSON.parse(json).version, 2)
+  const parsed = parseBackup(json)
+  assert.deepEqual(parsed.sources[0].headers, {
+    'user-agent': 'ExampleFeed/1.0',
+    referer: 'https://feed.example/post/1?lang=zh',
+    accept: 'application/json',
+  })
+})
+
 test('backup keeps subscription anchors and dates but drops runtime anchor errors', () => {
   const json = createBackup({
     sources: [],
