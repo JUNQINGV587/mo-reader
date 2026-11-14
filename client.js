@@ -8,7 +8,7 @@ window.__ModuleLoader__.load({
     const { useEffect, useLayoutEffect, useMemo, useRef, useState } = React;
     const PANEL_ID = 'reader';
     const REMOTE_METHODS = [
-      'state', 'importSource', 'addSubscriptions', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'removeSource', 'setSourceEnabled', 'restoreBuiltinSources', 'search', 'discover', 'addBook', 'removeBook',
+      'state', 'importSource', 'addSubscriptions', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'removeSource', 'setSourceEnabled', 'search', 'discover', 'addBook', 'removeBook',
       'toc', 'chapter', 'searchSubscription', 'openSubscriptionEntry', 'saveProgress', 'download', 'cancelJob', 'cancelDownloadChapters', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'mediaCacheStats', 'listMediaCache', 'setChapterRetained',
       'setSettings', 'setBookSettings', 'saveNote', 'deleteNote', 'exportBackup', 'importBackup', 'fetchCover',
       'cacheBookCover', 'bookCandidates', 'applyBookMeta',
@@ -1379,7 +1379,7 @@ window.__ModuleLoader__.load({
       if (!imported) return rssText;
       return [`已导入 ${imported} 个书源`, rssText, skippedText].filter(Boolean).join('；');
     }
-    function Sources({ sources, subscriptions = [], onImport, onAddSubscriptions, onRemove, onToggle, onSubscribe, onUnsubscribe, onRefresh, onConfirmUpdate, onRejectUpdate, checkingIds = [], busy, onRestoreBuiltin }) {
+    function Sources({ sources, subscriptions = [], onImport, onAddSubscriptions, onRemove, onToggle, onSubscribe, onUnsubscribe, onRefresh, onConfirmUpdate, onRejectUpdate, checkingIds = [], busy }) {
       const [draft, setDraft] = useState('');
       const [allowHttp, setAllowHttp] = useState(false);
       const [libraryText, setLibraryText] = useState('');
@@ -1443,7 +1443,6 @@ window.__ModuleLoader__.load({
                   });
                 }, () => {}) }, '导入'),
                 h(Button, { icon: 'upload', onClick: () => fileRef.current?.click(), disabled: busy }, '选文件'),
-                h(Button, { icon: 'refresh', onClick: () => onRestoreBuiltin(), disabled: busy }, '恢复内置'),
                 h('input', { ref: fileRef, type: 'file', accept: '.json,application/json', hidden: true, onChange: async (e) => { const file = e.target.files?.[0]; if (file) setDraft(await file.text()); e.target.value = ''; } }))),
             rssImports.map((item) => {
               const picked = pickedFor(item.sourceId);
@@ -1537,10 +1536,10 @@ window.__ModuleLoader__.load({
                 h('span', { className: 'mr-source-icon', 'aria-hidden': true }, name.slice(0, 1)),
                 h('div', null, h('h3', null, name), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl), source.kind === 'rss' && unsupported.length ? h('p', { className: 'mr-source-unsupported' }, `导入时丢弃：${unsupported.join('、')}`) : null),
                 h('div', { className: 'mr-source-side' },
-                  h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || (unsupported.length ? `不支持：${unsupported.join('、')}` : '') }, local ? '本机导入' : source.kind === 'rss' ? (disabled ? '订阅源 · 已停用' : '订阅源') : source.contentType === 'website' ? (disabled ? '网站 · 已停用' : '网站入口') : disabled ? '已停用' : source.lastError ? '解析失败 · 需更新规则' : unsupported.length ? `不支持 · ${unsupported.join('/')}` : source.builtin ? '内置 · 可用' : (source.compatibility || '基础规则')),
+                  h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || (unsupported.length ? `不支持：${unsupported.join('、')}` : '') }, local ? '本机导入' : source.kind === 'rss' ? (disabled ? '订阅源 · 已停用' : '订阅源') : source.contentType === 'website' ? (disabled ? '网站 · 已停用' : '网站入口') : disabled ? '已停用' : source.lastError ? '解析失败 · 需更新规则' : unsupported.length ? `不支持 · ${unsupported.join('/')}` : (source.compatibility || '基础规则')),
                   source.kind === 'rss' && source.feed !== true && source.categories?.length ? h(Button, { kind: 'text', onClick: () => openRssSource(source), disabled: busy }, '分类') : null,
                   local ? null : h(Button, { kind: 'text', onClick: () => onToggle(source), disabled: busy, 'aria-pressed': !disabled }, disabled ? '启用' : '停用'),
-                  source.builtin || local ? null : h(Button, { kind: 'text danger', onClick: () => onRemove(source), disabled: busy }, '移除')));
+                  local ? null : h(Button, { kind: 'text danger', onClick: () => onRemove(source), disabled: busy }, '移除')));
             }) : h(Empty, { icon: 'source', title: '暂无书源', detail: '导入后即可搜索和追更。' }))));
     }
 
@@ -4456,7 +4455,6 @@ window.__ModuleLoader__.load({
             }).catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
           !loading && tab === 'sources' ? h(Sources, { sources, subscriptions: data.subscriptions || [], checkingIds: [...new Set([...(data.subscriptions || []).filter(item => item.checking).map(item => item.id), ...refreshingSubscriptions])], busy, onImport: importSource, onAddSubscriptions: addSubscriptions,
-              onRestoreBuiltin: () => run(() => call(ctx, 'restoreBuiltinSources'), '内置书源已恢复').then((result) => { if (result) setNotice({ kind: 'success', text: `已恢复 ${result.added} 个内置书源` }); }, () => {}),
               onSubscribe: subscribeLibrary,
               onRefresh: refreshSubscription,
               onConfirmUpdate: confirmSubscriptionUpdate,

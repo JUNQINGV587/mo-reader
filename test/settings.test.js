@@ -12,12 +12,12 @@ test('desktop reading measure defaults to 960 while preserving explicit choices'
   assert.equal(normalizeSettings({ measureWidth: 800 }).measureWidth, 800)
 })
 
-test('settings writes keep internal builtin bookkeeping keys', () => {
+test('settings writes drop retired builtin bookkeeping keys', () => {
   const current = { ...DEFAULT_SETTINGS, builtinSourcesAt: '2026-01-01T00:00:00.000Z', builtinSourcesVersion: 2 }
-  const next = normalizeSettings({ fontSize: 20 }, current)
-  assert.equal(next.fontSize, 20)
-  assert.equal(next.builtinSourcesAt, '2026-01-01T00:00:00.000Z')
-  assert.equal(next.builtinSourcesVersion, 2)
+  const value = normalizeSettings({ fontSize: 20 }, current)
+  assert.equal(value.fontSize, 20)
+  assert.equal('builtinSourcesAt' in value, false)
+  assert.equal('builtinSourcesVersion' in value, false)
   assert.equal('builtinSourcesAt' in normalizeSettings({}, DEFAULT_SETTINGS), false)
 })
 

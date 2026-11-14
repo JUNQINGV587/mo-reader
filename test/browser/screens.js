@@ -22,7 +22,7 @@ document.body.append(host)
 const root = createRoot(host)
 const noop = () => {}
 const sources = [
-  { id: 'src-1', bookSourceName: '起点中文网', bookSourceUrl: 'https://a.example.com', builtin: true },
+  { id: 'src-1', bookSourceName: '起点中文网', bookSourceUrl: 'https://a.example.com' },
   { id: 'src-2', bookSourceName: '17K 小说', bookSourceUrl: 'https://www.17k.com', compatibility: '基础规则' },
   { id: 'src-3', bookSourceName: '维基文库', bookSourceUrl: 'https://zh.wikisource.org', lastError: 'timeout' },
   { id: 'src-4', bookSourceName: '笔趣阁', bookSourceUrl: 'https://b.example.com', enabled: false },
@@ -205,7 +205,7 @@ window.screensUI = {
   websiteShelf: () => render(h(WebsiteShelf, { sources: websites })),
   websiteEmpty: () => render(h(WebsiteShelf, { sources: [websites[1]] })),
   discover: () => render(h(Discover, { sources: discoverySources, onSearch: noop, onAdd: noop, results, busy: false, failed: 1 })),
-  sources: () => render(h(Sources, { sources, subscriptions, onImport: noop, onRemove: noop, onToggle: noop, onSubscribe: async () => false, onRefresh: (id) => { window.__refreshClicked = id; }, onConfirmUpdate: (id) => { window.__confirmClicked = id; }, onRejectUpdate: (id) => { window.__rejectClicked = id; }, onUnsubscribe: noop, busy: false, onRestoreBuiltin: noop })),
+  sources: () => render(h(Sources, { sources, subscriptions, onImport: noop, onRemove: noop, onToggle: noop, onSubscribe: async () => false, onRefresh: (id) => { window.__refreshClicked = id; }, onConfirmUpdate: (id) => { window.__confirmClicked = id; }, onRejectUpdate: (id) => { window.__rejectClicked = id; }, onUnsubscribe: noop, busy: false })),
   settings: () => render(h(Settings, props)),
   mediaComic: () => root.render(h(MediaComicScreen)),
   mediaAudio: () => root.render(h(MediaAudioScreen)),

@@ -20,7 +20,6 @@ import { normalizeSource } from './lib/rules.js'
 import { categoryPageUrl, detectRssSource, normalizeRssSource, rssImportSummary } from './lib/rss-source.js'
 import { ATOM_UNSUPPORTED_MESSAGE, MAX_FEED_BYTES, feedKind, normalizeFeedSource, parseRssFeed } from './lib/rss-feed.js'
 import { SUBSCRIPTION_ENTRY_LIMIT, decideSubscriptionAdditions, insertSubscriptionEntry, mergeSubscriptionChapters, pruneSubscriptionChapters } from './lib/subscription-follow.js'
-import { BUILTIN_SOURCES, BUILTIN_SOURCES_VERSION, RETIRED_BUILTIN_SOURCE_NAMES } from './lib/builtin-sources.js'
 import { SourceEngine } from './lib/source-engine.js'
 import { parseSourceLibrary, permissionExpansion, planSourceRefresh } from './lib/subscription-refresh.js'
 import { DEFAULT_SETTINGS, entries, openReaderStorage } from './lib/storage.js'
@@ -29,7 +28,7 @@ import { base64ToBuffer, chapterId, clone, id, MAX_ARCHIVE_BYTES, MAX_TEXT_BYTES
 const COVER_MAX_BYTES = 2 * 1024 * 1024
 
 export const REMOTE_METHODS = Object.freeze([
-  'state', 'importSource', 'addSubscriptions', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'restoreBuiltinSources', 'removeSource', 'setSourceEnabled', 'search', 'searchSubscription', 'openSubscriptionEntry', 'discover', 'addBook', 'removeBook', 'toc', 'chapter', 'cancelDownloadChapters',
+  'state', 'importSource', 'addSubscriptions', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'removeSource', 'setSourceEnabled', 'search', 'searchSubscription', 'openSubscriptionEntry', 'discover', 'addBook', 'removeBook', 'toc', 'chapter', 'cancelDownloadChapters',
   'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
   'exportBackup', 'importBackup', 'fetchCover', 'cacheBookCover', 'bookCandidates', 'applyBookMeta',
   'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markChapterRead', 'markBookRead', 'exportNotes',
@@ -83,7 +82,6 @@ export class ReaderService extends TypertRemoteService {
     const settings = this.db.settings.get()
     this.media ??= new MediaStore({ root: this.mediaRoot, quotaBytes: settings.mediaQuotaBytes ?? DEFAULT_MEDIA_QUOTA })
     await this.media.init()
-    await this.seedBuiltinSources()
     this.mediaRouteDisposers = []
     this.ctx.effect(() => async () => {
       this.disposed = true
@@ -170,55 +168,6 @@ export class ReaderService extends TypertRemoteService {
     }
   }
 
-  async restoreBuiltinSources(args) {
-    args ??= {}
-    this.assertReady()
-    const settings = this.db.settings.get()
-    let added = 0
-    for (const raw of BUILTIN_SOURCES) {
-      const source = normalizeSource(raw)
-      if (this.db.sources.get(source.id)) continue
-      await this.db.sources.put(source.id, { ...source, builtin: true })
-      added += 1
-    }
-    await this.db.settings.set({ ...settings, builtinSourcesAt: settings.builtinSourcesAt ?? now(), builtinSourcesVersion: BUILTIN_SOURCES_VERSION })
-    return { added, total: BUILTIN_SOURCES.length }
-  }
-
-  async seedBuiltinSources() {
-    const settings = this.db.settings.get()
-    if (settings.builtinSourcesAt) {
-      await this.migrateBuiltinSources(settings)
-      return
-    }
-    for (const raw of BUILTIN_SOURCES) {
-      const source = normalizeSource(raw)
-      if (!this.db.sources.get(source.id)) await this.db.sources.put(source.id, { ...source, builtin: true })
-    }
-    await this.db.settings.set({ ...settings, builtinSourcesAt: now(), builtinSourcesVersion: BUILTIN_SOURCES_VERSION })
-  }
-
-  async migrateBuiltinSources(settings) {
-    const current = settings.builtinSourcesVersion ?? 1
-    if (current >= BUILTIN_SOURCES_VERSION) return
-    // Only add sources introduced after the installed version. Re-adding every
-    // builtin would revive sources the user removed on purpose.
-    for (const raw of BUILTIN_SOURCES) {
-      if ((raw.builtinSince ?? 1) <= current) continue
-      const source = normalizeSource(raw)
-      if (!this.db.sources.get(source.id)) await this.db.sources.put(source.id, { ...source, builtin: true })
-    }
-    for (const name of RETIRED_BUILTIN_SOURCE_NAMES) {
-      for (const source of entries(this.db.sources)) {
-        if (!source.builtin || source.name !== name) continue
-        const used = entries(this.db.books).some(book => book.sourceId === source.id)
-        if (used) await this.db.sources.put(source.id, { ...source, enabled: false, retired: true })
-        else await this.db.sources.delete(source.id)
-      }
-    }
-    await this.db.settings.set({ ...this.db.settings.get(), builtinSourcesVersion: BUILTIN_SOURCES_VERSION })
-  }
-
   log(level, message, error) {
     const logger = this.ctx.logger
     if (logger && typeof logger[level] === 'function') logger[level]('%s: %s', message, error?.message ?? error ?? '')
@@ -275,7 +224,6 @@ export class ReaderService extends TypertRemoteService {
     const next = {
       ...source,
       enabled: previous ? previous.enabled !== false : source.enabled !== false,
-      ...(previous?.builtin ? { builtin: true } : {}),
     }
     await this.db.sources.put(source.id, next)
     return next
@@ -528,7 +476,6 @@ export class ReaderService extends TypertRemoteService {
     args ??= {}
     this.assertReady()
     const source = this.source(args.id, { allowDisabled: true })
-    if (source.builtin) throw new ReaderError('reader/unsupported-source', '内置书源不能删除，可以关闭。')
     if (entries(this.db.books).some(book => book.sourceId === source.id)) throw new ReaderError('reader/source-in-use', '请先从书架移除该书源的书籍。')
     const affected = entries(this.db.subscriptions).filter(subscription => subscription.sourceIds?.includes(source.id))
     return this.withSubscriptionLocks(affected.map(subscription => subscription.id), async () => {
@@ -1627,10 +1574,6 @@ export class ReaderService extends TypertRemoteService {
     if (meta.sourceId && meta.bookUrl) {
       let source = this.db.sources.get(meta.sourceId)
       if (source) source = this.source(meta.sourceId)
-      if (source?.builtin && !source.rules?.bookInfo) {
-        const raw = BUILTIN_SOURCES.find((item) => normalizeSource(item).id === source.id)
-        if (raw) source = { ...source, rules: normalizeSource(raw).rules }
-      }
       if (source) {
         try {
           const info = await this.engine.bookInfo(source, meta.bookUrl)

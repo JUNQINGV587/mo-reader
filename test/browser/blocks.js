@@ -213,7 +213,7 @@ window.blocksTest = (async () => {
       }),
       onAddSubscriptions: async (sourceId, categories) => { addedCalls.push({ sourceId, categories }); return { added: categories.length } },
       onRemove() {}, onToggle() {}, onSubscribe() {}, onUnsubscribe() {}, onRefresh() {},
-      onConfirmUpdate() {}, onRejectUpdate() {}, onRestoreBuiltin() {},
+      onConfirmUpdate() {}, onRejectUpdate() {},
     }
     root.render(React.createElement(window.__readerTest.Sources, sourceCtx))
     await waitFor(() => host.querySelector('.mr-sources-left textarea'), '导入输入框没有渲染')

@@ -275,60 +275,19 @@ test('Service.init opens storage, recovers persisted jobs and registers hourly u
   assert.equal(stopIntervalCalled, false, 'ctx.interval owns its own disposer')
 })
 
-test('builtin sources are seeded once and can be turned off without re-adding', async () => {
-  const { service, db } = await serviceFixture()
-  await service.seedBuiltinSources()
-  const seeded = [...db.sources.entries()].map(([, value]) => value)
-  assert.deepEqual(seeded.map(item => item.name).sort(), ['MangaDex 漫画', '品书斋', '维基文库'])
-  assert.equal(seeded.every(item => item.builtin === true), true)
-  // Second call is a no-op even after the user deletes one.
-  await db.sources.delete(seeded[0].id)
-  await service.seedBuiltinSources()
-  assert.equal(db.sources.size, 2)
-})
-
-test('builtin migration adds new sources and retires 17K without reviving deleted sources', async () => {
-  const { service, db } = await serviceFixture()
-  await db.settings.set({ ...db.settings.get(), builtinSourcesAt: '2026-01-01T00:00:00.000Z' })
-  await db.sources.put('legacy-17k', {
-    id: 'legacy-17k', name: '17K 小说', bookSourceUrl: 'https://www.17k.com', builtin: true,
-    enabled: true, contentType: 'novel', rules: {},
-  })
-  await service.seedBuiltinSources()
-  assert.deepEqual([...db.sources.entries()].map(([, item]) => item.name).sort(), ['MangaDex 漫画', '品书斋'])
-  assert.equal(db.settings.get().builtinSourcesVersion, 2)
-})
-
-test('builtin migration keeps a retired source when a book still uses it', async () => {
-  const { service, db } = await serviceFixture()
-  await db.settings.set({ ...db.settings.get(), builtinSourcesAt: '2026-01-01T00:00:00.000Z' })
-  await db.sources.put('legacy-17k', {
-    id: 'legacy-17k', name: '17K 小说', bookSourceUrl: 'https://www.17k.com', builtin: true,
-    enabled: true, contentType: 'novel', rules: {},
-  })
-  await db.books.put('book-1', { id: 'book-1', name: '旧书', sourceId: 'legacy-17k' })
-  await service.seedBuiltinSources()
-  const legacy = db.sources.get('legacy-17k')
-  assert.equal(legacy.enabled, false)
-  assert.equal(legacy.retired, true)
-  assert.equal([...db.sources.entries()].filter(([, item]) => item.name === '品书斋').length, 1)
-})
-
 test('addBook accepts search-result data when a source has no bookInfo rule', async () => {
   const { service } = await serviceFixture({ async bookInfo() { return {} } })
-  const { source: builtin } = { source }
-  await service.db.sources.put(builtin.id, builtin)
-  const book = await service.addBook({ sourceId: builtin.id, bookUrl: 'https://example.com/book/1', book: { name: '公版书', author: '作者甲' } })
+  await service.db.sources.put(source.id, source)
+  const book = await service.addBook({ sourceId: source.id, bookUrl: 'https://example.com/book/1', book: { name: '公版书', author: '作者甲' } })
   assert.equal(book.name, '公版书')
   assert.equal(book.author, '作者甲')
 })
 
-test('built-in sources cannot be removed', async () => {
+test('sources can be removed when no book uses them', async () => {
   const { service, db } = await serviceFixture()
-  await service.seedBuiltinSources()
-  const [builtin] = [...db.sources.entries()].map(([, value]) => value)
-  await assert.rejects(() => service.removeSource({ id: builtin.id }), /内置书源不能删除/)
-  assert.equal(db.sources.get(builtin.id)?.builtin, true)
+  await db.sources.put(source.id, source)
+  await service.removeSource({ id: source.id })
+  assert.equal(db.sources.get(source.id), undefined)
 })
 
 test('source subscriptions persist source relationships and enabled state', async () => {
