@@ -244,6 +244,7 @@ window.blocksTest = (async () => {
       books: [{
         id: 'card-1', name: '分类01', title: '分类01', contentType: 'subscription', unread: 2,
         latestChapter: '最近一条', latestEntryAt: '2026-11-14 08:00',
+        download: { status: 'none', total: 0, done: 0 },
         subscription: { sourceName: '示例订阅', categoryName: '分类01' },
       }],
       category: { label: '订阅', unit: '份' }, view: 'list', onView() {}, onOpen() {}, onCheck() {}, onRemove() {},
@@ -257,6 +258,7 @@ window.blocksTest = (async () => {
     check('相对日期也能显示', /^\d{2}-\d{2}$/.test(window.__readerTest.formatShortDate('3天前')))
     check('月日日期也能显示', /^\d{2}-\d{2}$/.test(window.__readerTest.formatShortDate('11-14')))
     check('列表卡显示未读数', host.querySelector('.mr-book-card .mr-badge')?.textContent === '2 条')
+    check('未下载的订阅卡不显示下载徽标', !host.querySelector('.mr-dl-badge'))
 
     // 未读：打开条目应标记当前条目，目录标出剩余未读，并提供全部已读。
     const readCalls = []

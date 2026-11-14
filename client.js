@@ -659,7 +659,7 @@ window.__ModuleLoader__.load({
     function downloadBadge(book) {
       const job = book && typeof book.download === 'object' ? book.download : null;
       const status = book?.downloadStatus || (typeof book?.download === 'string' ? book.download : job?.status);
-      if (!status) return null;
+      if (!status || status === 'none') return null;
       const total = Number(job?.total || 0);
       const done = Number(job?.done || 0);
       const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((done / total) * 100))) : 0;
