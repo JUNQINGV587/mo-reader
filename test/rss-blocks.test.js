@@ -277,3 +277,47 @@ test('a block image response must really be an image', async (t) => {
   assert.equal(response.status, 415)
   assert.equal((await response.json()).error, 'reader/unsupported-media')
 })
+
+test('a subscription entry cover goes through the media proxy and is cached', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'reader-rss-cover-'))
+  const store = new MediaStore({ root, quotaBytes: 4 * 1024 * 1024 })
+  await store.init()
+  const { service, db } = await serviceFixture({}, { mediaStore: store })
+  const source = { id: 'source-cover', name: '图源', bookSourceUrl: SITE, allowHttp: false, enabled: true, kind: 'rss', contentType: 'subscription', rules: {} }
+  const book = { id: 'book-cover', sourceId: source.id, contentType: 'subscription', name: '图文订阅' }
+  const chapter = {
+    id: 'chapter-cover', bookId: book.id, index: 0, title: '一篇图文', contentType: 'subscription', text: '',
+    coverUrl: SITE + '/cover/1.jpg', blocks: [{ type: 'paragraph', text: '正文' }],
+  }
+  await db.sources.put(source.id, source)
+  await db.books.put(book.id, book)
+  await db.chapters.put(chapter.id, chapter)
+  let fetches = 0
+  service.fetchRemote = async (url) => {
+    fetches += 1
+    return { status: 200, url, headers: { 'content-type': 'image/jpeg', 'content-length': '3' }, buffer: Buffer.from('jpg') }
+  }
+  const request = () => new Request('http://reader.local/api/reader/proxy?bookId=' + book.id + '&chapterId=' + chapter.id + '&cover=1')
+  const first = await proxyResponse(service, request())
+  assert.equal(first.status, 200)
+  assert.equal(first.headers.get('content-type'), 'image/jpeg')
+  assert.equal(await first.text(), 'jpg')
+  const second = await proxyResponse(service, request())
+  assert.equal(second.status, 200)
+  assert.equal(second.headers.get('cache-control'), 'private, max-age=86400')
+  assert.equal(await second.text(), 'jpg')
+  assert.equal(fetches, 1)
+})
+
+test('a cover request without a cover is refused', async () => {
+  const { service, db } = await serviceFixture()
+  const source = { id: 'source-nocover', name: '图源', bookSourceUrl: SITE, allowHttp: false, enabled: true, kind: 'rss', contentType: 'subscription', rules: {} }
+  const book = { id: 'book-nocover', sourceId: source.id, contentType: 'subscription', name: '图文订阅' }
+  const chapter = { id: 'chapter-nocover', bookId: book.id, index: 0, title: '一篇图文', contentType: 'subscription', text: '', blocks: [] }
+  await db.sources.put(source.id, source)
+  await db.books.put(book.id, book)
+  await db.chapters.put(chapter.id, chapter)
+  const response = await proxyResponse(service, new Request('http://reader.local/api/reader/proxy?bookId=' + book.id + '&chapterId=' + chapter.id + '&cover=1'))
+  assert.equal(response.status, 404)
+  assert.equal((await response.json()).error, 'reader/media-not-found')
+})

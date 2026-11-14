@@ -117,6 +117,25 @@ test('addSubscriptions creates one subscription book per selected category', asy
   assert.equal(again.missing.length, 0)
 })
 
+test('removing one subscription leaves sibling categories and the source intact', async () => {
+  const { service, db } = await serviceFixture()
+  const imported = await service.importSource({ text: JSON.stringify(rssSample()) })
+  await service.addSubscriptions({
+    sourceId: imported.sourceId,
+    categories: [imported.categories[0].url, imported.categories[1].url],
+  })
+  const before = (await service.state()).books.filter((book) => book.contentType === 'subscription')
+  assert.equal(before.length, 2)
+
+  await service.removeBook({ bookId: before[0].id })
+
+  const after = (await service.state()).books.filter((book) => book.contentType === 'subscription')
+  assert.equal(after.length, 1)
+  assert.equal(after[0].id, before[1].id)
+  assert.equal(db.sources.get(imported.sourceId)?.kind, 'rss')
+  assert.equal(db.sources.get(imported.sourceId)?.categories.length, CATEGORY_COUNT)
+})
+
 test('hourly updates use the subscription toc path instead of the book toc path', async () => {
   let subscriptionTocs = 0
   const { service } = await serviceFixture({
@@ -226,7 +245,7 @@ test('subscriptions do not offer download jobs before entries exist', async () =
   await service.addSubscriptions({ sourceId: imported.sourceId, categories: [imported.categories[0].url] })
   const book = (await service.state()).books.find(item => item.contentType === 'subscription')
   await assert.rejects(service.download({ bookId: book.id }), /订阅还没有条目/)
-  await assert.rejects(service.batchDownloadBooks({ bookIds: [book.id] }), /订阅暂不支持下载/)
+  await assert.rejects(service.batchDownloadBooks({ bookIds: [book.id] }), /订阅请逐条下载/)
 })
 
 test('an ordinary book source cannot declare itself a subscription', async () => {

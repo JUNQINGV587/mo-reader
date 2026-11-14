@@ -1,7 +1,7 @@
 import { Service } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { createBackup, parseBackup } from './lib/backup.js'
-import { hasChapterPayload, isTextContentType, normalizeBookContentType, normalizeSourceContentType } from './lib/content-types.js'
+import { hasChapterPayload, isMediaPayloadType, isTextContentType, normalizeBookContentType, normalizeSourceContentType } from './lib/content-types.js'
 import { ReaderError } from './lib/errors.js'
 import { fetchRemote } from './lib/http.js'
 import { MediaStore, DEFAULT_MEDIA_QUOTA } from './lib/media-store.js'
@@ -41,7 +41,7 @@ function hasOfflinePayload(chapter, contentType) {
   const offline = chapter?.offline
   if (!offline || typeof offline !== 'object') return false
   if (contentType === 'comic') return Array.isArray(offline.images) && offline.images.length > 0
-  if (contentType === 'audio' || contentType === 'video') {
+  if (isMediaPayloadType(contentType)) {
     return typeof offline.playlistId === 'string' || typeof offline.mediaId === 'string'
   }
   return false
@@ -302,7 +302,9 @@ export class ReaderService extends TypertRemoteService {
     const contentType = normalizeBookContentType(chapter.contentType)
     const textType = isTextContentType(contentType)
     const streaming = contentType === 'subscription' && typeof chapter.mediaUrl === 'string' && chapter.mediaUrl.length > 0
-    const offline = textType ? false : this.offlineRecordReady(chapter, contentType)
+    const offline = textType
+      ? contentType === 'subscription' && streaming && this.offlineRecordReady(chapter, contentType)
+      : this.offlineRecordReady(chapter, contentType)
     return {
       id: chapter.id,
       bookId: chapter.bookId,
@@ -324,25 +326,28 @@ export class ReaderService extends TypertRemoteService {
     const source = this.db.sources.get(book.sourceId)
     const contentType = normalizeBookContentType(book.contentType)
     const textType = isTextContentType(contentType)
-    const downloaded = chapters.filter(chapter => {
-      const streaming = contentType === 'subscription' && typeof chapter.mediaUrl === 'string' && chapter.mediaUrl.length > 0
-      return textType && !streaming ? hasChapterPayload(chapter, contentType) : this.offlineRecordReady(chapter, contentType)
-    }).length
+    const downloadable = contentType === 'subscription'
+      ? chapters.filter(chapter => typeof chapter.mediaUrl === 'string' && chapter.mediaUrl.length > 0).length
+      : chapters.length
+    const downloaded = contentType === 'subscription'
+      ? chapters.filter(chapter => this.offlineRecordReady(chapter, contentType)).length
+      : chapters.filter(chapter => textType ? hasChapterPayload(chapter, contentType) : this.offlineRecordReady(chapter, contentType)).length
     const readIndex = book.progress ? chapters.findIndex(chapter => chapter.id === book.progress.chapterId) : -1
     const unread = contentType === 'subscription'
       // 旧订阅在升级前没有 readBaselineAt，也没有任何 readAt；票面约定按「全部已读」处理。
       ? (book.readBaselineAt ? chapters.filter(chapter => !chapter.readAt).length : 0)
       : Math.max(0, readIndex < 0 ? chapters.length : chapters.length - readIndex - 1)
-    const status = book.download?.status === 'completed' && downloaded < chapters.length ? 'partial' : book.download?.status ?? (downloaded ? 'partial' : 'none')
+    const status = book.download?.status === 'completed' && downloaded < downloadable ? 'partial' : book.download?.status ?? (downloaded ? 'partial' : 'none')
     return {
       ...clone(book),
       contentType: normalizeBookContentType(book.contentType),
       latestChapter: book.latestChapter ?? (contentType === 'subscription' ? chapters[0]?.title : chapters.at(-1)?.title),
+      ...(contentType === 'subscription' ? { latestEntryAt: chapters[0]?.publishedAt ?? null } : {}),
       unread,
       lastRead: clone(book.progress ?? null),
       sourceHome: /^https?:/i.test(String(source?.bookSourceUrl ?? '')) ? source.bookSourceUrl : null,
       readerPrefs: book.readerPrefs && Object.keys(book.readerPrefs).length ? clone(book.readerPrefs) : null,
-      download: { status, total: chapters.length, done: downloaded, jobId: book.download?.jobId, auto: book.download?.auto === true },
+      download: { status, total: downloadable, done: downloaded, jobId: book.download?.jobId, auto: book.download?.auto === true },
     }
   }
 
@@ -1081,7 +1086,15 @@ export class ReaderService extends TypertRemoteService {
     args ??= {}
     this.assertReady()
     const book = this.book(args.bookId)
-    if (normalizeBookContentType(book.contentType) === 'subscription') throw new ReaderError('reader/invalid-input', '订阅还没有条目，暂不支持整本下载。')
+    const subscription = normalizeBookContentType(book.contentType) === 'subscription'
+    if (subscription && !this.chapters(book.id).length) throw new ReaderError('reader/invalid-input', '订阅还没有条目，暂时无法下载。')
+    if (subscription && (!Array.isArray(args.chapterIds) || args.chapterIds.length !== 1)) throw new ReaderError('reader/invalid-input', '订阅一次只能下载一条，请在阅读器里点下载。')
+    const active = subscription ? this.activeJobFor(book.id) : null
+    if (active) {
+      throw new ReaderError('reader/busy', active.status === 'paused'
+        ? '这部订阅还有暂停的下载，请先在下载面板继续或取消。'
+        : '这部订阅还有下载任务，请等它完成。')
+    }
     if (!book.local) this.source(book.sourceId)
     const pending = this.downloadLocks.get(book.id)
     if (pending) {
@@ -1106,7 +1119,9 @@ export class ReaderService extends TypertRemoteService {
   }
 
   async beginDownload(book, args) {
+    const subscription = normalizeBookContentType(book.contentType) === 'subscription'
     const existing = this.activeJobFor(book.id)
+    if (existing && subscription) throw new ReaderError('reader/busy', '这部订阅还有下载任务，请等它完成。')
     if (existing) return jobView(existing)
     const cachedChapters = this.chapters(book.id)
     let chapterIds
@@ -1115,6 +1130,10 @@ export class ReaderService extends TypertRemoteService {
       chapterIds = [...new Set(args.chapterIds.map(chapterId => requiredString(chapterId, 'chapterId', 256)))]
       const known = new Set(cachedChapters.map(chapter => chapter.id))
       if (chapterIds.some(chapterId => !known.has(chapterId))) throw new ReaderError('reader/not-found', '下载章节不属于这本书。')
+    }
+    if (normalizeBookContentType(book.contentType) === 'subscription') {
+      const selected = cachedChapters.filter(chapter => chapterIds.includes(chapter.id))
+      if (selected.some(chapter => typeof chapter.mediaUrl !== 'string' || !chapter.mediaUrl)) throw new ReaderError('reader/invalid-input', '订阅条目还没有播放地址，请打开条目后再下载。')
     }
     const total = chapterIds?.length ?? cachedChapters.length
     const job = { ...createJob({ bookId: book.id, total }), ...(chapterIds ? { chapterIds } : {}) }
@@ -1164,7 +1183,7 @@ export class ReaderService extends TypertRemoteService {
       if (job.type !== 'download') throw new ReaderError('reader/job-state', `Unknown job type ${job.type}.`)
       const storedBook = this.book(job.bookId)
       const book = { ...storedBook, contentType: normalizeBookContentType(storedBook.contentType) }
-      const allChapters = book.local ? this.chapters(book.id) : await this.syncToc(book, await this.engine.toc(this.source(book.sourceId), book))
+      const allChapters = book.local || book.contentType === 'subscription' ? this.chapters(book.id) : await this.syncToc(book, await this.engine.toc(this.source(book.sourceId), book))
       const selected = job.chapterIds ? new Set(job.chapterIds) : null
       const chapters = selected ? allChapters.filter(chapter => selected.has(chapter.id)) : allChapters
       job = this.db.jobs.get(jobId)
@@ -1184,7 +1203,13 @@ export class ReaderService extends TypertRemoteService {
           let lastError = null
           if (needsPayload) {
             for (let attempt = 1; attempt <= MAX_CHAPTER_ATTEMPTS; attempt += 1) {
-              try { content = await this.engine.content(this.source(book.sourceId), book, chapter); lastError = null; break }
+              try {
+                content = book.contentType === 'subscription'
+                  ? await this.engine.subscriptionContent(this.source(book.sourceId), book, chapter)
+                  : await this.engine.content(this.source(book.sourceId), book, chapter)
+                lastError = null
+                break
+              }
               catch (error) {
                 lastError = error
                 if (this.disposed) return
@@ -1712,7 +1737,7 @@ export class ReaderService extends TypertRemoteService {
     const bookIds = Array.isArray(args.bookIds) ? args.bookIds : [args.bookId]
     if (!bookIds.length) throw new ReaderError('reader/invalid-input', 'No books selected.')
     if (bookIds.some(bookId => normalizeBookContentType(this.db.books.get(bookId)?.contentType) === 'subscription')) {
-      throw new ReaderError('reader/invalid-input', '订阅暂不支持下载，请先取消勾选订阅。')
+      throw new ReaderError('reader/invalid-input', '订阅请逐条下载，请先取消勾选订阅。')
     }
     const queued = []
     for (const bookId of bookIds) {

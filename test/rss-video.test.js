@@ -1,9 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import { SourceEngine } from '../lib/source-engine.js'
+import { MediaStore } from '../lib/media-store.js'
 import { proxyResponse } from '../lib/media-http.js'
 import { MEDIA_PROBE_TIMEOUT_MS, extractMediaCandidates, firstPlayableMedia, probeMediaUrl } from '../lib/media-probe.js'
-import { serviceFixture } from './helpers.js'
+import { serviceFixture, waitForJob } from './helpers.js'
 
 const SITE = 'https://rss.example'
 const DEAD = 'https://media.example/dead.mp4'
@@ -62,7 +66,7 @@ async function fixture(options = {}) {
       throw new Error('unexpected URL ' + url)
     },
   })
-  const { service, db } = await serviceFixture(engine)
+  const { service, db } = await serviceFixture(engine, options)
   const imported = await service.importSource({ text: JSON.stringify(source()) })
   const added = await service.addSubscriptions({ sourceId: imported.sourceId, categories: [imported.categories[0].url] })
   return {
@@ -241,4 +245,52 @@ test('extractMediaCandidates keeps document order, dedupes and caps at five', ()
     'https://cdn.example/d.mp4',
     'https://cdn.example/e.m3u8',
   ])
+})
+
+async function tempStore() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'reader-rss-video-'))
+  const store = new MediaStore({ root, quotaBytes: 4 * 1024 * 1024 })
+  await store.init()
+  return store
+}
+
+test('a subscription media entry downloads only when one entry is selected', async () => {
+  const store = await tempStore()
+  const segments = []
+  const fetchRemote = async (url) => {
+    segments.push(url)
+    if (url === LIVE) {
+      const text = '#EXTM3U\n#EXTINF:1.0,\nseg0.ts\n#EXT-X-ENDLIST\n'
+      return { url, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, text, buffer: Buffer.from(text) }
+    }
+    if (url === new URL('seg0.ts', LIVE).href) return { url, headers: { 'content-type': 'video/mp2t' }, buffer: Buffer.from('segment-bytes') }
+    throw new Error('unexpected media URL ' + url)
+  }
+  const { service, db, book } = await fixture({ mediaStore: store, fetchRemote })
+  const toc = await service.toc({ bookId: book.id })
+  const chapter = await service.chapter({ bookId: book.id, chapterId: toc[0].id })
+  assert.equal(chapter.mediaUrl, LIVE)
+
+  await assert.rejects(() => service.download({ bookId: book.id }), error => error.code === 'reader/invalid-input' && /一次只能下载一条/.test(error.message))
+  const job = await service.download({ bookId: book.id, chapterIds: [toc[0].id] })
+  const finished = await waitForJob(service, job.id)
+  assert.equal(finished.status, 'completed')
+  assert.equal(db.jobs.get(job.id).status, 'completed')
+  const stored = db.chapters.get(toc[0].id)
+  assert.equal(stored.offline.kind, 'hls')
+  assert.ok(stored.offline.playlistId)
+  assert.ok(segments.some(url => url.endsWith('seg0.ts')))
+  const state = await service.state()
+  assert.equal(state.books[0].download.done, 1)
+  const refreshed = await service.toc({ bookId: book.id })
+  assert.ok(refreshed[0].offline)
+  assert.equal(refreshed[0].downloaded, true)
+})
+
+test('a subscription entry without a playable address is refused before a job starts', async () => {
+  const { service, book } = await fixture({ candidates: [DEAD], live: false })
+  const toc = await service.toc({ bookId: book.id })
+  const chapter = await service.chapter({ bookId: book.id, chapterId: toc[0].id }).catch(() => null)
+  assert.equal(chapter, null)
+  await assert.rejects(() => service.download({ bookId: book.id, chapterIds: [toc[0].id] }), error => error.code === 'reader/invalid-input' && /播放地址/.test(error.message))
 })

@@ -47,6 +47,16 @@ export async function serviceFixture(engine = {}, options = {}) {
   return { ctx, service, db: service.db }
 }
 
+export async function waitForJob(service, jobId, timeout = 5000) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    const job = (await service.state())?.jobs?.find(item => item.id === jobId)
+    if (job && ['completed', 'failed', 'cancelled'].includes(job.status)) return job
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  throw new Error('job did not finish: ' + jobId)
+}
+
 export const source = {
   id: stableId('source', 'https://example.com'),
   name: 'Example',

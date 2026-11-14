@@ -102,6 +102,107 @@ window.blocksTest = (async () => {
     check('播放器有控制条', video.controls === true)
     check('视频走媒体代理', String(video.getAttribute('src')).includes('/api/reader/proxy?') && String(video.getAttribute('src')).includes('chapterId=video-0'))
 
+    // 订阅媒体：手动下载当前条目后，播放器切到本地缓存地址；目录显示封面与日期。
+    const downloadCalls = [];
+    let downloaded = false
+    const downloadCtx = { remote: { reader: {
+      toc: async () => {
+        const item = { id: 'dl-0', name: '可下载条目', coverUrl: 'https://img.example/entry.png', publishedAt: '2026-11-14 08:00' }
+        if (downloaded) item.offline = { kind: 'file', mediaId: 'local-1' }
+        return [item]
+      },
+      chapter: async () => {
+        const entry = { id: 'dl-0', name: '可下载条目', contentType: 'subscription', mediaUrl: 'https://media.example/clip.mp4', coverUrl: 'https://img.example/entry.png', publishedAt: '2026-11-14 08:00' }
+        if (downloaded) entry.offline = { kind: 'file', mediaId: 'local-1' }
+        return entry
+      },
+      download: async (args) => { downloadCalls.push(args); downloaded = true; return { id: 'job-dl' } },
+      markChapterRead: async () => ({}),
+      saveProgress: async () => ({}),
+    } } }
+    const downloadBook = {
+      id: 'download-book', title: '下载回归', contentType: 'subscription', readBaselineAt: '2026-01-01T00:00:00.000Z',
+      readerPrefs: { mode: 'scroll', ambience: 'off' },
+      lastRead: { chapterId: 'dl-0', percent: 0, offset: 0 },
+    }
+    root.render(React.createElement(window.__readerTest.ReaderView, {
+      key: 'download-book', ctx: downloadCtx, book: downloadBook, settings, notes: [], onClose() {},
+    }))
+    await waitFor(() => host.querySelector('.mr-video-player video'), '可下载条目未渲染播放器')
+    const downloadButton = [...host.querySelectorAll('button')].find((node) => node.getAttribute('aria-label') === '下载这一条')
+    check('订阅条目显示下载入口', !!downloadButton)
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    const tocButtonForDownload = [...host.querySelectorAll('button')].find((node) => node.getAttribute('aria-label') === '目录')
+    tocButtonForDownload.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await waitFor(() => host.querySelector('.mr-toc-cover'), '目录没有显示封面')
+    check('目录封面走媒体代理', /cover=1/.test(host.querySelector('.mr-toc-cover img')?.getAttribute('src') || ''))
+    check('目录显示日期', /11-14$/.test(host.querySelector('.mr-toc-date')?.textContent || ''))
+    const downloadNow = host.querySelector('.mr-reader-top-download')
+    downloadNow.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await waitFor(() => downloadCalls.length === 1, '点击下载没有调用服务')
+    check('下载只提交当前条目', downloadCalls[0].bookId === 'download-book' && downloadCalls[0].chapterIds.length === 1 && downloadCalls[0].chapterIds[0] === 'dl-0')
+    await waitFor(() => String(host.querySelector('.mr-video-player video')?.getAttribute('src')).includes('/api/reader/media?id=local-1'), '下载后播放器未切到本地地址')
+    check('下载后走本地缓存', String(host.querySelector('.mr-video-player video')?.getAttribute('src')).includes('/api/reader/media?id=local-1'))
+
+    // 导入订阅源：分类默认不选、可全选/全不选，勾选后按分类加入书架。
+    const addedCalls = []
+    const sourceCtx = {
+      sources: [], subscriptions: [], busy: false,
+      onImport: async () => ({
+        kind: 'rss', sourceId: 'rss-ui', name: '示例订阅',
+        categories: [
+          { name: '分类01', url: 'https://rss.example/list/1/page/{{page}}.html' },
+          { name: '分类02', url: 'https://rss.example/list/2/page/{{page}}.html' },
+        ],
+        unsupported: ['cookie'],
+      }),
+      onAddSubscriptions: async (sourceId, categories) => { addedCalls.push({ sourceId, categories }); return { added: categories.length } },
+      onRemove() {}, onToggle() {}, onSubscribe() {}, onUnsubscribe() {}, onRefresh() {},
+      onConfirmUpdate() {}, onRejectUpdate() {}, onRestoreBuiltin() {},
+    }
+    root.render(React.createElement(window.__readerTest.Sources, sourceCtx))
+    await waitFor(() => host.querySelector('.mr-sources-left textarea'), '导入输入框没有渲染')
+    const draft = host.querySelector('.mr-sources-left textarea')
+    check('导入输入框存在', !!draft)
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(draft, '{"sourceName":"示例订阅"}')
+    draft.dispatchEvent(new Event('input', { bubbles: true }))
+    const importButton = [...host.querySelectorAll('button')].find((node) => node.textContent === '导入')
+    check('导入按钮存在', !!importButton)
+    importButton.click()
+    await waitFor(() => host.querySelector('.mr-rss-import'), '订阅源分类面板未出现')
+    check('面板提示不支持能力', /Cookie/.test(host.querySelector('.mr-rss-import .mr-source-warning')?.textContent || ''))
+    check('分类默认全不选', [...host.querySelectorAll('.mr-rss-row input')].every((node) => node.checked === false))
+    const addButton = () => [...host.querySelectorAll('.mr-rss-import button')].find((node) => /加入书架/.test(node.textContent || ''))
+    check('未选分类时不能加入书架', addButton()?.disabled === true)
+    ;[...host.querySelectorAll('.mr-rss-import button')].find((node) => node.textContent === '全选').click()
+    await waitFor(() => [...host.querySelectorAll('.mr-rss-row input')].every((node) => node.checked), '全选没有选中全部分类')
+    ;[...host.querySelectorAll('.mr-rss-import button')].find((node) => node.textContent === '全不选').click()
+    await waitFor(() => [...host.querySelectorAll('.mr-rss-row input')].every((node) => !node.checked), '全不选没有清空分类')
+    host.querySelector('.mr-rss-row input').click()
+    await waitFor(() => /加入书架（1）/.test(addButton()?.textContent || ''), '勾选一个分类后按钮计数不对')
+    addButton().click()
+    await waitFor(() => addedCalls.length === 1, '加入书架没有调用服务')
+    check('只提交勾选分类', addedCalls[0].sourceId === 'rss-ui' && addedCalls[0].categories.length === 1 && addedCalls[0].categories[0] === 'https://rss.example/list/1/page/{{page}}.html')
+
+    // 列表卡：订阅卡显示来源名、最近条目标题与日期。
+    root.render(React.createElement(window.__readerTest.Library, {
+      books: [{
+        id: 'card-1', name: '分类01', title: '分类01', contentType: 'subscription', unread: 2,
+        latestChapter: '最近一条', latestEntryAt: '2026-11-14 08:00',
+        subscription: { sourceName: '示例订阅', categoryName: '分类01' },
+      }],
+      category: { label: '订阅', unit: '份' }, view: 'list', onView() {}, onOpen() {}, onCheck() {}, onRemove() {},
+      onMarkRead() {}, onToggleDownload() {}, busy: false,
+    }))
+    await waitFor(() => host.querySelector('.mr-book-card'), '订阅列表卡未渲染')
+    check('列表卡显示来源名', host.querySelector('.mr-book-info p')?.textContent === '示例订阅')
+    const cardMeta = host.querySelector('.mr-book-info small')?.textContent || ''
+    check('列表卡显示最近条目', cardMeta.includes('最近一条'))
+    check('列表卡显示最近日期', /11-14$/.test(cardMeta))
+    check('相对日期也能显示', /^\d{2}-\d{2}$/.test(window.__readerTest.formatShortDate('3天前')))
+    check('月日日期也能显示', /^\d{2}-\d{2}$/.test(window.__readerTest.formatShortDate('11-14')))
+    check('列表卡显示未读数', host.querySelector('.mr-book-card .mr-badge')?.textContent === '2 条')
+
     // 未读：打开条目应标记当前条目，目录标出剩余未读，并提供全部已读。
     const readCalls = []
     const markAllCalls = []

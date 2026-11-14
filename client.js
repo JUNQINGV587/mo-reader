@@ -63,6 +63,9 @@ window.__ModuleLoader__.load({
     function bookUnit(book) {
       return bookContentType(book) === 'subscription' ? '条' : '章';
     }
+    const isMediaBookType = (type) => type === 'audio' || type === 'video' || type === 'subscription';
+    const joinMeta = (...values) => values.filter(Boolean).join(' · ');
+    const chapterCacheKey = (bookId, chapterId) => `mo-reader:chapter:${bookId}:${chapterId}`;
     function mediaLocalUrl(id) {
       return id ? `/api/reader/media?id=${encodeURIComponent(id)}` : '';
     }
@@ -115,15 +118,16 @@ window.__ModuleLoader__.load({
       const [error, setError] = useState('');
       const [retry, setRetry] = useState(0);
       const videoRef = useRef(null);
-      const src = mediaProxyUrl(book.id || book.bookId, chapter.id);
-      const hls = /\.m3u8(?:[?#]|$)/i.test(chapter.mediaUrl || '');
+      const source = mediaChapterSource(book, chapter);
+      const src = source.kind === 'media' ? source.url : '';
+      const hls = source.kind === 'media' && source.hls === true;
       useEffect(() => {
         const element = videoRef.current;
         if (!element || !src) return undefined;
         setError('');
         element.removeAttribute('src');
         element.load();
-        if (!hls || nativeHlsSupported()) { element.src = src; return undefined; }
+        if (!hls) { element.src = src; return undefined; }
         return attachHlsPlayer(element, src, {
           onUnsupported: () => setError('媒体地址失效：浏览器不支持 HLS 播放。'),
           onFatal: () => setError('媒体地址失效：视频加载失败，请重试。'),
@@ -131,7 +135,7 @@ window.__ModuleLoader__.load({
         });
       }, [src, hls, retry, chapter.id]);
       return h('div', { className: 'mr-video-player' },
-        h('video', {
+        source.kind !== 'media' ? h('div', { className: 'mr-media-error', role: 'alert' }, h(Glyph, { name: 'warning', size: 24 }), h('p', null, source.error || '这一条没有可播放的媒体。')) : h('video', {
           ref: videoRef, controls: true, playsInline: true, preload: 'metadata',
           poster: chapter.coverUrl || undefined,
           onError: () => setError('媒体地址失效：视频加载失败，请重试。'),
@@ -150,7 +154,7 @@ window.__ModuleLoader__.load({
         const images = offline.length ? offline : (Array.isArray(chapter.images) ? chapter.images.map((url, index) => /^https?:/i.test(url) ? mediaProxyUrl(book.id || book.bookId, chapter.id, `image=${index}`) : url) : []);
         return images.length ? { kind: 'images', images } : { kind: 'error', error: '这一章没有可显示的图片。' };
       }
-      if (type === 'audio' || type === 'video') {
+      if (isMediaBookType(type)) {
         const offline = chapter.offline;
         const offlineId = offline?.playlistId || offline?.mediaId;
         if (offlineId) {
@@ -184,6 +188,52 @@ window.__ModuleLoader__.load({
       const mins = Math.floor(seconds % 3600 / 60);
       const secs = seconds % 60;
       return hours ? `${hours}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}` : `${mins}:${String(secs).padStart(2, '0')}`;
+    }
+    function formatShortDate(value) {
+      const raw = String(value || '').trim();
+      if (!raw) return '';
+      const local = (year, month, day, hour = 0, minute = 0, second = 0) => new Date(year, month - 1, day, hour, minute, second).getTime();
+      let time = NaN;
+      // 先认完整日期，再认 Legado 常见的「11-14」「3天前」「昨天 10:00」。
+      const full = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/);
+      if (full) time = local(Number(full[1]), Number(full[2]), Number(full[3]), Number(full[4] || 0), Number(full[5] || 0), Number(full[6] || 0));
+      if (!Number.isFinite(time)) {
+        const monthDay = raw.match(/^(\d{1,2})[-/](\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?$/);
+        if (monthDay) {
+          const now = new Date();
+          let year = now.getFullYear();
+          let date = local(year, Number(monthDay[1]), Number(monthDay[2]), Number(monthDay[3] || 0), Number(monthDay[4] || 0));
+          if (date > now.getTime() + 24 * 3600 * 1000) {
+            year -= 1;
+            date = local(year, Number(monthDay[1]), Number(monthDay[2]), Number(monthDay[3] || 0), Number(monthDay[4] || 0));
+          }
+          time = date;
+        }
+      }
+      if (!Number.isFinite(time)) {
+        const relative = raw.match(/^(?:(\d+)\s*)?(分钟|小时|天)前$/);
+        if (relative) {
+          const amount = Number(relative[1] || 1);
+          const unit = relative[2] === '分钟' ? 60 * 1000 : relative[2] === '小时' ? 3600 * 1000 : 24 * 3600 * 1000;
+          time = Date.now() - amount * unit;
+        }
+      }
+      if (!Number.isFinite(time)) {
+        const day = raw.match(/^(今天|昨天|前天)(?:\s+(\d{1,2}):(\d{2}))?/);
+        if (day) {
+          const now = new Date();
+          const offset = day[1] === '前天' ? 2 : day[1] === '昨天' ? 1 : 0;
+          time = local(now.getFullYear(), now.getMonth() + 1, now.getDate() - offset, Number(day[2] || 0), Number(day[3] || 0));
+        } else if (/^(刚刚|刚才)$/.test(raw)) {
+          time = Date.now();
+        }
+      }
+      if (!Number.isFinite(time)) time = Date.parse(raw);
+      if (!Number.isFinite(time)) return '';
+      const date = new Date(time);
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      return date.getFullYear() === new Date().getFullYear() ? `${month}-${day}` : `${date.getFullYear()}-${month}-${day}`;
     }
     function formatBytes(value) {
       const bytes = Number(value) || 0;
@@ -881,7 +931,7 @@ window.__ModuleLoader__.load({
         const name = String(book.name || book.title || '未命名');
         const variant = (index % 7) + 2;
         const isSelected = selected.has(id);
-        const byline = book.author || book.subscription?.sourceName || '';
+        const byline = joinMeta(book.author || book.subscription?.sourceName || '', formatShortDate(book.latestEntryAt));
         return h('button', {
           key: `book-${id}`,
           className: `mr-shelf-piece mr-shelf-book${isSelected ? ' mr-selected' : ''}`,
@@ -1062,7 +1112,7 @@ window.__ModuleLoader__.load({
             h('button', { className: 'mr-select-close', type: 'button', 'aria-label': '取消', title: '退出多选', onClick: exitSelect }, h(Glyph, { name: 'close', size: 18 }))),
           h('div', { className: 'mr-select-actions' },
             h(Button, { icon: 'folder', disabled: selectionBusy || !selected.size, onClick: () => setFolderSheet(true) }, h('span', null, '移动')),
-            h(Button, { icon: 'download', disabled: selectionBusy || !selected.size || subscriptionSelected, title: subscriptionSelected ? '订阅暂不支持下载' : '下载', onClick: () => runSelectionAction(() => onBatchDownload?.(Array.from(selected))) }, h('span', null, '下载')),
+            h(Button, { icon: 'download', disabled: selectionBusy || !selected.size || subscriptionSelected, title: subscriptionSelected ? '订阅请逐条下载' : '下载', onClick: () => runSelectionAction(() => onBatchDownload?.(Array.from(selected))) }, h('span', null, '下载')),
             h(Button, { icon: 'upload', disabled: selectionBusy || !selected.size, onClick: () => runSelectionAction(() => onExport?.(Array.from(selected))) }, h('span', null, '导出')),
             h(Button, { icon: 'check', disabled: selectionBusy || !selected.size, onClick: () => runSelectionAction(() => onMarkRead?.(Array.from(selected))) }, h('span', null, '已读')),
             h(Button, { icon: 'trash', kind: 'mr-select-delete', disabled: selectionBusy || !selected.size, onClick: () => { if (window.confirm(`删除 ${selected.size} 本书？`)) runSelectionAction(() => onBatchDelete?.(Array.from(selected))); } }, h('span', null, '删除')))) : null,
@@ -1178,7 +1228,7 @@ window.__ModuleLoader__.load({
               h('div', { className: 'mr-book-info' },
                 h('div', { className: 'mr-book-title-row' }, h('h3', { title: name }, name), unread > 0 ? h('span', { className: 'mr-badge' }, `${unread} ${bookUnit(book)}`) : null),
                 h('p', null, book.author || book.subscription?.sourceName || (book.sourceType === 'local' ? '本地书籍' : '未知作者')),
-                h('small', null, book.sourceFailed ? '源失效' : (book.latestChapter || book.lastChapter || (bookContentType(book) === 'subscription' ? '还没有条目' : job === 'running' ? '下载中' : '尚未读'))))),
+                h('small', null, book.sourceFailed ? '源失效' : joinMeta(book.latestChapter || book.lastChapter || (bookContentType(book) === 'subscription' ? '还没有条目' : job === 'running' ? '下载中' : '尚未读'), formatShortDate(book.latestEntryAt))))),
             h('div', { className: 'mr-book-actions' },
               bookContentType(book) === 'subscription'
                 ? (unread > 0 ? h(Button, { kind: 'text', icon: 'check', title: '把这部订阅标为已读', onClick: () => onMarkRead?.([id]), disabled: busy }, '全部已读') : null)
@@ -2176,7 +2226,7 @@ window.__ModuleLoader__.load({
             active ? h(Button, { onClick: () => onJobAction('cancel') }, '取消任务') : null)));
     }
 
-    function ReaderView({ ctx, book, settings, onSettings, onBookSettings, notes, onClose, onSaveNote, onDeleteNote, notify, notice, onDismissNotice, deferMs = 0 }) {
+    function ReaderView({ ctx, book, settings, onSettings, onBookSettings, notes, onClose, onSaveNote, onDeleteNote, notify, notice, onDismissNotice, deferMs = 0, onRefresh }) {
       const [toc, setToc] = useState([]);
       const [chromeOpen, setChromeOpen] = useState(false);
       const [chapter, setChapter] = useState(null);
@@ -2247,6 +2297,8 @@ window.__ModuleLoader__.load({
       const mirrorAtRef = useRef({ at: 0, chapterId: '' });
       const [scrollChapters, setScrollChapters] = useState([]);
       const [scrollError, setScrollError] = useState(null);
+      const [downloadingChapterId, setDownloadingChapterId] = useState('');
+      const downloadPollRef = useRef(null);
       const scrollChaptersRef = useRef([]);
       const chapterIndexRef = useRef(-1);
       const chapterNodesRef = useRef(new Map());
@@ -2269,6 +2321,7 @@ window.__ModuleLoader__.load({
       useEffect(() => { pageIndexRef.current = pageIndex; }, [pageIndex]);
       useEffect(() => { chapterIndexRef.current = chapterIndex; }, [chapterIndex]);
       useEffect(() => { scrollChaptersRef.current = scrollChapters; }, [scrollChapters]);
+      useEffect(() => () => { if (downloadPollRef.current) clearInterval(downloadPollRef.current); }, []);
       const restorePendingScroll = () => {
         const pending = pendingScrollRestoreRef.current;
         if (!pending || modeRef.current !== 'scroll') return;
@@ -2544,7 +2597,7 @@ window.__ModuleLoader__.load({
         const item = list[index];
         return item && (item.id || item.chapterId || item.url || item.chapterUrl || String(index));
       };
-      const CHAPTER_CACHE_VERSION = 2;
+      const CHAPTER_CACHE_VERSION = 3;
       const cacheChapterPayload = (cacheKey, value, id) => {
         if (!value?.text && !(Array.isArray(value?.blocks) && value.blocks.length) && !value?.mediaUrl) return;
         try {
@@ -2554,6 +2607,7 @@ window.__ModuleLoader__.load({
             text: value.text || '',
             blocks: Array.isArray(value.blocks) ? value.blocks : undefined,
             mediaUrl: typeof value.mediaUrl === 'string' ? value.mediaUrl : undefined,
+            offline: value.offline && typeof value.offline === 'object' ? value.offline : undefined,
             timestamp: Date.now(),
           });
           // 图文块可能很大；超过 256KB 就不进本地缓存，避免把 localStorage 配额吃满。
@@ -2565,18 +2619,18 @@ window.__ModuleLoader__.load({
         const id = chapterSourceId(index, list);
         if (!id) return null;
         // 离线缓存：先查 localStorage，没有再请求
-        const cacheKey = `mo-reader:chapter:${bookId}:${id}`;
+        const cacheKey = chapterCacheKey(bookId, id);
         try {
           const cached = localStorage.getItem(cacheKey);
           if (cached) {
             const payload = JSON.parse(cached);
-            const { id: cachedId, text, blocks, mediaUrl, timestamp, version } = payload;
+            const { id: cachedId, text, blocks, mediaUrl, offline, timestamp, version } = payload;
             const staleSubscription = book.contentType === 'subscription' && version !== CHAPTER_CACHE_VERSION;
             // 旧订阅缓存没有图文块或媒体地址，交给服务端重取，避免把视频条目显示成空正文。
             const emptySubscription = book.contentType === 'subscription' && !text && !(Array.isArray(blocks) && blocks.length) && !mediaUrl;
             // 缓存 7 天有效。
             if (!staleSubscription && !emptySubscription && Date.now() - timestamp < 7 * 24 * 3600 * 1000) {
-              return { index, chapter: { id: cachedId || id, text, ...(Array.isArray(blocks) ? { blocks } : {}), ...(mediaUrl ? { mediaUrl } : {}), cached: true } };
+              return { index, chapter: { id: cachedId || id, text, ...(Array.isArray(blocks) ? { blocks } : {}), ...(mediaUrl ? { mediaUrl } : {}), ...(offline && typeof offline === 'object' ? { offline } : {}), cached: true } };
             }
           }
         } catch {}
@@ -2590,7 +2644,7 @@ window.__ModuleLoader__.load({
         if (next >= toc.length) return;
         const id = chapterSourceId(next, toc);
         if (!id) return;
-        const cacheKey = `mo-reader:chapter:${bookId}:${id}`;
+        const cacheKey = chapterCacheKey(bookId, id);
         try { if (localStorage.getItem(cacheKey)) return; } catch {}
         call(ctx, 'chapter', { bookId, chapterId: id }).then(value => cacheChapterPayload(cacheKey, value, id)).catch(() => {});
       };
@@ -3540,6 +3594,81 @@ window.__ModuleLoader__.load({
         transform: `translateX(${-(pageIndex * pageStep) + dragOffset}px)`,
       };
 
+      const activeChapter = isSubscription
+        ? (scrollChapters.find(entry => entry.index === chapterIndex)?.chapter || chapter)
+        : chapter;
+      const currentEntryId = activeChapter?.id || (chapterIndex >= 0 ? chapterSourceId(chapterIndex) : '');
+      const downloading = isSubscription && downloadingChapterId === currentEntryId;
+      const canDownloadCurrent = isSubscription && Boolean(currentEntryId) && Boolean(activeChapter?.mediaUrl) && !activeChapter?.offline;
+      const downloadCurrent = async () => {
+        if (!canDownloadCurrent || downloading) return;
+        if (downloadingChapterId) {
+          notify?.('这部订阅还有一条正在下载，请等它完成。', 'info');
+          return;
+        }
+        const chapterId = currentEntryId;
+        const targetIndex = chapterIndex;
+        clearInterval(downloadPollRef.current);
+        setDownloadingChapterId(chapterId);
+        let jobId = '';
+        try {
+          const created = await call(ctx, 'download', { bookId, chapterIds: [chapterId] });
+          jobId = created?.id || '';
+          notify?.('已加入下载', 'info');
+        } catch (cause) {
+          setDownloadingChapterId('');
+          notify?.(cause?.message || '下载失败，请稍后再试。', 'error');
+          return;
+        }
+        const startedAt = Date.now();
+        downloadPollRef.current = setInterval(async () => {
+          if (Date.now() - startedAt > 120000) {
+            clearInterval(downloadPollRef.current);
+            downloadPollRef.current = null;
+            setDownloadingChapterId('');
+            notify?.('下载超时，请稍后再试。', 'error');
+            return;
+          }
+          try {
+            const list = await call(ctx, 'toc', { bookId });
+            if (!Array.isArray(list)) return;
+            setToc(list);
+            const found = list.find((item, index) => (item.id || item.chapterId || item.url || String(index)) === chapterId);
+            if (!found?.offline) {
+              if (!jobId) return;
+              const job = (await call(ctx, 'state'))?.jobs?.find(item => item.id === jobId);
+              if (!job) return;
+              const reason = job.failedReasons?.[chapterId];
+              if (reason) {
+                clearInterval(downloadPollRef.current);
+                downloadPollRef.current = null;
+                setDownloadingChapterId('');
+                notify?.(reason, 'error');
+              } else if (job.status === 'failed' || job.status === 'cancelled') {
+                clearInterval(downloadPollRef.current);
+                downloadPollRef.current = null;
+                setDownloadingChapterId('');
+                notify?.('下载失败，请稍后再试。', 'error');
+              } else if (job.status === 'completed') {
+                clearInterval(downloadPollRef.current);
+                downloadPollRef.current = null;
+                setDownloadingChapterId('');
+                notify?.('这一条下载完成，但没有生成离线文件。', 'error');
+              }
+              return;
+            }
+            const value = await call(ctx, 'chapter', { bookId, chapterId });
+            clearInterval(downloadPollRef.current);
+            downloadPollRef.current = null;
+            setChapter(previous => previous && previous.id === chapterId ? { ...previous, ...value } : previous);
+            setScrollChapters(previous => previous.map(entry => entry.index === targetIndex ? { ...entry, chapter: { ...entry.chapter, ...value } } : entry));
+            cacheChapterPayload(chapterCacheKey(bookId, chapterId), value, chapterId);
+            setDownloadingChapterId('');
+            notify?.('这一条已下载，可离线播放。', 'success');
+            onRefresh?.();
+          } catch {}
+        }, 1200);
+      };
       const toolButton = (icon, label, onClick, extra = {}) => h('button', {
         type: 'button', className: 'mr-tool-btn', title: label, 'aria-label': label, onClick, ...extra,
       }, h(Glyph, { name: icon, size: 19 }), h('span', null, label));
@@ -3579,6 +3708,16 @@ window.__ModuleLoader__.load({
           h('div', { className: 'mr-reader-top-copy' },
             h('strong', null, bookLabel),
             h('span', null, name)),
+          isSubscription && (canDownloadCurrent || downloading)
+            ? h('button', {
+              type: 'button',
+              className: 'mr-reader-top-btn mr-reader-top-download',
+              'aria-label': downloading ? '正在下载' : '下载这一条',
+              title: downloading ? '正在下载' : '下载这一条',
+              disabled: downloading,
+              onClick: downloadCurrent,
+            }, h(Glyph, { name: 'download', size: 18 }), h('span', null, downloading ? '下载中' : '下载'))
+            : null,
           h('button', { type: 'button', className: 'mr-reader-top-btn', 'aria-label': '排版设置', onClick: () => setDrawer(drawer === 'settings' ? '' : 'settings') }, h(Glyph, { name: 'type', size: 18 }))),
         notice ? h(Notice, { notice, onClose: onDismissNotice }) : null,
         h('div', { className: 'mr-ambience', ref: ambienceHostRef, 'aria-hidden': true }),
@@ -3693,13 +3832,23 @@ window.__ModuleLoader__.load({
           h('div', { className: 'mr-toc' }, toc.map((item, index) => {
             const title = item.name || item.title || `第 ${index + 1} 章`;
             const unread = tracksUnread && !item.readAt;
+            const publishedAt = formatShortDate(item.publishedAt);
+            const cover = item.coverUrl || item.cover || '';
+            const coverSrc = cover && bookContentType(book) === 'subscription' && (item.id || item.chapterId)
+              ? mediaProxyUrl(book.id, item.id || item.chapterId, 'cover=1')
+              : cover;
             return h('button', {
               key: item.id || item.chapterId || item.url || index,
               ref: index === chapterIndex ? tocActiveRef : null,
               className: `${index === chapterIndex ? 'active' : ''}${unread ? ' mr-toc-unread' : ''}`,
-              'aria-label': unread ? `${title}（未读）` : title,
+              'aria-label': `${title}${publishedAt ? `（${publishedAt}）` : ''}${unread ? '（未读）' : ''}`,
               onClick: () => openChapter(index),
-            }, h('span', { className: 'mr-toc-label' }, title), unread ? h('span', { className: 'mr-toc-new', 'aria-hidden': 'true' }) : null);
+            },
+            cover ? h('span', { className: 'mr-toc-cover' }, h('img', { src: coverSrc, alt: '', loading: 'lazy', onError: (event) => { event.currentTarget.parentNode.style.display = 'none'; } })) : null,
+            h('span', { className: 'mr-toc-main' },
+              h('span', { className: 'mr-toc-label' }, title),
+              publishedAt ? h('span', { className: 'mr-toc-date' }, publishedAt) : null),
+            unread ? h('span', { className: 'mr-toc-new', 'aria-hidden': 'true' }) : null);
           }))) : null,
         drawer === 'notes' ? h('aside', { className: 'mr-drawer', role: 'dialog', 'aria-modal': true, 'aria-label': '笔记' },
           h('div', { className: 'mr-drawer-head' },
@@ -4187,7 +4336,7 @@ window.__ModuleLoader__.load({
       };
       if (activeBook) return h(React.Fragment, null, h('style', null, css), audioElement,
         bookContentType(activeBook) === 'novel' || bookContentType(activeBook) === 'subscription'
-          ? h(ReaderView, { ctx, book: activeBook, settings, notes, notice, onDismissNotice: () => setNotice(null), deferMs: opening ? 200 : 0, onSettings: updateSettings, onBookSettings: (partial) => updateBookSettings(activeBook.id || activeBook.bookId, partial), onClose: () => { setOpening(null); setReading(null); refresh(true); }, onSaveNote: saveNote, onDeleteNote: (note) => run(() => call(ctx, 'deleteNote', { id: note.id })).catch(() => {}), notify })
+          ? h(ReaderView, { ctx, book: activeBook, settings, notes, notice, onDismissNotice: () => setNotice(null), deferMs: opening ? 200 : 0, onSettings: updateSettings, onBookSettings: (partial) => updateBookSettings(activeBook.id || activeBook.bookId, partial), onClose: () => { setOpening(null); setReading(null); refresh(true); }, onRefresh: () => refresh(true), onSaveNote: saveNote, onDeleteNote: (note) => run(() => call(ctx, 'deleteNote', { id: note.id })).catch(() => {}), notify })
           : h(MediaReader, { ctx, book: activeBook, settings, notify, jobs: data.jobs || [], onClose: () => { setOpening(null); setReading(null); refresh(true); }, onRefresh: () => refresh(true), audioTrack, audioPlaying, audioTime, audioDuration, onAudioPlay: startAudio, onAudioToggle: toggleAudio, onAudioSeek: seekAudio }),
         audioTrack ? h(MediaAudioDock, { track: audioTrack, playing: audioPlaying, time: audioTime, duration: audioDuration, onToggle: toggleAudio, onSeek: seekAudio, onClose: closeAudio, onPrev: audioIndex > 0 ? () => playQueuedAudio(audioIndex - 1) : null, onNext: audioIndex >= 0 && audioIndex < audioQueue.length - 1 ? () => playQueuedAudio(audioIndex + 1) : null }) : null,
         opening ? h(OpenTransition, { key: opening.bookId || 'open', data: opening, onDone: () => setOpening(null) }) : null);
@@ -4513,7 +4662,12 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-drawer-head{height:52px;flex:0 0 52px;padding:0 8px 0 22px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid color-mix(in srgb,var(--reader-text) 10%,transparent)}
 .mr-drawer-head h2{font-size:14px;font-weight:600;letter-spacing:.22em;text-indent:.22em;color:var(--reader-text)}
 .mr-toc{overflow-y:auto;overscroll-behavior:contain;padding:6px 0 24px}
-.mr-toc button{position:relative;display:block;width:100%;min-height:44px;padding:11px 22px;border:0;border-radius:0;background:transparent;color:var(--reader-text);font-size:13px;line-height:1.55;text-align:left;opacity:.74;transition:background .15s ease,opacity .15s ease}
+.mr-toc button{position:relative;display:flex;align-items:center;gap:10px;width:100%;min-height:44px;padding:8px 22px;border:0;border-radius:0;background:transparent;color:var(--reader-text);font-size:13px;line-height:1.55;text-align:left;opacity:.74;transition:background .15s ease,opacity .15s ease}
+.mr-toc-cover{flex:none;width:36px;height:36px;border-radius:6px;overflow:hidden;background:color-mix(in srgb,var(--reader-text) 8%,transparent)}
+.mr-toc-cover img{display:block;width:100%;height:100%;object-fit:cover}
+.mr-toc-main{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}
+.mr-toc-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mr-toc-date{font-size:11px;font-weight:400;line-height:1.4;color:var(--reader-muted)}
 .mr-toc button:hover{background:color-mix(in srgb,var(--reader-text) 5%,transparent);opacity:1}
 .mr-toc button.active{color:var(--reader-accent);font-weight:600;opacity:1}
 .mr-toc button.active::before{content:"";position:absolute;left:0;top:12px;bottom:12px;width:2px;background:var(--reader-accent)}
@@ -4576,6 +4730,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 .mr-reader{position:fixed;inset:0;z-index:2147483000;width:100vw;height:100vh;height:100dvh;border-radius:0}
 .mr-reader-top{display:flex;align-items:center;gap:8px;flex:0 0 auto;padding:calc(6px + env(safe-area-inset-top,0px)) 10px 6px;border-bottom:1px solid color-mix(in srgb,var(--reader-border) 72%,transparent);background:color-mix(in srgb,var(--reader-bg) 94%,transparent);-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);z-index:9}
 .mr-reader-top-btn{flex:none;width:38px;height:38px;display:flex;align-items:center;justify-content:center;border:0;border-radius:10px;background:transparent;color:var(--reader-muted)}
+.mr-reader-top-download{width:auto;min-width:38px;padding:0 10px;gap:6px}.mr-reader-top-download span{font:500 12px/1 var(--mr-serif);white-space:nowrap}
 .mr-reader-top-btn:active{background:color-mix(in srgb,var(--reader-text) 7%,transparent)}
 .mr-reader-top-copy{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;padding:0 2px}
 .mr-reader-top-copy strong,.mr-reader-top-copy span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -4926,7 +5081,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 
     return {
       inject: ['slots', 'layout', 'remote'],
-      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, shelfPagination, ShelfBoard, ReaderNav, SHELF_CATEGORIES, bookContentType, booksForShelfCategory, WebsiteShelf, enabledWebsiteSources, websiteTarget, scrollMotion, Stats, Settings, Discover, Sources, ReaderView, MediaReader, MediaDownloadSheet, MediaAudioDock, mediaChapterSource, mediaProgressPayload, mediaStartSeconds, comicPageFromProgress, formatMediaTime, formatBytes, readerStyle: css } } : {}),
+      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, shelfPagination, ShelfBoard, ReaderNav, SHELF_CATEGORIES, bookContentType, booksForShelfCategory, WebsiteShelf, enabledWebsiteSources, websiteTarget, scrollMotion, Stats, Settings, Discover, Sources, Library, formatShortDate, ReaderView, MediaReader, MediaDownloadSheet, MediaAudioDock, mediaChapterSource, mediaProgressPayload, mediaStartSeconds, comicPageFromProgress, formatMediaTime, formatBytes, readerStyle: css } } : {}),
       async apply(ctx) {
         const unmount = await ctx.remote.$mount(readerContribution);
         const ui = ctx.inject(['remote.reader'], (inner) => {

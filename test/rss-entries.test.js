@@ -89,6 +89,14 @@ test('first toc pulls entries across pages, dedupes links and reads one entry as
   assert.equal(fetches(), count)
 })
 
+test('a subscription book exposes its latest entry time for cards', async () => {
+  const { service, book } = await fixture()
+  await service.toc({ bookId: book.id })
+  const view = (await service.state()).books.find(item => item.id === book.id)
+  assert.equal(view.latestChapter, '第一篇')
+  assert.equal(view.latestEntryAt, '2026-11-13 09:00')
+})
+
 test('reopening the same subscription keeps entries and their order', async () => {
   const { service, book, fetches } = await fixture()
   const first = await service.toc({ bookId: book.id })
@@ -191,4 +199,14 @@ test('an empty content rule still falls back to the list summary', async () => {
   const toc = await service.toc({ bookId: added.books[0].id })
   const chapter = await service.chapter({ bookId: added.books[0].id, chapterId: toc[0].id })
   assert.equal(chapter.text, '摘要第一段\n摘要第二段')
+})
+
+test('a text entry cannot be downloaded as media', async () => {
+  const { service, book } = await fixture()
+  const toc = await service.toc({ bookId: book.id })
+  await service.chapter({ bookId: book.id, chapterId: toc[0].id })
+  await assert.rejects(
+    () => service.download({ bookId: book.id, chapterIds: [toc[0].id] }),
+    (error) => error.code === 'reader/invalid-input' && /播放地址/.test(error.message),
+  )
 })
