@@ -46,6 +46,10 @@ test('basic source normalization accepts XPath and rejects unsupported syntax an
     error => error.code === 'reader/unsupported-source' && /Legado 订阅源（RSS）/.test(error.message),
   )
   assert.throws(() => normalizeSource({ ...base, ruleSearch: { ...base.ruleSearch, headers: { 'X-Api-Key': 'secret' } } }), /not allowed|must not contain secrets/)
+  assert.throws(
+    () => normalizeSource({ ...base, ruleToc: { chapterList: 0 } }),
+    error => error.code === 'reader/unsupported-rule' && /chapterList/.test(error.message),
+  )
 })
 
 test('HTTP and local/private SSRF targets are refused without network access', () => {

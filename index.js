@@ -1829,16 +1829,17 @@ export class ReaderService extends TypertRemoteService {
     const backup = parseBackup(args.data)
     // 恢复会先清空六张表再写入；任意一次写入失败都可能留下半套书源/章节。
     // 先快照旧数据，失败时整体回滚，让用户修正备份后可以直接重试。
-    const tables = [this.db.jobs, this.db.chapters, this.db.notes, this.db.books, this.db.sources, this.db.subscriptions]
-    const snapshot = tables.map(table => entries(table).map(record => clone(record)))
+    const tables = [
+      { table: this.db.jobs, records: entries(this.db.jobs).map(record => clone(record)) },
+      { table: this.db.chapters, records: entries(this.db.chapters).map(record => clone(record)) },
+      { table: this.db.notes, records: entries(this.db.notes).map(record => clone(record)) },
+      { table: this.db.books, records: entries(this.db.books).map(record => clone(record)) },
+      { table: this.db.sources, records: entries(this.db.sources).map(record => clone(record)) },
+      { table: this.db.subscriptions, records: entries(this.db.subscriptions).map(record => clone(record)) },
+    ]
     const previousSettings = clone(this.db.settings.get())
     try {
-      await this.db.jobs.deleteMany(entries(this.db.jobs).map(job => job.id))
-      await this.db.chapters.deleteMany(entries(this.db.chapters).map(chapter => chapter.id))
-      await this.db.notes.deleteMany(entries(this.db.notes).map(note => note.id))
-      await this.db.books.deleteMany(entries(this.db.books).map(book => book.id))
-      await this.db.sources.deleteMany(entries(this.db.sources).map(source => source.id))
-      await this.db.subscriptions.deleteMany(entries(this.db.subscriptions).map(subscription => subscription.id))
+      for (const { table, records } of tables) await table.deleteMany(records.map(record => record.id))
       for (const source of backup.sources) await this.db.sources.put(source.id, source)
       for (const subscription of backup.subscriptions) await this.db.subscriptions.put(subscription.id, subscription)
       for (const book of backup.books) await this.db.books.put(book.id, book)
@@ -1848,10 +1849,10 @@ export class ReaderService extends TypertRemoteService {
       return this.state()
     } catch (error) {
       let rollbackFailed = false
-      for (const [index, table] of tables.entries()) {
+      for (const { table, records } of tables) {
         try {
           await table.deleteMany(entries(table).map(record => record.id))
-          for (const record of snapshot[index]) await table.put(record.id, record)
+          for (const record of records) await table.put(record.id, record)
         } catch {
           rollbackFailed = true
         }

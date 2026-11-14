@@ -78,6 +78,7 @@ test('backup scrubs credentials from subscription header values but keeps ordina
     referer: 'https://feed.example/post/1?lang=zh',
     accept: 'application/json',
   })
+  assert.ok(parsed.sources[0].unsupported.includes('credentials'), '被删除的认证头要报告为 credentials')
 })
 
 test('feed backups drop headers and unsupported while rule subscriptions keep cleaned headers', () => {
@@ -120,6 +121,8 @@ test('feed backups drop headers and unsupported while rule subscriptions keep cl
   const feedSource = exported.sources.find((source) => source.feed === true)
   assert.equal(Object.hasOwn(feedSource, 'headers'), false)
   assert.equal(Object.hasOwn(feedSource, 'unsupported'), false)
+  assert.equal(Object.hasOwn(feedSource, 'rules'), false)
+  assert.equal(Object.hasOwn(feedSource, 'contentType'), false)
   const ruleSource = exported.sources.find((source) => source.id === 'rule-source-id')
   assert.deepEqual(ruleSource.headers, {
     referer: 'https://rule.example/post/1?lang=zh',
@@ -130,6 +133,66 @@ test('feed backups drop headers and unsupported while rule subscriptions keep cl
   const restoredRule = parsed.sources.find((source) => source.kind === 'rss' && source.feed !== true)
   assert.equal(restoredRule.headers.referer, 'https://rule.example/post/1?lang=zh')
   assert.deepEqual(restoredRule.unsupported, ['login'])
+})
+
+test('backup cleans relative header URLs and keeps benign query names', () => {
+  const token = 'relative-header-token'
+  const json = createBackup({
+    sources: [{
+      id: 'rss-relative',
+      name: '订阅源',
+      bookSourceUrl: 'https://feed.example/rss.xml',
+      kind: 'rss',
+      categories: [{ name: '分类', url: 'https://feed.example/rss.xml' }],
+      headers: {
+        referer: '/p?token=' + token + '&lang=zh#frag',
+        next: '//feed.example/p?access_token=' + token + '&design=1&author=2',
+        accept: 'application/json',
+      },
+      rules: { toc: { chapterList: '.entry' } },
+    }],
+    books: [],
+    chapters: [],
+    settings: {},
+    notes: [],
+  })
+  assert.equal(json.includes(token), false)
+  const headers = JSON.parse(json).sources[0].headers
+  assert.equal(headers.referer, '/p?lang=zh')
+  assert.equal(headers.next, '//feed.example/p?design=1&author=2')
+  assert.equal(headers.accept, 'application/json')
+  const parsed = parseBackup(json)
+  assert.equal(parsed.sources[0].headers.referer, '/p?lang=zh')
+  assert.equal(parsed.sources[0].headers.next, '//feed.example/p?design=1&author=2')
+})
+
+test('backup drops source Cookie and Authorization headers instead of rejecting the file', () => {
+  const json = createBackup({
+    sources: [{
+      id: 'rss-cookie',
+      name: '订阅源',
+      bookSourceUrl: 'https://feed.example/rss.xml',
+      kind: 'rss',
+      categories: [{ name: '分类', url: 'https://feed.example/rss.xml' }],
+      headers: { referer: 'https://feed.example/p?token=secret&lang=zh' },
+      rules: { toc: { chapterList: '.entry' } },
+    }],
+    books: [],
+    chapters: [],
+    settings: {},
+    notes: [],
+  })
+  const backup = JSON.parse(json)
+  backup.sources[0].headers = {
+    Cookie: 'sid=secret',
+    Authorization: 'Bearer secret',
+    referer: 'https://feed.example/p?token=secret&lang=zh',
+  }
+  const parsed = parseBackup(JSON.stringify(backup))
+  assert.equal('Cookie' in parsed.sources[0].headers, false)
+  assert.equal('Authorization' in parsed.sources[0].headers, false)
+  assert.equal(parsed.sources[0].headers.referer, 'https://feed.example/p?lang=zh')
+  assert.ok(parsed.sources[0].unsupported.includes('credentials'))
 })
 
 test('backup keeps subscription anchors and dates but drops runtime anchor errors', () => {
@@ -187,6 +250,7 @@ test('backup keeps subscription categories, anchor and read state but no media c
       title: '条目 2',
       url: 'https://feed.example/post/2',
       text: '正文',
+      description: '<p>正文</p>',
       readAt: '2026-11-13T01:00:00.000Z',
       mediaUrl: 'https://media.example/video.mp4',
       images: ['https://media.example/image.jpg'],
@@ -210,6 +274,35 @@ test('backup keeps subscription categories, anchor and read state but no media c
   assert.equal(parsed.books[0].latestChapter, '条目 2')
   assert.equal(parsed.chapters[0].readAt, '2026-11-13T01:00:00.000Z')
   assert.equal(parsed.chapters[0].mediaUrl, undefined)
+})
+
+test('feed entries still need a non-empty summary when text is present', () => {
+  const json = createBackup({
+    sources: [{
+      id: 'feed-source',
+      name: 'Feed',
+      bookSourceUrl: 'https://feed.example/rss.xml',
+      kind: 'rss',
+      feed: true,
+      categories: [{ name: '分类', url: 'https://feed.example/rss.xml' }],
+    }],
+    books: [{ id: 'b', sourceId: 'feed-source', bookUrl: 'https://feed.example/rss.xml', name: '订阅', contentType: 'subscription', subscription: { sourceId: 'feed-source', categoryName: '分类' } }],
+    chapters: [{ id: 'c', bookId: 'b', index: 0, title: '条目', url: 'https://feed.example/post/1', text: '正文' }],
+    settings: {},
+    notes: [],
+  })
+  assert.throws(() => parseBackup(json), /缺少摘要/)
+})
+
+test('an empty text is treated as missing for a novel chapter', () => {
+  const json = createBackup({
+    sources: [{ id: 's', name: '书源', bookSourceUrl: 'https://novel.example', rules: {} }],
+    books: [{ id: 'b', sourceId: 's', bookUrl: 'https://novel.example/book/1', name: '小说' }],
+    chapters: [{ id: 'c', bookId: 'b', index: 0, title: '第一章', url: 'https://novel.example/chapter/1', text: '' }],
+    settings: {},
+    notes: [],
+  })
+  assert.throws(() => parseBackup(json), /引用或内容无效/)
 })
 
 test('backup accepts a subscription media entry without text', () => {

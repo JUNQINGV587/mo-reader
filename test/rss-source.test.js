@@ -300,7 +300,7 @@ test('a backup with a secret key in a subscription rule is refused with its fiel
 test('a backup with a WebView subscription rule is refused with its field path', async () => {
   const backup = await exportedRssBackup()
   backup.sources.find((item) => item.kind === 'rss').rules.content.content = '<webview src="https://rss.example/player">'
-  await rejectsBackup(backup, /sources\[0\]\.rules\.content\.content.*WebView/)
+  await rejectsBackup(backup, /sources\[0\]\.rules\.content\.content.*该订阅源需要 WebView/)
 })
 
 test('subscriptions do not offer download jobs before entries exist', async () => {

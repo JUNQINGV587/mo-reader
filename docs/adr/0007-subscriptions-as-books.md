@@ -84,6 +84,13 @@ Negative:
 - 下载粒度是 ADR-0006 §7/§9 的订阅例外：订阅一次只能下载一条，入口在阅读器，不进 autoDownload；图文/图集条目没有离线下载，只有媒体条目可离线。
 - Non-goals 中「不定义图文块/抽址/播放器」由本节更新，现已实现；不执行 `injectJs`、不内嵌 WebView 的边界不变。
 
+### 2026-11-14 — 备份恢复的凭据与规则边界（#79）
+
+- 订阅源、订阅作品与条目元数据可随备份恢复；条目正文/媒体缓存/离线文件仍不进入备份。请求头在导出与恢复时都清洗 URL 用户名/密码、片段和敏感查询参数，并丢弃 Bearer/Basic/Token 值；源 headers 里的 Cookie/Authorization 在恢复时丢弃，不因坏头拒绝整份备份，规则里的敏感键仍拒绝。
+- 规则型订阅源的规则恢复复用导入校验（敏感键、WebView、类型），坏备份报 `reader/invalid-backup` 并带 `sources[i].rules` 路径，不落库；feed 源不校验规则，也不导出 `rules`/`contentType`/headers/unsupported。
+- 规则型订阅源允许恢复「无正文、只有条目 URL」的媒体条目，首次打开时重新抓取；RSS 2.0 feed 的每个条目仍必须有非空摘要，空 `text` 不能替代。
+- 恢复失败整体回滚六张表（jobs/chapters/notes/books/sources/subscriptions）与设置，避免留下半套数据；备份版本仍为 2。
+
 ## Alternatives considered
 
 - **单独的 feeds/articles 表**：拒绝。会复制书架、进度、笔记、备份和追更逻辑，且用户看到两套阅读入口。
