@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { createBackup, parseBackup } from '../lib/backup.js'
 import { createJob, transitionJob } from '../lib/jobs.js'
 import { stableId } from '../lib/utils.js'
+import { serviceFixture, source } from './helpers.js'
 
 test('persistent download state machine supports queue, recovery, progress and cancellation', () => {
   const created = createJob({ bookId: 'b1', total: 2 })
@@ -302,6 +303,28 @@ test('backup still rejects a novel chapter without text', () => {
   assert.throws(() => parseBackup(json), /引用或内容无效/)
 })
 
+test('backup rejects text-less chapters for every non-subscription content type', async () => {
+  for (const contentType of ['novel', 'comic', 'audio', 'video']) {
+    const bookId = `book-${contentType}`
+    const backup = createBackup({
+      sources: [source],
+      books: [{ id: bookId, sourceId: source.id, bookUrl: `https://example.com/${contentType}`, name: contentType, contentType }],
+      chapters: [{ id: `chapter-${contentType}`, bookId, index: 0, title: '缺正文', url: `https://example.com/${contentType}/1` }],
+      settings: {},
+      notes: [],
+    })
+    const { service, db } = await serviceFixture()
+    await assert.rejects(
+      () => service.importBackup({ data: backup }),
+      (error) => error.code === 'reader/invalid-backup' && /引用或内容无效/.test(error.message),
+      `${contentType} 作品缺正文应被拒绝`,
+    )
+    assert.equal(db.sources.size, 0, `${contentType} 备份被拒绝后不应留下源`)
+    assert.equal(db.books.size, 0, `${contentType} 备份被拒绝后不应留下作品`)
+    assert.equal(db.chapters.size, 0, `${contentType} 备份被拒绝后不应留下章节`)
+  }
+})
+
 test('a version-1 backup without subscription fields still imports', () => {
   const old = {
     type: 'modu-reader-backup',
@@ -343,4 +366,101 @@ test('backup never carries an unconfirmed candidate snapshot', () => {
   const parsed = parseBackup(json)
   assert.equal(parsed.subscriptions[0].status, 'ready')
   assert.equal(parsed.subscriptions[0].pending, undefined)
+})
+
+test('backup round trip keeps chapter id, title, url, publishedAt and readAt through the service', async () => {
+  const { service: exporter, db: sourceDb } = await serviceFixture()
+  await sourceDb.sources.put(source.id, source)
+  const book = { id: 'book-meta', sourceId: source.id, bookUrl: 'https://example.com/book/meta', name: '元数据', contentType: 'novel' }
+  await sourceDb.books.put(book.id, book)
+  const chapter = {
+    id: 'chapter-meta',
+    bookId: book.id,
+    index: 0,
+    title: '带元数据的章节',
+    url: 'https://example.com/chapter/meta',
+    text: '正文',
+    publishedAt: '2026-11-01T08:30:00.000Z',
+    readAt: '2026-11-02T09:45:00.000Z',
+  }
+  await sourceDb.chapters.put(chapter.id, chapter)
+
+  const backup = await exporter.exportBackup()
+  const { service: importer, db: restoredDb } = await serviceFixture()
+  await importer.importBackup({ data: backup })
+
+  const restored = restoredDb.chapters.get(chapter.id)
+  assert.ok(restored, '恢复后应保留原条目 ID')
+  assert.equal(restored.id, chapter.id)
+  assert.equal(restored.title, chapter.title)
+  assert.equal(restored.url, chapter.url)
+  assert.equal(restored.publishedAt, chapter.publishedAt)
+  assert.equal(restored.readAt, chapter.readAt)
+})
+
+test('a version-1 backup round trips through the service and repeated restore does not duplicate records', async () => {
+  const oldSourceId = stableId('source', 'https://old.example')
+  const old = {
+    type: 'modu-reader-backup',
+    version: 1,
+    exportedAt: '2026-01-01T00:00:00.000Z',
+    sources: [{ id: oldSourceId, name: '旧源', bookSourceUrl: 'https://old.example', rules: {} }],
+    books: [{ id: 'old-book', sourceId: oldSourceId, bookUrl: 'https://old.example/book', name: '旧书' }],
+    chapters: [{ id: 'old-chapter', bookId: 'old-book', index: 0, title: '第一章', url: 'https://old.example/c', text: '旧正文' }],
+    notes: [],
+    settings: {},
+  }
+  const data = JSON.stringify(old)
+  const { service, db } = await serviceFixture()
+  await service.importBackup({ data })
+  await service.importBackup({ data })
+
+  assert.equal(db.sources.size, 1)
+  assert.equal(db.books.size, 1)
+  assert.equal(db.chapters.size, 1)
+  assert.equal(db.sources.get(oldSourceId).name, '旧源')
+  assert.equal(db.books.get('old-book').name, '旧书')
+  assert.equal(db.chapters.get('old-chapter').text, '旧正文')
+})
+
+test('a failed restore rolls back sources, books and chapters instead of leaving a partial import', async () => {
+  const { service, db } = await serviceFixture()
+  await db.sources.put(source.id, source)
+  const oldBook = { id: 'old-book', sourceId: source.id, bookUrl: 'https://example.com/old', name: '旧书', contentType: 'novel' }
+  await db.books.put(oldBook.id, oldBook)
+  const oldChapter = { id: 'old-chapter', bookId: oldBook.id, index: 0, title: '旧章', url: 'https://example.com/old/1', text: '旧正文' }
+  await db.chapters.put(oldChapter.id, oldChapter)
+
+  const backupUrl = 'https://backup.example'
+  const backupSource = { ...source, id: stableId('source', backupUrl), bookSourceUrl: backupUrl, rules: {} }
+  const backupBook = { id: 'new-book', sourceId: backupSource.id, bookUrl: backupUrl + '/book', name: '新书', contentType: 'novel' }
+  const backupChapter = { id: 'new-chapter', bookId: backupBook.id, index: 0, title: '新章', url: backupUrl + '/c', text: '新正文' }
+  const backup = createBackup({ sources: [backupSource], books: [backupBook], chapters: [backupChapter], settings: {}, notes: [] })
+
+  const originalPut = db.chapters.put.bind(db.chapters)
+  db.chapters.put = async (key, value) => {
+    if (key === backupChapter.id) throw new Error('simulated write failure')
+    return originalPut(key, value)
+  }
+  await assert.rejects(
+    () => service.importBackup({ data: backup }),
+    (error) => error.code === 'reader/restore-failed' && /已保留原有数据/.test(error.message),
+  )
+
+  assert.equal(db.sources.size, 1)
+  assert.equal(db.books.size, 1)
+  assert.equal(db.chapters.size, 1)
+  assert.equal(db.sources.get(source.id).name, source.name)
+  assert.equal(db.books.get(oldBook.id).name, oldBook.name)
+  assert.equal(db.chapters.get(oldChapter.id).text, oldChapter.text)
+  assert.equal(db.sources.get(backupSource.id), undefined)
+  assert.equal(db.books.get(backupBook.id), undefined)
+  assert.equal(db.chapters.get(backupChapter.id), undefined)
+
+  db.chapters.put = originalPut
+  await service.importBackup({ data: backup })
+  assert.equal(db.sources.size, 1)
+  assert.equal(db.books.size, 1)
+  assert.equal(db.chapters.size, 1)
+  assert.equal(db.chapters.get(backupChapter.id).title, backupChapter.title)
 })
