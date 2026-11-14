@@ -44,6 +44,25 @@ test('backup allowlists records and strips secrets instead of exporting them', (
   assert.deepEqual(parseBackup(JSON.parse(json)), parsed)
 })
 
+test('backup keeps subscription anchors and dates but drops runtime anchor errors', () => {
+  const json = createBackup({
+    sources: [],
+    books: [{
+      id: 'b', sourceId: 's', bookUrl: 'https://example.com/b', name: 'B', contentType: 'subscription',
+      subscription: { sourceId: 's', anchorUrl: 'https://example.com/post/2', anchorError: '发布时间不完整' },
+    }],
+    chapters: [{ id: 'c', bookId: 'b', index: 0, title: 'C', url: 'https://example.com/post/2', text: '正文', publishedAt: '2026-11-12', readAt: '2026-11-13T00:00:00.000Z' }],
+    settings: {},
+    notes: [],
+  })
+  assert.equal(json.includes('发布时间不完整'), false)
+  const parsed = parseBackup(json)
+  assert.equal(parsed.books[0].subscription.anchorUrl, 'https://example.com/post/2')
+  assert.equal(parsed.books[0].subscription.anchorError, undefined)
+  assert.equal(parsed.chapters[0].publishedAt, '2026-11-12')
+  assert.equal(parsed.chapters[0].readAt, '2026-11-13T00:00:00.000Z')
+})
+
 test('backup import rejects secrets and malformed references', () => {
   assert.throws(() => parseBackup('{"type":"modu-reader-backup","version":1,"token":"x"}'), /must not contain secrets/)
   assert.throws(() => parseBackup('{}'), /格式或版本/)

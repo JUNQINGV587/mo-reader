@@ -4219,7 +4219,16 @@ window.__ModuleLoader__.load({
                 return call(ctx, 'cancelJob', { jobId });
               });
               return run(() => pending, '已暂停').catch(() => {});
-            }, onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), '补查完成').catch(() => {}) }) : null,
+            }, onRemove: (book) => run(() => call(ctx, 'removeBook', { bookId: book.id || book.bookId }), '已移出书架').catch(() => {}), onCheck: () => run(() => call(ctx, 'checkUpdates'), null).then((result) => {
+              const updated = Number(result?.updated || 0);
+              const warnings = Number(result?.warnings?.length || 0);
+              const errors = Array.isArray(result?.errors) ? result.errors : [];
+              const parts = [updated ? `${updated} 部有更新` : '补查完成'];
+              if (warnings) parts.push(`${warnings} 部订阅本轮无法判断新条目，目录未变`);
+              if (errors.length) parts.push(`${errors.length} 处失败：${String(errors[0].message || '').slice(0, 80)}`);
+              notify(parts.join('；'), errors.length ? 'error' : warnings ? 'info' : 'success');
+              return result;
+            }).catch(() => {}) }) : null,
           !loading && tab === 'discover' ? h(Discover, { sources, onSearch: search, onAdd: addBook, results, busy, failed: searchFailed }) : null,
           !loading && tab === 'sources' ? h(Sources, { sources, subscriptions: data.subscriptions || [], checkingIds: [...new Set([...(data.subscriptions || []).filter(item => item.checking).map(item => item.id), ...refreshingSubscriptions])], busy, onImport: importSource, onAddSubscriptions: addSubscriptions,
               onRestoreBuiltin: () => run(() => call(ctx, 'restoreBuiltinSources'), '内置书源已恢复').then((result) => { if (result) setNotice({ kind: 'success', text: `已恢复 ${result.added} 个内置书源` }); }, () => {}),

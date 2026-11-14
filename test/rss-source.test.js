@@ -117,14 +117,19 @@ test('addSubscriptions creates one subscription book per selected category', asy
   assert.equal(again.missing.length, 0)
 })
 
-test('hourly updates skip subscription books until the entry pipeline is wired', async () => {
-  const { service } = await serviceFixture({ toc: async () => { throw new Error('subscription books must not use the book toc path') } })
+test('hourly updates use the subscription toc path instead of the book toc path', async () => {
+  let subscriptionTocs = 0
+  const { service } = await serviceFixture({
+    toc: async () => { throw new Error('subscription books must not use the book toc path') },
+    subscriptionToc: async () => { subscriptionTocs += 1; return [] },
+  })
   const imported = await service.importSource({ text: JSON.stringify(rssSample()) })
   await service.addSubscriptions({ sourceId: imported.sourceId, categories: [imported.categories[0].url] })
 
   const result = await service.checkUpdates()
-  assert.equal(result.checked, 0)
-  assert.equal(result.skipped, 1)
+  assert.equal(subscriptionTocs, 1)
+  assert.equal(result.checked, 1)
+  assert.equal(result.skipped, 0)
   assert.deepEqual(result.errors, [])
 })
 

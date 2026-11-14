@@ -18,6 +18,7 @@ import { applyReplacements, applyReplacementsToBlocks } from './lib/replacements
 import { assertSettingKeys, normalizeReaderPrefs, normalizeSettings } from './lib/settings.js'
 import { normalizeSource } from './lib/rules.js'
 import { categoryPageUrl, detectRssSource, normalizeRssSource, rssImportSummary } from './lib/rss-source.js'
+import { SUBSCRIPTION_ENTRY_LIMIT, decideSubscriptionAdditions, mergeSubscriptionChapters, pruneSubscriptionChapters } from './lib/subscription-follow.js'
 import { BUILTIN_SOURCES } from './lib/builtin-sources.js'
 import { SourceEngine } from './lib/source-engine.js'
 import { parseSourceLibrary, permissionExpansion, planSourceRefresh } from './lib/subscription-refresh.js'
@@ -160,7 +161,10 @@ export class ReaderService extends TypertRemoteService {
   async runMaintenance() {
     const [updates, subscriptions] = await Promise.allSettled([this.checkUpdates(), this.refreshSubscriptions()])
     if (updates.status === 'rejected') this.log('warn', 'Scheduled book update check failed', updates.reason)
-    else for (const error of updates.value?.errors ?? []) this.log('warn', 'Book update failed', error)
+    else {
+      for (const warning of updates.value?.warnings ?? []) this.log('warn', 'Subscription update paused', warning)
+      for (const error of updates.value?.errors ?? []) this.log('warn', 'Book update failed', error)
+    }
     if (subscriptions.status === 'rejected') this.log('warn', 'Scheduled subscription refresh failed', subscriptions.reason)
     else for (const error of subscriptions.value?.errors ?? []) this.log('warn', 'Subscription refresh failed', error)
     return {
@@ -423,14 +427,15 @@ export class ReaderService extends TypertRemoteService {
     let updated = 0
     const timestamp = now()
     for (const { category, bookId, bookUrl } of prepared) {
+      const existing = this.db.books.get(bookId)
       const subscription = {
+        ...(existing?.subscription || {}),
         sourceId: source.id,
         sourceName: source.name,
         categoryName: category.name,
         sortUrl: category.url,
-        anchorUrl: null,
+        anchorUrl: existing?.subscription?.anchorUrl ?? null,
       }
-      const existing = this.db.books.get(bookId)
       if (existing) {
         await this.db.books.put(bookId, { ...existing, sourceId: source.id, bookUrl, name: category.name, contentType: 'subscription', subscription, updatedAt: timestamp })
         updated += 1
@@ -863,8 +868,8 @@ export class ReaderService extends TypertRemoteService {
     return chapters
   }
 
-  // 订阅条目只增不删：刷新时保留已有条目与阅读顺序，只补齐新链接。
-  // 失败时调用方不会走到这里，旧目录自然留在库里。
+  // 订阅条目只增不删：锚点还在首页时按锚点之前的条目补齐；锚点滚出首页时用发布时间兜底，
+  // 时间缺失或锚点边界无法判定就不猜，保留旧目录并记下原因。抓取失败时调用方不会走到这里。
   async syncSubscriptionToc(book, fresh) {
     const old = this.chapters(book.id)
     let latest = this.db.books.get(book.id) ?? book
@@ -882,29 +887,38 @@ export class ReaderService extends TypertRemoteService {
       latest = { ...latest, readBaselineAt: baseline }
     }
     const seedFreshReadAt = needsBaseline && old.length === 0
-    const oldByUrl = new Map(old.map(chapter => [chapter.url, chapter]))
-    const freshUrls = new Set()
-    const merged = fresh.map(chapter => {
-      freshUrls.add(chapter.url)
-      const cached = oldByUrl.get(chapter.url)
-      if (!cached) return {
-        ...chapter,
-        bookId: book.id,
-        contentType: 'subscription',
-        ...(seedFreshReadAt ? { readAt: chapter.readAt ?? baseline } : {}),
-      }
-      return { ...cached, ...chapter, id: cached.id, index: cached.index, bookId: book.id, contentType: 'subscription' }
+    const decision = decideSubscriptionAdditions({ fresh, old, anchorUrl: latest.subscription?.anchorUrl ?? null })
+    if (decision.reason) {
+      await this.db.books.put(book.id, {
+        ...latest,
+        subscription: { ...latest.subscription, anchorError: decision.reason },
+        lastCheckedAt: now(),
+      })
+      return { chapters: old, added: 0, anchorError: decision.reason }
+    }
+    const additions = seedFreshReadAt
+      ? decision.additions.map(chapter => ({ ...chapter, readAt: chapter.readAt ?? baseline }))
+      : decision.additions
+    const merged = mergeSubscriptionChapters({ old, additions, fresh, bookId: book.id })
+    const pruned = pruneSubscriptionChapters({
+      chapters: merged,
+      limit: SUBSCRIPTION_ENTRY_LIMIT,
+      progressChapterId: latest.progress?.chapterId,
+      anchorUrl: decision.anchorUrl,
     })
-    for (const cached of old) if (!freshUrls.has(cached.url)) merged.push(cached)
-    const chapters = merged.map((chapter, index) => ({ ...chapter, index }))
-    for (const chapter of chapters) await this.db.chapters.put(chapter.id, chapter)
+    for (const chapter of pruned.chapters) await this.db.chapters.put(chapter.id, chapter)
+    if (pruned.removed.length) await this.db.chapters.deleteMany(pruned.removed.map(chapter => chapter.id))
+    const subscription = { ...latest.subscription, anchorUrl: decision.anchorUrl }
+    delete subscription.anchorError
+    const checkedAt = now()
     await this.db.books.put(book.id, {
       ...latest,
+      subscription,
       latestChapter: fresh[0]?.title ?? latest.latestChapter,
-      lastCheckedAt: now(),
-      updatedAt: now(),
+      lastCheckedAt: checkedAt,
+      updatedAt: checkedAt,
     })
-    return chapters
+    return { chapters: pruned.chapters, added: additions.length, anchorError: null }
   }
 
   async toc(args) {
@@ -917,7 +931,8 @@ export class ReaderService extends TypertRemoteService {
     const source = this.source(book.sourceId)
     if (normalizeBookContentType(book.contentType) === 'subscription') {
       const fresh = await this.engine.subscriptionToc(source, book)
-      return (await this.syncSubscriptionToc(book, fresh)).map(chapter => this.chapterView(chapter))
+      const synced = await this.syncSubscriptionToc(book, fresh)
+      return synced.chapters.map(chapter => this.chapterView(chapter))
     }
     const fresh = await this.engine.toc(source, book)
     return (await this.syncToc(book, fresh)).map(chapter => this.chapterView(chapter))
@@ -956,7 +971,8 @@ export class ReaderService extends TypertRemoteService {
       if (content) {
         const headers = content.headers && typeof content.headers === 'object' ? clone(content.headers) : {}
         if (Object.keys(headers).length) this.streamHeaders.set(chapter.id, headers)
-        chapter = { ...chapter, ...content, downloadedAt: now() }
+        // 订阅条目每次打开都会缓存正文；这不等于用户下载了它，不能拿 downloadedAt 挡住 500 条上限。
+        chapter = subscription ? { ...chapter, ...content } : { ...chapter, ...content, downloadedAt: now() }
         // 订阅条目的媒体头要跨重启保留；普通视频沿用内存 Map，避免改变既有落库形状。
         if (subscription && Object.keys(headers).length) chapter.headers = headers
         else delete chapter.headers
@@ -1300,14 +1316,17 @@ export class ReaderService extends TypertRemoteService {
 
   async checkUpdates() {
     this.assertReady()
-    const result = { checked: 0, skipped: 0, updated: 0, errors: [] }
+    const result = { checked: 0, skipped: 0, updated: 0, warnings: [], errors: [] }
+    const subscriptionGroups = new Map()
     for (const original of entries(this.db.books).filter(book => !book.local)) {
+      if (normalizeBookContentType(original.contentType) === 'subscription') {
+        const group = subscriptionGroups.get(original.sourceId)
+        if (group) group.push(original)
+        else subscriptionGroups.set(original.sourceId, [original])
+        continue
+      }
+      // 小说/漫画/音频/视频/网页保持原来的逐本检查，不因为订阅的去重与串行改变行为。
       try {
-        // 订阅条目的拉取与追更由后续票接入；现在不能按书源目录去抓。
-        if (normalizeBookContentType(original.contentType) === 'subscription') {
-          result.skipped += 1
-          continue
-        }
         const source = this.source(original.sourceId, { allowDisabled: true })
         if (source.enabled === false) {
           result.skipped += 1
@@ -1326,7 +1345,44 @@ export class ReaderService extends TypertRemoteService {
         result.errors.push({ bookId: original.id, message: error.message })
       }
     }
+    const seenErrors = new Set()
+    // 订阅按来源分组、组内逐本顺序检查：同一来源的多个分类不会并发打源站。
+    for (const [sourceId, books] of subscriptionGroups) {
+      let source
+      try {
+        source = this.source(sourceId, { allowDisabled: true })
+      } catch (error) {
+        this.pushUpdateError(result, seenErrors, books[0], sourceId, error)
+        continue
+      }
+      if (source.enabled === false) {
+        result.skipped += books.length
+        continue
+      }
+      let firstError = null
+      for (const original of books) {
+        try {
+          result.checked += 1
+          const fresh = await this.engine.subscriptionToc(source, original)
+          const synced = await this.syncSubscriptionToc(original, fresh)
+          if (synced.added) result.updated += 1
+          if (synced.anchorError) result.warnings.push({ bookId: original.id, message: synced.anchorError })
+        } catch (error) {
+          firstError ??= error
+          this.pushUpdateError(result, seenErrors, original, sourceId, error)
+        }
+      }
+      // 整组成功才清掉旧的源错误；只要有一本失败，就把来源标成失效，旧目录已经在 sync 前保留。
+      await this.markSourceStatus(sourceId, firstError)
+    }
     return result
+  }
+
+  pushUpdateError(result, seenErrors, book, sourceId, error) {
+    // 同一来源的多个分类往往报同样的错，每个来源只留一条，避免整页都是重复错误。
+    if (seenErrors.has(sourceId)) return
+    seenErrors.add(sourceId)
+    result.errors.push({ bookId: book.id, sourceId, message: error.message })
   }
 
   async importLocal(args) {
