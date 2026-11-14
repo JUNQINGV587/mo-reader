@@ -58,6 +58,23 @@ test('basic source normalization accepts XPath and rejects unsupported syntax an
   )
 })
 
+test('common Legado header formats import without dropping the source', () => {
+  const base = { bookSourceName: 'header-test', bookSourceUrl: 'https://example.com', ruleSearch: { bookList: '.book' } }
+  const pairs = normalizeSource({ ...base, header: [['User-Agent', 'A'], 'Referer: https://example.com'] })
+  assert.equal(pairs.headers['user-agent'], 'A')
+  assert.equal(pairs.headers.referer, 'https://example.com')
+  assert.equal(pairs.unsupported.includes('headers'), false)
+  const loose = normalizeSource({ ...base, header: "{'User-Agent':'B','Referer':'https://example.com',}" })
+  assert.equal(loose.headers['user-agent'], 'B')
+  assert.equal(loose.headers.referer, 'https://example.com')
+  const lines = normalizeSource({ ...base, header: 'User-Agent: C\nReferer: https://example.com' })
+  assert.equal(lines.headers['user-agent'], 'C')
+  assert.equal(lines.headers.referer, 'https://example.com')
+  const invalid = normalizeSource({ ...base, header: 42 })
+  assert.equal(invalid.headers, undefined)
+  assert.deepEqual(invalid.unsupported, ['headers'])
+})
+
 test('Legado retry metadata is ignored instead of rejecting the source', () => {
   const base = { bookSourceName: 'retry-test', bookSourceUrl: 'https://example.com', ruleSearch: { bookList: '.book' } }
   const fromUrlOptions = normalizeSource({ ...base, searchUrl: '/search,{"retry":3}' })

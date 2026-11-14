@@ -1415,7 +1415,7 @@ window.__ModuleLoader__.load({
         if (!urls.length || busy || !onAddSubscriptions) return;
         onAddSubscriptions(item.sourceId, urls).then((result) => { if (result) dismissRssImport(item.sourceId); }, () => {});
       };
-      const rssCapabilityLabels = { login: '登录', 'inject-js': '注入脚本', credentials: '登录凭据' };
+      const rssCapabilityLabels = { login: '登录', 'inject-js': '注入脚本', credentials: '登录凭据', headers: '请求头' };
       return h('div', { className: 'mr-screen mr-sources-screen' },
         h(ScreenHead, {
           kicker: 'MO READ · 窗边 / 书源',
@@ -1530,7 +1530,7 @@ window.__ModuleLoader__.load({
               const name = source.bookSourceName || source.name || '书源';
               const disabled = source.enabled === false;
               const local = source.id === 'local' || source.bookSourceUrl === 'local:';
-              const unsupportedLabels = { login: '登录', captcha: '验证码', payment: '付费', webview: '内置网页', 'inject-js': '注入脚本', credentials: '登录凭据' };
+              const unsupportedLabels = { login: '登录', captcha: '验证码', payment: '付费', webview: '内置网页', 'inject-js': '注入脚本', credentials: '登录凭据', headers: '请求头' };
               const unsupported = (Array.isArray(source.unsupported) ? source.unsupported : []).filter((item) => item !== 'cookie').map((item) => unsupportedLabels[item] || item);
               return h('article', { className: `mr-source-row${disabled ? ' is-disabled' : ''}`, key: id },
                 h('span', { className: 'mr-source-icon', 'aria-hidden': true }, name.slice(0, 1)),
