@@ -17,7 +17,7 @@ function siteFetch(requests = []) {
       return response(url, '<div class="book"><span class="name">书</span><a href="/book/1">详情</a></div>')
     }
     if (target.pathname === '/book/1') {
-      return response(url, '<h1>书</h1><ul><li class="chapter"><a href="/chapter/1">第一章</a></li></ul>')
+      return response(url, '<h1>书</h1><img class="cover" src="/cover-1.jpg"><img class="cover" src="/cover-2.jpg"><ul><li class="chapter"><a href="/chapter/1">第一章</a></li></ul>')
     }
     if (target.pathname === '/chapter/1') {
       return response(url, '<div id="content"><p>第一段</p><p>第二段</p></div>')
@@ -29,9 +29,46 @@ function siteFetch(requests = []) {
   }
 }
 
+function multiPartChapterFetch() {
+  const html = siteFetch()
+  return async (url) => {
+    if (new URL(url).pathname === '/chapter/1') {
+      return response(url, '<div class="part"><p>甲段</p></div><div class="part"><p>乙段</p></div>')
+    }
+    return html(url)
+  }
+}
+
+function jsonChapterFetch() {
+  const html = siteFetch()
+  return async (url) => {
+    if (new URL(url).pathname === '/chapter/1') {
+      return response(url, JSON.stringify({ sections: [{ text: '甲段' }, { text: '乙段' }] }), 'application/json')
+    }
+    return html(url)
+  }
+}
+
+function xpathChapterFetch() {
+  const html = siteFetch()
+  return async (url) => {
+    if (new URL(url).pathname === '/chapter/1') {
+      return response(url, '<p>甲段</p><p>乙段</p>')
+    }
+    return html(url)
+  }
+}
+
 async function importSource(service, rules) {
   const imported = await service.importSource({ text: JSON.stringify({ bookSourceName: '上下文样本', bookSourceUrl: SITE, rules }) })
   return imported.id
+}
+
+async function readChapter(service, sourceId) {
+  const found = await service.search({ sourceId, query: '样本' })
+  const book = await service.addBook({ sourceId, bookUrl: found.items[0].bookUrl })
+  const toc = await service.toc({ bookId: book.id })
+  return service.chapter({ bookId: book.id, chapterId: toc[0].id })
 }
 
 test('URL templates resolve JS expressions with the current page and keyword', async () => {
@@ -53,11 +90,79 @@ test('a JS rule can transform the result of the selector that precedes it', asyn
     toc: { chapterList: '.chapter', chapterName: 'a', chapterUrl: 'a@href' },
     content: { content: '#content@html@js:result.replace(/<[^>]+>/g, "|")' },
   })
+  const chapter = await readChapter(service, sourceId)
+  assert.equal(chapter.text, '|第一段||第二段|')
+})
+
+test('a selector prefix hands every match to the JS rule, not just the first', async () => {
+  const { service } = await serviceFixture(new SourceEngine({ fetch: multiPartChapterFetch() }))
+  const sourceId = await importSource(service, {
+    search: { url: '/search', bookList: '.book', name: '.name', bookUrl: 'a@href' },
+    bookInfo: { name: 'h1' },
+    toc: { chapterList: '.chapter', chapterName: 'a', chapterUrl: 'a@href' },
+    content: { content: '.part@html@js:result.replace(/<[^>]+>/g, "|")' },
+  })
+  const chapter = await readChapter(service, sourceId)
+  assert.equal(chapter.text, '|甲段|\n|乙段|')
+})
+
+test('a text selector prefix joins matches before the JS runs', async () => {
+  const { service } = await serviceFixture(new SourceEngine({ fetch: multiPartChapterFetch() }))
+  const sourceId = await importSource(service, {
+    search: { url: '/search', bookList: '.book', name: '.name', bookUrl: 'a@href' },
+    bookInfo: { name: 'h1' },
+    toc: { chapterList: '.chapter', chapterName: 'a', chapterUrl: 'a@href' },
+    content: { content: '.part@js:result.replace(/\\n/g, "|")' },
+  })
+  const chapter = await readChapter(service, sourceId)
+  assert.equal(chapter.text, '甲段|乙段')
+})
+
+test('URL fields keep only the first selector match for JS rules', async () => {
+  const { service } = await serviceFixture(new SourceEngine({ fetch: siteFetch() }))
+  const sourceId = await importSource(service, {
+    search: { url: '/search', bookList: '.book', name: '.name', bookUrl: 'a@href' },
+    bookInfo: { name: 'h1', coverUrl: '.cover@src@js:result + "?x"' },
+  })
   const found = await service.search({ sourceId, query: '样本' })
   const book = await service.addBook({ sourceId, bookUrl: found.items[0].bookUrl })
-  const toc = await service.toc({ bookId: book.id })
-  const chapter = await service.chapter({ bookId: book.id, chapterId: toc[0].id })
-  assert.equal(chapter.text, '|第一段||第二段|')
+  assert.equal(book.coverUrl, `${SITE}/cover-1.jpg?x`)
+})
+
+test('a selector prefix joins JSONPath matches before the JS runs', async () => {
+  const { service } = await serviceFixture(new SourceEngine({ fetch: jsonChapterFetch() }))
+  const sourceId = await importSource(service, {
+    search: { url: '/search', bookList: '.book', name: '.name', bookUrl: 'a@href' },
+    bookInfo: { name: 'h1' },
+    toc: { chapterList: '.chapter', chapterName: 'a', chapterUrl: 'a@href' },
+    content: { content: '@Json:$.sections[*].text@js:result.replace(/\\n/g, "|")' },
+  })
+  const chapter = await readChapter(service, sourceId)
+  assert.equal(chapter.text, '甲段|乙段')
+})
+
+test('a selector prefix joins XPath matches before the JS runs', async () => {
+  const { service } = await serviceFixture(new SourceEngine({ fetch: xpathChapterFetch() }))
+  const sourceId = await importSource(service, {
+    search: { url: '/search', bookList: '.book', name: '.name', bookUrl: 'a@href' },
+    bookInfo: { name: 'h1' },
+    toc: { chapterList: '.chapter', chapterName: 'a', chapterUrl: 'a@href' },
+    content: { content: '//p@js:result.replace(/\\n/g, "|")' },
+  })
+  const chapter = await readChapter(service, sourceId)
+  assert.equal(chapter.text, '甲段|乙段')
+})
+
+test('a selector prefix with no match runs the JS with an empty result', async () => {
+  const { service } = await serviceFixture(new SourceEngine({ fetch: siteFetch() }))
+  const sourceId = await importSource(service, {
+    search: { url: '/search', bookList: '.book', name: '.name', bookUrl: 'a@href' },
+    bookInfo: { name: 'h1' },
+    toc: { chapterList: '.chapter', chapterName: 'a', chapterUrl: 'a@href' },
+    content: { content: '.missing@js:result === "" ? "空结果" : "非空"' },
+  })
+  const chapter = await readChapter(service, sourceId)
+  assert.equal(chapter.text, '空结果')
 })
 
 test('a bare JS rule receives the whole page as its result', async () => {
@@ -68,10 +173,7 @@ test('a bare JS rule receives the whole page as its result', async () => {
     toc: { chapterList: '.chapter', chapterName: 'a', chapterUrl: 'a@href' },
     content: { content: '@js:result.match(/<p>([\\s\\S]*?)<\\/p>/)[1]' },
   })
-  const found = await service.search({ sourceId, query: '样本' })
-  const book = await service.addBook({ sourceId, bookUrl: found.items[0].bookUrl })
-  const toc = await service.toc({ bookId: book.id })
-  const chapter = await service.chapter({ bookId: book.id, chapterId: toc[0].id })
+  const chapter = await readChapter(service, sourceId)
   assert.equal(chapter.text, '第一段')
 })
 
@@ -94,10 +196,7 @@ test('a JS rule can run multiple statements and return the last expression', asy
     toc: { chapterList: '.chapter', chapterName: 'a', chapterUrl: 'a@href' },
     content: { content: '@js:const text = result.match(/<p>([\\s\\S]*?)<\\/p>/)[1]; text + "!"' },
   })
-  const found = await service.search({ sourceId, query: '样本' })
-  const book = await service.addBook({ sourceId, bookUrl: found.items[0].bookUrl })
-  const toc = await service.toc({ bookId: book.id })
-  const chapter = await service.chapter({ bookId: book.id, chapterId: toc[0].id })
+  const chapter = await readChapter(service, sourceId)
   assert.equal(chapter.text, '第一段!')
 })
 
