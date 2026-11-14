@@ -39,6 +39,9 @@ test('basic source normalization accepts XPath and rejects unsupported syntax an
   assert.throws(() => normalizeSource({ ...base, ruleSearch: { ...base.ruleSearch, headers: { Cookie: 'secret' } } }), /not allowed|must not contain secrets/)
   assert.throws(() => normalizeSource({ ...base, token: 'secret' }), /must not contain secrets/)
   assert.equal(normalizeSource({ ...base, bookSourceType: 4 }).contentType, 'video')
+  assert.deepEqual(normalizeSource({ ...base, headers: { 'User-Agent': 'ModuReader/1.0', 'Accept-Language': 'zh-CN' } }).headers, { 'user-agent': 'ModuReader/1.0', 'accept-language': 'zh-CN' })
+  assert.equal(normalizeSource({ ...base, headers: '{"User-Agent":"ModuReader/1.0"}' }).headers['user-agent'], 'ModuReader/1.0')
+  assert.throws(() => normalizeSource({ ...base, headers: { Cookie: 'secret' } }), /not allowed|must not contain secrets/)
   assert.throws(() => normalizeSource({ ...base, bookSourceType: 3 }), /类型 3|网络文件/)
   assert.throws(() => normalizeSource({ sourceName: '采集源', sourceUrl: 'https://example.com' }), /采集源|bookSourceUrl/)
   assert.throws(

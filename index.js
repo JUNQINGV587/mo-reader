@@ -20,7 +20,7 @@ import { normalizeSource } from './lib/rules.js'
 import { categoryPageUrl, detectRssSource, normalizeRssSource, rssImportSummary } from './lib/rss-source.js'
 import { ATOM_UNSUPPORTED_MESSAGE, MAX_FEED_BYTES, feedKind, normalizeFeedSource, parseRssFeed } from './lib/rss-feed.js'
 import { SUBSCRIPTION_ENTRY_LIMIT, decideSubscriptionAdditions, insertSubscriptionEntry, mergeSubscriptionChapters, pruneSubscriptionChapters } from './lib/subscription-follow.js'
-import { BUILTIN_SOURCES } from './lib/builtin-sources.js'
+import { BUILTIN_SOURCES, BUILTIN_SOURCES_VERSION, RETIRED_BUILTIN_SOURCE_NAMES } from './lib/builtin-sources.js'
 import { SourceEngine } from './lib/source-engine.js'
 import { parseSourceLibrary, permissionExpansion, planSourceRefresh } from './lib/subscription-refresh.js'
 import { DEFAULT_SETTINGS, entries, openReaderStorage } from './lib/storage.js'
@@ -99,11 +99,7 @@ export class ReaderService extends TypertRemoteService {
     for (const job of entries(this.db.jobs)) {
       if (job.status === 'running') await this.db.jobs.put(job.id, transitionJob(job, 'recover'))
     }
-    try {
-      await this.runMaintenance()
-    } catch (error) {
-      this.log('warn', 'Startup maintenance failed', error)
-    }
+    this.startupMaintenance = this.runMaintenance().catch(error => this.log('warn', 'Startup maintenance failed', error))
     for (const job of entries(this.db.jobs)) if (job.status === 'queued') this.scheduleJob(job.id)
   }
 
@@ -185,18 +181,42 @@ export class ReaderService extends TypertRemoteService {
       await this.db.sources.put(source.id, { ...source, builtin: true })
       added += 1
     }
-    await this.db.settings.set({ ...settings, builtinSourcesAt: settings.builtinSourcesAt ?? now() })
+    await this.db.settings.set({ ...settings, builtinSourcesAt: settings.builtinSourcesAt ?? now(), builtinSourcesVersion: BUILTIN_SOURCES_VERSION })
     return { added, total: BUILTIN_SOURCES.length }
   }
 
   async seedBuiltinSources() {
     const settings = this.db.settings.get()
-    if (settings.builtinSourcesAt) return
+    if (settings.builtinSourcesAt) {
+      await this.migrateBuiltinSources(settings)
+      return
+    }
     for (const raw of BUILTIN_SOURCES) {
       const source = normalizeSource(raw)
       if (!this.db.sources.get(source.id)) await this.db.sources.put(source.id, { ...source, builtin: true })
     }
-    await this.db.settings.set({ ...settings, builtinSourcesAt: now() })
+    await this.db.settings.set({ ...settings, builtinSourcesAt: now(), builtinSourcesVersion: BUILTIN_SOURCES_VERSION })
+  }
+
+  async migrateBuiltinSources(settings) {
+    const current = settings.builtinSourcesVersion ?? 1
+    if (current >= BUILTIN_SOURCES_VERSION) return
+    // Only add sources introduced after the installed version. Re-adding every
+    // builtin would revive sources the user removed on purpose.
+    for (const raw of BUILTIN_SOURCES) {
+      if ((raw.builtinSince ?? 1) <= current) continue
+      const source = normalizeSource(raw)
+      if (!this.db.sources.get(source.id)) await this.db.sources.put(source.id, { ...source, builtin: true })
+    }
+    for (const name of RETIRED_BUILTIN_SOURCE_NAMES) {
+      for (const source of entries(this.db.sources)) {
+        if (!source.builtin || source.name !== name) continue
+        const used = entries(this.db.books).some(book => book.sourceId === source.id)
+        if (used) await this.db.sources.put(source.id, { ...source, enabled: false, retired: true })
+        else await this.db.sources.delete(source.id)
+      }
+    }
+    await this.db.settings.set({ ...this.db.settings.get(), builtinSourcesVersion: BUILTIN_SOURCES_VERSION })
   }
 
   log(level, message, error) {

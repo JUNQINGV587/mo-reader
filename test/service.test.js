@@ -253,6 +253,7 @@ test('Service.init opens storage, recovers persisted jobs and registers hourly u
     return disposer
   }
   await service[Service.init]()
+  await service.startupMaintenance
   assert.deepEqual(routes.map(route => route.path), ['/api/reader/media', '/api/reader/proxy', '/api/reader/hls.js'])
   rejection = 401
   const denied = { statusCode: 0, headers: {}, setHeader(key, value) { this.headers[key] = value }, end() { this.ended = true } }
@@ -278,12 +279,39 @@ test('builtin sources are seeded once and can be turned off without re-adding', 
   const { service, db } = await serviceFixture()
   await service.seedBuiltinSources()
   const seeded = [...db.sources.entries()].map(([, value]) => value)
-  assert.deepEqual(seeded.map(item => item.name).sort(), ['17K 小说', '维基文库'])
+  assert.deepEqual(seeded.map(item => item.name).sort(), ['MangaDex 漫画', '品书斋', '维基文库'])
   assert.equal(seeded.every(item => item.builtin === true), true)
   // Second call is a no-op even after the user deletes one.
   await db.sources.delete(seeded[0].id)
   await service.seedBuiltinSources()
-  assert.equal(db.sources.size, 1)
+  assert.equal(db.sources.size, 2)
+})
+
+test('builtin migration adds new sources and retires 17K without reviving deleted sources', async () => {
+  const { service, db } = await serviceFixture()
+  await db.settings.set({ ...db.settings.get(), builtinSourcesAt: '2026-01-01T00:00:00.000Z' })
+  await db.sources.put('legacy-17k', {
+    id: 'legacy-17k', name: '17K 小说', bookSourceUrl: 'https://www.17k.com', builtin: true,
+    enabled: true, contentType: 'novel', rules: {},
+  })
+  await service.seedBuiltinSources()
+  assert.deepEqual([...db.sources.entries()].map(([, item]) => item.name).sort(), ['MangaDex 漫画', '品书斋'])
+  assert.equal(db.settings.get().builtinSourcesVersion, 2)
+})
+
+test('builtin migration keeps a retired source when a book still uses it', async () => {
+  const { service, db } = await serviceFixture()
+  await db.settings.set({ ...db.settings.get(), builtinSourcesAt: '2026-01-01T00:00:00.000Z' })
+  await db.sources.put('legacy-17k', {
+    id: 'legacy-17k', name: '17K 小说', bookSourceUrl: 'https://www.17k.com', builtin: true,
+    enabled: true, contentType: 'novel', rules: {},
+  })
+  await db.books.put('book-1', { id: 'book-1', name: '旧书', sourceId: 'legacy-17k' })
+  await service.seedBuiltinSources()
+  const legacy = db.sources.get('legacy-17k')
+  assert.equal(legacy.enabled, false)
+  assert.equal(legacy.retired, true)
+  assert.equal([...db.sources.entries()].filter(([, item]) => item.name === '品书斋').length, 1)
 })
 
 test('addBook accepts search-result data when a source has no bookInfo rule', async () => {
