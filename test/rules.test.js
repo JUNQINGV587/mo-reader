@@ -58,6 +58,16 @@ test('basic source normalization accepts XPath and rejects unsupported syntax an
   )
 })
 
+test('book source comments mentioning WebView do not reject the source', () => {
+  const base = { bookSourceName: 'comment-test', bookSourceUrl: 'https://example.com', ruleSearch: { bookList: '.book' } }
+  const source = normalizeSource({ ...base, bookSourceComment: '该源需要 WebView 才能看评论，请用浏览器打开。' })
+  assert.equal(source.name, 'comment-test')
+  assert.throws(
+    () => normalizeSource({ ...base, ruleContent: { content: 'webView://chapter' } }),
+    error => error.code === 'reader/unsupported-source' && /WebView/.test(error.message),
+  )
+})
+
 test('common Legado header formats import without dropping the source', () => {
   const base = { bookSourceName: 'header-test', bookSourceUrl: 'https://example.com', ruleSearch: { bookList: '.book' } }
   const pairs = normalizeSource({ ...base, header: [['User-Agent', 'A'], 'Referer: https://example.com'] })
