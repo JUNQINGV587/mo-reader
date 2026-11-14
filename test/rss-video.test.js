@@ -106,6 +106,27 @@ test('a video entry probes candidates in order, plays the first working address 
   assert.equal(fetches(), before)
 })
 
+test('a restored subscription media entry is fetched and played again', async () => {
+  const { service, book, db } = await fixture()
+  const toc = await service.toc({ bookId: book.id })
+  const opened = await service.chapter({ bookId: book.id, chapterId: toc[0].id })
+  assert.equal(opened.mediaUrl, LIVE)
+
+  const backup = await service.exportBackup()
+  await service.importBackup({ data: backup })
+
+  const restoredSource = db.sources.get(book.sourceId)
+  assert.equal(restoredSource.headers.referer, SITE + '/watch')
+  assert.equal(restoredSource.rules.toc.chapterList, '.entry')
+  assert.equal(restoredSource.rules.content.content, '#player')
+
+  const restoredToc = await service.toc({ bookId: book.id })
+  assert.equal(restoredToc.length, 1)
+  const restored = await service.chapter({ bookId: book.id, chapterId: restoredToc[0].id })
+  assert.equal(restored.mediaUrl, LIVE)
+  assert.equal(restored.mediaHls, true)
+})
+
 test('a .m3u8 address stays HLS even when the server says octet-stream', async () => {
   const url = 'https://media.example/live.m3u8'
   const requests = []

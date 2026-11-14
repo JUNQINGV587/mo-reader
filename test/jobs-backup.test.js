@@ -124,6 +124,56 @@ test('backup keeps subscription categories, anchor and read state but no media c
   assert.equal(parsed.chapters[0].mediaUrl, undefined)
 })
 
+test('backup accepts a subscription media entry without text', () => {
+  const json = createBackup({
+    sources: [{
+      id: 's',
+      name: '订阅源',
+      bookSourceUrl: 'https://feed.example',
+      kind: 'rss',
+      categories: [{ name: '分类', url: 'https://feed.example' }],
+      rules: {},
+    }],
+    books: [{
+      id: 'b',
+      sourceId: 's',
+      bookUrl: 'https://feed.example',
+      name: '订阅',
+      contentType: 'subscription',
+      subscription: { sourceId: 's', categoryName: '分类', sortUrl: 'https://feed.example' },
+    }],
+    chapters: [{
+      id: 'c',
+      bookId: 'b',
+      index: 0,
+      title: '视频条目',
+      url: 'https://feed.example/post/1',
+      publishedAt: '2026-11-14',
+      readAt: '2026-11-14T01:00:00.000Z',
+      mediaUrl: 'https://media.example/live.m3u8',
+      mediaHls: true,
+    }],
+    settings: {},
+    notes: [],
+  })
+  const parsed = parseBackup(json)
+  assert.equal(parsed.chapters.length, 1)
+  assert.equal(parsed.chapters[0].text, undefined)
+  assert.equal(parsed.chapters[0].url, 'https://feed.example/post/1')
+  assert.equal(parsed.chapters[0].readAt, '2026-11-14T01:00:00.000Z')
+})
+
+test('backup still rejects a novel chapter without text', () => {
+  const json = createBackup({
+    sources: [{ id: 's', name: '书源', bookSourceUrl: 'https://novel.example', rules: {} }],
+    books: [{ id: 'b', sourceId: 's', bookUrl: 'https://novel.example/book/1', name: '小说' }],
+    chapters: [{ id: 'c', bookId: 'b', index: 0, title: '第一章', url: 'https://novel.example/chapter/1' }],
+    settings: {},
+    notes: [],
+  })
+  assert.throws(() => parseBackup(json), /引用或内容无效/)
+})
+
 test('a version-1 backup without subscription fields still imports', () => {
   const old = {
     type: 'modu-reader-backup',
