@@ -18,6 +18,7 @@ import { applyReplacements, applyReplacementsToBlocks } from './lib/replacements
 import { assertSettingKeys, normalizeReaderPrefs, normalizeSettings } from './lib/settings.js'
 import { normalizeSource } from './lib/rules.js'
 import { categoryPageUrl, detectRssSource, normalizeRssSource, rssImportSummary } from './lib/rss-source.js'
+import { ATOM_UNSUPPORTED_MESSAGE, MAX_FEED_BYTES, feedKind, normalizeFeedSource, parseRssFeed } from './lib/rss-feed.js'
 import { SUBSCRIPTION_ENTRY_LIMIT, decideSubscriptionAdditions, mergeSubscriptionChapters, pruneSubscriptionChapters } from './lib/subscription-follow.js'
 import { BUILTIN_SOURCES } from './lib/builtin-sources.js'
 import { SourceEngine } from './lib/source-engine.js'
@@ -336,6 +337,7 @@ export class ReaderService extends TypertRemoteService {
     return {
       ...clone(book),
       contentType: normalizeBookContentType(book.contentType),
+      latestChapter: book.latestChapter ?? chapters.at(-1)?.title,
       unread,
       lastRead: clone(book.progress ?? null),
       sourceHome: /^https?:/i.test(String(source?.bookSourceUrl ?? '')) ? source.bookSourceUrl : null,
@@ -362,18 +364,49 @@ export class ReaderService extends TypertRemoteService {
     this.assertReady()
     assertObject(args)
     let text = args.text
-    if (text === undefined && args.url !== undefined) {
-      const response = await this.fetchRemote(requiredString(args.url, 'url', 4096), { allowHttp: args.allowHttp === true, maxBytes: 2 * 1024 * 1024 })
+    let feedUrl = args.url === undefined || args.url === null ? undefined : requiredString(args.url, 'url', 4096)
+    if (text === undefined && feedUrl !== undefined) {
+      const response = await this.fetchRemote(feedUrl, { allowHttp: args.allowHttp === true, maxBytes: MAX_FEED_BYTES })
       text = response.text
+      // 重定向后的地址才是 feed 的真实基准地址。
+      feedUrl = response.url || feedUrl
     }
     if (typeof text !== 'string') throw new ReaderError('reader/invalid-input', 'importSource requires text or url.')
+    const allowHttp = args.allowHttp === true
+    if (text.trimStart().startsWith('<')) {
+      const kind = feedKind(text)
+      if (!kind) throw new ReaderError('reader/invalid-source', '这个地址不是 RSS/Atom feed，也不是书源 JSON。')
+      // Atom 不需要 feed URL 也能明确报「不支持」，不要把用户引到「填写 feed 地址」。
+      if (kind === 'atom') {
+        throw new ReaderError('reader/unsupported-source', ATOM_UNSUPPORTED_MESSAGE)
+      }
+      if (Buffer.byteLength(text) > MAX_FEED_BYTES) {
+        throw new ReaderError('reader/too-large', 'RSS feed 超过 2 MiB，无法导入。')
+      }
+      if (!feedUrl) throw new ReaderError('reader/invalid-input', '导入 RSS 订阅需要填写 feed 地址。')
+      const parsed = parseRssFeed(text, { feedUrl, allowHttp })
+      if (!parsed.entries.length) throw new ReaderError('reader/parse-error', '这个 RSS feed 没有可阅读的条目。')
+      const feedSource = normalizeFeedSource(parsed, { feedUrl, allowHttp })
+      const existed = Boolean(this.db.sources.get(feedSource.id))
+      const saved = await this.saveSource(feedSource)
+      // 一个 feed 就是一部订阅：导入即建作品，用户不需要再走分类勾选。
+      let added
+      try {
+        added = await this.addSubscriptions({ sourceId: saved.id, categories: saved.categories.map(category => category.url) })
+      } catch (error) {
+        // 新建源时作品没建起来就回滚源，避免书源列表里留下一个无作品的孤儿。
+        if (!existed) await this.db.sources.deleteMany([saved.id])
+        throw error
+      }
+      return { ...rssImportSummary(saved), feed: true, imported: 0, skipped: [], total: 1, names: [], added: added.added, books: added.books }
+    }
     let raw
     try {
       raw = JSON.parse(text)
     } catch (error) {
+      if (feedUrl) throw new ReaderError('reader/invalid-source', '这个地址不是 RSS/Atom feed，也不是书源 JSON。', undefined, { cause: error })
       throw new ReaderError('reader/invalid-source', '书源不是有效 JSON。', undefined, { cause: error })
     }
-    const allowHttp = args.allowHttp === true
     if (Array.isArray(raw)) {
       const imported = []
       const rss = []

@@ -52,7 +52,7 @@ window.__ModuleLoader__.load({
       { id: 'audio', label: '音频', icon: 'audio', unit: '本', blurb: '听书与播客，戴上耳机继续。', empty: '导入音频书源后，作品会出现在这里。' },
       { id: 'video', label: '视频', icon: 'video', unit: '本', blurb: '影视与课程，按集播放。', empty: '导入视频书源后，作品会出现在这里。' },
       { id: 'website', label: '网页', icon: 'web', unit: '个', blurb: '网站入口，点击在浏览器打开。', empty: '在书源里添加网站源，启用后会出现在这里。' },
-      { id: 'subscription', label: '订阅', icon: 'rss', unit: '份', blurb: '订阅源的最新条目，按时间倒序。', empty: '在书源里导入 Legado 订阅源，勾选分类后会出现在这里。' },
+      { id: 'subscription', label: '订阅', icon: 'rss', unit: '份', blurb: '订阅源的最新条目，按时间倒序。', empty: '在书源里导入 Legado 订阅源或 RSS 2.0 feed 后会出现在这里。' },
     ];
     const SHELF_CATEGORY_IDS = new Set(SHELF_CATEGORIES.map((item) => item.id));
     const BOOK_CONTENT_TYPES = new Set(['novel', 'comic', 'audio', 'video', 'subscription']);
@@ -1310,6 +1310,9 @@ window.__ModuleLoader__.load({
 
     function importSummary(result) {
       if (!result || typeof result !== 'object') return '书源已导入';
+      if (result.feed === true) return Number(result.added) > 0
+        ? `已加入订阅「${result.name || '订阅源'}」`
+        : `订阅「${result.name || '订阅源'}」已在书架`;
       const rss = Array.isArray(result.rss) ? result.rss : result.kind === 'rss' ? [result] : [];
       const imported = result.kind === 'rss' ? 0 : Number(result.imported || 0);
       const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
@@ -1370,13 +1373,14 @@ window.__ModuleLoader__.load({
           h('div', { className: 'mr-sources-left' },
             h('section', { className: 'mr-window-card', 'aria-labelledby': 'source-import-title' },
               h('h2', { id: 'source-import-title' }, '导入书源'),
-              h('p', { className: 'mr-help' }, '粘贴书源 JSON，或填写公开 URL。不绕过登录、付费或验证码。'),
-              h('textarea', { value: draft, onChange: (e) => setDraft(e.target.value), placeholder: '粘贴书源 JSON，或填写公开 URL', rows: 5, 'aria-label': '书源 JSON 或 URL' }),
+              h('p', { className: 'mr-help' }, '粘贴书源或订阅源 JSON，或填写公开 URL（含 RSS 2.0 feed）。不绕过登录、付费或验证码。'),
+              h('textarea', { value: draft, onChange: (e) => setDraft(e.target.value), placeholder: '粘贴书源或订阅源 JSON，或填写公开 URL', rows: 5, 'aria-label': '书源、订阅源 JSON 或 URL' }),
               h('label', { className: 'mr-check' }, h('input', { type: 'checkbox', checked: allowHttp, onChange: (e) => setAllowHttp(e.target.checked) }), '允许明文 HTTP'),
               h('div', { className: 'mr-inline-actions' },
                 h(Button, { kind: 'primary', icon: 'plus', disabled: busy || !draft.trim(), onClick: () => onImport(draft, allowHttp).then((result) => {
                   setDraft('');
-                  const list = Array.isArray(result?.rss) ? result.rss : result?.kind === 'rss' ? [result] : [];
+                  // feed 导入即建好作品，不再弹分类勾选面板。
+                  const list = (Array.isArray(result?.rss) ? result.rss : result?.kind === 'rss' ? [result] : []).filter((item) => item.feed !== true);
                   if (!list.length) return;
                   setRssImports((current) => {
                     const next = [...current];
@@ -1480,7 +1484,7 @@ window.__ModuleLoader__.load({
                 h('div', null, h('h3', null, name), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl), source.kind === 'rss' && unsupported.length ? h('p', { className: 'mr-source-unsupported' }, `导入时丢弃：${unsupported.join('、')}`) : null),
                 h('div', { className: 'mr-source-side' },
                   h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || (unsupported.length ? `不支持：${unsupported.join('、')}` : '') }, local ? '本机导入' : source.kind === 'rss' ? (disabled ? '订阅源 · 已停用' : '订阅源') : source.contentType === 'website' ? (disabled ? '网站 · 已停用' : '网站入口') : disabled ? '已停用' : source.lastError ? '解析失败 · 需更新规则' : unsupported.length ? `不支持 · ${unsupported.join('/')}` : source.builtin ? '内置 · 可用' : (source.compatibility || '基础规则')),
-                  source.kind === 'rss' && source.categories?.length ? h(Button, { kind: 'text', onClick: () => openRssSource(source), disabled: busy }, '分类') : null,
+                  source.kind === 'rss' && source.feed !== true && source.categories?.length ? h(Button, { kind: 'text', onClick: () => openRssSource(source), disabled: busy }, '分类') : null,
                   local ? null : h(Button, { kind: 'text', onClick: () => onToggle(source), disabled: busy, 'aria-pressed': !disabled }, disabled ? '启用' : '停用'),
                   source.builtin || local ? null : h(Button, { kind: 'text danger', onClick: () => onRemove(source), disabled: busy }, '移除')));
             }) : h(Empty, { icon: 'source', title: '暂无书源', detail: '导入后即可搜索和追更。' }))));
