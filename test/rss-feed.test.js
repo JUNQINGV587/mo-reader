@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { SourceEngine } from '../lib/source-engine.js'
 import { serviceFixture } from './helpers.js'
+import { stableId } from '../lib/utils.js'
 
 const FEED_URL = 'https://feed.example/rss.xml'
 const ATOM_URL = 'https://feed.example/atom.xml'
@@ -322,7 +323,7 @@ test('a pasted feed over the 2 MiB limit is refused before parsing', async () =>
   const { service, db } = await fixture('')
   const body = '<rss version="2.0">' + ' '.repeat(2 * 1024 * 1024) + '</rss>'
   await assert.rejects(
-    service.importSource({ text: body }),
+    service.importSource({ text: body, url: FEED_URL }),
     (error) => error.code === 'reader/too-large',
   )
   assert.equal(db.sources.size, 0)
@@ -392,6 +393,164 @@ test('feed subscriptions reuse the 500 entry cap', async () => {
   for (const entry of initial.slice(-5)) assert.equal(cappedIds.has(entry.id), false)
   assert.equal(capped[0].title, '条目505')
   assert.equal(chapters(db).length, 500)
+})
+
+test('backup rejects invalid subscription book metadata', async () => {
+  const body = feed({ items: [item({ title: '元数据', link: '/posts/meta', description: '摘要', date: 'Thu, 13 Nov 2025 09:00:00 GMT' })] })
+  const { service, db } = await fixture(body)
+  await service.importSource({ url: FEED_URL })
+  const book = books(db)[0]
+  await service.toc({ bookId: book.id })
+  const backup = JSON.parse(await service.exportBackup())
+  const variants = [
+    (entry) => { entry.latestChapter = {} },
+    (entry) => { entry.latestChapter = 123 },
+    (entry) => { entry.readBaselineAt = 1 },
+  ]
+  for (const mutate of variants) {
+    const copy = JSON.parse(JSON.stringify(backup))
+    mutate(copy.books[0])
+    const fresh = await fixture(body)
+    await assert.rejects(
+      fresh.service.importBackup({ data: copy }),
+      (error) => error.code === 'reader/invalid-backup',
+    )
+  }
+})
+
+test('a restored subscription without latestChapter falls back to its newest entry', async () => {
+  const body = feed({
+    items: [
+      item({ title: '最新条目', link: '/posts/newest', description: '摘要', date: 'Fri, 14 Nov 2025 09:00:00 GMT' }),
+      item({ title: '最旧条目', link: '/posts/oldest', description: '摘要', date: 'Wed, 12 Nov 2025 09:00:00 GMT' }),
+    ],
+  })
+  const { service, db } = await fixture(body)
+  await service.importSource({ url: FEED_URL })
+  const book = books(db)[0]
+  await service.toc({ bookId: book.id })
+  const stored = db.books.get(book.id)
+  delete stored.latestChapter
+  await db.books.put(book.id, stored)
+  const state = await service.state()
+  const view = state.books.find((entry) => entry.id === book.id)
+  assert.equal(view.latestChapter, '最新条目')
+})
+
+test('feed cover HTTP policy follows allowHttp', async () => {
+  const body = feed({
+    items: [item({
+      title: '明文封面',
+      link: '/posts/http-cover',
+      description: '摘要',
+      date: 'Thu, 13 Nov 2025 09:00:00 GMT',
+      thumb: 'http://feed.example/cover.jpg',
+    })],
+  })
+  const plain = await fixture(body)
+  await plain.service.importSource({ url: FEED_URL })
+  const plainToc = await plain.service.toc({ bookId: books(plain.db)[0].id })
+  assert.equal(plainToc[0].coverUrl, undefined)
+
+  const allowed = await fixture(body)
+  await allowed.service.importSource({ url: FEED_URL, allowHttp: true })
+  const allowedToc = await allowed.service.toc({ bookId: books(allowed.db)[0].id })
+  assert.equal(allowedToc[0].coverUrl, 'http://feed.example/cover.jpg')
+})
+
+test('a failed subscription creation rolls back a newly imported feed source', async () => {
+  const body = feed({ items: [item({ title: '回滚', link: '/posts/rollback', description: '摘要', date: 'Thu, 13 Nov 2025 09:00:00 GMT' })] })
+  const { service, db } = await fixture(body)
+  service.addSubscriptions = async () => { throw new Error('boom') }
+  await assert.rejects(service.importSource({ url: FEED_URL }), /boom/)
+  assert.equal(db.sources.size, 0)
+  assert.equal(db.books.size, 0)
+})
+
+test('a feed with more than 2000 entries is capped during parsing', async () => {
+  const items = Array.from({ length: 2001 }, (_, index) => item({
+    title: '条目' + index,
+    link: '/posts/' + index,
+    description: '摘要' + index,
+    date: new Date(Date.UTC(2025, 10, 13, 9, index % 60)).toUTCString(),
+  }))
+  const { service, db } = await fixture(feed({ items }))
+  await service.importSource({ url: FEED_URL })
+  const toc = await service.toc({ bookId: books(db)[0].id })
+  assert.equal(toc.length, 2000)
+})
+
+test('a restored feed with too many categories is rejected', async () => {
+  const body = feed({ items: [item({ title: '分类上限', link: '/posts/categories', description: '摘要', date: 'Thu, 13 Nov 2025 09:00:00 GMT' })] })
+  const { service, db } = await fixture(body)
+  await service.importSource({ url: FEED_URL })
+  await service.toc({ bookId: books(db)[0].id })
+  const backup = JSON.parse(await service.exportBackup())
+  const source = backup.sources.find((entry) => entry.feed === true)
+  source.categories = Array.from({ length: 501 }, (_, index) => ({ name: '分类' + index, url: 'https://feed.example/category/' + index }))
+  const fresh = await fixture(body)
+  await assert.rejects(
+    fresh.service.importBackup({ data: backup }),
+    (error) => error.code === 'reader/invalid-backup',
+  )
+})
+
+test('a namespaced RSS root still parses through its local element names', async () => {
+  const body = '<rss:rss xmlns:rss="http://purl.org/rss/1.0/" xmlns:content="http://purl.org/rss/1.0/modules/content/" version="2.0">'
+    + '<rss:channel><rss:title>前缀源</rss:title>'
+    + '<rss:item><rss:title>前缀条目</rss:title><rss:link>https://feed.example/ns/1</rss:link>'
+    + '<rss:description><![CDATA[<p>前缀摘要</p>]]></rss:description>'
+    + '<rss:pubDate>Thu, 13 Nov 2025 09:00:00 GMT</rss:pubDate></rss:item>'
+    + '</rss:channel></rss:rss>'
+  const { service, db } = await fixture(body)
+  await service.importSource({ url: FEED_URL })
+  const toc = await service.toc({ bookId: books(db)[0].id })
+  assert.equal(toc[0].title, '前缀条目')
+})
+
+test('a feed backup preserves read state and the follow anchor', async () => {
+  const body = feed({
+    items: [
+      item({ title: '已读条目', link: '/posts/read', description: '摘要', date: 'Fri, 14 Nov 2025 09:00:00 GMT' }),
+      item({ title: '未读条目', link: '/posts/unread', description: '摘要', date: 'Thu, 13 Nov 2025 09:00:00 GMT' }),
+    ],
+  })
+  const { service, db } = await fixture(body)
+  await service.importSource({ url: FEED_URL })
+  const book = books(db)[0]
+  const toc = await service.toc({ bookId: book.id })
+  await service.markChapterRead({ bookId: book.id, chapterId: toc[0].id })
+  const backup = await service.exportBackup()
+  const fresh = await fixture(body)
+  const state = await fresh.service.importBackup({ data: backup })
+  const restored = state.books.find((entry) => entry.contentType === 'subscription')
+  assert.equal(restored.unread, 1)
+  assert.equal(restored.subscription.anchorUrl, toc[0].url)
+  const restoredToc = await fresh.service.toc({ bookId: restored.id })
+  assert.equal(restoredToc[0].url, toc[0].url)
+  assert.equal(restoredToc[0].readAt !== undefined, true)
+  assert.equal(restoredToc[1].readAt, undefined)
+})
+
+test('a version-1 backup without subscription fields imports through the service', async () => {
+  const { service } = await fixture('')
+  const sourceId = stableId('source', 'https://old.example')
+  const state = await service.importBackup({
+    data: {
+      type: 'modu-reader-backup',
+      version: 1,
+      exportedAt: '2026-01-01T00:00:00.000Z',
+      sources: [{ id: sourceId, name: '旧源', bookSourceUrl: 'https://old.example', rules: {} }],
+      books: [{ id: 'b', sourceId, bookUrl: 'https://old.example/book', name: '旧书' }],
+      chapters: [{ id: 'c', bookId: 'b', index: 0, title: '第一章', url: 'https://old.example/c', text: '旧正文' }],
+      notes: [],
+      settings: {},
+    },
+  })
+  assert.equal(state.sources.filter((entry) => entry.name === '旧源').length, 1)
+  assert.equal(state.books.length, 1)
+  assert.equal(state.books[0].name, '旧书')
+  assert.equal(state.books[0].contentType, 'novel')
 })
 
 test('feed sources and subscription books survive a backup round trip', async () => {

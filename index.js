@@ -337,7 +337,7 @@ export class ReaderService extends TypertRemoteService {
     return {
       ...clone(book),
       contentType: normalizeBookContentType(book.contentType),
-      latestChapter: book.latestChapter ?? chapters.at(-1)?.title,
+      latestChapter: book.latestChapter ?? (contentType === 'subscription' ? chapters[0]?.title : chapters.at(-1)?.title),
       unread,
       lastRead: clone(book.progress ?? null),
       sourceHome: /^https?:/i.test(String(source?.bookSourceUrl ?? '')) ? source.bookSourceUrl : null,
@@ -375,13 +375,14 @@ export class ReaderService extends TypertRemoteService {
     const allowHttp = args.allowHttp === true
     if (text.trimStart().startsWith('<')) {
       const kind = feedKind(text)
-      if (!kind) throw new ReaderError('reader/invalid-source', '这个地址不是 RSS/Atom feed，也不是书源 JSON。')
+      if (!kind) {
+        throw new ReaderError('reader/invalid-source', feedUrl
+          ? '这个地址不是 RSS/Atom feed，也不是书源 JSON。'
+          : '粘贴的内容不是 RSS/Atom feed，也不是书源 JSON。')
+      }
       // Atom 不需要 feed URL 也能明确报「不支持」，不要把用户引到「填写 feed 地址」。
       if (kind === 'atom') {
         throw new ReaderError('reader/unsupported-source', ATOM_UNSUPPORTED_MESSAGE)
-      }
-      if (Buffer.byteLength(text) > MAX_FEED_BYTES) {
-        throw new ReaderError('reader/too-large', 'RSS feed 超过 2 MiB，无法导入。')
       }
       if (!feedUrl) throw new ReaderError('reader/invalid-input', '导入 RSS 订阅需要填写 feed 地址。')
       const parsed = parseRssFeed(text, { feedUrl, allowHttp })

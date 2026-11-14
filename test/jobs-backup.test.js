@@ -63,6 +63,85 @@ test('backup keeps subscription anchors and dates but drops runtime anchor error
   assert.equal(parsed.chapters[0].readAt, '2026-11-13T00:00:00.000Z')
 })
 
+test('backup keeps subscription categories, anchor and read state but no media cache or cookies', () => {
+  const sourceId = 'rss-source-id'
+  const json = createBackup({
+    sources: [{
+      id: sourceId,
+      name: '订阅源',
+      bookSourceUrl: 'https://feed.example/rss.xml',
+      kind: 'rss',
+      feed: true,
+      categories: [{ name: '分类', url: 'https://feed.example/rss.xml' }],
+      headers: { Cookie: 'secret' },
+      rules: {},
+    }],
+    books: [{
+      id: 'b',
+      sourceId,
+      bookUrl: 'https://feed.example/rss.xml',
+      name: '订阅',
+      contentType: 'subscription',
+      subscription: {
+        sourceId,
+        sourceName: '订阅源',
+        categoryName: '分类',
+        sortUrl: 'https://feed.example/rss.xml',
+        anchorUrl: 'https://feed.example/post/2',
+      },
+      readBaselineAt: '2026-11-13T00:00:00.000Z',
+      latestChapter: '条目 2',
+    }],
+    chapters: [{
+      id: 'c',
+      bookId: 'b',
+      index: 0,
+      title: '条目 2',
+      url: 'https://feed.example/post/2',
+      text: '正文',
+      readAt: '2026-11-13T01:00:00.000Z',
+      mediaUrl: 'https://media.example/video.mp4',
+      images: ['https://media.example/image.jpg'],
+      blocks: [{ type: 'paragraph', text: '正文' }],
+      offline: { path: '/cache/video.mp4' },
+      headers: { Cookie: 'secret' },
+      downloadedAt: '2026-11-13T01:00:00.000Z',
+    }],
+    settings: {},
+    notes: [],
+  })
+  assert.equal(json.includes('Cookie'), false)
+  assert.equal(json.includes('mediaUrl'), false)
+  assert.equal(json.includes('images'), false)
+  assert.equal(json.includes('offline'), false)
+  const parsed = parseBackup(json)
+  assert.equal(parsed.sources[0].feed, true)
+  assert.deepEqual(parsed.sources[0].categories, [{ name: '分类', url: 'https://feed.example/rss.xml' }])
+  assert.equal(parsed.books[0].subscription.anchorUrl, 'https://feed.example/post/2')
+  assert.equal(parsed.books[0].readBaselineAt, '2026-11-13T00:00:00.000Z')
+  assert.equal(parsed.books[0].latestChapter, '条目 2')
+  assert.equal(parsed.chapters[0].readAt, '2026-11-13T01:00:00.000Z')
+  assert.equal(parsed.chapters[0].mediaUrl, undefined)
+})
+
+test('a version-1 backup without subscription fields still imports', () => {
+  const old = {
+    type: 'modu-reader-backup',
+    version: 1,
+    exportedAt: '2026-01-01T00:00:00.000Z',
+    sources: [{ id: 's', name: '旧源', bookSourceUrl: 'https://old.example', rules: {} }],
+    books: [{ id: 'b', sourceId: 's', bookUrl: 'https://old.example/book', name: '旧书' }],
+    chapters: [{ id: 'c', bookId: 'b', index: 0, title: '第一章', url: 'https://old.example/c', text: '旧正文' }],
+    notes: [],
+    settings: {},
+  }
+  const parsed = parseBackup(old)
+  assert.equal(parsed.books[0].contentType, 'novel')
+  assert.equal(parsed.books[0].subscription, undefined)
+  assert.equal(parsed.chapters[0].text, '旧正文')
+  assert.equal(parsed.subscriptions.length, 0)
+})
+
 test('backup import rejects secrets and malformed references', () => {
   assert.throws(() => parseBackup('{"type":"modu-reader-backup","version":1,"token":"x"}'), /must not contain secrets/)
   assert.throws(() => parseBackup('{}'), /格式或版本/)

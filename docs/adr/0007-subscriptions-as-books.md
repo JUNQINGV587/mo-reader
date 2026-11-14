@@ -88,4 +88,4 @@ Negative:
 - 不保存或代理浏览器 Cookie，不做登录/验证码。
 - 不执行 `injectJs`，不内嵌 WebView。
 - 本 ADR 不定义图文块载荷、视频抽址和播放器；由后续票补齐。
-- 不做 Atom 解析；RSS 2.0 适配器在 #74 接入。
+- 不做 Atom 解析；RSS 2.0 适配器已在 #74 接入（见 Amendments）。
