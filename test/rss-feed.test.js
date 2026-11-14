@@ -553,6 +553,22 @@ test('a version-1 backup without subscription fields imports through the service
   assert.equal(state.books[0].contentType, 'novel')
 })
 
+test('a feed backup is restored without Legado rule validation', async () => {
+  const body = feed({
+    items: [item({ title: '规则无关', link: '/posts/rules', description: '摘要', date: 'Thu, 13 Nov 2025 09:00:00 GMT' })],
+  })
+  const { service } = await fixture(body)
+  await service.importSource({ url: FEED_URL })
+  const backup = JSON.parse(await service.exportBackup())
+  const source = backup.sources.find((entry) => entry.feed === true)
+  source.rules = { toc: { chapterList: 123 }, content: '.not-an-object' }
+  const fresh = await fixture(body)
+  const state = await fresh.service.importBackup({ data: backup })
+  const restored = state.sources.find((entry) => entry.feed === true)
+  assert.equal(restored.kind, 'rss')
+  assert.equal(restored.contentType, 'subscription')
+})
+
 test('feed sources and subscription books survive a backup round trip', async () => {
   const body = feed({
     items: [item({ title: '备份条目', link: '/posts/backup', description: '备份摘要', date: 'Thu, 13 Nov 2025 09:00:00 GMT' })],

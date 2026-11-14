@@ -239,6 +239,70 @@ test('backups keep RSS sources and subscription books across a restore', async (
   assert.equal(book.subscription.categoryName, '分类03')
 })
 
+async function exportedRssBackup() {
+  const { service } = await serviceFixture()
+  await service.importSource({ text: JSON.stringify(rssSample()) })
+  return JSON.parse(await service.exportBackup())
+}
+
+async function rejectsBackup(backup, pattern) {
+  const fresh = await serviceFixture()
+  await assert.rejects(
+    fresh.service.importBackup({ data: JSON.stringify(backup) }),
+    (error) => error.code === 'reader/invalid-backup' && pattern.test(error.message),
+  )
+  assert.equal(fresh.db.sources.size, 0, '坏备份不能留下半套源')
+}
+
+test('a restored RSS source keeps its headers, rules and capability hints', async () => {
+  const backup = await exportedRssBackup()
+  const source = backup.sources.find((item) => item.kind === 'rss')
+  source.rules.toc.chapterList = ['.item', '.entry']
+  const fresh = await serviceFixture()
+  const state = await fresh.service.importBackup({ data: JSON.stringify(backup) })
+  const restored = state.sources.find((item) => item.kind === 'rss')
+  assert.equal(restored.headers['user-agent'], 'Legado/3.0')
+  assert.equal('cookie' in restored.headers, false)
+  assert.deepEqual(restored.rules.toc.chapterList, ['.item', '.entry'])
+  assert.equal(restored.rules.toc.chapterName, 'a@title')
+  assert.equal(restored.rules.content.content, '<js>result</js>')
+  assert.deepEqual([...restored.unsupported].sort(), ['cookie', 'inject-js', 'login'])
+  assert.equal(restored.enabled, true)
+  assert.equal(restored.contentType, 'subscription')
+})
+
+test('a backup with a non-string subscription rule is refused with its field path', async () => {
+  const backup = await exportedRssBackup()
+  backup.sources.find((item) => item.kind === 'rss').rules.toc.chapterList = 123
+  await rejectsBackup(backup, /sources\[0\]\.rules\.toc\.chapterList/)
+})
+
+test('a backup whose subscription toc or content is not an object is refused', async () => {
+  for (const field of ['toc', 'content']) {
+    const backup = await exportedRssBackup()
+    backup.sources.find((item) => item.kind === 'rss').rules[field] = 'rule'
+    await rejectsBackup(backup, new RegExp('sources\\[0\\]\\.rules\\.' + field))
+  }
+})
+
+test('a backup with a sensitive subscription rule is refused', async () => {
+  const backup = await exportedRssBackup()
+  backup.sources.find((item) => item.kind === 'rss').rules.content.headers = { Cookie: 'sid=1' }
+  await rejectsBackup(backup, /sources\[0\]\.rules.*not allowed/)
+})
+
+test('a backup with a secret key in a subscription rule is refused with its field path', async () => {
+  const backup = await exportedRssBackup()
+  backup.sources.find((item) => item.kind === 'rss').rules.content.cookie = 'sid=1'
+  await rejectsBackup(backup, /sources\[0\]\.rules\.content\.cookie/)
+})
+
+test('a backup with a WebView subscription rule is refused with its field path', async () => {
+  const backup = await exportedRssBackup()
+  backup.sources.find((item) => item.kind === 'rss').rules.content.content = '<webview src="https://rss.example/player">'
+  await rejectsBackup(backup, /sources\[0\]\.rules\.content\.content.*WebView/)
+})
+
 test('subscriptions do not offer download jobs before entries exist', async () => {
   const { service } = await serviceFixture()
   const imported = await service.importSource({ text: JSON.stringify(rssSample()) })
