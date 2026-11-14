@@ -62,6 +62,7 @@ test('source URLs without a scheme are completed as HTTPS', () => {
   const base = { bookSourceName: 'url-test', ruleSearch: { bookList: '.book' } }
   assert.equal(normalizeSource({ ...base, bookSourceUrl: 'example.com/path' }).bookSourceUrl, 'https://example.com/path')
   assert.equal(normalizeSource({ ...base, bookSourceUrl: '//example.com' }).bookSourceUrl, 'https://example.com')
+  assert.equal(normalizeSource({ ...base, bookSourceUrl: 'https//example.com/path' }).bookSourceUrl, 'https://example.com/path')
   assert.throws(
     () => normalizeSource({ ...base, bookSourceUrl: '/relative' }),
     error => error.code === 'reader/invalid-url' && /书源地址/.test(error.message),
