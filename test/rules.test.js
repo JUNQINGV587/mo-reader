@@ -58,6 +58,15 @@ test('basic source normalization accepts XPath and rejects unsupported syntax an
   )
 })
 
+test('Legado retry metadata is ignored instead of rejecting the source', () => {
+  const base = { bookSourceName: 'retry-test', bookSourceUrl: 'https://example.com', ruleSearch: { bookList: '.book' } }
+  const fromUrlOptions = normalizeSource({ ...base, searchUrl: '/search,{"retry":3}' })
+  assert.equal(fromUrlOptions.rules.search.url, 'https://example.com/search')
+  assert.equal('retry' in fromUrlOptions.rules.search, false)
+  const fromRule = normalizeSource({ ...base, ruleSearch: { ...base.ruleSearch, retry: 2 } })
+  assert.equal('retry' in fromRule.rules.search, false)
+})
+
 test('HTTP and local/private SSRF targets are refused without network access', () => {
   assert.equal(parseRemoteUrl('https://example.com/path').hostname, 'example.com')
   assert.equal(parseRemoteUrl('http://example.com', { allowHttp: true }).protocol, 'http:')
