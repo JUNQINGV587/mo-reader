@@ -100,6 +100,46 @@ test('common Legado header formats import without dropping the source', () => {
   assert.deepEqual(invalid.unsupported, ['headers'])
 })
 
+test('Legado option headers written as a string are parsed', () => {
+  const source = normalizeSource({
+    bookSourceName: 'option-header',
+    bookSourceUrl: 'https://example.com',
+    searchUrl: "/search,{\"headers\":\"{os:'pc'}\"}",
+  })
+  assert.deepEqual(source.rules.search.headers, { os: 'pc' })
+})
+
+test('label-like source URLs fall back to the origin used by their rules', () => {
+  const base = {
+    bookSourceName: 'label-test',
+    bookSourceUrl: 'APP小说接口',
+    searchUrl: 'https://api.example.com/search?q={{key}}',
+    ruleSearch: { bookList: '.book', bookUrl: '/book/1' },
+  }
+  const source = normalizeSource(base)
+  assert.equal(source.bookSourceUrl, 'https://api.example.com')
+  assert.equal(source.sourceLabel, 'APP小说接口')
+  assert.equal(source.rules.search.url, 'https://api.example.com/search?q={{key}}')
+  const sibling = normalizeSource({ ...base, bookSourceUrl: 'APP短剧接口' })
+  assert.notEqual(source.id, sibling.id)
+  const nested = normalizeSource({ ...base, searchUrl: undefined, ruleToc: { chapterUrl: 'https://books.example.com/c/1' } })
+  assert.equal(nested.bookSourceUrl, 'https://books.example.com')
+  const scripted = normalizeSource({ ...base, searchUrl: undefined, ruleSearch: { bookUrl: '@js:\'https://api.example.com/item/\' + result.id' } })
+  assert.equal(scripted.bookSourceUrl, 'https://api.example.com')
+  assert.throws(
+    () => normalizeSource({ ...base, searchUrl: 'https://{{getUrl("x")}}/search' }),
+    error => error.code === 'reader/invalid-url' && /不是网址/.test(error.message),
+  )
+  assert.throws(
+    () => normalizeSource({ bookSourceName: '合集', bookSourceUrl: '合集说明', searchUrl: '@js:return "https://space.bilibili.com/1"' }),
+    error => error.code === 'reader/invalid-url' && /不是网址/.test(error.message),
+  )
+  assert.throws(
+    () => normalizeSource({ ...base, searchUrl: 'http://api.example.com/search' }),
+    error => error.code === 'reader/insecure-url' && /明文 HTTP/.test(error.message),
+  )
+})
+
 test('Legado retry metadata is ignored instead of rejecting the source', () => {
   const base = { bookSourceName: 'retry-test', bookSourceUrl: 'https://example.com', ruleSearch: { bookList: '.book' } }
   const fromUrlOptions = normalizeSource({ ...base, searchUrl: '/search,{"retry":3}' })

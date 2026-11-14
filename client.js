@@ -1362,6 +1362,17 @@ window.__ModuleLoader__.load({
             })))));
     }
 
+    function skipReasonGroup(item) {
+      const reason = String(item?.reason || '');
+      const code = String(item?.code || '');
+      if (/WebView|网页视图/i.test(reason)) return '网页视图';
+      if (/网络文件|类型 3/i.test(reason)) return '网络文件';
+      if (/headers must be an object|请求头格式/i.test(reason)) return '请求头格式';
+      if (/Authorization|Cookie|凭据|credentials|secret|not allowed/i.test(reason) || code === 'reader/credentials-forbidden') return '凭据';
+      if (code === 'reader/insecure-url' || /明文 HTTP|Only HTTPS/i.test(reason)) return '需要 HTTP';
+      if (code === 'reader/invalid-url' || /地址|URL must be an absolute|不是网址/i.test(reason)) return '地址';
+      return '其他';
+    }
     function importSummary(result) {
       if (!result || typeof result !== 'object') return '书源已导入';
       if (result.feed === true) return Number(result.added) > 0
@@ -1369,13 +1380,19 @@ window.__ModuleLoader__.load({
         : `订阅「${result.name || '订阅源'}」已在书架`;
       const rss = Array.isArray(result.rss) ? result.rss : result.kind === 'rss' ? [result] : [];
       const imported = result.kind === 'rss' ? 0 : Number(result.imported || 0);
-      const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
-      const first = Array.isArray(result.skipped) && result.skipped[0]?.reason ? String(result.skipped[0].reason).replace(/^source\./, '') : '';
-      const skippedText = skipped ? `跳过 ${skipped} 个${first ? `（${first.slice(0, 40)}）` : ''}` : '';
+      const skippedList = Array.isArray(result.skipped) ? result.skipped : [];
+      const groups = new Map();
+      for (const item of skippedList) {
+        const label = skipReasonGroup(item);
+        groups.set(label, (groups.get(label) || 0) + 1);
+      }
+      const skippedText = skippedList.length
+        ? `跳过 ${skippedList.length} 个：${[...groups.entries()].sort((a, b) => b[1] - a[1]).map(([label, count]) => `${label} ${count} 个`).join('、')}`
+        : '';
       const rssText = rss.length
         ? `${rss.length > 1 ? `${rss.length} 个订阅源` : `订阅源「${rss[0].name}」`}，共 ${rss.reduce((count, item) => count + (item.categories?.length || 0), 0)} 个分类，请在下方勾选`
         : '';
-      if (!imported && !rss.length) return '这批书源都不符合规则，一个也没有导入';
+      if (!imported && !rss.length) return ['这批书源都没有导入', skippedText].filter(Boolean).join('；');
       if (!imported) return rssText;
       return [`已导入 ${imported} 个书源`, rssText, skippedText].filter(Boolean).join('；');
     }
@@ -1534,7 +1551,7 @@ window.__ModuleLoader__.load({
               const unsupported = (Array.isArray(source.unsupported) ? source.unsupported : []).filter((item) => item !== 'cookie').map((item) => unsupportedLabels[item] || item);
               return h('article', { className: `mr-source-row${disabled ? ' is-disabled' : ''}`, key: id },
                 h('span', { className: 'mr-source-icon', 'aria-hidden': true }, name.slice(0, 1)),
-                h('div', null, h('h3', null, name), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl), source.kind === 'rss' && source.cookieCount ? h('p', { className: 'mr-source-unsupported' }, `Cookie ${source.cookieCount} 条`) : null, source.kind === 'rss' && unsupported.length ? h('p', { className: 'mr-source-unsupported' }, `导入时丢弃：${unsupported.join('、')}`) : null),
+                h('div', null, h('h3', null, name), h('p', { title: source.sourceLabel ? `${source.sourceLabel} · ${source.bookSourceUrl}` : source.bookSourceUrl }, source.sourceLabel ? `${source.sourceLabel} · ${source.bookSourceUrl}` : source.bookSourceUrl), source.kind === 'rss' && source.cookieCount ? h('p', { className: 'mr-source-unsupported' }, `Cookie ${source.cookieCount} 条`) : null, source.kind === 'rss' && unsupported.length ? h('p', { className: 'mr-source-unsupported' }, `导入时丢弃：${unsupported.join('、')}`) : null),
                 h('div', { className: 'mr-source-side' },
                   h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || (unsupported.length ? `不支持：${unsupported.join('、')}` : '') }, local ? '本机导入' : source.kind === 'rss' ? (disabled ? '订阅源 · 已停用' : '订阅源') : source.contentType === 'website' ? (disabled ? '网站 · 已停用' : '网站入口') : disabled ? '已停用' : source.lastError ? '解析失败 · 需更新规则' : unsupported.length ? `不支持 · ${unsupported.join('/')}` : (source.compatibility || '基础规则')),
                   source.kind === 'rss' && source.feed !== true && source.categories?.length ? h(Button, { kind: 'text', onClick: () => openRssSource(source), disabled: busy }, '分类') : null,
@@ -5165,7 +5182,7 @@ body[data-ds-dark-theme] .mr-view-toggle button.active{box-shadow:0 1px 2px rgba
 
     return {
       inject: ['slots', 'layout', 'remote'],
-      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, shelfPagination, ShelfBoard, ReaderNav, SHELF_CATEGORIES, bookContentType, booksForShelfCategory, WebsiteShelf, enabledWebsiteSources, websiteTarget, scrollMotion, Stats, Settings, Discover, Sources, Library, formatShortDate, ReaderView, MediaReader, MediaDownloadSheet, MediaAudioDock, mediaChapterSource, mediaProgressPayload, mediaStartSeconds, comicPageFromProgress, formatMediaTime, formatBytes, readerStyle: css } } : {}),
+      ...(globalThis.__MO_READER_TEST__ ? { __test: { pagination: paginationMath, shelfLayout, shelfPagination, ShelfBoard, ReaderNav, SHELF_CATEGORIES, bookContentType, booksForShelfCategory, WebsiteShelf, enabledWebsiteSources, websiteTarget, scrollMotion, Stats, Settings, Discover, Sources, Library, importSummary, formatShortDate, ReaderView, MediaReader, MediaDownloadSheet, MediaAudioDock, mediaChapterSource, mediaProgressPayload, mediaStartSeconds, comicPageFromProgress, formatMediaTime, formatBytes, readerStyle: css } } : {}),
       async apply(ctx) {
         const unmount = await ctx.remote.$mount(readerContribution);
         const ui = ctx.inject(['remote.reader'], (inner) => {

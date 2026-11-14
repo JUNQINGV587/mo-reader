@@ -191,6 +191,24 @@ test('local TXT/EPUB API and settings validation need no network', async () => {
   await assert.rejects(() => service.importSource({ text: '{bad json' }), /有效 JSON/)
 })
 
+test('array imports report a stable reason code for every skipped source', async () => {
+  const { service } = await serviceFixture()
+  const result = await service.importSource({
+    text: JSON.stringify([
+      { bookSourceName: '正常源', bookSourceUrl: 'https://ok.example', ruleSearch: { bookList: '.book' } },
+      { bookSourceName: '标签源', bookSourceUrl: 'APP接口', searchUrl: 'https://api.example.com/search?q={{key}}' },
+      { bookSourceName: '坏源', bookSourceUrl: '/relative' },
+    ]),
+  })
+  assert.equal(result.imported, 2)
+  assert.equal(result.skipped.length, 1)
+  assert.equal(result.skipped[0].code, 'reader/invalid-url')
+  assert.match(result.skipped[0].reason, /书源地址/)
+  const label = (await service.state()).sources.find(item => item.name === '标签源')
+  assert.equal(label.bookSourceUrl, 'https://api.example.com')
+  assert.equal(label.sourceLabel, 'APP接口')
+})
+
 test('Service.init opens storage, recovers persisted jobs and registers hourly updates', async (t) => {
   const mediaRoot = await mkdtemp(join(tmpdir(), 'reader-media-'))
   t.after(() => rm(mediaRoot, { recursive: true, force: true }))

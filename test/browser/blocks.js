@@ -199,6 +199,17 @@ window.blocksTest = (async () => {
     await waitFor(() => host.querySelector('.mr-toc'), '无搜索订阅目录未渲染')
     check('没有 searchUrl 不显示搜索框', !host.querySelector('.mr-toc-search'))
 
+    const grouped = window.__readerTest.importSummary({
+      imported: 73,
+      skipped: [
+        { code: 'reader/unsupported-source', reason: '该书源需要 WebView，暂不支持。' },
+        { code: 'reader/insecure-url', reason: 'Only HTTPS is allowed.' },
+        { code: 'reader/invalid-source', reason: 'headers must be an object.' },
+        { code: 'reader/invalid-url', reason: '书源地址「APP接口」不是网址。' },
+      ],
+    })
+    check('导入摘要按原因分组', ['网页视图 1 个', '需要 HTTP 1 个', '请求头格式 1 个', '地址 1 个'].every((part) => grouped.includes(part)))
+
     // 导入订阅源：分类默认不选、可全选/全不选，勾选后按分类加入书架。
     const addedCalls = []
     const sourceCtx = {

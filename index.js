@@ -431,7 +431,7 @@ export class ReaderService extends TypertRemoteService {
           if (detectRssSource(item)) rss.push(normalizeRssSource(item, { allowHttp }))
           else imported.push(normalizeSource(item, { allowHttp }))
         } catch (error) {
-          skipped.push({ index, reason: error?.message || String(error) })
+          skipped.push({ index, code: error?.code || 'reader/invalid-source', reason: error?.message || String(error) })
         }
       })
       if (!imported.length && !rss.length) throw new ReaderError('reader/invalid-source', skipped.length ? `这批书源都不符合规则，一个也没有导入：${skipped[0].reason}` : '这批书源都不符合规则，一个也没有导入。', undefined, { cause: skipped.length ? new Error(skipped[0].reason) : undefined })
@@ -569,7 +569,7 @@ export class ReaderService extends TypertRemoteService {
       try {
         imported.push(normalizeSource(item, { allowHttp: args.allowHttp === true }))
       } catch (error) {
-        skipped.push({ index, reason: error?.message || String(error) })
+        skipped.push({ index, code: error?.code || 'reader/invalid-source', reason: error?.message || String(error) })
       }
     })
     if (!imported.length) {

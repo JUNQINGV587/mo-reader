@@ -45,6 +45,18 @@ test('backup allowlists records and strips secrets instead of exporting them', (
   assert.deepEqual(parseBackup(JSON.parse(json)), parsed)
 })
 
+test('backup keeps the label that distinguishes a source sharing another origin', () => {
+  const label = 'APP接口'
+  const sourceId = stableId('source', 'https://api.example.com', label)
+  const json = createBackup({
+    sources: [{ id: sourceId, name: '标签源', bookSourceUrl: 'https://api.example.com', sourceLabel: label, rules: { search: { url: 'https://api.example.com/search' } } }],
+    books: [], chapters: [], notes: [], subscriptions: [], settings: {},
+  })
+  const parsed = parseBackup(json)
+  assert.equal(parsed.sources[0].sourceLabel, label)
+  assert.equal(parsed.sources[0].id, sourceId)
+})
+
 test('backup scrubs credentials from subscription header values but keeps ordinary headers', () => {
   const token = 'header-token-must-not-leak'
   const json = createBackup({
