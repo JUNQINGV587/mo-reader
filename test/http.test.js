@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import http from 'node:http'
 import zlib from 'node:zlib'
 import { fetchRemote } from '../lib/http.js'
 
@@ -27,6 +28,42 @@ test('fetchRemote decodes gzip responses and caps decompressed size', async () =
   const result = await fetchRemote('https://source.example/library.json', options)
   assert.deepEqual(JSON.parse(result.text), [{ bookSourceName: '压缩源', bookSourceUrl: 'https://source.example' }])
   await assert.rejects(fetchRemote('https://source.example/library.json', { ...options, maxBytes: 10 }), /too-large|超过/)
+})
+
+test('a HEAD probe of a large media file is not rejected by its declared size', async () => {
+  const server = http.createServer((request, response) => {
+    response.writeHead(200, { 'content-type': 'video/mp4', 'content-length': String(1024 * 1024 * 1024) })
+    response.end()
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  try {
+    const result = await fetchRemote('http://media.example:' + port + '/big.mp4', {
+      method: 'HEAD',
+      readBody: false,
+      allowHttp: true,
+      maxBytes: 1024,
+      resolvePublic: async () => [{ address: '127.0.0.1', family: 4 }],
+    })
+    assert.equal(result.status, 200)
+    assert.equal(result.buffer.length, 0)
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
+})
+
+test('fetchRemote allows HEAD requests for media probes', async () => {
+  let seen
+  const requestOnce = async (_url, options) => {
+    seen = options
+    return { status: 200, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, buffer: Buffer.alloc(0) }
+  }
+  const result = await fetchRemote('https://media.example/live.m3u8', {
+    method: 'HEAD', headers: { Referer: 'https://source.example/watch' }, resolvePublic: async () => '93.184.216.34', requestOnce,
+  })
+  assert.equal(seen.method, 'HEAD')
+  assert.equal(seen.headers.referer, 'https://source.example/watch')
+  assert.equal(result.status, 200)
 })
 
 test('fetchRemote turns 401 and 403 into a readable login error', async () => {

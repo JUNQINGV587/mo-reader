@@ -296,6 +296,7 @@ export class ReaderService extends TypertRemoteService {
   chapterView(chapter) {
     const contentType = normalizeBookContentType(chapter.contentType)
     const textType = isTextContentType(contentType)
+    const streaming = contentType === 'subscription' && typeof chapter.mediaUrl === 'string' && chapter.mediaUrl.length > 0
     const offline = textType ? false : this.offlineRecordReady(chapter, contentType)
     return {
       id: chapter.id,
@@ -304,7 +305,7 @@ export class ReaderService extends TypertRemoteService {
       title: chapter.title,
       url: chapter.url,
       contentType: chapter.contentType,
-      downloaded: textType ? hasChapterPayload(chapter, contentType) : offline,
+      downloaded: textType && !streaming ? hasChapterPayload(chapter, contentType) : offline,
       downloadedAt: chapter.downloadedAt,
       ...(chapter.coverUrl ? { coverUrl: chapter.coverUrl } : {}),
       ...(chapter.publishedAt ? { publishedAt: chapter.publishedAt } : {}),
@@ -317,9 +318,10 @@ export class ReaderService extends TypertRemoteService {
     const source = this.db.sources.get(book.sourceId)
     const contentType = normalizeBookContentType(book.contentType)
     const textType = isTextContentType(contentType)
-    const downloaded = chapters.filter(chapter => textType
-      ? hasChapterPayload(chapter, contentType)
-      : this.offlineRecordReady(chapter, contentType)).length
+    const downloaded = chapters.filter(chapter => {
+      const streaming = contentType === 'subscription' && typeof chapter.mediaUrl === 'string' && chapter.mediaUrl.length > 0
+      return textType && !streaming ? hasChapterPayload(chapter, contentType) : this.offlineRecordReady(chapter, contentType)
+    }).length
     const readIndex = book.progress ? chapters.findIndex(chapter => chapter.id === book.progress.chapterId) : -1
     const status = book.download?.status === 'completed' && downloaded < chapters.length ? 'partial' : book.download?.status ?? (downloaded ? 'partial' : 'none')
     return {
@@ -903,31 +905,46 @@ export class ReaderService extends TypertRemoteService {
     let chapter = this.db.chapters.get(chapterId)
     if (!chapter || chapter.bookId !== book.id) throw new ReaderError('reader/not-found', `Chapter ${chapterId} not found in this book.`)
     const contentType = normalizeBookContentType(book.contentType)
-    const textType = isTextContentType(contentType)
+    const subscription = contentType === 'subscription'
+    // 订阅条目可能是图文块，也可能是一段视频；有 mediaUrl 就按媒体条目走，
+    // 这样第二次打开直接用落库地址，不再重新抽址和探测。
+    const cachedMedia = subscription && hasChapterPayload(chapter, contentType) && typeof chapter.mediaUrl === 'string'
+    const textType = isTextContentType(contentType) && !cachedMedia
     const offline = textType ? false : await this.offlineReady(book, chapter)
-    if (textType ? !hasChapterPayload(chapter, contentType) : !offline) {
+    const needsFetch = subscription
+      ? !hasChapterPayload(chapter, contentType)
+      : (textType ? !hasChapterPayload(chapter, contentType) : !offline)
+    if (needsFetch) {
       if (book.local) throw new ReaderError('reader/not-found', 'Local chapter cache is missing.')
       let content = null
       try {
         const source = this.source(book.sourceId)
-        content = contentType === 'subscription'
+        content = subscription
           ? await this.engine.subscriptionContent(source, book, chapter)
           : await this.engine.content(source, book, chapter)
       } catch (error) {
         // 旧订阅条目只有文本时，重取失败不应把已经能读的正文变成错误；下次打开再试。
-        const canReadCached = contentType === 'subscription' && typeof chapter.text === 'string' && chapter.text.trim().length > 0
+        const canReadCached = subscription && typeof chapter.text === 'string' && chapter.text.trim().length > 0
         if (!canReadCached) throw error
       }
       if (content) {
         const headers = content.headers && typeof content.headers === 'object' ? clone(content.headers) : {}
         if (Object.keys(headers).length) this.streamHeaders.set(chapter.id, headers)
         chapter = { ...chapter, ...content, downloadedAt: now() }
-        delete chapter.headers
-        if (!textType) delete chapter.offline
+        // 订阅条目的媒体头要跨重启保留；普通视频沿用内存 Map，避免改变既有落库形状。
+        if (subscription && Object.keys(headers).length) chapter.headers = headers
+        else delete chapter.headers
+        if (!textType && !subscription) delete chapter.offline
         await this.db.chapters.put(chapter.id, chapter)
       }
     }
     const view = this.chapterView(chapter)
+    if (subscription && typeof chapter.mediaUrl === 'string' && chapter.mediaUrl.length) {
+      view.mediaUrl = clone(chapter.mediaUrl)
+      const headers = this.streamHeaders.get(chapter.id) ?? chapter.headers
+      if (headers && Object.keys(headers).length) view.headers = clone(headers)
+      return view
+    }
     if (textType) {
       const replacements = this.db.settings.get().replacements
       const blocks = applyReplacementsToBlocks(chapter.blocks, replacements)

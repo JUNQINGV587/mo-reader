@@ -61,6 +61,25 @@ test('imports a Legado RSS source with its categories and drops unsupported capa
   for (const key of ['header', 'loginUrl', 'injectJs', 'enabledCookieJar']) {
     assert.equal(key in source, false, `落库的订阅源不能包含 ${key}`)
   }
+  assert.equal(source.headers['user-agent'], 'Legado/3.0')
+  assert.equal('cookie' in source.headers, false)
+  // 只落用户声明的头，不把 cleanHeaders 补的默认 Accept 带进媒体请求。
+  assert.equal('accept' in source.headers, false)
+})
+
+test('credentials in RSS headers are reported as dropped and never stored', async () => {
+  const { service } = await serviceFixture()
+  const sample = {
+    ...rssSample(),
+    header: JSON.stringify({ Authorization: 'Bearer secret', 'X-Api-Key': 'key-1' }),
+    enabledCookieJar: false,
+    loginUrl: '',
+    injectJs: '',
+  }
+  const result = await service.importSource({ text: JSON.stringify(sample) })
+  assert.deepEqual([...result.unsupported].sort(), ['credentials'])
+  const source = (await service.state()).sources.find((item) => item.id === result.sourceId)
+  assert.deepEqual(source.headers, {})
 })
 
 test('importing the same RSS source twice keeps one source record', async () => {

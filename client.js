@@ -87,6 +87,58 @@ window.__ModuleLoader__.load({
       }).catch((error) => { hlsPlayerPromise = null; throw error; });
       return hlsPlayerPromise;
     }
+    // 统一的 HLS 挂载：视频、订阅视频和音频共用，避免三份略有差异的生命周期。
+    function attachHlsPlayer(element, url, handlers = {}) {
+      let live = true;
+      let player = null;
+      loadHlsPlayer().then((Hls) => {
+        if (!live || !element) return;
+        if (!Hls.isSupported()) { handlers.onUnsupported?.(); return; }
+        player = new Hls({ enableWorker: false });
+        player.loadSource(url);
+        player.attachMedia(element);
+        player.on(Hls.Events.MANIFEST_PARSED, () => { if (live) handlers.onReady?.(); });
+        player.on(Hls.Events.ERROR, (_event, data) => {
+          if (live && data?.fatal) handlers.onFatal?.(data);
+        });
+      }).catch(() => { if (live) handlers.onLoadFailed?.(); });
+      return () => {
+        live = false;
+        player?.destroy();
+        player = null;
+      };
+    }
+    function SubscriptionVideo({ book, chapter, notify }) {
+      const [error, setError] = useState('');
+      const [retry, setRetry] = useState(0);
+      const videoRef = useRef(null);
+      const src = mediaProxyUrl(book.id || book.bookId, chapter.id);
+      const hls = /\.m3u8(?:[?#]|$)/i.test(chapter.mediaUrl || '');
+      useEffect(() => {
+        const element = videoRef.current;
+        if (!element || !src) return undefined;
+        setError('');
+        element.removeAttribute('src');
+        element.load();
+        if (!hls || nativeHlsSupported()) { element.src = src; return undefined; }
+        return attachHlsPlayer(element, src, {
+          onUnsupported: () => setError('媒体地址失效：浏览器不支持 HLS 播放。'),
+          onFatal: () => setError('媒体地址失效：视频加载失败，请重试。'),
+          onLoadFailed: () => setError('媒体地址失效：播放器加载失败，请重试。'),
+        });
+      }, [src, hls, retry, chapter.id]);
+      return h('div', { className: 'mr-video-player' },
+        h('video', {
+          ref: videoRef, controls: true, playsInline: true, preload: 'metadata',
+          poster: chapter.coverUrl || undefined,
+          onError: () => setError('媒体地址失效：视频加载失败，请重试。'),
+          onEnded: () => notify?.('这一条已播完。', 'info'),
+        }),
+        error ? h('div', { className: 'mr-media-error', role: 'alert' },
+          h(Glyph, { name: 'warning', size: 24 }),
+          h('p', null, error),
+          h(Button, { onClick: () => setRetry((value) => value + 1) }, '重试')) : null);
+    }
     function mediaChapterSource(book, chapter) {
       const type = bookContentType(book);
       if (!chapter) return { kind: 'empty', error: '这一章还没有可用的媒体。' };
@@ -1301,7 +1353,7 @@ window.__ModuleLoader__.load({
         if (!urls.length || busy || !onAddSubscriptions) return;
         onAddSubscriptions(item.sourceId, urls).then((result) => { if (result) dismissRssImport(item.sourceId); }, () => {});
       };
-      const rssCapabilityLabels = { cookie: 'Cookie', login: '登录', 'inject-js': '注入脚本' };
+      const rssCapabilityLabels = { cookie: 'Cookie', login: '登录', 'inject-js': '注入脚本', credentials: '登录凭据' };
       return h('div', { className: 'mr-screen mr-sources-screen' },
         h(ScreenHead, {
           kicker: 'MO READ · 窗边 / 书源',
@@ -1416,7 +1468,7 @@ window.__ModuleLoader__.load({
               const name = source.bookSourceName || source.name || '书源';
               const disabled = source.enabled === false;
               const local = source.id === 'local' || source.bookSourceUrl === 'local:';
-              const unsupportedLabels = { login: '登录', captcha: '验证码', payment: '付费', webview: '内置网页', cookie: 'Cookie', 'inject-js': '注入脚本' };
+              const unsupportedLabels = { login: '登录', captcha: '验证码', payment: '付费', webview: '内置网页', cookie: 'Cookie', 'inject-js': '注入脚本', credentials: '登录凭据' };
               const unsupported = (Array.isArray(source.unsupported) ? source.unsupported : []).map((item) => unsupportedLabels[item] || item);
               return h('article', { className: `mr-source-row${disabled ? ' is-disabled' : ''}`, key: id },
                 h('span', { className: 'mr-source-icon', 'aria-hidden': true }, name.slice(0, 1)),
@@ -1779,7 +1831,6 @@ window.__ModuleLoader__.load({
       const scrollRef = useRef(null);
       const pageRefs = useRef([]);
       const videoRef = useRef(null);
-      const videoHlsRef = useRef(null);
       const videoMark = useRef(0);
       const saveTimer = useRef(null);
       const pendingProgress = useRef(null);
@@ -1871,32 +1922,17 @@ window.__ModuleLoader__.load({
       }, [type, pageIndex, comicMode, chapter?.id, source.images?.length]);
 
       useEffect(() => {
-        if (type !== 'video' || source.kind !== 'media' || !source.hls || !chapter) return;
-        let live = true;
-        loadHlsPlayer().then((Hls) => {
-          if (!live || !videoRef.current) return;
-          if (!Hls.isSupported()) {
-            setError('浏览器不支持 HLS 播放，可先下载这一章。');
-            return;
-          }
-          const player = new Hls({ enableWorker: false });
-          videoHlsRef.current = player;
-          player.loadSource(source.url);
-          player.attachMedia(videoRef.current);
-          player.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (type !== 'video' || source.kind !== 'media' || !source.hls || !chapter || !videoRef.current) return;
+        return attachHlsPlayer(videoRef.current, source.url, {
+          onReady: () => {
             const start = mediaStartSeconds(book, chapter);
             const el = videoRef.current;
             if (el && start > 0) { try { el.currentTime = start; } catch {} }
-          });
-          player.on(Hls.Events.ERROR, (_event, data) => {
-            if (data?.fatal) setError(String(data?.details || '').includes('manifest') ? '这个视频需要 DRM 或使用了不受支持的 HLS 格式，无法在线播放；请尝试下载。' : '视频加载失败：媒体地址失效或格式不支持。');
-          });
-        }).catch(() => { if (live) setError('在线 HLS 播放器加载失败，可先下载这一章。'); });
-        return () => {
-          live = false;
-          videoHlsRef.current?.destroy();
-          videoHlsRef.current = null;
-        };
+          },
+          onUnsupported: () => setError('浏览器不支持 HLS 播放，可先下载这一章。'),
+          onFatal: (data) => setError(String(data?.details || '').includes('manifest') ? '这个视频需要 DRM 或使用了不受支持的 HLS 格式，无法在线播放；请尝试下载。' : '视频加载失败：媒体地址失效或格式不支持。'),
+          onLoadFailed: () => setError('在线 HLS 播放器加载失败，可先下载这一章。'),
+        });
       }, [chapter?.id, type, source.kind, source.url, source.hls]);
 
       useEffect(() => {
@@ -2496,13 +2532,14 @@ window.__ModuleLoader__.load({
       };
       const CHAPTER_CACHE_VERSION = 2;
       const cacheChapterPayload = (cacheKey, value, id) => {
-        if (!value?.text && !(Array.isArray(value?.blocks) && value.blocks.length)) return;
+        if (!value?.text && !(Array.isArray(value?.blocks) && value.blocks.length) && !value?.mediaUrl) return;
         try {
           const payload = JSON.stringify({
             version: CHAPTER_CACHE_VERSION,
             id: value.id || id,
             text: value.text || '',
             blocks: Array.isArray(value.blocks) ? value.blocks : undefined,
+            mediaUrl: typeof value.mediaUrl === 'string' ? value.mediaUrl : undefined,
             timestamp: Date.now(),
           });
           // 图文块可能很大；超过 256KB 就不进本地缓存，避免把 localStorage 配额吃满。
@@ -2519,11 +2556,13 @@ window.__ModuleLoader__.load({
           const cached = localStorage.getItem(cacheKey);
           if (cached) {
             const payload = JSON.parse(cached);
-            const { id: cachedId, text, blocks, timestamp, version } = payload;
+            const { id: cachedId, text, blocks, mediaUrl, timestamp, version } = payload;
             const staleSubscription = book.contentType === 'subscription' && version !== CHAPTER_CACHE_VERSION;
-            // 缓存 7 天有效；旧版订阅缓存没有图文块，交给服务端重取。
-            if (!staleSubscription && Date.now() - timestamp < 7 * 24 * 3600 * 1000) {
-              return { index, chapter: { id: cachedId || id, text, ...(Array.isArray(blocks) ? { blocks } : {}), cached: true } };
+            // 旧订阅缓存没有图文块或媒体地址，交给服务端重取，避免把视频条目显示成空正文。
+            const emptySubscription = book.contentType === 'subscription' && !text && !(Array.isArray(blocks) && blocks.length) && !mediaUrl;
+            // 缓存 7 天有效。
+            if (!staleSubscription && !emptySubscription && Date.now() - timestamp < 7 * 24 * 3600 * 1000) {
+              return { index, chapter: { id: cachedId || id, text, ...(Array.isArray(blocks) ? { blocks } : {}), ...(mediaUrl ? { mediaUrl } : {}), cached: true } };
             }
           }
         } catch {}
@@ -2548,7 +2587,15 @@ window.__ModuleLoader__.load({
       };
       const loadScrollWindow = async (center, list0 = toc, options = {}) => {
         const wanted = [center - 1, center, center + 1].filter((index) => index >= 0 && index < list0.length);
-        const entries = await Promise.all(wanted.map((index) => fetchChapterEntry(index, list0).catch(() => null)));
+        // 中心章失败要保留原始错误（例如「媒体地址失效」）；邻章失败可以继续滚动，不阻塞当前阅读。
+        const entries = await Promise.all(wanted.map(async (index) => {
+          try {
+            return await fetchChapterEntry(index, list0)
+          } catch (error) {
+            if (index === center) throw error
+            return null
+          }
+        }));
         const list = entries.filter(Boolean).sort((a, b) => a.index - b.index);
         if (options.restore) pendingScrollRestoreRef.current = options.restore;
         setScrollChapters(list);
@@ -2607,8 +2654,8 @@ window.__ModuleLoader__.load({
           setScrollChapters(list);
           scrollChaptersRef.current = list;
           setScrollError(null);
-        } catch {
-          setScrollError(index);
+        } catch (error) {
+          setScrollError({ index, message: error?.message || String(error) });
         } finally {
           scrollAppendRef.current = false;
         }
@@ -3355,6 +3402,7 @@ window.__ModuleLoader__.load({
         const lines = String(source.content || source.text || '').split(/\n+/).map((line) => line.trim()).filter(Boolean);
         const blocks = book.contentType === 'subscription' && Array.isArray(source.blocks) ? source.blocks : [];
         const hasBlocks = blocks.some((block) => block && typeof block === 'object' && typeof block.type === 'string');
+        const subscriptionMedia = book.contentType === 'subscription' && typeof source.mediaUrl === 'string' && source.mediaUrl ? source.mediaUrl : '';
         const heading = source.name || source.title || toc[index]?.name || toc[index]?.title || '正文';
         const rawHeading = String(heading || '').trim();
         const prefixed = bookLabel && (rawHeading === bookLabel || rawHeading.startsWith(`${bookLabel}/`) || rawHeading.startsWith(`${bookLabel}·`));
@@ -3364,7 +3412,7 @@ window.__ModuleLoader__.load({
         const chapterTitle = titleMatch ? titleMatch[2].trim() : rawTitle;
         const chars = hasBlocks
           ? blocks.reduce((sum, block) => sum + blockPlainText(block).replace(/\s/g, '').length, 0)
-          : lines.reduce((sum, line) => sum + line.replace(/\s/g, '').length, 0);
+          : subscriptionMedia ? 0 : lines.reduce((sum, line) => sum + line.replace(/\s/g, '').length, 0);
         const meta = [bookLabel, chars ? `${chars} 字` : ''].filter(Boolean).join(' · ');
         const showEnd = options.withEnd === true;
         return [
@@ -3375,9 +3423,10 @@ window.__ModuleLoader__.load({
           ...(book.contentType === 'comic' ? renderComic(lines) :
               book.contentType === 'audio' ? [renderAudio(source)] :
               book.contentType === 'video' ? [renderVideo(source)] :
+              subscriptionMedia ? [h(SubscriptionVideo, { key: 'media', book, chapter: source, notify })] :
               hasBlocks ? renderBlocks(blocks, source) :
               lines.map((line, key) => h('p', { key }, line))),
-          !hasBlocks && !lines.length && book.contentType !== 'audio' && book.contentType !== 'video' ? h(Empty, { key: 'empty', title: '本章无正文', detail: book.contentType === 'subscription' ? '这条订阅没有正文内容，稍后重试或换一条。' : '可尝试刷新目录。' }) : null,
+          !hasBlocks && !subscriptionMedia && !lines.length && book.contentType !== 'audio' && book.contentType !== 'video' ? h(Empty, { key: 'empty', title: '本章无正文', detail: book.contentType === 'subscription' ? '这条订阅没有正文内容，稍后重试或换一条。' : '可尝试刷新目录。' }) : null,
           showEnd
             ? h('div', { key: 'end', className: 'mr-chapter-end' }, index + 1 < toc.length
               ? h(Button, { kind: 'primary soft', onClick: () => openChapter(index + 1) }, '下一章')
@@ -3509,8 +3558,8 @@ window.__ModuleLoader__.load({
                 }, chapterNodesFor(entry, { withEnd: entry.index === toc.length - 1 }))),
                 scrollError != null
                   ? h('div', { key: 'retry', className: 'mr-scroll-retry' },
-                    h('p', null, '本章未加载'),
-                    h(Button, { onClick: () => { const next = scrollError; setScrollError(null); appendScrollChapter(next); } }, '重试'))
+                    h('p', null, scrollError.message || '本章未加载'),
+                    h(Button, { onClick: () => { const next = scrollError.index; setScrollError(null); appendScrollChapter(next); } }, '重试'))
                   : null,
               ],
           chapterVeil ? h('div', { className: `mr-chapter-veil${chapterVeil ? ' show' : ''}`, key: chapterVeil }, chapterVeil) : null),
@@ -3728,7 +3777,6 @@ window.__ModuleLoader__.load({
       const [audioTime, setAudioTime] = useState(0);
       const [audioDuration, setAudioDuration] = useState(0);
       const audioElRef = useRef(null);
-      const audioHlsRef = useRef(null);
       const audioSaveAt = useRef(0);
       const mounted = useRef(true);
       const settings = { ...DEFAULT_SETTINGS, ...(data.settings || {}) };
@@ -4032,8 +4080,6 @@ window.__ModuleLoader__.load({
       };
       useEffect(() => {
         const el = audioElRef.current;
-        audioHlsRef.current?.destroy();
-        audioHlsRef.current = null;
         if (!el || !audioTrack) {
           if (el) { el.pause(); el.removeAttribute('src'); el.load(); }
           return;
@@ -4045,28 +4091,18 @@ window.__ModuleLoader__.load({
           el.play().then(() => setAudioPlaying(true)).catch(() => setAudioPlaying(false));
         };
         if (audioTrack.hls) {
-          loadHlsPlayer().then((Hls) => {
-            if (!live) return;
-            if (!Hls.isSupported()) { notify('浏览器不支持 HLS 音频，可先下载这一章', 'error'); return; }
-            const player = new Hls({ enableWorker: false });
-            audioHlsRef.current = player;
-            player.loadSource(audioTrack.url);
-            player.attachMedia(el);
-            player.on(Hls.Events.MANIFEST_PARSED, play);
-            player.on(Hls.Events.ERROR, (_event, data) => {
-              if (data?.fatal) { setAudioPlaying(false); notify('音频加载失败：媒体地址失效或格式不支持', 'error'); }
-            });
-          }).catch(() => { if (live) notify('在线 HLS 播放器加载失败，可先下载这一章', 'error'); });
-        } else {
-          el.src = audioTrack.url;
-          el.load();
-          play();
+          const detach = attachHlsPlayer(el, audioTrack.url, {
+            onReady: play,
+            onUnsupported: () => notify('浏览器不支持 HLS 音频，可先下载这一章', 'error'),
+            onFatal: () => { setAudioPlaying(false); notify('音频加载失败：媒体地址失效或格式不支持', 'error'); },
+            onLoadFailed: () => notify('在线 HLS 播放器加载失败，可先下载这一章', 'error'),
+          });
+          return () => { live = false; detach(); };
         }
-        return () => {
-          live = false;
-          audioHlsRef.current?.destroy();
-          audioHlsRef.current = null;
-        };
+        el.src = audioTrack.url;
+        el.load();
+        play();
+        return () => { live = false; };
       }, [audioTrack?.nonce]);
       const onAudioTime = () => {
         const el = audioElRef.current;

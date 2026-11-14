@@ -81,6 +81,26 @@ window.blocksTest = (async () => {
     const order = [...host.querySelectorAll('.mr-block-heading, .mr-block-quote, .mr-block-code, .mr-block-list, .mr-block-image')]
       .map((node) => node.className)
     check('块顺序与正文一致', order.join('|') === 'mr-block-heading|mr-block-quote|mr-block-code|mr-block-list|mr-block-image')
+
+    // 视频条目：订阅条目带 mediaUrl 时应渲染可直接播放的播放器，而不是空正文。
+    const mediaCtx = { remote: { reader: {
+      toc: async () => [{ id: 'video-0', name: '视频条目' }],
+      chapter: async () => ({ id: 'video-0', name: '视频条目', contentType: 'subscription', mediaUrl: 'https://media.example/clip.mp4' }),
+      saveProgress: async () => ({}),
+    } } }
+    const mediaBook = {
+      id: 'video-book', title: '视频订阅回归', contentType: 'subscription',
+      readerPrefs: { mode: 'scroll', ambience: 'off' },
+      lastRead: { chapterId: 'video-0', percent: 0, offset: 0 },
+    }
+    root.render(React.createElement(window.__readerTest.ReaderView, {
+      ctx: mediaCtx, book: mediaBook, settings, notes: [], onClose() {},
+    }))
+    await waitFor(() => host.querySelector('.mr-video-player video')?.getAttribute('src')?.includes('/api/reader/proxy?'), '视频条目未渲染播放器')
+    const video = host.querySelector('.mr-video-player video')
+    check('视频条目渲染播放器', !!video)
+    check('播放器有控制条', video.controls === true)
+    check('视频走媒体代理', String(video.getAttribute('src')).includes('/api/reader/proxy?') && String(video.getAttribute('src')).includes('chapterId=video-0'))
     return { ok: true, checks }
   } catch (error) {
     return { ok: false, error: error.stack || String(error) }
