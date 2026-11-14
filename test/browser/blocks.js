@@ -209,7 +209,7 @@ window.blocksTest = (async () => {
           { name: '分类01', url: 'https://rss.example/list/1/page/{{page}}.html' },
           { name: '分类02', url: 'https://rss.example/list/2/page/{{page}}.html' },
         ],
-        unsupported: ['cookie'],
+        unsupported: ['login'],
       }),
       onAddSubscriptions: async (sourceId, categories) => { addedCalls.push({ sourceId, categories }); return { added: categories.length } },
       onRemove() {}, onToggle() {}, onSubscribe() {}, onUnsubscribe() {}, onRefresh() {},
@@ -225,7 +225,7 @@ window.blocksTest = (async () => {
     check('导入按钮存在', !!importButton)
     importButton.click()
     await waitFor(() => host.querySelector('.mr-rss-import'), '订阅源分类面板未出现')
-    check('面板提示不支持能力', /Cookie/.test(host.querySelector('.mr-rss-import .mr-source-warning')?.textContent || ''))
+    check('面板提示不支持能力', /登录/.test(host.querySelector('.mr-rss-import .mr-source-warning')?.textContent || ''))
     check('分类默认全不选', [...host.querySelectorAll('.mr-rss-row input')].every((node) => node.checked === false))
     const addButton = () => [...host.querySelectorAll('.mr-rss-import button')].find((node) => /加入书架/.test(node.textContent || ''))
     check('未选分类时不能加入书架', addButton()?.disabled === true)

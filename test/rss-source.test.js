@@ -51,7 +51,7 @@ test('imports a Legado RSS source with its categories and drops unsupported capa
   assert.deepEqual(result.categories[0], { name: '分类01', url: 'https://rss.example/list/1/page/{{page}}.html' })
   assert.equal(result.categories.at(-1).name, '分类30')
   assert.equal(result.searchable, true)
-  assert.deepEqual([...result.unsupported].sort(), ['cookie', 'inject-js', 'login'])
+  assert.deepEqual([...result.unsupported].sort(), ['inject-js', 'login'])
 
   const sources = [...db.sources.entries()]
   assert.equal(sources.length, 1)
@@ -66,6 +66,10 @@ test('imports a Legado RSS source with its categories and drops unsupported capa
   }
   assert.equal(source.headers['user-agent'], 'Legado/3.0')
   assert.equal('cookie' in source.headers, false)
+  // 静态 Cookie 进独立的 host-only jar，不混进请求头。
+  assert.deepEqual(source.cookies.map(cookie => ({ name: cookie.name, domain: cookie.domain, path: cookie.path })), [
+    { name: '_slide_passed', domain: 'rss.example', path: '/' },
+  ])
   // 只落用户声明的头，不把 cleanHeaders 补的默认 Accept 带进媒体请求。
   assert.equal('accept' in source.headers, false)
 })
@@ -296,7 +300,8 @@ test('a restored RSS source keeps its headers, rules and capability hints', asyn
   assert.deepEqual(restored.rules.toc.chapterList, ['.item', '.entry'])
   assert.equal(restored.rules.toc.chapterName, 'a@title')
   assert.equal(restored.rules.content.content, '<js>result</js>')
-  assert.deepEqual([...restored.unsupported].sort(), ['cookie', 'inject-js', 'login'])
+  assert.deepEqual([...restored.unsupported].sort(), ['inject-js', 'login'])
+  assert.equal(restored.cookieCount, 0)
   assert.equal(restored.enabled, true)
   assert.equal(restored.contentType, 'subscription')
 })

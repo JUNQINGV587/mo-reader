@@ -132,10 +132,10 @@ test('a category page without entries reports a readable error and names dropped
     fetch: async (url) => response(url, '<div></div>'),
   })
   const { service } = await serviceFixture(engine)
-  const source = { ...rssSource(), enabledCookieJar: true }
+  const source = { ...rssSource(), loginUrl: SITE + '/login' }
   const imported = await service.importSource({ text: JSON.stringify(source) })
   const added = await service.addSubscriptions({ sourceId: imported.sourceId, categories: [imported.categories[0].url] })
-  await assert.rejects(service.toc({ bookId: added.books[0].id }), /没有解析到条目.*Cookie/)
+  await assert.rejects(service.toc({ bookId: added.books[0].id }), /没有解析到条目.*登录/)
 })
 
 test('an entry without a content rule falls back to the list description', async () => {

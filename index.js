@@ -4,6 +4,7 @@ import { createBackup, parseBackup } from './lib/backup.js'
 import { hasChapterPayload, isMediaPayloadType, isTextContentType, normalizeBookContentType, normalizeSourceContentType } from './lib/content-types.js'
 import { ReaderError } from './lib/errors.js'
 import { fetchRemote, parseRemoteUrl } from './lib/http.js'
+import { normalizeCookies } from './lib/cookies.js'
 import { MediaStore, DEFAULT_MEDIA_QUOTA } from './lib/media-store.js'
 import { downloadMediaChapter } from './lib/media-download.js'
 import { mediaResponse, proxyResponse, sendWebResponse } from './lib/media-http.js'
@@ -56,6 +57,9 @@ export class ReaderService extends TypertRemoteService {
   constructor(ctx, options = {}) {
     super(ctx, 'reader')
     this.engine = options.engine ?? new SourceEngine(options)
+    this.engine.onCookies = async (source, cookies) => {
+      if (source?.id) await this.saveSourceCookies(source.id, cookies)
+    }
     this.fetchRemote = options.fetchRemote ?? fetchRemote
     this.runningJobs = new Map()
     this.subscriptionRefreshes = new Map()
@@ -185,7 +189,41 @@ export class ReaderService extends TypertRemoteService {
   }
 
   sourceView(source) {
-    return { ...clone(source), enabled: source.enabled !== false, contentType: normalizeSourceContentType(source.contentType) }
+    const { cookies, ...rest } = source
+    return {
+      ...clone(rest),
+      enabled: source.enabled !== false,
+      contentType: normalizeSourceContentType(source.contentType),
+      cookieCount: Array.isArray(cookies) ? cookies.length : 0,
+    }
+  }
+
+  // Cookie 只存在源记录与内存 jar 里；sourceView、备份和日志都不带它。
+  async saveSourceCookies(sourceId, cookies) {
+    if (!this.db || this.disposed) return
+    const current = this.db.sources.get(sourceId)
+    if (!current) return
+    const nextCookies = normalizeCookies(cookies)
+    const before = Array.isArray(current.cookies) ? current.cookies : []
+    if (JSON.stringify(before) === JSON.stringify(nextCookies)) return
+    const next = { ...current }
+    if (nextCookies.length) next.cookies = nextCookies
+    else delete next.cookies
+    await this.db.sources.put(sourceId, next)
+  }
+
+  // 所有抓取都通过这里：带上源级 cookie jar，收到 Set-Cookie 时回写存储。
+  fetchSource(sourceOrId, url, options = {}) {
+    const source = typeof sourceOrId === 'string' ? this.db?.sources.get(sourceOrId) : sourceOrId
+    return this.fetchRemote(url, {
+      ...options,
+      cookies: options.cookies ?? normalizeCookies(source?.cookies),
+      onCookies: async (cookies, href) => {
+        if (source?.id) await this.saveSourceCookies(source.id, cookies)
+        if (source) source.cookies = cookies
+        if (options.onCookies) await options.onCookies(cookies, href)
+      },
+    })
   }
 
   withSubscriptionLock(id, operation) {
@@ -225,6 +263,8 @@ export class ReaderService extends TypertRemoteService {
       ...source,
       enabled: previous ? previous.enabled !== false : source.enabled !== false,
     }
+    // 重新导入/恢复旧数据没有 cookies 字段时，不要清掉已经捕获的登录态。
+    if (source.cookies === undefined && previous?.cookies !== undefined) next.cookies = previous.cookies
     await this.db.sources.put(source.id, next)
     return next
   }
@@ -1213,7 +1253,8 @@ export class ReaderService extends TypertRemoteService {
       if (job.type !== 'download') throw new ReaderError('reader/job-state', `Unknown job type ${job.type}.`)
       const storedBook = this.book(job.bookId)
       const book = { ...storedBook, contentType: normalizeBookContentType(storedBook.contentType) }
-      const allChapters = book.local || book.contentType === 'subscription' ? this.chapters(book.id) : await this.syncToc(book, await this.engine.toc(this.source(book.sourceId), book))
+      const source = book.local ? null : this.source(book.sourceId)
+      const allChapters = book.local || book.contentType === 'subscription' ? this.chapters(book.id) : await this.syncToc(book, await this.engine.toc(source, book))
       const selected = job.chapterIds ? new Set(job.chapterIds) : null
       const chapters = selected ? allChapters.filter(chapter => selected.has(chapter.id)) : allChapters
       job = this.db.jobs.get(jobId)
@@ -1221,7 +1262,7 @@ export class ReaderService extends TypertRemoteService {
       job = { ...job, total: chapters.length, done: 0, failedChapters: [], failedReasons: {}, updatedAt: now() }
       await this.db.jobs.put(job.id, job)
       const mediaType = book.contentType !== 'novel'
-      const allowHttp = book.local ? false : this.source(book.sourceId).allowHttp === true
+      const allowHttp = book.local ? false : source.allowHttp === true
       for (const chapter of chapters) {
         job = this.db.jobs.get(jobId)
         if (!job || job.status !== 'running' || this.disposed) return
@@ -1235,8 +1276,8 @@ export class ReaderService extends TypertRemoteService {
             for (let attempt = 1; attempt <= MAX_CHAPTER_ATTEMPTS; attempt += 1) {
               try {
                 content = book.contentType === 'subscription'
-                  ? await this.engine.subscriptionContent(this.source(book.sourceId), book, chapter)
-                  : await this.engine.content(this.source(book.sourceId), book, chapter)
+                  ? await this.engine.subscriptionContent(source, book, chapter)
+                  : await this.engine.content(source, book, chapter)
                 lastError = null
                 break
               }
@@ -1258,7 +1299,7 @@ export class ReaderService extends TypertRemoteService {
                   book,
                   chapter,
                   payload: content,
-                  fetchRemote: this.fetchRemote,
+                  fetchRemote: source ? (url, options = {}) => this.fetchSource(source, url, options) : this.fetchRemote,
                   allowHttp,
                   isRunning: async () => {
                     const current = this.db.jobs.get(jobId)
@@ -1506,7 +1547,7 @@ export class ReaderService extends TypertRemoteService {
       this.coverCache.set(url, cached)
       return { dataUrl: cached, cached: true }
     }
-    const response = await this.fetchRemote(url, { maxBytes: COVER_MAX_BYTES })
+    const response = await this.fetchSource(book.sourceId, url, { maxBytes: COVER_MAX_BYTES })
     const contentType = String(response.headers['content-type'] || '').split(';')[0].trim().toLowerCase()
     if (!contentType.startsWith('image/')) throw new ReaderError('reader/parse-error', '封面地址返回的不是图片。')
     if (response.buffer.length > COVER_MAX_BYTES) throw new ReaderError('reader/too-large', `封面超过 ${COVER_MAX_BYTES} 字节。`)

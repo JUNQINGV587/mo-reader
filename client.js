@@ -1415,7 +1415,7 @@ window.__ModuleLoader__.load({
         if (!urls.length || busy || !onAddSubscriptions) return;
         onAddSubscriptions(item.sourceId, urls).then((result) => { if (result) dismissRssImport(item.sourceId); }, () => {});
       };
-      const rssCapabilityLabels = { cookie: 'Cookie', login: '登录', 'inject-js': '注入脚本', credentials: '登录凭据' };
+      const rssCapabilityLabels = { login: '登录', 'inject-js': '注入脚本', credentials: '登录凭据' };
       return h('div', { className: 'mr-screen mr-sources-screen' },
         h(ScreenHead, {
           kicker: 'MO READ · 窗边 / 书源',
@@ -1530,11 +1530,11 @@ window.__ModuleLoader__.load({
               const name = source.bookSourceName || source.name || '书源';
               const disabled = source.enabled === false;
               const local = source.id === 'local' || source.bookSourceUrl === 'local:';
-              const unsupportedLabels = { login: '登录', captcha: '验证码', payment: '付费', webview: '内置网页', cookie: 'Cookie', 'inject-js': '注入脚本', credentials: '登录凭据' };
-              const unsupported = (Array.isArray(source.unsupported) ? source.unsupported : []).map((item) => unsupportedLabels[item] || item);
+              const unsupportedLabels = { login: '登录', captcha: '验证码', payment: '付费', webview: '内置网页', 'inject-js': '注入脚本', credentials: '登录凭据' };
+              const unsupported = (Array.isArray(source.unsupported) ? source.unsupported : []).filter((item) => item !== 'cookie').map((item) => unsupportedLabels[item] || item);
               return h('article', { className: `mr-source-row${disabled ? ' is-disabled' : ''}`, key: id },
                 h('span', { className: 'mr-source-icon', 'aria-hidden': true }, name.slice(0, 1)),
-                h('div', null, h('h3', null, name), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl), source.kind === 'rss' && unsupported.length ? h('p', { className: 'mr-source-unsupported' }, `导入时丢弃：${unsupported.join('、')}`) : null),
+                h('div', null, h('h3', null, name), h('p', { title: source.bookSourceUrl }, source.bookSourceUrl), source.kind === 'rss' && source.cookieCount ? h('p', { className: 'mr-source-unsupported' }, `Cookie ${source.cookieCount} 条`) : null, source.kind === 'rss' && unsupported.length ? h('p', { className: 'mr-source-unsupported' }, `导入时丢弃：${unsupported.join('、')}`) : null),
                 h('div', { className: 'mr-source-side' },
                   h('span', { className: `mr-tag${source.lastError ? ' failed' : ''}`, title: source.lastError || (unsupported.length ? `不支持：${unsupported.join('、')}` : '') }, local ? '本机导入' : source.kind === 'rss' ? (disabled ? '订阅源 · 已停用' : '订阅源') : source.contentType === 'website' ? (disabled ? '网站 · 已停用' : '网站入口') : disabled ? '已停用' : source.lastError ? '解析失败 · 需更新规则' : unsupported.length ? `不支持 · ${unsupported.join('/')}` : (source.compatibility || '基础规则')),
                   source.kind === 'rss' && source.feed !== true && source.categories?.length ? h(Button, { kind: 'text', onClick: () => openRssSource(source), disabled: busy }, '分类') : null,

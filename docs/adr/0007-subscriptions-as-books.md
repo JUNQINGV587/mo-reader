@@ -10,14 +10,14 @@
 
 墨读原本把 Legado 的「订阅源（RssSource）」当成书源拒绝导入。用户要求支持 RSS 订阅，且希望与现有书架、阅读器、进度、缓存和备份共用同一套链路，而不是再维护一套独立的订阅阅读器。
 
-Legado 订阅源不是标准 RSS/Atom XML：它用 `sortUrl` 描述分类列表，用 `ruleArticles` / `ruleTitle` / `ruleLink` / `ruleImage` / `rulePubDate` / `ruleContent` 抓网页。订阅源产出的是一条条文章（条目），不是一本书的章节；条目可能需要 Cookie、登录或注入脚本才能在 Legado 的 WebView 里打开。
+Legado 订阅源不是标准 RSS/Atom XML：它用 `sortUrl` 描述分类列表，用 `ruleArticles` / `ruleTitle` / `ruleLink` / `ruleImage` / `rulePubDate` / `ruleContent` 抓网页。订阅源产出的是一条条文章（条目），不是一本书的章节；条目可能需要 Cookie、登录或注入脚本才能在 Legado 的 WebView 里打开。Cookie 由源级 jar 保存并发送；登录和注入脚本仍不支持。
 
 #66 已确认的产品边界：
 
 - 一个「源 × 分类」是一部作品；导入时列出分类，用户勾选后每类生成一张作品卡；
 - 条目按发布时间倒序，只增不删，保留阅读进度与已读标记；
 - 正文先是文本或摘要，图文块与视频播放后续补；
-- 不保存/发送 Cookie，不执行 `injectJs`，不内嵌 WebView；缺能力时明确提示。
+- Cookie 按源保存并只在同 host 发送，不读取外部浏览器 Cookie；不执行 `injectJs`，不内嵌 WebView；缺能力时明确提示。
 
 ## Decision
 
@@ -40,14 +40,14 @@ Legado 订阅源不是标准 RSS/Atom XML：它用 `sortUrl` 描述分类列表�
 - `RssSource` 的列表/正文规则映射为现有规则字段：`chapterList`、`chapterName`、`chapterUrl`、`chapterCover`、`chapterDate`、`chapterDescription`、`nextPage`、`content`。
 - 复用 CSS/JSONPath/XPath/`@js` 子集和 `{{...}}` 模板；`ruleNextPage=page` 是 Legado 的页码哨兵，分类地址含 `{{page}}` 时页码递增重请求；也接受 URL 模板或下一页选择器。
 - 分页到 `maxTocPages` 停止；重复链接按绝对 URL 去重；分页循环报 `reader/pagination-loop`，不静默返回半页。
-- 订阅抓取不因为源声明了 Cookie/登录/注入脚本就整源拒绝——这些能力在导入时已列为「不可用」，公开页面仍可能成功；如果最终没有解析到条目/正文，错误里必须点名被丢弃的能力，不能只报空页。
+- 订阅抓取不因为源声明了登录/注入脚本就整源拒绝——这些能力在导入时已列为「不可用」，公开页面仍可能成功；Cookie 会进入源级 jar。如果最终没有解析到条目/正文，错误里必须点名被丢弃的能力，不能只报空页。
 - 正文规则失败但条目有摘要时，回退到摘要；两者都没有才报 `reader/parse-error`，并带章节上下文。
 
 ### 4. 与 ADR-0006 的关系
 
 - ADR-0006 的四种作品类型扩展为五种：新增 `subscription`；书架左侧由五类变为六类（小说、漫画、音频、视频、网页、订阅）。
 - ADR-0006 的章节载荷联合类型增加「`subscription`：文本（后续为图文块）」；漫画/音频/视频载荷与缓存规则不变。
-- ADR-0006 的「不导入 Cookie、不 WebView、网站源不是作品」继续有效；本 ADR 不放开这些边界。
+- ADR-0006 的「不读取外部浏览器 Cookie、不 WebView、网站源不是作品」继续有效；Cookie 只按源保存和发送，本 ADR 不放开 WebView 或登录边界。
 
 ## Consequences
 
@@ -74,7 +74,7 @@ Negative:
 
 - 标准 RSS 2.0 feed 已从同一个导入入口接入：一个 feed URL 建一部订阅，条目复用章节模型，`description` / `content:encoded` 作为条目载荷；有摘要的 feed 可以只靠 feed 内容阅读。没有摘要/正文的条目会被跳过，不生成打不开的死条目。
 - Atom 仍不支持，导入时明确报错；非 feed 地址不会建空作品。
-- 安全边界不变：不保存或发送 Cookie、不执行 `injectJs`、不内嵌 WebView；feed 的条目链接只作为展示地址，不在服务端抓取文章页。
+- 安全边界：不读取外部浏览器 Cookie；源级 Cookie 只在同 host 发送且不进备份；不执行 `injectJs`、不内嵌 WebView；feed 的条目链接只作为展示地址，不在服务端抓取文章页。
 
 ### 2026-11-14 — 图文块、抽址与单条下载（#66/#70/#71）
 
@@ -91,6 +91,12 @@ Negative:
 - 规则型订阅源允许恢复「无正文、只有条目 URL」的媒体条目，首次打开时重新抓取；RSS 2.0 feed 的每个条目仍必须有非空摘要，空 `text` 不能替代。
 - 恢复失败整体回滚六张表（jobs/chapters/notes/books/sources/subscriptions）与设置，避免留下半套数据；备份版本仍为 2。
 
+### 2026-11-14 — 源级 Cookie jar（用户授权）
+
+- 用户明确允许墨读保存并发送 Cookie。订阅源导入时接受源声明请求头里的 Cookie，抓取中接收并合并 `Set-Cookie`，按源保存在独立 jar；Cookie 是 host-only，忽略 `Domain`，跨站重定向不带。
+- 目录、条目正文、媒体探测、媒体代理、封面与下载都使用同一源级 jar；401/403 仍报 `reader/auth-required`。
+- Cookie 不进入备份，`sourceView` 只暴露 `cookieCount`；登录信息与 `injectJs` 仍不支持。
+
 ## Alternatives considered
 
 - **单独的 feeds/articles 表**：拒绝。会复制书架、进度、笔记、备份和追更逻辑，且用户看到两套阅读入口。
@@ -100,7 +106,7 @@ Negative:
 
 ## Non-goals
 
-- 不保存或代理浏览器 Cookie，不做登录/验证码。
+- 不读取或代理外部浏览器 Cookie；源级 Cookie 按上面规则保存，不做登录/验证码。
 - 不执行 `injectJs`，不内嵌 WebView。
 - 本 ADR 不定义图文块载荷、视频抽址和播放器；由 #70/#71 落地（见 Amendments），本节仅保留原始边界。
 - 不做 Atom 解析；RSS 2.0 适配器已在 #74 接入（见 Amendments）。

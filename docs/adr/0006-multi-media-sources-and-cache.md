@@ -14,7 +14,7 @@
 - 覆盖搜索、详情、目录、播放/看图、进度和按需下载的全链路；
 - 兼容 Legado 的 0 文本、1 音频、2 图片/漫画、4 视频类型，继续使用现有 CSS/JSON/JS 子集；
 - 网站源用我们自己的网址模板，不依赖 Legado 的 WebView 规则；
-- 网页登录由外部浏览器处理，墨读不保存或代理浏览器 Cookie；
+- 网页登录由外部浏览器处理，墨读不读取或代理外部浏览器 Cookie；书源/订阅源声明的 Cookie 与站点下发的 `Set-Cookie` 由源级 jar 保存（2026-11-14 修订）；
 - 媒体文件存到 DSH 服务端，可跨设备访问；
 - HLS 完整离线缓存，默认最高清晰度，AES-128 可解，DRM 不支持；
 - 媒体在线播放走后端代理，避免 CORS/Referer 问题。
@@ -54,7 +54,7 @@
 
 - `homeUrl` 必填；`searchUrl` 可选，`{{key}}` 由墨读做 URL 编码。
 - `contentType=website` 的记录没有抓取规则、不会产出作品卡；启用后自动出现在“网页”书架。
-- 点站点卡或全局搜索里的站点结果，用用户点击触发的 `window.open(..., noopener)` 打开外部浏览器。墨读不渲染 iframe，不读取、不保存浏览器 Cookie；站点登录和验证码完全由浏览器处理。
+- 点站点卡或全局搜索里的站点结果，用用户点击触发的 `window.open(..., noopener)` 打开外部浏览器。墨读不渲染 iframe，不读取、不保存外部浏览器 Cookie；站点登录和验证码完全由浏览器处理。网站源没有抓取链路，不创建源级 Cookie jar。
 - 全局搜索把站点结果单独列在底部；没有 `searchUrl` 的站点只打开首页。
 - 网站源的权限 origin 来自 `homeUrl` 和 `searchUrl`；订阅扩权检查必须把它们计入。
 
@@ -80,8 +80,9 @@
 
 ### 6. 鉴权边界
 
-- 媒体请求只带书源规则里声明的请求头/Referer；不读取外部浏览器 Cookie。
-- 需要浏览器登录 Cookie 才能拉取的媒体不在首版支持范围，必须报明确的“需要登录”错误，不能静默失败。
+- 媒体请求带书源/订阅源声明的请求头/Referer 和该源的 Cookie jar；不读取外部浏览器 Cookie。
+- 源级 Cookie 按 host-only 保存，只在匹配 host 的请求发送，跨站重定向不带；Cookie 不写入备份，也不通过客户端接口暴露。
+- 源级 jar 没有有效凭据、站点仍返回 401/403 时，必须报明确的“需要登录”错误，不能静默失败。
 - AES-128 的 key 请求沿用同一套源请求头，但 key 不写入磁盘。
 - 外部浏览器的登录态与墨读服务端完全分离；退出/清空浏览器由用户自行处理。
 
@@ -108,6 +109,14 @@
 
 ## Amendments
 
+### 2026-11-14 — 源级 Cookie jar
+
+- 用户明确允许墨读保存并发送 Cookie。范围限定为书源/订阅源自己的 Cookie：导入时接受源声明请求头里的 Cookie，抓取过程中接收并合并 `Set-Cookie`，按源保存在独立 jar 中。
+- Cookie 是 host-only：忽略 `Domain` 属性，只发给完全相同的主机；跨站重定向不携带；不读取外部浏览器 Cookie，不把 Cookie 暴露给客户端接口或日志。
+- 抓取、媒体探测、媒体代理、封面和下载都使用同一源级 jar；没有有效凭据导致 401/403 时仍报 `reader/auth-required`。
+- Cookie 不进入备份；恢复备份从空 jar 开始。导入/恢复的静态请求头仍拒绝 `Authorization` 等凭据，规则级 `headers.Cookie` 仍被拒绝；只有源顶层声明的 Cookie 进入 jar。
+- 持久化字段为源记录的 `cookies` 数组；`sourceView` 只返回 `cookieCount`。旧备份和没有 Cookie 的源不受影响。
+
 ### 2026-11-14 — 媒体类型标记与 HLS 判定（#77）
 
 - §2 的音频/视频章节载荷增加可选 `mediaHls`：`true` 为 HLS playlist，`false` 为直链。地址以 `.m3u8` 结尾，或响应 `content-type` 为 `application/vnd.apple.mpegurl` / `application/x-mpegurl` / `audio/mpegurl` / `audio/x-mpegurl` 时判为 HLS。
@@ -129,7 +138,7 @@ Negative:
 
 - 需要新增 `webServer` 媒体路由、文件缓存索引、HLS 下载器和媒体播放器，范围明显大于文字书。
 - 服务端承担媒体带宽和 50GB 存储；需要配额、清理和 Range 测试。
-- 外部浏览器无法提供墨读内的独立登录态，需要登录 Cookie 的媒体首版不支持。
+- 外部浏览器无法提供墨读内的独立登录态；需要登录时只能用源声明的 Cookie 或站点抓取时下发的 Set-Cookie，源级 jar 没有凭据就仍会失败。
 - 缓存分片不是通用视频文件，不能直接导出为 MP4。
 
 ## Alternatives considered
@@ -143,7 +152,7 @@ Negative:
 
 ## Non-goals
 
-- 不做浏览器 Cookie 导入、服务端无头浏览器或验证码代理。
+- 不做外部浏览器 Cookie 导入、服务端无头浏览器或验证码代理；源声明的 Cookie 走独立 jar，这不是浏览器登录态。
 - 不支持 Legado `bookSourceType=3`（网络文件）。
 - 不支持 SAMPLE-AES、Widevine、FairPlay 或其他 DRM。
 - 不做字幕、弹幕、投屏、转码导出。
