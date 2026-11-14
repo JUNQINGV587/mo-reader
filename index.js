@@ -1827,19 +1827,43 @@ export class ReaderService extends TypertRemoteService {
     this.assertReady()
     if (this.runningJobs.size) throw new ReaderError('reader/busy', '请先取消或等待下载任务结束。')
     const backup = parseBackup(args.data)
-    await this.db.jobs.deleteMany(entries(this.db.jobs).map(job => job.id))
-    await this.db.chapters.deleteMany(entries(this.db.chapters).map(chapter => chapter.id))
-    await this.db.notes.deleteMany(entries(this.db.notes).map(note => note.id))
-    await this.db.books.deleteMany(entries(this.db.books).map(book => book.id))
-    await this.db.sources.deleteMany(entries(this.db.sources).map(source => source.id))
-    await this.db.subscriptions.deleteMany(entries(this.db.subscriptions).map(subscription => subscription.id))
-    for (const source of backup.sources) await this.db.sources.put(source.id, source)
-    for (const subscription of backup.subscriptions) await this.db.subscriptions.put(subscription.id, subscription)
-    for (const book of backup.books) await this.db.books.put(book.id, book)
-    for (const chapter of backup.chapters) await this.db.chapters.put(chapter.id, chapter)
-    for (const note of backup.notes) await this.db.notes.put(note.id, note)
-    await this.db.settings.set({ ...DEFAULT_SETTINGS, ...backup.settings })
-    return this.state()
+    // 恢复会先清空六张表再写入；任意一次写入失败都可能留下半套书源/章节。
+    // 先快照旧数据，失败时整体回滚，让用户修正备份后可以直接重试。
+    const tables = [
+      { table: this.db.jobs, records: entries(this.db.jobs).map(record => clone(record)) },
+      { table: this.db.chapters, records: entries(this.db.chapters).map(record => clone(record)) },
+      { table: this.db.notes, records: entries(this.db.notes).map(record => clone(record)) },
+      { table: this.db.books, records: entries(this.db.books).map(record => clone(record)) },
+      { table: this.db.sources, records: entries(this.db.sources).map(record => clone(record)) },
+      { table: this.db.subscriptions, records: entries(this.db.subscriptions).map(record => clone(record)) },
+    ]
+    const previousSettings = clone(this.db.settings.get())
+    try {
+      for (const { table, records } of tables) await table.deleteMany(records.map(record => record.id))
+      for (const source of backup.sources) await this.db.sources.put(source.id, source)
+      for (const subscription of backup.subscriptions) await this.db.subscriptions.put(subscription.id, subscription)
+      for (const book of backup.books) await this.db.books.put(book.id, book)
+      for (const chapter of backup.chapters) await this.db.chapters.put(chapter.id, chapter)
+      for (const note of backup.notes) await this.db.notes.put(note.id, note)
+      await this.db.settings.set({ ...DEFAULT_SETTINGS, ...backup.settings })
+      return this.state()
+    } catch (error) {
+      let rollbackFailed = false
+      for (const { table, records } of tables) {
+        try {
+          await table.deleteMany(entries(table).map(record => record.id))
+          for (const record of records) await table.put(record.id, record)
+        } catch {
+          rollbackFailed = true
+        }
+      }
+      try {
+        await this.db.settings.set(previousSettings)
+      } catch {
+        rollbackFailed = true
+      }
+      throw new ReaderError('reader/restore-failed', rollbackFailed ? '备份恢复失败，旧数据回滚未完成。' : '备份恢复失败，已保留原有数据。', undefined, { cause: error })
+    }
   }
 
   mediaEntryView(record) {

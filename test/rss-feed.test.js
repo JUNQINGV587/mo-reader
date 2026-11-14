@@ -553,6 +553,22 @@ test('a version-1 backup without subscription fields imports through the service
   assert.equal(state.books[0].contentType, 'novel')
 })
 
+test('a feed backup is restored without Legado rule validation', async () => {
+  const body = feed({
+    items: [item({ title: '规则无关', link: '/posts/rules', description: '摘要', date: 'Thu, 13 Nov 2025 09:00:00 GMT' })],
+  })
+  const { service } = await fixture(body)
+  await service.importSource({ url: FEED_URL })
+  const backup = JSON.parse(await service.exportBackup())
+  const source = backup.sources.find((entry) => entry.feed === true)
+  source.rules = { toc: { chapterList: 123 }, content: '.not-an-object' }
+  const fresh = await fixture(body)
+  const state = await fresh.service.importBackup({ data: backup })
+  const restored = state.sources.find((entry) => entry.feed === true)
+  assert.equal(restored.kind, 'rss')
+  assert.equal(restored.contentType, 'subscription')
+})
+
 test('feed sources and subscription books survive a backup round trip', async () => {
   const body = feed({
     items: [item({ title: '备份条目', link: '/posts/backup', description: '备份摘要', date: 'Thu, 13 Nov 2025 09:00:00 GMT' })],
@@ -575,4 +591,34 @@ test('feed sources and subscription books survive a backup round trip', async ()
   assert.deepEqual(toc.map((entry) => entry.title), ['备份条目'])
   const chapter = await fresh.service.chapter({ bookId: restored.id, chapterId: toc[0].id })
   assert.match(chapter.text, /备份摘要/)
+})
+
+test('a restored feed backup rejects a link-only entry but keeps a summarized entry', async () => {
+  const body = feed({
+    items: [item({ title: '摘要条目', link: '/posts/summary', description: '<p>可读摘要</p>', date: 'Thu, 13 Nov 2025 09:00:00 GMT' })],
+  })
+  const { service, db } = await fixture(body)
+  await service.importSource({ url: FEED_URL })
+  await service.toc({ bookId: books(db)[0].id })
+  const backup = JSON.parse(await service.exportBackup())
+  const source = backup.sources.find((entry) => entry.feed === true)
+  assert.equal(Object.hasOwn(source, 'headers'), false)
+  assert.equal(Object.hasOwn(source, 'unsupported'), false)
+  assert.equal(backup.chapters.length, 1)
+
+  const fresh = await fixture(body)
+  const state = await fresh.service.importBackup({ data: backup })
+  const restored = state.books.find((entry) => entry.contentType === 'subscription')
+  const toc = await fresh.service.toc({ bookId: restored.id })
+  const chapter = await fresh.service.chapter({ bookId: restored.id, chapterId: toc[0].id })
+  assert.match(chapter.text, /可读摘要/)
+
+  const linkOnly = JSON.parse(JSON.stringify(backup))
+  delete linkOnly.chapters[0].description
+  delete linkOnly.chapters[0].text
+  const rejected = await fixture(body)
+  await assert.rejects(
+    rejected.service.importBackup({ data: linkOnly }),
+    (error) => error.code === 'reader/invalid-backup' && /摘要/.test(error.message),
+  )
 })

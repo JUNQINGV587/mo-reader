@@ -48,12 +48,15 @@ function playPage(candidates = [DEAD, LIVE]) {
 }
 
 async function fixture(options = {}) {
+  const { source: sourceOverrides, ...serviceOptions } = options
   let live = options.live !== false
   const probes = []
+  const requests = []
   let fetches = 0
   const engine = new SourceEngine({
     fetch: async (url, config = {}) => {
       fetches += 1
+      requests.push({ url, method: config.method, headers: config.headers || {} })
       const path = new URL(url).pathname
       if (path === '/video/page/1.html') return response(url, listPage())
       if (path === '/post/1') return response(url, playPage(options.candidates))
@@ -66,8 +69,8 @@ async function fixture(options = {}) {
       throw new Error('unexpected URL ' + url)
     },
   })
-  const { service, db } = await serviceFixture(engine, options)
-  const imported = await service.importSource({ text: JSON.stringify(source()) })
+  const { service, db } = await serviceFixture(engine, serviceOptions)
+  const imported = await service.importSource({ text: JSON.stringify(source(sourceOverrides)) })
   const added = await service.addSubscriptions({ sourceId: imported.sourceId, categories: [imported.categories[0].url] })
   return {
     service,
@@ -75,6 +78,7 @@ async function fixture(options = {}) {
     book: added.books[0],
     sourceId: imported.sourceId,
     probes,
+    requests,
     fetches: () => fetches,
     setLive: (value) => { live = value },
   }
@@ -125,6 +129,55 @@ test('a restored subscription media entry is fetched and played again', async ()
   const restored = await service.chapter({ bookId: book.id, chapterId: restoredToc[0].id })
   assert.equal(restored.mediaUrl, LIVE)
   assert.equal(restored.mediaHls, true)
+})
+
+test('a backup export scrubs subscription header credentials and the restored source fetches with the cleaned headers', async () => {
+  const token = 'header-token-must-not-leak'
+  const { service, book, requests } = await fixture({
+    source: {
+      header: JSON.stringify({
+        'User-Agent': 'ExampleVideo/2.0',
+        Referer: SITE + '/watch?token=' + token + '&lang=zh#player',
+        Accept: 'application/json',
+        Cookie: 'session=' + token,
+        Authorization: 'Bearer ' + token,
+        'X-Preview': 'Bearer ' + token,
+      }),
+    },
+  })
+
+  const backup = await service.exportBackup()
+  assert.equal(backup.includes(token), false)
+  const parsed = JSON.parse(backup)
+  assert.equal(parsed.version, 2)
+  assert.equal(parsed.sources[0].headers.referer, SITE + '/watch?lang=zh')
+  assert.equal(parsed.sources[0].headers.cookie, undefined)
+  assert.equal(parsed.sources[0].headers.authorization, undefined)
+  assert.equal(parsed.sources[0].headers['x-preview'], undefined)
+  assert.equal(parsed.sources[0].headers.accept, 'application/json')
+
+  // 旧版本导出的备份里可能还带着凭据，恢复时要再清洗一次。
+  parsed.sources[0].headers.referer = SITE + '/watch?token=' + token + '&lang=zh'
+  requests.length = 0
+  const fresh = await serviceFixture(service.engine)
+  await fresh.service.importBackup({ data: parsed })
+
+  const restored = fresh.db.sources.get(book.sourceId)
+  assert.equal(restored.headers.referer, SITE + '/watch?lang=zh')
+  assert.equal(restored.headers.cookie, undefined)
+  assert.equal(restored.headers.authorization, undefined)
+  assert.equal(restored.headers['x-preview'], undefined)
+
+  const toc = await fresh.service.toc({ bookId: book.id })
+  assert.equal(toc.length, 1)
+  await fresh.service.chapter({ bookId: book.id, chapterId: toc[0].id })
+  const sent = requests.filter(item => new URL(item.url).hostname === 'rss.example')
+  assert.ok(sent.some(item => new URL(item.url).pathname === '/video/page/1.html'), '恢复后应重新抓取订阅列表')
+  assert.ok(sent.some(item => new URL(item.url).pathname === '/post/1'), '恢复后应重新抓取条目正文')
+  for (const item of sent) {
+    assert.equal(item.headers.referer, SITE + '/watch?lang=zh')
+    assert.equal(item.headers.accept, 'application/json')
+  }
 })
 
 test('a .m3u8 address stays HLS even when the server says octet-stream', async () => {
