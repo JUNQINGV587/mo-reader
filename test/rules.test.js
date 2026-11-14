@@ -58,6 +58,20 @@ test('basic source normalization accepts XPath and rejects unsupported syntax an
   )
 })
 
+test('source URLs without a scheme are completed as HTTPS', () => {
+  const base = { bookSourceName: 'url-test', ruleSearch: { bookList: '.book' } }
+  assert.equal(normalizeSource({ ...base, bookSourceUrl: 'example.com/path' }).bookSourceUrl, 'https://example.com/path')
+  assert.equal(normalizeSource({ ...base, bookSourceUrl: '//example.com' }).bookSourceUrl, 'https://example.com')
+  assert.throws(
+    () => normalizeSource({ ...base, bookSourceUrl: '/relative' }),
+    error => error.code === 'reader/invalid-url' && /书源地址/.test(error.message),
+  )
+  assert.throws(
+    () => normalizeSource({ ...base, bookSourceUrl: 'http://example.com' }),
+    error => error.code === 'reader/insecure-url' && /Only HTTPS/.test(error.message),
+  )
+})
+
 test('book source comments mentioning WebView do not reject the source', () => {
   const base = { bookSourceName: 'comment-test', bookSourceUrl: 'https://example.com', ruleSearch: { bookList: '.book' } }
   const source = normalizeSource({ ...base, bookSourceComment: '该源需要 WebView 才能看评论，请用浏览器打开。' })
