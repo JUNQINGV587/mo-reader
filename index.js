@@ -30,7 +30,7 @@ export const REMOTE_METHODS = Object.freeze([
   'state', 'importSource', 'addSubscriptions', 'subscribeSourceLibrary', 'refreshSubscription', 'confirmSubscriptionUpdate', 'rejectSubscriptionUpdate', 'removeSubscription', 'restoreBuiltinSources', 'removeSource', 'setSourceEnabled', 'search', 'discover', 'addBook', 'removeBook', 'toc', 'chapter', 'cancelDownloadChapters',
   'saveProgress', 'download', 'cancelJob', 'pauseJob', 'resumeJob', 'checkUpdates', 'importLocal', 'setSettings', 'setBookSettings', 'saveNote', 'deleteNote',
   'exportBackup', 'importBackup', 'fetchCover', 'cacheBookCover', 'bookCandidates', 'applyBookMeta',
-  'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markBookRead', 'exportNotes',
+  'createFolder', 'renameFolder', 'removeFolder', 'moveBooksToFolder', 'batchDeleteBooks', 'batchDownloadBooks', 'exportBook', 'markChapterRead', 'markBookRead', 'exportNotes',
   'aiSummarize', 'aiTranslate', 'aiAsk',
   'mediaCacheStats', 'listMediaCache', 'setMediaRetained', 'setChapterRetained', 'removeMediaCache',
 ])
@@ -309,6 +309,7 @@ export class ReaderService extends TypertRemoteService {
       downloadedAt: chapter.downloadedAt,
       ...(chapter.coverUrl ? { coverUrl: chapter.coverUrl } : {}),
       ...(chapter.publishedAt ? { publishedAt: chapter.publishedAt } : {}),
+      ...(chapter.readAt ? { readAt: chapter.readAt } : {}),
       ...(offline ? { offline: clone(chapter.offline) } : {}),
     }
   }
@@ -323,11 +324,15 @@ export class ReaderService extends TypertRemoteService {
       return textType && !streaming ? hasChapterPayload(chapter, contentType) : this.offlineRecordReady(chapter, contentType)
     }).length
     const readIndex = book.progress ? chapters.findIndex(chapter => chapter.id === book.progress.chapterId) : -1
+    const unread = contentType === 'subscription'
+      // 旧订阅在升级前没有 readBaselineAt，也没有任何 readAt；票面约定按「全部已读」处理。
+      ? (book.readBaselineAt ? chapters.filter(chapter => !chapter.readAt).length : 0)
+      : Math.max(0, readIndex < 0 ? chapters.length : chapters.length - readIndex - 1)
     const status = book.download?.status === 'completed' && downloaded < chapters.length ? 'partial' : book.download?.status ?? (downloaded ? 'partial' : 'none')
     return {
       ...clone(book),
       contentType: normalizeBookContentType(book.contentType),
-      unread: Math.max(0, readIndex < 0 ? chapters.length : chapters.length - readIndex - 1),
+      unread,
       lastRead: clone(book.progress ?? null),
       sourceHome: /^https?:/i.test(String(source?.bookSourceUrl ?? '')) ? source.bookSourceUrl : null,
       readerPrefs: book.readerPrefs && Object.keys(book.readerPrefs).length ? clone(book.readerPrefs) : null,
@@ -441,6 +446,8 @@ export class ReaderService extends TypertRemoteService {
         local: false,
         subscription,
         addedAt: timestamp,
+        // 建订阅时记下基线：此后新增的条目没有 readAt，才算未读。
+        readBaselineAt: timestamp,
         progress: null,
         download: { status: 'none', auto: false },
         createdAt: timestamp,
@@ -860,18 +867,37 @@ export class ReaderService extends TypertRemoteService {
   // 失败时调用方不会走到这里，旧目录自然留在库里。
   async syncSubscriptionToc(book, fresh) {
     const old = this.chapters(book.id)
+    let latest = this.db.books.get(book.id) ?? book
+    // 第一次刷新旧订阅时补一次基线：已有条目按「全部已读」处理，之后新增的才算未读。
+    // 本地没有旧条目时，这一批就是升级前的全部积压，也一并记为已读；否则升级后会突然多出几百条未读。
+    const needsBaseline = !latest.readBaselineAt && (old.length > 0 || fresh.length > 0)
+    let baseline = latest.readBaselineAt
+    if (needsBaseline) {
+      baseline = now()
+      for (const cached of old) {
+        if (cached.readAt) continue
+        cached.readAt = baseline
+        await this.db.chapters.put(cached.id, cached)
+      }
+      latest = { ...latest, readBaselineAt: baseline }
+    }
+    const seedFreshReadAt = needsBaseline && old.length === 0
     const oldByUrl = new Map(old.map(chapter => [chapter.url, chapter]))
     const freshUrls = new Set()
     const merged = fresh.map(chapter => {
       freshUrls.add(chapter.url)
       const cached = oldByUrl.get(chapter.url)
-      if (!cached) return { ...chapter, bookId: book.id, contentType: 'subscription' }
+      if (!cached) return {
+        ...chapter,
+        bookId: book.id,
+        contentType: 'subscription',
+        ...(seedFreshReadAt ? { readAt: chapter.readAt ?? baseline } : {}),
+      }
       return { ...cached, ...chapter, id: cached.id, index: cached.index, bookId: book.id, contentType: 'subscription' }
     })
     for (const cached of old) if (!freshUrls.has(cached.url)) merged.push(cached)
     const chapters = merged.map((chapter, index) => ({ ...chapter, index }))
     for (const chapter of chapters) await this.db.chapters.put(chapter.id, chapter)
-    const latest = this.db.books.get(book.id) ?? book
     await this.db.books.put(book.id, {
       ...latest,
       latestChapter: fresh[0]?.title ?? latest.latestChapter,
@@ -1631,11 +1657,40 @@ export class ReaderService extends TypertRemoteService {
     throw new ReaderError('reader/invalid-input', `不支持的导出格式 ${format}，目前只支持 txt、md 和 epub。`)
   }
 
+  async markChapterRead(args) {
+    args ??= {}
+    this.assertReady()
+    const book = this.book(args.bookId)
+    const chapter = this.db.chapters.get(requiredString(args.chapterId, 'chapterId'))
+    if (!chapter || chapter.bookId !== book.id) throw new ReaderError('reader/not-found', 'Chapter does not belong to this book.')
+    // 未读只在订阅作品里生效；其它作品保持原有阅读进度语义。
+    if (normalizeBookContentType(book.contentType) !== 'subscription') return this.bookView(book)
+    // 旧订阅没有基线时不能在这里补：补了会把其余旧条目算成未读；基线由首次刷新统一补。
+    if (chapter.readAt) return this.bookView(book)
+    await this.db.chapters.put(chapter.id, { ...chapter, readAt: now() })
+    return this.bookView(this.book(book.id))
+  }
+
   async markBookRead(args) {
     args ??= {}
     this.assertReady()
     const book = this.book(args.bookId)
-    await this.db.books.put(book.id, { ...book, readAt: now(), updatedAt: now() })
+    const timestamp = now()
+    if (normalizeBookContentType(book.contentType) === 'subscription') {
+      for (const chapter of this.chapters(book.id)) {
+        if (chapter.readAt) continue
+        await this.db.chapters.put(chapter.id, { ...chapter, readAt: timestamp })
+      }
+      const latest = this.db.books.get(book.id) ?? book
+      await this.db.books.put(book.id, {
+        ...latest,
+        readAt: timestamp,
+        readBaselineAt: latest.readBaselineAt ?? timestamp,
+        updatedAt: timestamp,
+      })
+      return this.bookView(this.book(book.id))
+    }
+    await this.db.books.put(book.id, { ...book, readAt: timestamp, updatedAt: timestamp })
     return this.bookView(this.book(book.id))
   }
 

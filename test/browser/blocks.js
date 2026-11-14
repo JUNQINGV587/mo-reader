@@ -101,6 +101,37 @@ window.blocksTest = (async () => {
     check('视频条目渲染播放器', !!video)
     check('播放器有控制条', video.controls === true)
     check('视频走媒体代理', String(video.getAttribute('src')).includes('/api/reader/proxy?') && String(video.getAttribute('src')).includes('chapterId=video-0'))
+
+    // 未读：打开条目应标记当前条目，目录标出剩余未读，并提供全部已读。
+    const readCalls = []
+    const markAllCalls = []
+    const unreadCtx = { remote: { reader: {
+      toc: async () => [{ id: 'u-0', name: '未读条目' }, { id: 'u-1', name: '第二条' }],
+      chapter: async () => ({ id: 'u-0', name: '条目正文', contentType: 'subscription', text: '条目正文' }),
+      markChapterRead: async (args) => { readCalls.push(args.chapterId); return {} },
+      markBookRead: async () => { markAllCalls.push('all'); return {} },
+      saveProgress: async () => ({}),
+    } } }
+    const unreadBook = {
+      id: 'unread-book', title: '未读回归', contentType: 'subscription', readBaselineAt: '2026-01-01T00:00:00.000Z',
+      readerPrefs: { mode: 'scroll', ambience: 'off' },
+      lastRead: { chapterId: 'u-0', percent: 0, offset: 0 },
+    }
+    root.render(React.createElement(window.__readerTest.ReaderView, {
+      key: 'unread-book', ctx: unreadCtx, book: unreadBook, settings, notes: [], onClose() {},
+    }))
+    await waitFor(() => readCalls.length === 1, '打开未读条目没有标记已读')
+    check('打开条目标记当前条目', readCalls[0] === 'u-0')
+    const tocButton = [...host.querySelectorAll('button')].find((node) => node.getAttribute('aria-label') === '目录')
+    check('目录入口存在', !!tocButton)
+    tocButton.click()
+    await waitFor(() => host.querySelector('.mr-toc-new'), '目录没有标出未读条目')
+    check('目录标出剩余未读', host.querySelectorAll('.mr-toc-new').length === 1)
+    const markAll = [...host.querySelectorAll('button')].find((node) => node.textContent === '全部已读')
+    check('全部已读入口存在', !!markAll)
+    markAll.click()
+    await waitFor(() => !host.querySelector('.mr-toc-new'), '全部已读后仍有未读标记')
+    check('全部已读调用服务', markAllCalls.length === 1)
     return { ok: true, checks }
   } catch (error) {
     return { ok: false, error: error.stack || String(error) }
