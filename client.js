@@ -164,7 +164,11 @@ window.__ModuleLoader__.load({
         if (!chapter.mediaUrl) return { kind: 'error', error: '这一章缺少媒体地址。' };
         const url = mediaProxyUrl(book.id || book.bookId, chapter.id);
         if (!url) return { kind: 'error', error: '缺少章节媒体地址。' };
-        const hls = /\.m3u8(?:[?#]|$)/i.test(chapter.mediaUrl || '');
+        // 新数据由服务端探测后写入 mediaHls；旧数据没有标记时，无扩展名的地址按 HLS 处理，
+        // 避免无后缀播放列表在非原生 HLS 浏览器里被当成直链。
+        const mediaUrl = String(chapter.mediaUrl || '');
+        const hasExtension = /\.[a-z0-9]{1,5}(?:[?#]|$)/i.test(mediaUrl);
+        const hls = chapter.mediaHls === true || (chapter.mediaHls !== false && (/\.m3u8(?:[?#]|$)/i.test(mediaUrl) || !hasExtension));
         return { kind: 'media', url, offline: false, hls: hls && !nativeHlsSupported() };
       }
       return { kind: 'error', error: '不支持这种媒体类型。' };

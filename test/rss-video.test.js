@@ -6,7 +6,7 @@ import path from 'node:path'
 import { SourceEngine } from '../lib/source-engine.js'
 import { MediaStore } from '../lib/media-store.js'
 import { proxyResponse } from '../lib/media-http.js'
-import { MEDIA_PROBE_TIMEOUT_MS, extractMediaCandidates, firstPlayableMedia, probeMediaUrl } from '../lib/media-probe.js'
+import { MEDIA_PROBE_TIMEOUT_MS, extractMediaCandidates, firstPlayableMedia, firstPlayableMediaInfo, probeMediaUrl } from '../lib/media-probe.js'
 import { serviceFixture, waitForJob } from './helpers.js'
 
 const SITE = 'https://rss.example'
@@ -106,6 +106,55 @@ test('a video entry probes candidates in order, plays the first working address 
   assert.equal(fetches(), before)
 })
 
+test('a .m3u8 address stays HLS even when the server says octet-stream', async () => {
+  const url = 'https://media.example/live.m3u8'
+  const requests = []
+  const engine = new SourceEngine({
+    fetch: async (requestUrl, config = {}) => {
+      requests.push({ url: requestUrl, method: config.method })
+      const path = new URL(requestUrl).pathname
+      if (path === '/video/page/1.html') return response(requestUrl, listPage())
+      if (path === '/post/1') return response(requestUrl, '<div id="player"><video src="' + url + '"></video></div>')
+      if (requestUrl === url) return { status: 200, headers: { 'content-type': 'application/octet-stream' }, text: '#EXTM3U' }
+      throw new Error('unexpected URL ' + requestUrl)
+    },
+  })
+  const { service } = await serviceFixture(engine)
+  const imported = await service.importSource({ text: JSON.stringify(source()) })
+  const added = await service.addSubscriptions({ sourceId: imported.sourceId, categories: [imported.categories[0].url] })
+  const toc = await service.toc({ bookId: added.books[0].id })
+  const chapter = await service.chapter({ bookId: added.books[0].id, chapterId: toc[0].id })
+  assert.equal(chapter.mediaUrl, url)
+  assert.equal(chapter.mediaHls, true)
+  assert.ok(requests.some(item => item.url === url && item.method === 'HEAD'))
+})
+
+test('a content-type-only HLS address is reported to the client as HLS and cached', async () => {
+  const url = 'https://media.example/stream/42'
+  const requests = []
+  const engine = new SourceEngine({
+    fetch: async (requestUrl, config = {}) => {
+      requests.push({ url: requestUrl, method: config.method })
+      const path = new URL(requestUrl).pathname
+      if (path === '/video/page/1.html') return response(requestUrl, listPage())
+      if (path === '/post/1') return response(requestUrl, '<div id="player"><video src="' + url + '"></video></div>')
+      if (requestUrl === url) return { status: 200, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, text: '#EXTM3U' }
+      throw new Error('unexpected URL ' + requestUrl)
+    },
+  })
+  const { service, db } = await serviceFixture(engine)
+  const imported = await service.importSource({ text: JSON.stringify(source()) })
+  const added = await service.addSubscriptions({ sourceId: imported.sourceId, categories: [imported.categories[0].url] })
+  const toc = await service.toc({ bookId: added.books[0].id })
+  const chapter = await service.chapter({ bookId: added.books[0].id, chapterId: toc[0].id })
+  assert.equal(chapter.mediaUrl, url)
+  assert.equal(chapter.mediaHls, true)
+  assert.equal(db.chapters.get(toc[0].id).mediaHls, true)
+  const before = requests.length
+  await service.chapter({ bookId: added.books[0].id, chapterId: toc[0].id })
+  assert.equal(requests.length, before, '第二次打开应直接复用落库判定')
+})
+
 test('a long article with an ad video literal stays an article', async () => {
   const requested = []
   const longText = '正'.repeat(300)
@@ -199,6 +248,32 @@ test('the proxy plays a probed subscription video with the source headers', asyn
   assert.equal(calls[0].options.headers.cookie, undefined)
 })
 
+test('probing skips an unknown content type and uses the next candidate', async () => {
+  const calls = []
+  const info = await firstPlayableMediaInfo(['https://media.example/bad', 'https://media.example/good'], {
+    fetch: async (url, options) => {
+      calls.push({ url, method: options.method })
+      if (url === 'https://media.example/bad') {
+        return { status: 200, headers: { 'content-type': 'application/json' }, text: '{}' }
+      }
+      return { status: 200, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, text: '#EXTM3U' }
+    },
+  })
+  assert.equal(info.url, 'https://media.example/good')
+  assert.equal(info.kind, 'hls')
+  assert.ok(calls.some(call => call.url === 'https://media.example/bad' && call.method === 'HEAD'))
+  assert.ok(calls.some(call => call.url === 'https://media.example/bad' && call.method === 'GET'))
+})
+
+test('an unknown content type with no usable candidate is a readable unsupported-media error', async () => {
+  await assert.rejects(
+    firstPlayableMediaInfo(['https://media.example/image.jpg'], {
+      fetch: async () => ({ status: 200, headers: { 'content-type': 'image/jpeg' }, text: '' }),
+    }),
+    error => error.code === 'reader/unsupported-media' && /不是可播放/.test(error.message),
+  )
+})
+
 test('a server that rejects HEAD is probed again with a one-byte range request', async () => {
   const calls = []
   const found = await probeMediaUrl('https://media.example/live.m3u8', {
@@ -245,6 +320,14 @@ test('extractMediaCandidates keeps document order, dedupes and caps at five', ()
     'https://cdn.example/d.mp4',
     'https://cdn.example/e.m3u8',
   ])
+})
+
+test('video tags keep suffixless sources while bare literals still need a media suffix', () => {
+  const html = [
+    '<video src="https://cdn.example/stream/42"></video>',
+    '<script>var ad = "https://cdn.example/stream/43";</script>',
+  ].join('\n')
+  assert.deepEqual(extractMediaCandidates(html, SITE), ['https://cdn.example/stream/42'])
 })
 
 async function tempStore() {

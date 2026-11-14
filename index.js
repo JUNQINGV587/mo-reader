@@ -315,6 +315,7 @@ export class ReaderService extends TypertRemoteService {
       downloaded: textType && !streaming ? hasChapterPayload(chapter, contentType) : offline,
       downloadedAt: chapter.downloadedAt,
       ...(chapter.coverUrl ? { coverUrl: chapter.coverUrl } : {}),
+      ...(typeof chapter.mediaHls === 'boolean' ? { mediaHls: chapter.mediaHls } : {}),
       ...(chapter.publishedAt ? { publishedAt: chapter.publishedAt } : {}),
       ...(chapter.readAt ? { readAt: chapter.readAt } : {}),
       ...(offline ? { offline: clone(chapter.offline) } : {}),
@@ -894,7 +895,7 @@ export class ReaderService extends TypertRemoteService {
       const next = { ...chapter, bookId: book.id, index: chapter.index ?? position, contentType: bookType }
       if (!cached) return next
       const preserved = {}
-      for (const key of ['text', 'html', 'blocks', 'payloadVersion', 'images', 'mediaUrl', 'offline', 'downloadedAt']) {
+      for (const key of ['text', 'html', 'blocks', 'payloadVersion', 'images', 'mediaUrl', 'mediaHls', 'offline', 'downloadedAt']) {
         if (cached[key] !== undefined) preserved[key] = cached[key]
       }
       return { ...next, ...preserved }
@@ -1199,7 +1200,7 @@ export class ReaderService extends TypertRemoteService {
         const needsPayload = !hasChapterPayload(chapter, book.contentType)
         const needsOffline = mediaType && !(await this.offlineReady(book, chapter))
         if (needsPayload || needsOffline) {
-          let content = needsPayload ? null : Object.fromEntries(['text', 'html', 'images', 'mediaUrl', 'headers'].filter(key => chapter[key] !== undefined).map(key => [key, chapter[key]]))
+          let content = needsPayload ? null : Object.fromEntries(['text', 'html', 'images', 'mediaUrl', 'mediaHls', 'headers'].filter(key => chapter[key] !== undefined).map(key => [key, chapter[key]]))
           let lastError = null
           if (needsPayload) {
             for (let attempt = 1; attempt <= MAX_CHAPTER_ATTEMPTS; attempt += 1) {

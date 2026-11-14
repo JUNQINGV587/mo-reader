@@ -34,7 +34,7 @@
 - 章节载荷是联合类型：
   - `novel`：文本；
   - `comic`：有序的图片 URL 列表；
-  - `audio` / `video`：一个媒体 URL（可为 HLS playlist）及请求头；
+  - `audio` / `video`：一个媒体 URL（可为 HLS playlist）、可选的媒体类型标记 `mediaHls` 及请求头；
   - `website`：没有章节。
 - 媒体章节的“解析失败”不能变成空正文或假图片；必须报明确错误，并保留“在外部浏览器打开书源主页”的入口。
 
@@ -105,6 +105,16 @@
 - 发现页一次搜索全部启用源；作品结果按类型筛选、标识并合并；网站源作为独立“站点结果”组，不混入作品卡。
 - 书架各分类的下载按钮只对作品显示；网站卡没有下载按钮。
 - 下载前弹出章节范围选择；默认全选，清晰度固定为最高可用。
+
+## Amendments
+
+### 2026-11-14 — 媒体类型标记与 HLS 判定（#77）
+
+- §2 的音频/视频章节载荷增加可选 `mediaHls`：`true` 为 HLS playlist，`false` 为直链。地址以 `.m3u8` 结尾，或响应 `content-type` 为 `application/vnd.apple.mpegurl` / `application/x-mpegurl` / `audio/mpegurl` / `audio/x-mpegurl` 时判为 HLS。
+- 地址后缀已能判定时以地址为准：`.m3u8` 即使响应 `octet-stream` 仍按 HLS，`.mp4` 即使响应 `octet-stream` 仍按直链；只有后缀无法判定时才看响应类型。
+- 地址无法从后缀判定时，服务端用 HEAD（失败再用 1 字节 Range 的 GET）探测一次；结果随章节落库并在下载时复用。下载、播放与服务端代理共用同一判定，不再只认 `.m3u8` 后缀。
+- 直链下载前若响应是 `text/html` 等明确的非媒体类型，报 `reader/unsupported-media` 且不写入媒体缓存。
+- `reader/unsupported-media` 也用于远端返回了可读但非音频/视频的内容；探测失败或全部候选不可用仍是 `reader/media-unavailable`。
 
 ## Consequences
 

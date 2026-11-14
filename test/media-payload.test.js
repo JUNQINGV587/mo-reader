@@ -84,6 +84,44 @@ test('audio media chain returns stream url and source headers', async () => {
   assert.deepEqual(chapter.headers, { Referer: 'https://audio.example/book/1', 'User-Agent': 'ReaderTest' })
 })
 
+test('a media address without a suffix is probed and cached as HLS', async () => {
+  const target = 'https://audio.example/stream/42'
+  let probes = 0
+  const fetch = async (url, config = {}) => {
+    if (url.includes('/search')) return { url, headers: { 'content-type': 'text/html' }, text: '<div class="book"><span class="name">音频</span><a href="/book/1">详情</a></div>' }
+    if (url === target) {
+      probes += 1
+      return { url, status: 200, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, text: '#EXTM3U' }
+    }
+    return { url, headers: { 'content-type': 'text/html' }, text: page('音频') }
+  }
+  const { service, db, book, chapter } = await runChain(mediaSource(1, {
+    content: { content: '<js>"' + target + '"</js>' },
+  }, 'audio'), fetch)
+  assert.equal(chapter.mediaUrl, target)
+  assert.equal(chapter.mediaHls, true)
+  assert.equal(db.chapters.get(chapter.id).mediaHls, true)
+  const toc = await service.toc({ bookId: book.id })
+  const reopened = await service.chapter({ bookId: book.id, chapterId: toc[0].id })
+  assert.equal(reopened.mediaHls, true)
+  assert.equal(probes, 1, '再次打开应复用落库判定，不再探测')
+})
+
+test('an explicit mp4 address stays direct without probing', async () => {
+  const target = 'https://video.example/movie.mp4'
+  const fetch = async (url) => {
+    if (url === target) throw new Error('mp4 不应探测')
+    if (url.includes('/search')) return { url, headers: { 'content-type': 'text/html' }, text: '<div class="book"><span class="name">视频</span><a href="/book/1">详情</a></div>' }
+    if (url.includes('/chapter/')) return { url, headers: { 'content-type': 'text/html' }, text: '<div id="player">' + target + '</div>' }
+    return { url, headers: { 'content-type': 'text/html' }, text: page('视频') }
+  }
+  const { chapter } = await runChain(mediaSource(4, {
+    content: { content: '<js>"' + target + '"</js>' },
+  }, 'video'), fetch)
+  assert.equal(chapter.mediaUrl, target)
+  assert.equal(chapter.mediaHls, false)
+})
+
 test('video media chain supports JSON POST and JSONPath payloads', async () => {
   const calls = []
   const fetch = async (url, config) => {

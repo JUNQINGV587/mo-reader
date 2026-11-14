@@ -188,6 +188,117 @@ test('direct audio/video downloads one decryptable file asset', async () => {
   assert.equal(JSON.stringify(store.list()).includes('referer'), false)
 })
 
+test('HLS content-type is detected when the address has no .m3u8 suffix', async () => {
+  const { store } = await tempStore()
+  const calls = []
+  const playlist = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\nseg0.ts\n#EXT-X-ENDLIST\n'
+  const fetchRemote = async (url, options = {}) => {
+    calls.push({ url, method: options.method, readBody: options.readBody, range: options.headers?.range })
+    if (url === 'https://media.example/play/123') {
+      if (options.readBody === false) {
+        return { url, status: 200, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, text: '', buffer: Buffer.alloc(0) }
+      }
+      return { url, status: 200, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, text: playlist, buffer: Buffer.from(playlist) }
+    }
+    if (url.endsWith('seg0.ts')) return { url, status: 200, headers: { 'content-type': 'video/mp2t' }, buffer: Buffer.from('segment-data') }
+    throw new Error('unexpected ' + url)
+  }
+  const offline = await downloadMediaChapter({
+    store, book, chapter, fetchRemote,
+    payload: { mediaUrl: 'https://media.example/play/123', headers: {} },
+  })
+  assert.equal(offline.kind, 'hls')
+  assert.equal(store.record(offline.playlistId).contentType, 'application/vnd.apple.mpegurl')
+  assert.equal(calls.filter(call => call.url === 'https://media.example/play/123' && call.readBody === false).length, 1)
+})
+
+test('a HEAD response with a generic type falls back to a range GET and detects HLS', async () => {
+  const { store } = await tempStore()
+  const target = 'https://media.example/play/456'
+  const calls = []
+  const playlist = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\nseg0.ts\n#EXT-X-ENDLIST\n'
+  const fetchRemote = async (url, options = {}) => {
+    calls.push({ url, method: options.method, readBody: options.readBody })
+    if (url === target) {
+      if (options.method === 'HEAD') return { url, status: 200, headers: { 'content-type': 'application/octet-stream' }, text: '', buffer: Buffer.alloc(0) }
+      if (options.readBody === false) return { url, status: 206, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, text: '', buffer: Buffer.alloc(0) }
+      return { url, status: 200, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, text: playlist, buffer: Buffer.from(playlist) }
+    }
+    return { url, status: 200, headers: { 'content-type': 'video/mp2t' }, text: '', buffer: Buffer.from('segment-data') }
+  }
+  const offline = await downloadMediaChapter({
+    store, book, chapter, fetchRemote,
+    payload: { mediaUrl: target, headers: {} },
+  })
+  assert.equal(offline.kind, 'hls')
+  assert.equal(calls.filter(call => call.url === target && call.method === 'HEAD').length, 1)
+  assert.equal(calls.filter(call => call.url === target && call.method === 'GET' && call.readBody === false).length, 1)
+})
+
+test('a stored mediaHls flag is reused instead of probing the address again', async () => {
+  const { store } = await tempStore()
+  const target = 'https://media.example/play/789'
+  const calls = []
+  const playlist = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\nseg0.ts\n#EXT-X-ENDLIST\n'
+  const fetchRemote = async (url, options = {}) => {
+    calls.push({ url, method: options.method, readBody: options.readBody })
+    if (url === target) return { url, status: 200, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, text: playlist, buffer: Buffer.from(playlist) }
+    return { url, status: 200, headers: { 'content-type': 'video/mp2t' }, text: '', buffer: Buffer.from('segment-data') }
+  }
+  const offline = await downloadMediaChapter({
+    store, book, chapter, fetchRemote,
+    payload: { mediaUrl: target, mediaHls: true, headers: {} },
+  })
+  assert.equal(offline.kind, 'hls')
+  assert.equal(calls.some(call => call.readBody === false), false)
+})
+
+test('an unknown address with a non-media content type fails without saving it as media', async () => {
+  const { store } = await tempStore()
+  const fetchRemote = async (url) => ({ url, status: 200, headers: { 'content-type': 'application/json' }, text: '{"type":"playlist"}', buffer: Buffer.from('{"type":"playlist"}') })
+  await assert.rejects(() => downloadMediaChapter({
+    store, book, chapter, fetchRemote,
+    payload: { mediaUrl: 'https://media.example/play/123', headers: {} },
+  }), error => error.code === 'reader/unsupported-media' && /不是可下载/.test(error.message))
+  assert.equal(store.list().length, 0)
+})
+
+test('a direct address returning an HTML error page is not stored as media', async () => {
+  const { store } = await tempStore()
+  const target = 'https://media.example/movie.mp4'
+  const fetchRemote = async url => ({ url, status: 200, headers: { 'content-type': 'text/html; charset=utf-8' }, text: '<html>not found</html>', buffer: Buffer.from('<html>not found</html>') })
+  await assert.rejects(() => downloadMediaChapter({
+    store, book, chapter, fetchRemote,
+    payload: { mediaUrl: target, mediaHls: false, headers: {} },
+  }), error => error.code === 'reader/unsupported-media' && /不是音频或视频/.test(error.message))
+  assert.equal(store.list().length, 0)
+})
+
+test('a probe failure is a readable media-unavailable error and stores nothing', async () => {
+  const { store } = await tempStore()
+  const fetchRemote = async () => { throw new Error('network down') }
+  await assert.rejects(() => downloadMediaChapter({
+    store, book, chapter, fetchRemote,
+    payload: { mediaUrl: 'https://media.example/play/down', headers: {} },
+  }), error => error.code === 'reader/media-unavailable' && /无法确认地址类型/.test(error.message))
+  assert.equal(store.list().length, 0)
+})
+
+test('an empty HLS playlist fails without publishing a media file', async () => {
+  const { store } = await tempStore()
+  const target = 'https://media.example/play/empty'
+  const body = '#EXTM3U\n#EXT-X-ENDLIST\n'
+  const fetchRemote = async (url, options = {}) => {
+    if (url !== target) throw new Error('unexpected ' + url)
+    return { url, status: 200, headers: { 'content-type': 'application/vnd.apple.mpegurl' }, text: options.readBody === false ? '' : body, buffer: Buffer.from(options.readBody === false ? '' : body) }
+  }
+  await assert.rejects(() => downloadMediaChapter({
+    store, book, chapter, fetchRemote,
+    payload: { mediaUrl: target, headers: {} },
+  }), error => error.code === 'reader/parse-error' && /没有分片/.test(error.message))
+  assert.equal(store.list().length, 0)
+})
+
 test('quota exhaustion fails without publishing a playlist', async () => {
   const { store } = await tempStore(20)
   const { fetchRemote } = fixture()
