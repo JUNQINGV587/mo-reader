@@ -26,6 +26,18 @@ function stringArg(args: Args, name: string): string {
   return value.trim()
 }
 
+const SAFE_KEY = /^[a-z][a-z0-9_-]+$/
+
+/**
+ * 存储的 per-record key 只能是路径安全的小写串；书源的 bookSourceUrl
+ * 常是完整 URL，用 sha1 生成稳定 key，兼容旧数据里本身就是安全串的 key。
+ */
+function sourceKey(bookSourceUrl: string): string {
+  return SAFE_KEY.test(bookSourceUrl)
+    ? bookSourceUrl
+    : `src-${createHash('sha1').update(bookSourceUrl).digest('hex').slice(0, 24)}`
+}
+
 export class ReaderService extends TypertRemoteService {
   static inject = ['storageDomain', 'timer']
 
@@ -98,7 +110,7 @@ export class ReaderService extends TypertRemoteService {
     for (const item of list) {
       try {
         const source = parseSource(item)
-        const key = source.bookSourceUrl
+        const key = sourceKey(source.bookSourceUrl)
         const existed = this.requireDb().sources.get(key) !== undefined
         await this.requireDb().sources.put(key, { ...source, id: key })
         if (existed) updated += 1
@@ -116,7 +128,7 @@ export class ReaderService extends TypertRemoteService {
   async saveSource(args: Args) {
     const raw = args?.source
     const source = parseSource(raw)
-    const key = source.bookSourceUrl
+    const key = sourceKey(source.bookSourceUrl)
     await this.requireDb().sources.put(key, { ...source, id: key })
     return { source: { ...source, id: key } }
   }
@@ -126,7 +138,9 @@ export class ReaderService extends TypertRemoteService {
     if (!Array.isArray(urls) || urls.length === 0) {
       throw new Error('缺少参数 urls')
     }
-    const keys = urls.filter((url): url is string => typeof url === 'string' && url.length > 0)
+    const keys = urls
+      .filter((url): url is string => typeof url === 'string' && url.length > 0)
+      .map((url) => sourceKey(url))
     const deleted = await this.requireDb().sources.deleteMany(keys)
     return { deleted }
   }
@@ -312,9 +326,15 @@ export class ReaderService extends TypertRemoteService {
   }
 
   private getSource(url: string): BookSource {
-    const source = this.requireDb().sources.get(url)
-    if (!source) throw new Error(`书源不存在：${url}`)
-    return source as BookSource
+    const db = this.requireDb()
+    const direct = db.sources.get(url)
+    if (direct) return direct as BookSource
+    const hashed = db.sources.get(sourceKey(url))
+    if (hashed) return hashed as BookSource
+    for (const [, value] of db.sources.entries()) {
+      if ((value as BookSource).bookSourceUrl === url) return value as BookSource
+    }
+    throw new Error(`书源不存在：${url}`)
   }
 
   private async fetch(request: RequestSpec, source: BookSource) {

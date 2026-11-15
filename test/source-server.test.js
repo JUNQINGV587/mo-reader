@@ -72,8 +72,10 @@ test('书源列表按名称排序，保存与删除生效', async () => {
   const saved = await service.saveSource({
     source: { ...A, bookSourceName: '甲源改' },
   })
-  assert.equal(saved.source.id, A.bookSourceUrl)
-  assert.equal(map.get(A.bookSourceUrl).bookSourceName, '甲源改')
+  assert.match(saved.source.id, /^src-[0-9a-f]{24}$/)
+  assert.equal(saved.source.bookSourceUrl, A.bookSourceUrl)
+  const savedList = await service.listSources()
+  assert.equal(savedList.sources.find((item) => item.bookSourceUrl === A.bookSourceUrl)?.bookSourceName, '甲源改')
 
   const deleted = await service.deleteSources({ urls: [A.bookSourceUrl, 'https://none.example.com'] })
   assert.equal(deleted.deleted, 1)
