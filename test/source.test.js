@@ -160,3 +160,15 @@ test('正文解析：保留段落文本', async () => {
   assert.ok(text.includes('第一段'))
   assert.ok(text.includes('第三段'))
 })
+
+test('正文 HTML 片段转纯文本', async () => {
+  const { analyzeContent } = await import('../dist/core/source/analyze.js')
+  const { parseSource } = await import('../dist/core/model/source.js')
+  const source = parseSource({
+    bookSourceUrl: 'https://example.com',
+    bookSourceName: '示例源',
+    ruleContent: { content: '<js>"<p>第一段</p><p>第二段</p>"</js>' },
+  })
+  const text = analyzeContent({}, source)
+  assert.equal(text, '第一段\n第二段')
+})

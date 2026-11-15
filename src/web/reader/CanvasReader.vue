@@ -269,6 +269,10 @@ onMounted(() => {
   if (!canvas) return
   ctx = canvas.getContext('2d')
   layout()
+  if (props.initialPage > 0) {
+    page.value = Math.min(props.initialPage, Math.max(0, pages.value.length - 1))
+    layout()
+  }
   observer = new ResizeObserver(() => layout())
   if (canvas.parentElement) observer.observe(canvas.parentElement)
   window.addEventListener('keydown', onKey)
@@ -284,6 +288,17 @@ watch(
   () => {
     page.value = Math.min(props.initialPage, Math.max(0, pages.value.length - 1))
     layout()
+  },
+)
+
+watch(
+  () => props.initialPage,
+  (value) => {
+    const target = Math.min(value, Math.max(0, pages.value.length - 1))
+    if (target !== page.value) {
+      page.value = target
+      layout()
+    }
   },
 )
 

@@ -61,7 +61,7 @@ export function analyzeSearch(
       kind: clean(item.getString(rule.kind ?? '')),
       wordCount: clean(item.getString(rule.wordCount ?? '')),
       lastChapter: clean(item.getString(rule.lastChapter ?? '')),
-      intro: trimText(item.getString(rule.intro ?? '')),
+      intro: htmlToText(item.getString(rule.intro ?? '')),
       coverUrl: toAbsolute(item.getString(rule.coverUrl ?? ''), baseUrl),
       bookUrl,
       origin: source.bookSourceUrl,
@@ -93,7 +93,7 @@ export function analyzeBookInfo(
     author: clean(analyzer.getString(rule.author ?? '')),
     kind: clean(analyzer.getString(rule.kind ?? '')),
     lastChapter: clean(analyzer.getString(rule.lastChapter ?? '')),
-    intro: trimText(analyzer.getString(rule.intro ?? '')),
+    intro: htmlToText(analyzer.getString(rule.intro ?? '')),
     coverUrl: toAbsolute(analyzer.getString(rule.coverUrl ?? ''), baseUrl),
     tocUrl: toAbsolute(analyzer.getString(rule.tocUrl ?? ''), baseUrl) || fallbackTocUrl,
     wordCount: clean(analyzer.getString(rule.wordCount ?? '')),
@@ -135,7 +135,51 @@ export function analyzeContent(
   const rule = source.ruleContent ?? {};
   const contentRule = rule.content ?? '';
   if (!contentRule) return '';
-  return trimText(new AnalyzeRule(content, { baseUrl, source }).getString(contentRule));
+  return htmlToText(new AnalyzeRule(content, { baseUrl, source }).getString(contentRule));
+}
+
+const ENTITIES: Record<string, string> = {
+  nbsp: ' ',
+  lrm: '',
+  rlm: '',
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  hellip: '…',
+  mdash: '—',
+  ndash: '–',
+  ldquo: '“',
+  rdquo: '”',
+  lsquo: '‘',
+  rsquo: '’',
+};
+
+function decodeEntities(value: string): string {
+  return value.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (match, body: string) => {
+    if (body.startsWith('#')) {
+      const code =
+        body[1]?.toLowerCase() === 'x' ? parseInt(body.slice(2), 16) : parseInt(body.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+    }
+    return ENTITIES[body.toLowerCase()] ?? match;
+  });
+}
+
+/**
+ * 把书源规则返回的 HTML 片段转成纯文本：`<br>` 换行、`</p>` 分段，
+ * 其余标签剥掉，并解码常见实体（`&nbsp;`/`&lrm;` 等）。
+ */
+function htmlToText(value: string): string {
+  const text = /<([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>/.test(value)
+    ? value
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/p>/gi, '\n\n')
+        .replace(/<\/div>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+    : value;
+  return trimText(decodeEntities(text).replace(/[ \t]+\n/g, '\n'));
 }
 
 function clean(value: string): string {
