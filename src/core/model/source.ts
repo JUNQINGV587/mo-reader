@@ -19,6 +19,7 @@ const RuleSearchSchema = z
     author: z.string().optional(),
     kind: z.string().optional(),
     wordCount: z.string().optional(),
+    rating: z.string().optional(),
     lastChapter: z.string().optional(),
     intro: z.string().optional(),
     coverUrl: z.string().optional(),
@@ -38,6 +39,7 @@ const RuleBookInfoSchema = z
     coverUrl: z.string().optional(),
     tocUrl: z.string().optional(),
     wordCount: z.string().optional(),
+    rating: z.string().optional(),
     canReName: z.string().optional(),
   })
   .passthrough();

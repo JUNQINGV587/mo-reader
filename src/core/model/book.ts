@@ -18,6 +18,7 @@ export const BookSchema = z
     intro: z.string().default(''),
     totalChapterNum: z.number().int().min(0).default(0),
     wordCount: z.string().default(''),
+    rating: z.string().default(''),
     pinned: z.boolean().default(false),
     latestChapterTitle: z.string().default(''),
     lastReadAt: z.number().int().min(0).default(0),

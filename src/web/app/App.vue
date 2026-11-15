@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import CanvasReader from '../reader/CanvasReader.vue'
 import {
   DEFAULT_MENU_ITEMS,
@@ -58,6 +58,7 @@ const sourceTypeNames: Record<number, string> = { 0: '文本', 1: '音频', 2: '
 const shelfBooks = ref<any[]>([])
 const shelfSort = ref<'recent' | 'name' | 'progress'>('recent')
 const shelfGroup = ref('')
+const shelfGroupInput = ref('')
 const shelfSelecting = ref(false)
 const selectedBookIds = ref<Set<string>>(new Set())
 let longPressTimer: ReturnType<typeof setTimeout> | undefined
@@ -79,6 +80,29 @@ const currentChapter = ref<any>(null)
 const content = ref('')
 const readerTitle = ref('')
 const progress = ref<any>(null)
+const batteryPercent = ref<number | null>(null)
+const bookPercent = computed(() => {
+  const total = chapters.value.length
+  if (!total) return 0
+  const chapter = currentChapter.value
+  const index = chapter ? chapters.value.findIndex((item: any) => item.url && item.url === chapter.url) : -1
+  const done = index >= 0 ? index : Number(progress.value?.chapterIndex ?? 0)
+  return Math.min(100, Math.max(0, ((done + 1) / total) * 100))
+})
+
+async function loadBattery() {
+  const getBattery = (navigator as any).getBattery
+  if (typeof getBattery !== 'function') return
+  try {
+    const battery = await getBattery.call(navigator)
+    batteryPercent.value = Math.round(Number(battery.level) * 100)
+    battery.addEventListener?.('levelchange', () => {
+      batteryPercent.value = Math.round(Number(battery.level) * 100)
+    })
+  } catch {
+    batteryPercent.value = null
+  }
+}
 const settings = ref({
   fontSize: 22,
   lineSpacing: 1.9,
@@ -259,6 +283,11 @@ const shelfGroups = computed(() => {
   }
   return [...groups]
 })
+function sortTime(book: any): number {
+  const raw = Number(book?.lastReadAt) || (typeof book?.updatedAt === 'string' ? Date.parse(book.updatedAt) : Number(book?.updatedAt)) || 0
+  return Number.isFinite(raw) ? raw : 0
+}
+
 const shelfSortedBooks = computed(() => {
   let list = [...shelfBooks.value]
   if (shelfGroup.value) list = list.filter((book) => String(book.group ?? '') === shelfGroup.value)
@@ -267,7 +296,7 @@ const shelfSortedBooks = computed(() => {
   } else if (shelfSort.value === 'progress') {
     list.sort((a, b) => Number(b.progress?.chapterIndex ?? -1) - Number(a.progress?.chapterIndex ?? -1))
   } else {
-    list.sort((a, b) => Number(b.lastReadAt ?? b.updatedAt ?? 0) - Number(a.lastReadAt ?? a.updatedAt ?? 0))
+    list.sort((a, b) => sortTime(b) - sortTime(a))
   }
   list.sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)))
   return list
@@ -444,7 +473,7 @@ async function search() {
     if (scopedSourceUrls.value) args.sourceUrls = scopedSourceUrls.value
     const result = await call('searchBooks', args)
     let list = result.books ?? []
-    if (searchExact.value) list = list.filter((book: any) => String(book.name ?? '').includes(key))
+    if (searchExact.value) list = list.filter((book: any) => String(book.name ?? '').trim() === key.trim())
     books.value = list
     searchErrors.value = result.errors ?? []
     rememberSearch(key)
@@ -521,6 +550,22 @@ function toggleShelfSelect(book: any) {
   if (next.has(book.id)) next.delete(book.id)
   else next.add(book.id)
   selectedBookIds.value = next
+}
+
+async function applyGroupToSelected() {
+  const ids = [...selectedBookIds.value]
+  if (!ids.length) return
+  busy.value = true
+  try {
+    for (const id of ids) await call('updateBook', { id, patch: { group: shelfGroupInput.value.trim() } })
+    status.value = `已分组 ${ids.length} 本`
+    exitShelfSelect()
+    await refresh()
+  } catch (error: any) {
+    status.value = `分组失败：${error?.message ?? error}`
+  } finally {
+    busy.value = false
+  }
 }
 
 function startShelfSelect() {
@@ -762,8 +807,19 @@ function setTapZone(index: number, event: Event) {
   persistSettings()
 }
 
+function scrollToCurrentChapter() {
+  nextTick(() => {
+    const node = document.querySelector('.mo-drawer-list li.on')
+    node?.scrollIntoView({ block: 'center' })
+  })
+}
+
 function toggleMenuItem(key: string) {
   const list = settings.value.menuItems
+  if (list.includes(key) && list.length <= 1) {
+    status.value = '底栏至少保留一项'
+    return
+  }
   settings.value.menuItems = list.includes(key) ? list.filter((item) => item !== key) : [...list, key]
   persistSettings()
 }
@@ -814,6 +870,7 @@ onMounted(async () => {
   } catch {
     // 隐私模式下 localStorage 可能不可用
   }
+  void loadBattery()
   await refresh()
 })
 </script>
@@ -852,6 +909,8 @@ onMounted(async () => {
             <button v-if="!shelfSelecting" class="mo-btn" data-testid="shelf-manage" @click="startShelfSelect">管理</button>
             <template v-else>
               <span class="muted">已选 {{ selectedBookCount }} 本</span>
+              <input v-model="shelfGroupInput" class="mo-group-input" placeholder="分组名" />
+              <button class="mo-btn" :disabled="selectedBookCount === 0 || busy" @click="applyGroupToSelected">设分组</button>
               <button class="mo-btn" :disabled="selectedBookCount === 0 || busy" @click="pinSelected(true)">置顶</button>
               <button class="mo-btn" :disabled="selectedBookCount === 0 || busy" @click="pinSelected(false)">取消置顶</button>
               <button class="mo-btn" :disabled="selectedBookCount === 0 || busy" @click="refreshSelectedToc">更新目录</button>
@@ -981,7 +1040,10 @@ onMounted(async () => {
           </span>
           <div class="mo-hero-main">
             <h2>{{ currentBook.name }}</h2>
-            <p class="muted">{{ currentBook.author || '未知作者' }} · {{ currentBook.kind || '小说' }}</p>
+            <p class="muted">
+              {{ currentBook.author || '未知作者' }} · {{ currentBook.kind || '小说' }}
+              <span v-if="currentBook.rating" class="mo-score">{{ currentBook.rating }}</span>
+            </p>
             <p class="muted">
               {{ currentBook.originName || currentBook.origin }} · {{ chapters.length }} 章
               <span v-if="currentBook.wordCount"> · {{ currentBook.wordCount }}</span>
@@ -1167,6 +1229,8 @@ onMounted(async () => {
             :show-header-line="settings.showHeaderLine"
             :show-footer-line="settings.showFooterLine"
             :tap-zones="settings.tapZones"
+            :book-percent="bookPercent"
+            :battery-percent="batteryPercent"
             @page="onPage"
             @tap-action="onTapAction"
           />
@@ -1271,6 +1335,7 @@ onMounted(async () => {
             <div class="mo-sheet-head">
               <strong>目录</strong>
               <span class="muted">{{ chapters.length }} 章</span>
+              <button class="mo-btn" data-testid="toc-current" @click="scrollToCurrentChapter">当前章</button>
               <button class="mo-icon-btn" @click="tocOpen = false">✕</button>
             </div>
             <input v-model="tocFilter" class="mo-filter" placeholder="搜索章节" />
@@ -1760,7 +1825,28 @@ onMounted(async () => {
   border: 1px solid var(--mo-line);
   color: var(--mo-ink-2);
 }
+.mo-score {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--mo-accent-soft);
+  color: var(--mo-accent);
+  font-size: 12px;
+}
+.mo-group-input {
+  width: 80px;
+  padding: 5px 8px;
+  border: 1px solid var(--mo-line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--mo-ink);
+  font-size: 12px;
+}
 .mo-intro {
+  line-height: 1.9;
+  letter-spacing: 0.01em;
+  text-align: justify;
   max-width: 720px;
   margin: 0 0 24px;
   color: var(--mo-ink-2);

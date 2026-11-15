@@ -28,6 +28,7 @@ export interface BookInfo {
   coverUrl: string;
   tocUrl: string;
   wordCount: string;
+  rating: string;
 }
 
 export interface TocChapter {
@@ -97,6 +98,7 @@ export function analyzeBookInfo(
     coverUrl: toAbsolute(analyzer.getString(rule.coverUrl ?? ''), baseUrl),
     tocUrl: toAbsolute(analyzer.getString(rule.tocUrl ?? ''), baseUrl) || fallbackTocUrl,
     wordCount: clean(analyzer.getString(rule.wordCount ?? '')),
+    rating: clean(analyzer.getString(rule.rating ?? '')),
   };
 }
 

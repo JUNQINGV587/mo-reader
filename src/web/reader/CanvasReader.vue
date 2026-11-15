@@ -25,6 +25,7 @@ const props = withDefaults(
     showFooterLine?: boolean
     tapZones?: number[]
     bookPercent?: number
+    batteryPercent?: number | null
   }>(),
   {
     title: '',
@@ -43,6 +44,7 @@ const props = withDefaults(
     showFooterLine: true,
     tapZones: () => DEFAULT_TAP_ZONES,
     bookPercent: 0,
+    batteryPercent: null,
   },
 )
 
@@ -139,6 +141,7 @@ function tipContext() {
     page: page.value + 1,
     totalPages: pages.value.length,
     bookPercent: props.bookPercent,
+    batteryPercent: props.batteryPercent ?? undefined,
     time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
   }
 }
