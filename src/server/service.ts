@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { Service } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { VERSION } from '../core/version.js'
@@ -24,6 +25,11 @@ export const REMOTE_METHODS = Object.freeze([
   'getToc',
   'getContent',
   'debugSource',
+  'addBook',
+  'listBooks',
+  'removeBooks',
+  'saveProgress',
+  'getProgress',
 ])
 
 type Args = Record<string, unknown> | undefined
@@ -237,6 +243,69 @@ export class ReaderService extends TypertRemoteService {
       raw: raw.text.slice(0, 200_000),
       result,
     }
+  }
+
+  async addBook(args: Args) {
+    const book = args?.book
+    if (!book || typeof book !== 'object') throw new Error('缺少参数 book')
+    const source = book as Record<string, unknown>
+    const origin = typeof source.origin === 'string' ? source.origin : ''
+    const bookUrl = typeof source.bookUrl === 'string' ? source.bookUrl : ''
+    const name = typeof source.name === 'string' ? source.name : ''
+    if (!origin || !bookUrl || !name) throw new Error('书缺少 origin/bookUrl/name')
+
+    const id = createHash('sha1').update(`${origin}|${bookUrl}`).digest('hex')
+    const now = new Date().toISOString()
+    const existing = this.requireDb().books.get(id) as Record<string, unknown> | undefined
+    const record = { ...source, id, createdAt: existing?.createdAt ?? now, updatedAt: now }
+    await this.requireDb().books.put(id, record)
+    return { book: record }
+  }
+
+  async listBooks() {
+    const books: Array<Record<string, unknown>> = []
+    for (const [, value] of this.requireDb().books.entries()) {
+      books.push(value as Record<string, unknown>)
+    }
+    books.sort((a, b) => {
+      const left = String(a.lastReadAt ?? a.updatedAt ?? '')
+      const right = String(b.lastReadAt ?? b.updatedAt ?? '')
+      return right.localeCompare(left)
+    })
+    return { books }
+  }
+
+  async removeBooks(args: Args) {
+    const ids = args?.ids
+    if (!Array.isArray(ids) || ids.length === 0) throw new Error('缺少参数 ids')
+    const keys = ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
+    const deleted = await this.requireDb().books.deleteMany(keys)
+    for (const id of keys) await this.requireDb().readRecords.delete(id)
+    return { deleted }
+  }
+
+  async saveProgress(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const record = {
+      id: bookId,
+      bookId,
+      chapterIndex: Number(args?.chapterIndex ?? 0) || 0,
+      chapterTitle: typeof args?.chapterTitle === 'string' ? args.chapterTitle : '',
+      chapterUrl: typeof args?.chapterUrl === 'string' ? args.chapterUrl : '',
+      position: Number(args?.position ?? 0) || 0,
+      updatedAt: new Date().toISOString(),
+    }
+    await this.requireDb().readRecords.put(bookId, record)
+    const book = this.requireDb().books.get(bookId) as Record<string, unknown> | undefined
+    if (book) {
+      await this.requireDb().books.put(bookId, { ...book, lastReadAt: record.updatedAt })
+    }
+    return { progress: record }
+  }
+
+  async getProgress(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    return { progress: this.requireDb().readRecords.get(bookId) ?? null }
   }
 
   private requireDb(): any {
