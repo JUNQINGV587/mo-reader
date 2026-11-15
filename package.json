@@ -1,76 +1,63 @@
 {
   "name": "@local/mo-reader",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "墨读：在 DSH 中阅读文字、漫画、音频、视频与网站入口。",
-  "author": "JUNQINGV587",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/JUNQINGV587/mo-reader.git"
-  },
-  "bugs": {
-    "url": "https://github.com/JUNQINGV587/mo-reader/issues"
-  },
-  "homepage": "https://github.com/JUNQINGV587/mo-reader#readme",
+  "description": "墨读：在 DSH 中复刻「阅读」的阅读插件。",
+  "type": "module",
+  "license": "GPL-3.0-only",
   "engines": {
     "node": ">=24.9.0"
   },
-  "type": "module",
   "exports": {
-    ".": "./index.js",
-    "./client": "./client.js",
-    "./locale/*.json": "./locale/*.json",
-    "./icon": "./icon.svg"
+    ".": "./dist/server/index.js",
+    "./client": "./dist/client/client.js"
   },
   "files": [
-    "index.js",
-    "client.js",
-    "client.gl.js",
-    "lib/**/*.js",
+    "dist",
     "cordis.patch.yml",
-    "locale/*.json",
-    "icon.svg"
+    "LICENSE",
+    "NOTICE",
+    "README.md"
   ],
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
+    "build": "npm run build:server && npm run build:client",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:client": "vite build --config vite.client.config.ts && node scripts/wrap-client.mjs",
+    "typecheck": "tsc -p tsconfig.json",
     "test": "node --test test/*.test.js",
-    "test:browser": "node test/browser/scroll-restore.runner.mjs && node test/browser/shelf-pagination.runner.mjs && node test/browser/blocks.runner.mjs && node test/browser/screens.runner.mjs"
+    "prepack": "npm run build"
   },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,
-      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
   },
   "dependencies": {
     "@deepseek-ai/cordis": "4.0.6-alpha.2",
     "@deepseek-ai/dsh-storage-domain": "0.2.2-alpha.3",
     "@deepseek-ai/dsh-typert-protocol": "0.2.2-alpha.3",
-    "cheerio": "^1.1.2",
-    "hls.js": "^1.7.4",
+    "cheerio": "^1.2.0",
     "iconv-lite": "^0.6.3",
-    "jsonpath-plus": "^10.3.0",
-    "jszip": "^3.10.1",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "react-router-dom": "^7.9.0",
-    "zod": "4.6.7"
-  },
-  "overrides": {
-    "zod": "4.6.7"
+    "jsonpath-plus": "^10.4.0",
+    "jszip": "^3.10.2",
+    "vue": "^3.5.45",
+    "zod": "4.4.3"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh-api-gateway": "0.2.2-alpha.3",
-    "@deepseek-ai/dsh-storage-json": "0.2.2-alpha.3",
-    "@types/react": "^19.2.0",
-    "@types/react-dom": "^19.2.0",
-    "@vitejs/plugin-react": "^5.0.0",
-    "typescript": "^5.9.0",
-    "vite": "^7.1.0"
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.3.0",
+    "@vitejs/plugin-vue": "^6.0.11",
+    "jsdom": "^31.0.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.7"
   }
 }

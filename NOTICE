@@ -1,0 +1,9 @@
+墨读 / mo-reader
+Copyright (C) 2026 JUNQINGV587
+
+本项目的产品设计与部分实现移植、参考自「阅读」(Legado)：
+https://github.com/LegadoTeam/legado
+基准提交：330e606c4d57e08adc056ff8ab7a4132c784da9a
+
+Legado 以 GNU General Public License v3 发布，版权归其贡献者所有。
+本项目中源自 Legado 的部分同样按 GNU GPL v3 发布，详见 LICENSE。
