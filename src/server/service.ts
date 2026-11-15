@@ -138,11 +138,31 @@ export class ReaderService extends TypertRemoteService {
     if (!Array.isArray(urls) || urls.length === 0) {
       throw new Error('缺少参数 urls')
     }
+    const db = this.requireDb()
     const keys = urls
       .filter((url): url is string => typeof url === 'string' && url.length > 0)
-      .map((url) => sourceKey(url))
-    const deleted = await this.requireDb().sources.deleteMany(keys)
+      // 兼容两种入参：存储 key（src-<sha1>）或书源 URL。
+      .map((url) => (db.sources.get(url) !== undefined ? url : sourceKey(url)))
+    const deleted = await db.sources.deleteMany(keys)
     return { deleted }
+  }
+
+  /** 批量启停：入参是存储 key（listSources 返回的 id），一次写盘。 */
+  async setSourcesEnabled(args: Args) {
+    const ids = Array.isArray(args?.ids)
+      ? (args!.ids as unknown[]).filter((id): id is string => typeof id === 'string' && id.length > 0)
+      : []
+    if (ids.length === 0) throw new Error('缺少参数 ids')
+    const enabled = args?.enabled !== false
+    const db = this.requireDb()
+    let updated = 0
+    for (const id of ids) {
+      const source = db.sources.get(id) as BookSource | undefined
+      if (!source) continue
+      await db.sources.put(id, { ...source, enabled })
+      updated += 1
+    }
+    return { updated }
   }
 
   async searchBooks(args: Args) {

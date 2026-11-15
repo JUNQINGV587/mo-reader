@@ -5,6 +5,7 @@ export const REMOTE_METHODS = Object.freeze([
   'importSources',
   'saveSource',
   'deleteSources',
+  'setSourcesEnabled',
   'searchBooks',
   'getBookInfo',
   'getToc',

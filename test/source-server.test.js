@@ -82,6 +82,25 @@ test('书源列表按名称排序，保存与删除生效', async () => {
   assert.equal(map.size, 1)
 })
 
+test('书源批量启停：按存储 key 更新，删除兼容 URL', async () => {
+  const { service } = await makeService()
+  await service.importSources({ payload: JSON.stringify([A, B]) })
+  const list = await service.listSources()
+  const ids = list.sources.map((source) => source.id)
+  assert.equal(ids.length, 2)
+
+  const disabled = await service.setSourcesEnabled({ ids, enabled: false })
+  assert.equal(disabled.updated, 2)
+  const after = await service.listSources()
+  assert.equal(after.sources.filter((source) => source.enabled === false).length, 2)
+
+  const enabled = await service.setSourcesEnabled({ ids: [ids[0]], enabled: true })
+  assert.equal(enabled.updated, 1)
+
+  const byUrl = await service.deleteSources({ urls: [A.bookSourceUrl] })
+  assert.equal(byUrl.deleted, 1)
+})
+
 test('搜索：无书源/禁用书源返回空，未知书源报错', async () => {
   const { service } = await makeService()
   const empty = await service.searchBooks({ key: '三体' })

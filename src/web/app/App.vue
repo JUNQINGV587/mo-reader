@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import CanvasReader from '../reader/CanvasReader.vue'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
@@ -36,6 +36,14 @@ const sources = ref<any[]>([])
 const importText = ref('')
 const importMessage = ref('')
 const sourceFilter = ref('')
+const sourceGroup = ref('')
+const sourceDomain = ref('')
+const sourceSort = ref<'name' | 'url' | 'updated' | 'enabled'>('name')
+const SOURCE_PAGE_SIZE = 50
+const sourcePage = ref(1)
+const selectedSourceIds = ref<Set<string>>(new Set())
+const checkReport = ref<{ total: number; ok: number; problems: Array<{ name: string; message: string }> } | null>(null)
+const sourceTypeNames: Record<number, string> = { 0: '文本', 1: '音频', 2: '图片', 3: '文件', 4: '视频' }
 
 const shelfBooks = ref<any[]>([])
 
@@ -78,15 +86,56 @@ const chapterIndex = computed(() =>
 const theme = computed<Theme>(() =>
   settings.value.theme === 'system' ? 'light' : (settings.value.theme as Theme),
 )
-const filteredSources = computed(() => {
+function hostOf(url?: string) {
+  try {
+    return new URL(String(url ?? '')).host
+  } catch {
+    return ''
+  }
+}
+const sourceGroups = computed(() =>
+  [...new Set(sources.value.map((source) => source.bookSourceGroup).filter((group): group is string => typeof group === 'string' && group.length > 0))].sort((a, b) => a.localeCompare(b, 'zh')),
+)
+const sourceDomains = computed(() => [...new Set(sources.value.map((source) => hostOf(source.bookSourceUrl)).filter(Boolean))].sort())
+const filteredSortedSources = computed(() => {
   const key = sourceFilter.value.trim().toLowerCase()
-  if (!key) return sources.value
-  return sources.value.filter((source) =>
-    `${source.bookSourceName ?? ''} ${source.bookSourceUrl ?? ''} ${source.bookSourceGroup ?? ''}`
-      .toLowerCase()
-      .includes(key),
-  )
+  let list = sources.value
+  if (key) {
+    list = list.filter((source) =>
+      `${source.bookSourceName ?? ''} ${source.bookSourceUrl ?? ''} ${source.bookSourceGroup ?? ''}`.toLowerCase().includes(key),
+    )
+  }
+  if (sourceGroup.value) list = list.filter((source) => source.bookSourceGroup === sourceGroup.value)
+  if (sourceDomain.value) list = list.filter((source) => hostOf(source.bookSourceUrl) === sourceDomain.value)
+  const sorted = [...list]
+  if (sourceSort.value === 'url') {
+    sorted.sort((a, b) => String(a.bookSourceUrl ?? '').localeCompare(String(b.bookSourceUrl ?? '')))
+  } else if (sourceSort.value === 'updated') {
+    sorted.sort((a, b) => Number(b.lastUpdateTime ?? 0) - Number(a.lastUpdateTime ?? 0))
+  } else if (sourceSort.value === 'enabled') {
+    sorted.sort((a, b) => Number(b.enabled !== false) - Number(a.enabled !== false) || String(a.bookSourceName ?? '').localeCompare(String(b.bookSourceName ?? ''), 'zh'))
+  } else {
+    sorted.sort((a, b) => String(a.bookSourceName ?? '').localeCompare(String(b.bookSourceName ?? ''), 'zh'))
+  }
+  return sorted
 })
+const sourcePageCount = computed(() => Math.max(1, Math.ceil(filteredSortedSources.value.length / SOURCE_PAGE_SIZE)))
+const pagedSources = computed(() =>
+  filteredSortedSources.value.slice((sourcePage.value - 1) * SOURCE_PAGE_SIZE, sourcePage.value * SOURCE_PAGE_SIZE),
+)
+const allPageSelected = computed(
+  () => pagedSources.value.length > 0 && pagedSources.value.every((source) => selectedSourceIds.value.has(source.id)),
+)
+const selectedCount = computed(() => selectedSourceIds.value.size)
+watch([sourceFilter, sourceGroup, sourceDomain, sourceSort], () => {
+  sourcePage.value = 1
+})
+watch(
+  () => filteredSortedSources.value.length,
+  () => {
+    if (sourcePage.value > sourcePageCount.value) sourcePage.value = sourcePageCount.value
+  },
+)
 
 const filteredChapters = computed(() => {
   const key = tocFilter.value.trim()
@@ -202,6 +251,57 @@ async function removeSource(source: any) {
   } catch (error) {
     status.value = errorText(error)
   }
+}
+
+function toggleSelectSource(source: any) {
+  const next = new Set(selectedSourceIds.value)
+  if (next.has(source.id)) next.delete(source.id)
+  else next.add(source.id)
+  selectedSourceIds.value = next
+}
+
+function toggleSelectPage() {
+  const next = new Set(selectedSourceIds.value)
+  if (allPageSelected.value) {
+    for (const source of pagedSources.value) next.delete(source.id)
+  } else {
+    for (const source of pagedSources.value) next.add(source.id)
+  }
+  selectedSourceIds.value = next
+}
+
+async function batchSetEnabled(enabled: boolean) {
+  const ids = [...selectedSourceIds.value]
+  if (ids.length === 0) return
+  busy.value = true
+  try {
+    const result = await call('setSourcesEnabled', { ids, enabled })
+    selectedSourceIds.value = new Set()
+    await refresh()
+    status.value = `已${enabled ? '启用' : '禁用'} ${result.updated} 个书源`
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+function runSourceCheck() {
+  const list = filteredSortedSources.value
+  const problems: Array<{ name: string; message: string }> = []
+  for (const source of list) {
+    const messages: string[] = []
+    if (!source.bookSourceUrl) messages.push('缺少地址')
+    if (!source.bookSourceName) messages.push('缺少名称')
+    if (!source.searchUrl && !source.ruleSearch?.bookList) messages.push('缺少搜索地址/规则')
+    if (!source.ruleToc?.chapterList) messages.push('缺少目录规则')
+    if (!source.ruleContent?.content) messages.push('缺少正文规则')
+    if (messages.length > 0) {
+      problems.push({ name: source.bookSourceName || source.bookSourceUrl, message: messages.join('、') })
+    }
+  }
+  checkReport.value = { total: list.length, ok: list.length - problems.length, problems }
+  status.value = `检查 ${list.length} 个：通过 ${list.length - problems.length}，问题 ${problems.length}`
 }
 
 function beginEdit(source: any) {
@@ -588,21 +688,67 @@ onMounted(refresh)
         <div class="mo-card">
           <div class="mo-card-head">
             <h3 class="mo-card-title">书源列表</h3>
-            <input v-model="sourceFilter" class="mo-filter" placeholder="筛选名称 / 地址 / 分组" />
+            <span class="muted">{{ filteredSortedSources.length }} 个 · 启用 {{ enabledCount }}</span>
           </div>
-          <div v-if="filteredSources.length === 0" class="mo-empty small">没有匹配的书源。</div>
+          <div class="mo-source-tools">
+            <input v-model="sourceFilter" class="mo-filter" placeholder="筛选名称 / 地址 / 分组" />
+            <select v-model="sourceGroup" class="mo-select" aria-label="分组筛选">
+              <option value="">全部分组</option>
+              <option v-for="group in sourceGroups" :key="group" :value="group">{{ group }}</option>
+            </select>
+            <select v-model="sourceDomain" class="mo-select" aria-label="域名筛选">
+              <option value="">全部域名</option>
+              <option v-for="domain in sourceDomains" :key="domain" :value="domain">{{ domain }}</option>
+            </select>
+            <select v-model="sourceSort" class="mo-select" aria-label="排序">
+              <option value="name">按名称</option>
+              <option value="url">按地址</option>
+              <option value="updated">按更新时间</option>
+              <option value="enabled">按启用状态</option>
+            </select>
+            <button class="mo-btn" data-testid="source-check" @click="runSourceCheck">检查</button>
+          </div>
+          <div class="mo-source-bulk">
+            <label class="mo-switch"><input type="checkbox" :checked="allPageSelected" @change="toggleSelectPage" />本页全选</label>
+            <span class="muted">已选 {{ selectedCount }} 个</span>
+            <button class="mo-btn" :disabled="selectedCount === 0 || busy" data-testid="batch-enable" @click="batchSetEnabled(true)">批量启用</button>
+            <button class="mo-btn" :disabled="selectedCount === 0 || busy" data-testid="batch-disable" @click="batchSetEnabled(false)">批量禁用</button>
+          </div>
+          <div v-if="checkReport" class="mo-check-report" data-testid="source-check-report">
+            <p>检查 {{ checkReport.total }} 个：通过 {{ checkReport.ok }}，问题 {{ checkReport.problems.length }}</p>
+            <ul v-if="checkReport.problems.length">
+              <li v-for="item in checkReport.problems.slice(0, 8)" :key="item.name">{{ item.name }}：{{ item.message }}</li>
+              <li v-if="checkReport.problems.length > 8" class="muted">…另有 {{ checkReport.problems.length - 8 }} 个</li>
+            </ul>
+          </div>
+          <div v-if="filteredSortedSources.length === 0" class="mo-empty small">没有匹配的书源。</div>
           <ul class="mo-sources">
-            <li v-for="source in filteredSources" :key="source.bookSourceUrl" data-testid="source-row">
+            <li v-for="source in pagedSources" :key="source.id || source.bookSourceUrl" data-testid="source-row">
+              <input
+                type="checkbox"
+                class="mo-pick"
+                :checked="selectedSourceIds.has(source.id)"
+                aria-label="选择书源"
+                @change="toggleSelectSource(source)"
+              />
               <label class="mo-switch">
                 <input type="checkbox" :checked="source.enabled !== false" @change="toggleSource(source)" />
                 <span class="mo-source-name">{{ source.bookSourceName || source.bookSourceUrl }}</span>
               </label>
               <span class="mo-url">{{ source.bookSourceUrl }}</span>
               <span v-if="source.bookSourceGroup" class="mo-tag soft">{{ source.bookSourceGroup }}</span>
+              <span class="mo-tag soft">{{ sourceTypeNames[source.bookSourceType ?? 0] ?? '文本' }}</span>
+              <span v-if="source.enabledExplore" class="mo-tag soft">发现</span>
+              <span v-if="source.loginUrl" class="mo-tag warn">需登录</span>
               <button class="mo-icon-btn" title="编辑" data-testid="source-edit" @click="beginEdit(source)">✎</button>
               <button class="mo-icon-btn danger" title="删除" @click="removeSource(source)">✕</button>
             </li>
           </ul>
+          <div v-if="sourcePageCount > 1" class="mo-pager">
+            <button class="mo-btn" :disabled="sourcePage <= 1" @click="sourcePage -= 1">上一页</button>
+            <span class="muted">第 {{ sourcePage }} / {{ sourcePageCount }} 页</span>
+            <button class="mo-btn" :disabled="sourcePage >= sourcePageCount" @click="sourcePage += 1">下一页</button>
+          </div>
         </div>
 
         <div v-if="editing" class="mo-card" data-testid="source-editor">
@@ -1210,6 +1356,59 @@ onMounted(refresh)
 }
 .mo-card-head .mo-filter {
   margin-left: auto;
+}
+.mo-source-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+.mo-source-tools .mo-filter {
+  flex: 1 1 220px;
+  width: auto;
+}
+.mo-select {
+  width: auto;
+  font-size: 12px;
+}
+.mo-source-bulk {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 2px 0 10px;
+  color: var(--mo-ink-2);
+  font-size: 12px;
+}
+.mo-pick {
+  accent-color: var(--mo-accent);
+}
+.mo-tag.warn {
+  color: #8a4b1e;
+  border-color: #d8b28d;
+}
+.mo-check-report {
+  margin: 6px 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--mo-line);
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--mo-ink-2);
+}
+.mo-check-report p {
+  margin: 0;
+}
+.mo-check-report ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+.mo-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 12px;
 }
 .mo-row {
   display: flex;
