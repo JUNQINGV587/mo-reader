@@ -12,6 +12,8 @@ export interface PaginateOptions {
   footerHeight?: number
   /** 段首缩进两个全角空格（默认开） */
   indent?: boolean
+  /** 段距（px）；>= 8 时在段后补一个空行，近似阅读的段距 */
+  paragraphSpacing?: number
   measure: (text: string) => number
 }
 
@@ -29,6 +31,7 @@ export function paginate(text: string, options: PaginateOptions): PaginateResult
   const maxHeight = Math.max(options.lineHeight, options.height - headerHeight - footerHeight)
   const linesPerPage = Math.max(1, Math.floor(maxHeight / options.lineHeight))
   const prefix = options.indent === false ? '' : '　　'
+  const gapLine = (options.paragraphSpacing ?? 0) >= 8
 
   const paragraphs = text.replace(/\r\n?/g, '\n').split('\n')
   const lines: string[] = []
@@ -50,6 +53,7 @@ export function paginate(text: string, options: PaginateOptions): PaginateResult
       }
     }
     if (current) lines.push(current)
+    if (gapLine) lines.push('')
   }
 
   const pages: string[][] = []

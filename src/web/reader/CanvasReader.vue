@@ -1,26 +1,54 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { paginate } from '../../core/reader/paginate'
+import { DEFAULT_TAP_ZONES, tapZoneIndex, tipText } from '../../core/reader/reader-config'
 
 type Theme = 'light' | 'sepia' | 'dark'
-type Turn = 'none' | 'cover' | 'slide'
+type Turn = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
 
 const props = withDefaults(
   defineProps<{
     text: string
     title?: string
+    bookName?: string
     fontSize?: number
     lineHeight?: number
+    paragraphSpacing?: number
+    indent?: number
+    padding?: { left: number; top: number; right: number; bottom: number }
     initialPage?: number
     theme?: Theme
     animation?: Turn
+    headerMode?: number
+    footerMode?: number
+    showHeaderLine?: boolean
+    showFooterLine?: boolean
+    tapZones?: number[]
+    bookPercent?: number
   }>(),
-  { title: '', fontSize: 22, lineHeight: 1.9, initialPage: 0, theme: 'light', animation: 'cover' },
+  {
+    title: '',
+    bookName: '',
+    fontSize: 22,
+    lineHeight: 1.9,
+    paragraphSpacing: 6,
+    indent: 2,
+    padding: () => ({ left: 22, top: 5, right: 22, bottom: 4 }),
+    initialPage: 0,
+    theme: 'light',
+    animation: 'cover',
+    headerMode: 1,
+    footerMode: 6,
+    showHeaderLine: true,
+    showFooterLine: true,
+    tapZones: () => DEFAULT_TAP_ZONES,
+    bookPercent: 0,
+  },
 )
 
 const emit = defineEmits<{
   page: [payload: { page: number; total: number }]
-  centerTap: []
+  tapAction: [code: number]
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -36,6 +64,7 @@ let height = 0
 let animating = false
 
 const SERIF = "'Noto Serif SC', 'Songti SC', 'Noto Sans SC', serif"
+const ACCENT = '#3d6b53'
 
 const palette = computed(() => {
   if (props.theme === 'dark') {
@@ -47,14 +76,20 @@ const palette = computed(() => {
   return { bg: '#f6f1e7', text: '#2b2a26', muted: '#7c7567', line: 'rgba(43,42,38,0.14)' }
 })
 
-const ACCENT = '#3d6b53'
-
 function measureFont() {
   return `${props.fontSize}px ${SERIF}`
 }
 
-function paddingX() {
-  return Math.max(22, Math.round(width * 0.055))
+function lineHeightPx() {
+  return props.fontSize * props.lineHeight
+}
+
+function headerHeight() {
+  return props.headerMode === 0 && !props.showHeaderLine ? 18 : 48
+}
+
+function footerHeight() {
+  return props.footerMode === 0 && !props.showFooterLine ? 18 : 44
 }
 
 function layout() {
@@ -74,11 +109,14 @@ function layout() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
   ctx.font = measureFont()
 
+  const pad = props.padding
   const result = paginate(props.text, {
-    width: rect.width - paddingX() * 2,
-    height: rect.height - 118,
+    width: rect.width - pad.left - pad.right,
+    height: rect.height - headerHeight() - footerHeight() - pad.top - pad.bottom,
     fontSize: props.fontSize,
-    lineHeight: props.fontSize * props.lineHeight,
+    lineHeight: lineHeightPx(),
+    indent: props.indent !== 0,
+    paragraphSpacing: props.paragraphSpacing,
     measure: (value) => ctx?.measureText(value).width ?? 0,
   })
   pages.value = result.pages
@@ -94,50 +132,71 @@ function fillBackground() {
   ctx.fillRect(0, 0, width, height)
 }
 
+function tipContext() {
+  return {
+    bookName: props.bookName,
+    chapterTitle: props.title,
+    page: page.value + 1,
+    totalPages: pages.value.length,
+    bookPercent: props.bookPercent,
+    time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+  }
+}
+
 function render() {
   const canvas = canvasRef.value
   if (!canvas || !ctx) return
   fillBackground()
   const { text: color, muted, line } = palette.value
-  const pad = paddingX()
-  const lineHeight = props.fontSize * props.lineHeight
+  const pad = props.padding
+  const lineHeight = lineHeightPx()
+  const headerText = tipText(props.headerMode, tipContext())
+  const footerText = tipText(props.footerMode, tipContext())
 
-  // 页眉：章名 + 细分隔线
-  ctx.fillStyle = muted
-  ctx.font = `${Math.max(11, props.fontSize - 9)}px ${SERIF}`
-  ctx.textAlign = 'center'
-  ctx.textBaseline = 'top'
-  const header = props.title.length > 24 ? `${props.title.slice(0, 24)}…` : props.title
-  ctx.fillText(header, width / 2, 20, width - pad * 2)
-  ctx.strokeStyle = line
-  ctx.lineWidth = 1
-  ctx.beginPath()
-  ctx.moveTo(pad, 46)
-  ctx.lineTo(width - pad, 46)
-  ctx.stroke()
+  // 页眉
+  if (headerText) {
+    ctx.fillStyle = muted
+    ctx.font = `${Math.max(11, props.fontSize - 9)}px ${SERIF}`
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'top'
+    ctx.fillText(headerText, width / 2, 18, width - pad.left - pad.right)
+  }
+  if (props.showHeaderLine) {
+    ctx.strokeStyle = line
+    ctx.lineWidth = 1
+    ctx.beginPath()
+    ctx.moveTo(pad.left, 44)
+    ctx.lineTo(width - pad.right, 44)
+    ctx.stroke()
+  }
 
   // 正文
   ctx.fillStyle = color
   ctx.textAlign = 'left'
+  ctx.textBaseline = 'top'
   ctx.font = measureFont()
   const lines = pages.value[page.value] ?? []
-  let y = 66
+  let y = 44 + pad.top + 8
   for (const value of lines) {
-    if (value) ctx.fillText(value, pad, y)
+    if (value) ctx.fillText(value, pad.left, y)
     y += lineHeight
   }
 
-  // 页脚：页码 + 进度线
-  ctx.fillStyle = muted
-  ctx.font = `${Math.max(10, props.fontSize - 10)}px ${SERIF}`
-  ctx.textAlign = 'right'
-  ctx.fillText(`${page.value + 1} / ${pages.value.length}`, width - pad, height - 34)
-  ctx.textAlign = 'left'
-  ctx.fillStyle = line
-  ctx.fillRect(pad, height - 18, width - pad * 2, 1)
-  const ratio = pages.value.length <= 1 ? 1 : (page.value + 1) / pages.value.length
-  ctx.fillStyle = ACCENT
-  ctx.fillRect(pad, height - 18, (width - pad * 2) * ratio, 1)
+  // 页脚
+  if (footerText) {
+    ctx.fillStyle = muted
+    ctx.font = `${Math.max(10, props.fontSize - 10)}px ${SERIF}`
+    ctx.textAlign = 'right'
+    ctx.textBaseline = 'alphabetic'
+    ctx.fillText(footerText, width - pad.right, height - 20 - pad.bottom)
+  }
+  if (props.showFooterLine) {
+    ctx.fillStyle = line
+    ctx.fillRect(pad.left, height - 12 - pad.bottom, width - pad.left - pad.right, 1)
+    const ratio = pages.value.length <= 1 ? 1 : (page.value + 1) / pages.value.length
+    ctx.fillStyle = ACCENT
+    ctx.fillRect(pad.left, height - 12 - pad.bottom, (width - pad.left - pad.right) * ratio, 1)
+  }
 
   emit('page', { page: page.value, total: pages.value.length })
 }
@@ -180,6 +239,46 @@ function overlayWith(image: HTMLCanvasElement): HTMLCanvasElement | null {
   return layer
 }
 
+function animate(mode: Turn, direction: 1 | -1, before: HTMLCanvasElement, after: HTMLCanvasElement) {
+  let layer: HTMLCanvasElement | null = null
+  const finish = () => {
+    layer?.remove()
+    animating = false
+    render()
+  }
+
+  if (mode === 'cover' || mode === 'simulate') {
+    restore(before)
+    layer = overlayWith(after)
+    if (!layer) return finish()
+    if (mode === 'simulate') layer.style.filter = 'drop-shadow(-8px 0 14px rgba(0,0,0,0.25))'
+    layer.style.transform = 'translateX(100%)'
+    requestAnimationFrame(() => {
+      layer!.style.transition = 'transform 260ms cubic-bezier(.25,.8,.25,1)'
+      layer!.style.transform = 'translateX(0)'
+    })
+  } else if (mode === 'scroll') {
+    restore(before)
+    layer = overlayWith(after)
+    if (!layer) return finish()
+    layer.style.transform = direction > 0 ? 'translateY(100%)' : 'translateY(-100%)'
+    requestAnimationFrame(() => {
+      layer!.style.transition = 'transform 260ms ease-out'
+      layer!.style.transform = 'translateY(0)'
+    })
+  } else {
+    restore(after)
+    layer = overlayWith(before)
+    if (!layer) return finish()
+    layer.style.transform = 'translateX(0)'
+    requestAnimationFrame(() => {
+      layer!.style.transition = 'transform 240ms ease-out'
+      layer!.style.transform = `translateX(${direction > 0 ? '-100%' : '100%'})`
+    })
+  }
+  window.setTimeout(finish, 300)
+}
+
 function turn(direction: 1 | -1) {
   if (animating) return
   const nextPage = page.value + direction
@@ -197,43 +296,8 @@ function turn(direction: 1 | -1) {
   render()
   const after = snapshot()
   if (!after) return
-
   animating = true
-  const finish = () => {
-    layer?.remove()
-    animating = false
-    render()
-  }
-
-  let layer: HTMLCanvasElement | null = null
-  if (props.animation === 'cover') {
-    // 旧页留在底层，新页从右侧盖上来
-    restore(before)
-    layer = overlayWith(after)
-    if (!layer) {
-      finish()
-      return
-    }
-    layer.style.transform = 'translateX(100%)'
-    requestAnimationFrame(() => {
-      layer!.style.transition = 'transform 240ms ease-out'
-      layer!.style.transform = 'translateX(0)'
-    })
-  } else {
-    // 新页在底层，旧页向左滑走
-    restore(after)
-    layer = overlayWith(before)
-    if (!layer) {
-      finish()
-      return
-    }
-    layer.style.transform = 'translateX(0)'
-    requestAnimationFrame(() => {
-      layer!.style.transition = 'transform 240ms ease-out'
-      layer!.style.transform = 'translateX(-100%)'
-    })
-  }
-  window.setTimeout(finish, 280)
+  animate(props.animation, direction, before, after)
 }
 
 function next() {
@@ -248,10 +312,11 @@ function onCanvasClick(event: MouseEvent) {
   const canvas = canvasRef.value
   if (!canvas) return
   const rect = canvas.getBoundingClientRect()
-  const ratio = (event.clientX - rect.left) / rect.width
-  if (ratio < 0.3) prev()
-  else if (ratio > 0.7) next()
-  else emit('centerTap')
+  const x = (event.clientX - rect.left) / rect.width
+  const y = (event.clientY - rect.top) / rect.height
+  const index = tapZoneIndex(x, y)
+  const zones = props.tapZones?.length === 9 ? props.tapZones : DEFAULT_TAP_ZONES
+  emit('tapAction', zones[index] ?? 0)
 }
 
 function onKey(event: KeyboardEvent) {
@@ -303,8 +368,22 @@ watch(
 )
 
 watch(
-  () => [props.title, props.fontSize, props.lineHeight, props.theme],
+  () => [
+    props.title,
+    props.bookName,
+    props.fontSize,
+    props.lineHeight,
+    props.paragraphSpacing,
+    props.indent,
+    props.theme,
+    props.headerMode,
+    props.footerMode,
+    props.showHeaderLine,
+    props.showFooterLine,
+    props.padding,
+  ],
   () => layout(),
+  { deep: true },
 )
 
 defineExpose({ next, prev, total, page })

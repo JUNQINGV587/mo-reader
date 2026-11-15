@@ -280,6 +280,22 @@ export class ReaderService extends TypertRemoteService {
     return { book: record }
   }
 
+  async updateBook(args: Args) {
+    const id = stringArg(args, 'id')
+    const patch = args?.patch
+    if (!patch || typeof patch !== 'object') throw new Error('缺少参数 patch')
+    const existing = this.requireDb().books.get(id) as Record<string, unknown> | undefined
+    if (!existing) throw new Error(`书不存在：${id}`)
+    const record = {
+      ...existing,
+      ...(patch as Record<string, unknown>),
+      id,
+      updatedAt: new Date().toISOString(),
+    }
+    await this.requireDb().books.put(id, record)
+    return { book: record }
+  }
+
   async listBooks() {
     const books: Array<Record<string, unknown>> = []
     for (const [id, value] of this.requireDb().books.entries()) {

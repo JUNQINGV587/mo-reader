@@ -1,12 +1,22 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import CanvasReader from '../reader/CanvasReader.vue'
+import {
+  DEFAULT_MENU_ITEMS,
+  DEFAULT_TAP_ZONES,
+  MENU_ITEMS,
+  READER_PRESETS,
+  TAP_ACTIONS,
+  TAP_ZONE_NAMES,
+  TIP_MODES,
+  tapActionLabel,
+} from '../../core/reader/reader-config'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
 type View = 'shelf' | 'sources' | 'search' | 'detail' | 'reader'
 type Theme = 'light' | 'sepia' | 'dark'
-type Turn = 'none' | 'cover' | 'slide'
+type Turn = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
 
 /** 旧数据里存的是原始 HTML 简介，展示前转成纯文本。 */
 function plainText(input?: string | null): string {
@@ -47,8 +57,11 @@ const sourceTypeNames: Record<number, string> = { 0: '文本', 1: '音频', 2: '
 
 const shelfBooks = ref<any[]>([])
 const shelfSort = ref<'recent' | 'name' | 'progress'>('recent')
+const shelfGroup = ref('')
 const shelfSelecting = ref(false)
 const selectedBookIds = ref<Set<string>>(new Set())
+let longPressTimer: ReturnType<typeof setTimeout> | undefined
+let longPressFired = false
 
 const searchKey = ref('')
 const searching = ref(false)
@@ -69,9 +82,19 @@ const progress = ref<any>(null)
 const settings = ref({
   fontSize: 22,
   lineSpacing: 1.9,
+  paragraphSpacing: 6,
+  indent: 2,
+  padding: { left: 22, top: 5, right: 22, bottom: 4 },
   theme: 'light' as Theme | 'system',
   pageAnimation: 'cover' as Turn,
+  headerMode: 1,
+  footerMode: 6,
+  showHeaderLine: true,
+  showFooterLine: true,
+  tapZones: [...DEFAULT_TAP_ZONES] as number[],
+  menuItems: [...DEFAULT_MENU_ITEMS] as string[],
 })
+const readerRef = ref<any>(null)
 const initialPage = ref(0)
 const tocFilter = ref('')
 const tocOpen = ref(false)
@@ -162,13 +185,18 @@ const searchScopeLabel = computed(() => {
   return `${enabledSources.value.length} 个启用源`
 })
 
-const filteredChapters = computed(() => {
+const TOC_PAGE_SIZE = 200
+const tocPage = ref(1)
+const tocFiltered = computed(() => {
   const key = tocFilter.value.trim()
-  const list = key ? chapters.value.filter((chapter) => chapter.title.includes(key)) : chapters.value
-  return list.slice(0, 1200)
+  return key ? chapters.value.filter((chapter) => chapter.title.includes(key)) : chapters.value
 })
-
-const tocTruncated = computed(() => filteredChapters.value.length >= 1200 && chapters.value.length > 1200)
+const filteredChapters = computed(() => tocFiltered.value.slice(0, tocPage.value * TOC_PAGE_SIZE))
+const tocHasMore = computed(() => filteredChapters.value.length < tocFiltered.value.length)
+const tocTotal = computed(() => tocFiltered.value.length)
+watch(tocFilter, () => {
+  tocPage.value = 1
+})
 
 async function call(method: string, args?: any) {
   const fn = props.remote?.[method]
@@ -208,6 +236,13 @@ async function refresh() {
   }
 }
 
+function bookStatus(book: any) {
+  const kind = String(book?.kind ?? '')
+  if (kind.includes('完结')) return '已完结'
+  if (kind.includes('连载')) return '连载中'
+  return ''
+}
+
 function shelfProgress(book: any) {
   const record = book?.progress
   if (!record) return null
@@ -216,8 +251,17 @@ function shelfProgress(book: any) {
   return { percent, text: record.chapterTitle ? `读至 ${record.chapterTitle}` : `第 ${record.chapterIndex + 1} 章` }
 }
 
+const shelfGroups = computed(() => {
+  const groups = new Set<string>()
+  for (const book of shelfBooks.value) {
+    const group = String(book.group ?? '').trim()
+    if (group) groups.add(group)
+  }
+  return [...groups]
+})
 const shelfSortedBooks = computed(() => {
-  const list = [...shelfBooks.value]
+  let list = [...shelfBooks.value]
+  if (shelfGroup.value) list = list.filter((book) => String(book.group ?? '') === shelfGroup.value)
   if (shelfSort.value === 'name') {
     list.sort((a, b) => String(a.name ?? '').localeCompare(String(b.name ?? ''), 'zh'))
   } else if (shelfSort.value === 'progress') {
@@ -225,6 +269,7 @@ const shelfSortedBooks = computed(() => {
   } else {
     list.sort((a, b) => Number(b.lastReadAt ?? b.updatedAt ?? 0) - Number(a.lastReadAt ?? a.updatedAt ?? 0))
   }
+  list.sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)))
   return list
 })
 const selectedBookCount = computed(() => selectedBookIds.value.size)
@@ -442,6 +487,7 @@ async function openBook(book: any) {
     await loadToc(currentBook.value, book.bookUrl)
     progress.value = null
     tocFilter.value = ''
+    tocPage.value = 1
     view.value = 'detail'
     status.value = `${currentBook.value.name} · ${chapters.value.length} 章`
   } catch (error) {
@@ -460,6 +506,7 @@ async function openShelfBook(book: any) {
     const result = await call('getProgress', { bookId: book.id })
     progress.value = result?.progress ?? null
     tocFilter.value = ''
+    tocPage.value = 1
     view.value = 'detail'
     status.value = `${book.name} · ${chapters.value.length} 章`
   } catch (error) {
@@ -487,6 +534,10 @@ function exitShelfSelect() {
 }
 
 function onShelfBookClick(book: any) {
+  if (longPressFired) {
+    longPressFired = false
+    return
+  }
   if (shelfSelecting.value) toggleShelfSelect(book)
   else void openShelfBook(book)
 }
@@ -500,6 +551,79 @@ async function removeSelectedBooks() {
     exitShelfSelect()
     await refresh()
     status.value = `移出书架 ${ids.length} 本`
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+function onShelfPointerDown(book: any) {
+  longPressFired = false
+  if (longPressTimer) clearTimeout(longPressTimer)
+  longPressTimer = setTimeout(() => {
+    longPressFired = true
+    if (!shelfSelecting.value) startShelfSelect()
+    toggleShelfSelect(book)
+  }, 520)
+}
+
+function onShelfPointerUp() {
+  if (longPressTimer) clearTimeout(longPressTimer)
+  longPressTimer = undefined
+}
+
+async function updateSelected(patch: (book: any) => Record<string, unknown>, message: string) {
+  const ids = [...selectedBookIds.value]
+  if (!ids.length) return
+  busy.value = true
+  try {
+    for (const id of ids) {
+      const book = shelfBooks.value.find((item) => item.id === id)
+      if (!book) continue
+      await call('updateBook', { id, patch: patch(book) })
+    }
+    exitShelfSelect()
+    await refresh()
+    status.value = message
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+function pinSelected(pinned: boolean) {
+  return updateSelected(() => ({ pinned }), pinned ? `已置顶 ${selectedBookCount.value} 本` : '已取消置顶')
+}
+
+async function refreshSelectedToc() {
+  const ids = [...selectedBookIds.value]
+  if (!ids.length) return
+  busy.value = true
+  let ok = 0
+  try {
+    for (const id of ids) {
+      const book = shelfBooks.value.find((item) => item.id === id)
+      if (!book) continue
+      try {
+        const info = await call('getBookInfo', { sourceUrl: book.origin, bookUrl: book.bookUrl })
+        const tocUrl = info?.tocUrl || book.tocUrl || book.bookUrl
+        const toc = await call('getToc', { sourceUrl: book.origin, tocUrl })
+        const list = toc?.chapters ?? []
+        const last = [...list].reverse().find((chapter: any) => !chapter.isVolume)
+        await call('updateBook', {
+          id,
+          patch: { totalChapterNum: list.length, latestChapterTitle: last?.title ?? '', tocUrl },
+        })
+        ok += 1
+      } catch {
+        // 单本失败继续
+      }
+    }
+    exitShelfSelect()
+    await refresh()
+    status.value = `已更新目录 ${ok}/${ids.length} 本`
   } catch (error) {
     status.value = errorText(error)
   } finally {
@@ -594,14 +718,73 @@ function onPage(payload: { page: number; total: number }) {
   }, 600)
 }
 
+function onTapAction(code: number) {
+  if (code === -1) return
+  if (code === 0) {
+    chrome.value = !chrome.value
+    return
+  }
+  if (code === 1) {
+    readerRef.value?.next()
+    return
+  }
+  if (code === 2) {
+    readerRef.value?.prev()
+    return
+  }
+  if (code === 3) {
+    openAdjacent(1)
+    return
+  }
+  if (code === 4) {
+    openAdjacent(-1)
+    return
+  }
+  if (code === 10) {
+    tocOpen.value = true
+    return
+  }
+  status.value = `「${tapActionLabel(code)}」暂未开放`
+}
+
+function applyPreset(preset: (typeof READER_PRESETS)[number]) {
+  settings.value.fontSize = preset.fontSize
+  settings.value.lineSpacing = preset.lineSpacing
+  settings.value.paragraphSpacing = preset.paragraphSpacing
+  settings.value.indent = preset.indent
+  settings.value.padding = { ...preset.padding }
+  persistSettings()
+}
+
+function setTapZone(index: number, event: Event) {
+  const value = Number((event.target as HTMLSelectElement).value)
+  settings.value.tapZones[index] = value
+  persistSettings()
+}
+
+function toggleMenuItem(key: string) {
+  const list = settings.value.menuItems
+  settings.value.menuItems = list.includes(key) ? list.filter((item) => item !== key) : [...list, key]
+  persistSettings()
+}
+
 async function persistSettings() {
   try {
     await call('saveSettings', {
       settings: {
         fontSize: settings.value.fontSize,
         lineSpacing: settings.value.lineSpacing,
+        paragraphSpacing: settings.value.paragraphSpacing,
+        indent: settings.value.indent,
+        padding: settings.value.padding,
         theme: settings.value.theme,
         pageAnimation: settings.value.pageAnimation,
+        headerMode: settings.value.headerMode,
+        footerMode: settings.value.footerMode,
+        showHeaderLine: settings.value.showHeaderLine,
+        showFooterLine: settings.value.showFooterLine,
+        tapZones: settings.value.tapZones,
+        menuItems: settings.value.menuItems,
       },
     })
   } catch (error) {
@@ -669,6 +852,9 @@ onMounted(async () => {
             <button v-if="!shelfSelecting" class="mo-btn" data-testid="shelf-manage" @click="startShelfSelect">管理</button>
             <template v-else>
               <span class="muted">已选 {{ selectedBookCount }} 本</span>
+              <button class="mo-btn" :disabled="selectedBookCount === 0 || busy" @click="pinSelected(true)">置顶</button>
+              <button class="mo-btn" :disabled="selectedBookCount === 0 || busy" @click="pinSelected(false)">取消置顶</button>
+              <button class="mo-btn" :disabled="selectedBookCount === 0 || busy" @click="refreshSelectedToc">更新目录</button>
               <button
                 class="mo-btn danger"
                 data-testid="shelf-remove"
@@ -680,6 +866,13 @@ onMounted(async () => {
               <button class="mo-btn" @click="exitShelfSelect">取消</button>
             </template>
           </div>
+        </div>
+
+        <div v-if="shelfGroups.length" class="mo-shelf-groups">
+          <button :class="{ on: shelfGroup === '' }" @click="shelfGroup = ''">全部</button>
+          <button v-for="group in shelfGroups" :key="group" :class="{ on: shelfGroup === group }" @click="shelfGroup = group">
+            {{ group }}
+          </button>
         </div>
 
         <div v-if="shelfBooks.length === 0" class="mo-empty">
@@ -696,6 +889,9 @@ onMounted(async () => {
             class="mo-cover-card"
             :class="{ selected: selectedBookIds.has(book.id) }"
             data-testid="shelf-book"
+            @pointerdown="onShelfPointerDown(book)"
+            @pointerup="onShelfPointerUp"
+            @pointerleave="onShelfPointerUp"
             @click="onShelfBookClick(book)"
           >
             <span class="mo-cover" :style="coverStyle(book)">
@@ -786,7 +982,11 @@ onMounted(async () => {
           <div class="mo-hero-main">
             <h2>{{ currentBook.name }}</h2>
             <p class="muted">{{ currentBook.author || '未知作者' }} · {{ currentBook.kind || '小说' }}</p>
-            <p class="muted">{{ currentBook.originName || currentBook.origin }} · {{ chapters.length }} 章</p>
+            <p class="muted">
+              {{ currentBook.originName || currentBook.origin }} · {{ chapters.length }} 章
+              <span v-if="currentBook.wordCount"> · {{ currentBook.wordCount }}</span>
+              <span v-if="bookStatus(currentBook)" class="mo-tag soft">{{ bookStatus(currentBook) }}</span>
+            </p>
             <div class="mo-hero-actions">
               <button class="mo-btn primary" data-testid="read-start" @click="continueReading">
                 {{ progress ? '继续阅读' : '开始阅读' }}
@@ -807,13 +1007,14 @@ onMounted(async () => {
             <h3>目录</h3>
             <input v-model="tocFilter" class="mo-toc-filter" placeholder="搜索章节" />
           </div>
-          <p v-if="tocTruncated" class="muted">目录较长，仅显示前 1200 章，可用搜索定位。</p>
+          <p v-if="tocHasMore" class="muted">已显示 {{ filteredChapters.length }} / {{ tocTotal }} 章</p>
           <ol class="mo-toc" data-testid="toc">
             <li v-for="chapter in filteredChapters" :key="chapter.url || chapter.title" :class="{ volume: chapter.isVolume }">
               <button v-if="!chapter.isVolume" data-testid="chapter" @click="openChapter(chapter)">{{ chapter.title }}</button>
               <span v-else>{{ chapter.title }}</span>
             </li>
           </ol>
+          <button v-if="tocHasMore" class="mo-btn" data-testid="toc-more" @click="tocPage += 1">加载更多</button>
         </div>
       </section>
 
@@ -892,6 +1093,7 @@ onMounted(async () => {
               <span class="mo-tag soft">{{ sourceTypeNames[source.bookSourceType ?? 0] ?? '文本' }}</span>
               <span v-if="source.enabledExplore" class="mo-tag soft">发现</span>
               <span v-if="source.loginUrl" class="mo-tag warn">需登录</span>
+              <span v-else-if="source.enabledCookieJar" class="mo-tag soft">Cookie</span>
               <button class="mo-icon-btn" title="编辑" data-testid="source-edit" @click="beginEdit(source)">✎</button>
               <button class="mo-icon-btn danger" title="删除" @click="removeSource(source)">✕</button>
             </li>
@@ -948,15 +1150,25 @@ onMounted(async () => {
         <div class="mo-reader-canvas" data-testid="reader-content">
           <CanvasReader
             v-if="content"
+            ref="readerRef"
             :text="content"
             :title="readerTitle"
+            :book-name="currentBook?.name || ''"
             :font-size="settings.fontSize"
             :line-height="settings.lineSpacing"
+            :paragraph-spacing="settings.paragraphSpacing"
+            :indent="settings.indent"
+            :padding="settings.padding"
             :initial-page="initialPage"
             :theme="theme"
             :animation="settings.pageAnimation"
+            :header-mode="settings.headerMode"
+            :footer-mode="settings.footerMode"
+            :show-header-line="settings.showHeaderLine"
+            :show-footer-line="settings.showFooterLine"
+            :tap-zones="settings.tapZones"
             @page="onPage"
-            @center-tap="chrome = !chrome"
+            @tap-action="onTapAction"
           />
           <p v-else class="muted mo-reader-loading">{{ busy ? '加载中…' : '（空章节）' }}</p>
         </div>
@@ -972,20 +1184,24 @@ onMounted(async () => {
               <button class="mo-icon-btn" title="目录" data-testid="reader-toc" @click="tocOpen = true">☰</button>
             </div>
             <div class="mo-chrome-bottom">
-              <button class="mo-chrome-btn" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
-              <button class="mo-chrome-btn" data-testid="reader-settings" @click="settingsOpen = true">Aa</button>
-              <button class="mo-chrome-btn" @click="tocOpen = true">目录</button>
-              <button class="mo-chrome-btn" :disabled="chapterIndex >= chapters.length - 1" @click="openAdjacent(1)">下一章</button>
+              <button v-if="settings.menuItems.includes('prev')" class="mo-chrome-btn" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
+              <button v-if="settings.menuItems.includes('settings')" class="mo-chrome-btn" data-testid="reader-settings" @click="settingsOpen = true">Aa</button>
+              <button v-if="settings.menuItems.includes('toc')" class="mo-chrome-btn" @click="tocOpen = true">目录</button>
+              <button v-if="settings.menuItems.includes('next')" class="mo-chrome-btn" :disabled="chapterIndex >= chapters.length - 1" @click="openAdjacent(1)">下一章</button>
             </div>
           </div>
         </transition>
 
         <transition name="mo-fade">
           <div v-if="settingsOpen" class="mo-sheet-mask" @click.self="settingsOpen = false">
-            <div class="mo-sheet">
+            <div class="mo-sheet mo-sheet-scroll">
               <div class="mo-sheet-head">
                 <strong>阅读设置</strong>
                 <button class="mo-icon-btn" @click="settingsOpen = false">✕</button>
+              </div>
+              <div class="mo-theme-row">
+                <span>预设</span>
+                <button v-for="preset in READER_PRESETS" :key="preset.key" @click="applyPreset(preset)">{{ preset.name }}</button>
               </div>
               <label class="mo-slider">
                 <span>字号</span>
@@ -997,13 +1213,54 @@ onMounted(async () => {
                 <input v-model.number="settings.lineSpacing" type="range" min="1.2" max="2.6" step="0.1" @change="persistSettings" />
                 <b>{{ settings.lineSpacing.toFixed(1) }}</b>
               </label>
+              <label class="mo-slider">
+                <span>段距</span>
+                <input v-model.number="settings.paragraphSpacing" type="range" min="0" max="20" step="1" @change="persistSettings" />
+                <b>{{ settings.paragraphSpacing }}</b>
+              </label>
+              <div class="mo-theme-row">
+                <span>缩进</span>
+                <button :class="{ on: settings.indent === 2 }" @click="settings.indent = 2; persistSettings()">两字</button>
+                <button :class="{ on: settings.indent === 0 }" @click="settings.indent = 0; persistSettings()">无</button>
+              </div>
               <div class="mo-theme-row">
                 <span>主题</span>
                 <button v-for="item in [{ value: 'light', label: '纸白' }, { value: 'sepia', label: '米黄' }, { value: 'dark', label: '夜读' }]" :key="item.value" :class="{ on: theme === item.value }" @click="settings.theme = item.value as any; persistSettings()">{{ item.label }}</button>
               </div>
               <div class="mo-theme-row">
                 <span>翻页</span>
-                <button v-for="item in [{ value: 'cover', label: '覆盖' }, { value: 'slide', label: '平移' }, { value: 'none', label: '无动画' }]" :key="item.value" :class="{ on: settings.pageAnimation === item.value }" @click="settings.pageAnimation = item.value as any; persistSettings()">{{ item.label }}</button>
+                <button v-for="item in [{ value: 'cover', label: '覆盖' }, { value: 'slide', label: '平移' }, { value: 'simulate', label: '仿真' }, { value: 'scroll', label: '滚动' }, { value: 'none', label: '无动画' }]" :key="item.value" :class="{ on: settings.pageAnimation === item.value }" @click="settings.pageAnimation = item.value as any; persistSettings()">{{ item.label }}</button>
+              </div>
+              <div class="mo-theme-row">
+                <span>页眉</span>
+                <select v-model.number="settings.headerMode" class="mo-select" @change="persistSettings">
+                  <option v-for="mode in TIP_MODES" :key="mode.code" :value="mode.code">{{ mode.label }}</option>
+                </select>
+              </div>
+              <div class="mo-theme-row">
+                <span>页脚</span>
+                <select v-model.number="settings.footerMode" class="mo-select" @change="persistSettings">
+                  <option v-for="mode in TIP_MODES" :key="mode.code" :value="mode.code">{{ mode.label }}</option>
+                </select>
+              </div>
+              <div class="mo-theme-row">
+                <span>分隔线</span>
+                <label class="mo-switch"><input v-model="settings.showHeaderLine" type="checkbox" @change="persistSettings" />页眉</label>
+                <label class="mo-switch"><input v-model="settings.showFooterLine" type="checkbox" @change="persistSettings" />页脚</label>
+              </div>
+              <div class="mo-zone-grid">
+                <div v-for="(zone, index) in settings.tapZones" :key="index" class="mo-zone-cell">
+                  <span>{{ TAP_ZONE_NAMES[index] }}</span>
+                  <select :value="zone" class="mo-select" @change="setTapZone(index, $event)">
+                    <option v-for="action in TAP_ACTIONS" :key="action.code" :value="action.code">{{ action.label }}{{ action.available ? '' : '（未开放）' }}</option>
+                  </select>
+                </div>
+              </div>
+              <div class="mo-theme-row">
+                <span>底栏</span>
+                <label v-for="item in MENU_ITEMS" :key="item.key" class="mo-switch">
+                  <input type="checkbox" :checked="settings.menuItems.includes(item.key)" @change="toggleMenuItem(item.key)" />{{ item.label }}
+                </label>
               </div>
             </div>
           </div>
@@ -1023,6 +1280,7 @@ onMounted(async () => {
                 <span v-else>{{ chapter.title }}</span>
               </li>
             </ol>
+            <button v-if="tocHasMore" class="mo-btn" @click="tocPage += 1">加载更多（{{ filteredChapters.length }}/{{ tocTotal }}）</button>
           </aside>
         </transition>
       </section>
@@ -1817,6 +2075,48 @@ textarea {
   border-radius: 14px 14px 0 0;
   background: var(--mo-paper-2);
   color: var(--mo-ink);
+}
+.mo-sheet-scroll {
+  max-height: 78vh;
+  overflow-y: auto;
+}
+.mo-shelf-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 18px;
+}
+.mo-shelf-groups button {
+  padding: 5px 12px;
+  border: 1px solid var(--mo-line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--mo-ink-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.mo-shelf-groups button.on {
+  border-color: var(--mo-accent);
+  background: var(--mo-accent-soft);
+  color: var(--mo-accent);
+}
+.mo-zone-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 10px 0;
+}
+.mo-zone-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--mo-ink-3);
+}
+.mo-zone-cell .mo-select {
+  width: 100%;
+  padding: 4px 6px;
+  font-size: 12px;
 }
 .mo-sheet-head {
   display: flex;

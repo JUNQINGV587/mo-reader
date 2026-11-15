@@ -1,5 +1,6 @@
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
+import { DEFAULT_MENU_ITEMS, DEFAULT_TAP_ZONES } from '../core/reader/reader-config.js'
 
 const identified = z.object({ id: z.string().min(1).max(4096) }).passthrough()
 
@@ -17,10 +18,40 @@ export const ReaderDomain = defineDomain({
         theme: z.enum(['light', 'sepia', 'dark', 'system']).default('light'),
         fontSize: z.number().int().min(12).max(48).default(24),
         lineSpacing: z.number().min(1).max(3).default(1.8),
-        pageAnimation: z.enum(['none', 'cover', 'slide']).default('cover'),
+        paragraphSpacing: z.number().int().min(0).max(40).default(6),
+        indent: z.number().int().min(0).max(2).default(2),
+        padding: z
+          .object({
+            left: z.number().int().min(0).max(80).default(22),
+            top: z.number().int().min(0).max(80).default(5),
+            right: z.number().int().min(0).max(80).default(22),
+            bottom: z.number().int().min(0).max(80).default(4),
+          })
+          .default({ left: 22, top: 5, right: 22, bottom: 4 }),
+        pageAnimation: z.enum(['none', 'cover', 'slide', 'simulate', 'scroll']).default('cover'),
+        headerMode: z.number().int().min(0).max(11).default(1),
+        footerMode: z.number().int().min(0).max(11).default(6),
+        showHeaderLine: z.boolean().default(true),
+        showFooterLine: z.boolean().default(true),
+        tapZones: z.array(z.number().int().min(-1).max(13)).length(9).default(DEFAULT_TAP_ZONES),
+        menuItems: z.array(z.string()).default(DEFAULT_MENU_ITEMS),
       })
       .passthrough(),
-    initial: { theme: 'light', fontSize: 22, lineSpacing: 1.9, pageAnimation: 'cover' },
+    initial: {
+      theme: 'light',
+      fontSize: 22,
+      lineSpacing: 1.9,
+      paragraphSpacing: 6,
+      indent: 2,
+      padding: { left: 22, top: 5, right: 22, bottom: 4 },
+      pageAnimation: 'cover',
+      headerMode: 1,
+      footerMode: 6,
+      showHeaderLine: true,
+      showFooterLine: true,
+      tapZones: DEFAULT_TAP_ZONES,
+      menuItems: DEFAULT_MENU_ITEMS,
+    },
   },
   tables: {
     books: domainTable(identified),
