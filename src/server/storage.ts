@@ -14,12 +14,13 @@ export const ReaderDomain = defineDomain({
   global: {
     schema: z
       .object({
-        theme: z.enum(['light', 'dark', 'system']).default('system'),
+        theme: z.enum(['light', 'sepia', 'dark', 'system']).default('light'),
         fontSize: z.number().int().min(12).max(48).default(24),
         lineSpacing: z.number().min(1).max(3).default(1.8),
+        pageAnimation: z.enum(['none', 'cover', 'slide']).default('cover'),
       })
       .passthrough(),
-    initial: { theme: 'system', fontSize: 24, lineSpacing: 1.8 },
+    initial: { theme: 'light', fontSize: 22, lineSpacing: 1.9, pageAnimation: 'cover' },
   },
   tables: {
     books: domainTable(identified),

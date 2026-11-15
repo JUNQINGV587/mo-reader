@@ -248,8 +248,9 @@ export class ReaderService extends TypertRemoteService {
 
   async listBooks() {
     const books: Array<Record<string, unknown>> = []
-    for (const [, value] of this.requireDb().books.entries()) {
-      books.push(value as Record<string, unknown>)
+    for (const [id, value] of this.requireDb().books.entries()) {
+      const record = this.requireDb().readRecords.get(id)
+      books.push({ ...(value as Record<string, unknown>), progress: record ?? null })
     }
     books.sort((a, b) => {
       const left = String(a.lastReadAt ?? a.updatedAt ?? '')
