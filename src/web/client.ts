@@ -1,25 +1,24 @@
 import { createElement } from 'react'
 import { z } from 'zod'
 import { PANEL_ID } from '../core/version'
+import { REMOTE_METHODS } from '../core/remote-methods'
 import { createReaderShell } from './shell'
 
 const jsonCodec = () => ({ mode: 'strict' as const, typeSymbol: '@local/mo-reader#Json', create: () => z.json() })
 
-/** M0 只暴露 state；M1 起把书源、搜索、书架、目录、正文等 descriptor 逐个加回来。 */
+/** 与 README / service 的 REMOTE_METHODS 一一对应，宿主据此生成 ctx.remote.reader 的方法。 */
 export const readerContribution = {
   package: '@local/mo-reader',
-  descriptors: [
-    {
-      id: '@local/mo-reader#reader/state',
-      package: '@local/mo-reader',
-      namespace: 'reader',
-      service: 'reader',
-      method: 'state',
-      invocation: { kind: 'direct' },
-      parameters: [{ name: 'args', wire: 'args', source: 'json', acceptsUndefined: true, codec: jsonCodec() }],
-      result: jsonCodec(),
-    },
-  ],
+  descriptors: REMOTE_METHODS.map((method) => ({
+    id: `@local/mo-reader#reader/${method}`,
+    package: '@local/mo-reader',
+    namespace: 'reader',
+    service: 'reader',
+    method,
+    invocation: { kind: 'direct' as const },
+    parameters: [{ name: 'args', wire: 'args', source: 'json', acceptsUndefined: true, codec: jsonCodec() }],
+    result: jsonCodec(),
+  })),
 }
 
 function ReaderIcon() {

@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { onMounted, ref, computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
-type View = 'shelf' | 'sources' | 'search' | 'reader'
-const view = ref<View>('sources')
+type View = 'shelf' | 'sources' | 'search' | 'detail' | 'reader'
+const view = ref<View>('shelf')
 const version = ref('')
 const status = ref('')
 const busy = ref(false)
@@ -12,6 +12,8 @@ const busy = ref(false)
 const sources = ref<any[]>([])
 const importText = ref('')
 const importMessage = ref('')
+
+const shelfBooks = ref<any[]>([])
 
 const searchKey = ref('')
 const searching = ref(false)
@@ -23,8 +25,12 @@ const chapters = ref<any[]>([])
 const currentChapter = ref<any>(null)
 const content = ref('')
 const readerTitle = ref('')
+const progress = ref<any>(null)
 
 const enabledCount = computed(() => sources.value.filter((source) => source.enabled !== false).length)
+const chapterIndex = computed(() =>
+  currentChapter.value ? chapters.value.indexOf(currentChapter.value) : -1,
+)
 
 async function call(method: string, args?: any) {
   const fn = props.remote?.[method]
@@ -32,14 +38,19 @@ async function call(method: string, args?: any) {
   return args === undefined ? fn.call(props.remote) : fn.call(props.remote, args)
 }
 
+function errorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}
+
 async function refresh() {
   busy.value = true
   try {
     const state = await call('state')
     version.value = state?.version ?? ''
-    const result = await call('listSources')
-    sources.value = result?.sources ?? []
-    status.value = `书源 ${sources.value.length} 个 · 启用 ${enabledCount.value}`
+    const [sourceResult, bookResult] = await Promise.all([call('listSources'), call('listBooks')])
+    sources.value = sourceResult?.sources ?? []
+    shelfBooks.value = bookResult?.books ?? []
+    status.value = `书源 ${sources.value.length} 个（启用 ${enabledCount.value}） · 书架 ${shelfBooks.value.length} 本`
   } catch (error) {
     status.value = errorText(error)
   } finally {
@@ -53,7 +64,8 @@ async function importSources() {
   importMessage.value = ''
   try {
     const result = await call('importSources', { payload: importText.value })
-    importMessage.value = `导入 ${result.total} 条：新增 ${result.added}，更新 ${result.updated}` +
+    importMessage.value =
+      `导入 ${result.total} 条：新增 ${result.added}，更新 ${result.updated}` +
       (result.errors?.length ? `，失败 ${result.errors.length}（${result.errors[0].message}）` : '')
     importText.value = ''
     await refresh()
@@ -66,8 +78,9 @@ async function importSources() {
 
 async function toggleSource(source: any) {
   try {
-    const next = { ...source, enabled: source.enabled === false }
-    const result = await call('saveSource', { source: next })
+    const result = await call('saveSource', {
+      source: { ...source, enabled: source.enabled === false },
+    })
     Object.assign(source, result.source)
   } catch (error) {
     status.value = errorText(error)
@@ -101,14 +114,22 @@ async function search() {
   }
 }
 
+async function loadToc(book: any, tocUrlFallback: string) {
+  const toc = await call('getToc', {
+    sourceUrl: book.origin,
+    tocUrl: book.tocUrl || tocUrlFallback,
+  })
+  chapters.value = toc.chapters ?? []
+}
+
 async function openBook(book: any) {
   busy.value = true
   try {
     const info = await call('getBookInfo', { sourceUrl: book.origin, bookUrl: book.bookUrl })
-    currentBook.value = { ...book, ...info.info }
-    const toc = await call('getToc', { sourceUrl: book.origin, tocUrl: info.info.tocUrl })
-    chapters.value = toc.chapters ?? []
-    view.value = 'search'
+    currentBook.value = { ...book, ...info.info, tocUrl: info.info.tocUrl || book.bookUrl }
+    await loadToc(currentBook.value, book.bookUrl)
+    progress.value = null
+    view.value = 'detail'
     status.value = `${currentBook.value.name} · ${chapters.value.length} 章`
   } catch (error) {
     status.value = errorText(error)
@@ -117,18 +138,16 @@ async function openBook(book: any) {
   }
 }
 
-async function openChapter(chapter: any) {
-  if (chapter.isVolume || !chapter.url) return
+async function openShelfBook(book: any) {
   busy.value = true
+  currentBook.value = { ...book }
+  chapters.value = []
   try {
-    const result = await call('getContent', {
-      sourceUrl: currentBook.value.origin ?? currentBook.value.bookSourceUrl,
-      chapterUrl: chapter.url,
-    })
-    currentChapter.value = chapter
-    content.value = result.content ?? ''
-    readerTitle.value = chapter.title
-    view.value = 'reader'
+    await loadToc(currentBook.value, book.bookUrl)
+    const result = await call('getProgress', { bookId: book.id })
+    progress.value = result?.progress ?? null
+    view.value = 'detail'
+    status.value = `${book.name} · ${chapters.value.length} 章`
   } catch (error) {
     status.value = errorText(error)
   } finally {
@@ -136,8 +155,63 @@ async function openChapter(chapter: any) {
   }
 }
 
-function errorText(error: unknown) {
-  return error instanceof Error ? error.message : String(error)
+async function addToShelf() {
+  if (!currentBook.value) return
+  try {
+    const result = await call('addBook', {
+      book: {
+        origin: currentBook.value.origin,
+        originName: currentBook.value.originName,
+        bookUrl: currentBook.value.bookUrl,
+        tocUrl: currentBook.value.tocUrl,
+        name: currentBook.value.name,
+        author: currentBook.value.author,
+        kind: currentBook.value.kind,
+        coverUrl: currentBook.value.coverUrl,
+        intro: currentBook.value.intro,
+        type: currentBook.value.type,
+      },
+    })
+    currentBook.value.id = result.book.id
+    await refresh()
+    status.value = '已加入书架'
+  } catch (error) {
+    status.value = errorText(error)
+  }
+}
+
+async function openChapter(chapter: any) {
+  if (chapter.isVolume || !chapter.url) return
+  busy.value = true
+  try {
+    const result = await call('getContent', {
+      sourceUrl: currentBook.value.origin,
+      chapterUrl: chapter.url,
+    })
+    const index = chapters.value.indexOf(chapter)
+    currentChapter.value = chapter
+    content.value = result.content ?? ''
+    readerTitle.value = chapter.title
+    view.value = 'reader'
+    if (currentBook.value?.id) {
+      call('saveProgress', {
+        bookId: currentBook.value.id,
+        chapterIndex: index,
+        chapterTitle: chapter.title,
+        chapterUrl: chapter.url,
+        position: 0,
+      }).catch(() => undefined)
+    }
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+function openAdjacent(delta: number) {
+  const next = chapters.value[chapterIndex.value + delta]
+  if (next) openChapter(next)
 }
 
 onMounted(refresh)
@@ -154,15 +228,22 @@ onMounted(refresh)
     <nav class="mo-nav">
       <button :class="{ on: view === 'shelf' }" data-testid="nav-shelf" @click="view = 'shelf'">书架</button>
       <button :class="{ on: view === 'sources' }" data-testid="nav-sources" @click="view = 'sources'">书源</button>
-      <button :class="{ on: view === 'search' }" data-testid="nav-search" @click="view = 'search'">搜索</button>
+      <button :class="{ on: view === 'search' || view === 'detail' }" data-testid="nav-search" @click="view = 'search'">搜索</button>
       <span class="mo-version">v{{ version }}</span>
     </nav>
 
     <main class="mo-body">
       <section v-if="view === 'shelf'" class="mo-pane">
-        <div class="mo-empty">
+        <div v-if="shelfBooks.length === 0" class="mo-empty">
           <p>书架还是空的。</p>
-          <p class="muted">先在「书源」导入书源，再在「搜索」里找书。</p>
+          <p class="muted">先在「书源」导入书源，再在「搜索」里找书，详情页可以加入书架。</p>
+        </div>
+        <div v-else class="mo-shelf" data-testid="shelf">
+          <button v-for="book in shelfBooks" :key="book.id" class="mo-shelf-book" data-testid="shelf-book" @click="openShelfBook(book)">
+            <span class="mo-shelf-name">{{ book.name }}</span>
+            <span class="muted">{{ book.author || '未知作者' }}</span>
+            <span class="muted">{{ book.originName || '' }}</span>
+          </button>
         </div>
       </section>
 
@@ -208,27 +289,37 @@ onMounted(refresh)
           </button>
         </div>
 
-        <div v-if="currentBook" class="mo-bookinfo">
-          <h3>{{ currentBook.name }}</h3>
-          <p class="muted">{{ currentBook.author }} · {{ currentBook.kind }} · {{ chapters.length }} 章</p>
-          <p v-if="currentBook.intro" class="mo-intro">{{ currentBook.intro }}</p>
-          <ol class="mo-toc">
-            <li v-for="chapter in chapters" :key="chapter.url || chapter.title" :class="{ volume: chapter.isVolume }">
-              <button v-if="!chapter.isVolume" data-testid="chapter" @click="openChapter(chapter)">{{ chapter.title }}</button>
-              <span v-else>{{ chapter.title }}</span>
-            </li>
-          </ol>
-        </div>
-
         <div v-if="searchErrors.length" class="mo-errors">
           <p v-for="error in searchErrors" :key="error.sourceUrl" class="muted">{{ error.sourceUrl }}：{{ error.message }}</p>
         </div>
       </section>
 
+      <section v-if="view === 'detail' && currentBook" class="mo-pane">
+        <div class="mo-row">
+          <button class="mo-btn ghost" data-testid="detail-back" @click="view = searchKey ? 'search' : 'shelf'">返回</button>
+          <button class="mo-btn" v-if="!currentBook.id" data-testid="add-shelf" @click="addToShelf">加入书架</button>
+          <span v-else class="muted">已在书架</span>
+          <span v-if="progress" class="muted">
+            上次读到 {{ progress.chapterTitle || `第 ${progress.chapterIndex + 1} 章` }}
+          </span>
+        </div>
+        <h3>{{ currentBook.name }}</h3>
+        <p class="muted">{{ currentBook.author }} · {{ currentBook.kind }} · {{ chapters.length }} 章</p>
+        <p v-if="currentBook.intro" class="mo-intro">{{ currentBook.intro }}</p>
+        <ol class="mo-toc">
+          <li v-for="chapter in chapters" :key="chapter.url || chapter.title" :class="{ volume: chapter.isVolume }">
+            <button v-if="!chapter.isVolume" data-testid="chapter" @click="openChapter(chapter)">{{ chapter.title }}</button>
+            <span v-else>{{ chapter.title }}</span>
+          </li>
+        </ol>
+      </section>
+
       <section v-if="view === 'reader'" class="mo-pane reader">
         <div class="mo-row">
-          <button class="mo-btn ghost" data-testid="reader-back" @click="view = 'search'">返回</button>
-          <strong>{{ readerTitle }}</strong>
+          <button class="mo-btn ghost" data-testid="reader-back" @click="view = 'detail'">返回</button>
+          <button class="mo-btn ghost" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
+          <strong class="mo-reader-title">{{ readerTitle }}</strong>
+          <button class="mo-btn ghost" @click="openAdjacent(1)">下一章</button>
         </div>
         <article class="mo-content" data-testid="reader-content">{{ content || '（空）' }}</article>
       </section>
@@ -301,9 +392,9 @@ onMounted(refresh)
   margin-bottom: 20px;
 }
 .mo-block h3,
-.mo-bookinfo h3 {
-  margin: 0 0 8px;
-  font-size: 14px;
+.mo-pane > h3 {
+  margin: 8px 0;
+  font-size: 16px;
 }
 .mo-row {
   display: flex;
@@ -311,8 +402,6 @@ onMounted(refresh)
   gap: 8px;
   margin: 8px 0;
 }
-.mo-row input[type='text'],
-.mo-row input:not([type]),
 .mo-row input {
   flex: 1;
 }
@@ -337,6 +426,7 @@ textarea {
   background: var(--dsh-fill, #f6f8fa);
   color: inherit;
   cursor: pointer;
+  white-space: nowrap;
 }
 .mo-btn:disabled {
   opacity: 0.5;
@@ -348,6 +438,27 @@ textarea {
 }
 .mo-btn.danger {
   color: #b42318;
+}
+.mo-shelf {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+}
+.mo-shelf-book {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 12px;
+  border: 1px solid var(--dsh-border, #d8dee4);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.mo-shelf-name {
+  font-weight: 600;
 }
 .mo-sources {
   list-style: none;
@@ -432,6 +543,10 @@ textarea {
   color: inherit;
   cursor: pointer;
   text-align: left;
+}
+.mo-reader-title {
+  flex: 1;
+  text-align: center;
 }
 .mo-content {
   white-space: pre-wrap;

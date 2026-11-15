@@ -1,0 +1,18 @@
+/** 服务端与客户端共享的 Remote 方法清单：两侧都按它生成方法/描述符。 */
+export const REMOTE_METHODS = Object.freeze([
+  'state',
+  'listSources',
+  'importSources',
+  'saveSource',
+  'deleteSources',
+  'searchBooks',
+  'getBookInfo',
+  'getToc',
+  'getContent',
+  'debugSource',
+  'addBook',
+  'listBooks',
+  'removeBooks',
+  'saveProgress',
+  'getProgress',
+])

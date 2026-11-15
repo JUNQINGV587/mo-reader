@@ -13,24 +13,8 @@ import {
 } from '../core/source/analyze.js'
 import { openReaderStorage } from './storage.js'
 
-/** M1 的 Remote 面：书源管理 + 搜索 + 详情/目录/正文 + 调试。 */
-export const REMOTE_METHODS = Object.freeze([
-  'state',
-  'listSources',
-  'importSources',
-  'saveSource',
-  'deleteSources',
-  'searchBooks',
-  'getBookInfo',
-  'getToc',
-  'getContent',
-  'debugSource',
-  'addBook',
-  'listBooks',
-  'removeBooks',
-  'saveProgress',
-  'getProgress',
-])
+export { REMOTE_METHODS } from '../core/remote-methods.js'
+import { REMOTE_METHODS } from '../core/remote-methods.js'
 
 type Args = Record<string, unknown> | undefined
 
