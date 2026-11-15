@@ -53,6 +53,7 @@ export function evalJs(script: string, env: JsEnv): unknown {
 function createSandbox(env: JsEnv): Record<string, unknown> {
   const book = env.book as { name?: string; bookUrl?: string } | undefined;
   const source = env.source as { bookSourceUrl?: string } | undefined;
+  const variables = env.variables ?? {};
 
   return {
     result: env.result,
@@ -66,7 +67,7 @@ function createSandbox(env: JsEnv): Record<string, unknown> {
     title: book?.name ?? '',
     src: source?.bookSourceUrl ?? '',
     nextChapterUrl: '',
-    variables: env.variables ?? {},
+    variables,
 
     ajax: (url: string, options?: RequestOptions) => request(url, options),
     connect: (url: string, options?: RequestOptions) => request(url, options),
@@ -94,6 +95,33 @@ function createSandbox(env: JsEnv): Record<string, unknown> {
     log: (value: unknown) => console.log('[mo-reader/source]', value),
 
     java: {
+      // 阅读的 JsExtensions 把常用函数也挂在 java 上（书源里常见 java.md5Encode / java.ajax）。
+      ajax: (url: string, options?: RequestOptions) => request(url, options),
+      connect: (url: string, options?: RequestOptions) => request(url, options),
+      get: (url: string, options?: RequestOptions) => request(url, { ...options, method: 'GET' }),
+      post: (url: string, body?: string) => request(url, { method: 'POST', body: body ?? '' }),
+      head: (url: string, options?: RequestOptions) => request(url, { ...options, method: 'HEAD' }),
+      put: (key: string, value: unknown) => {
+        variables[String(key)] = String(value)
+      },
+      getVariable: (key: string) => variables[String(key)],
+      longToast: () => {},
+      toast: () => {},
+      log: (value: unknown) => console.log('[mo-reader/source]', value),
+      webView: () => {
+        throw new Error('WebView 在 Web 版不可用')
+      },
+      md5Encode: (value: string) => hash('md5', value),
+      md5Encode16: (value: string) => hash('md5', value).slice(8, 24),
+      sha1Encode: (value: string) => hash('sha1', value),
+      sha256Encode: (value: string) => hash('sha256', value),
+      base64Encode: (value: string) => Buffer.from(String(value), 'utf8').toString('base64'),
+      base64Decode: (value: string) => Buffer.from(String(value), 'base64').toString('utf8'),
+      hexEncode: (value: string) => Buffer.from(String(value), 'utf8').toString('hex'),
+      hexDecode: (value: string) => Buffer.from(String(value), 'hex').toString('utf8'),
+      urlEncode: (value: string) => encodeURIComponent(String(value)),
+      urlDecode: (value: string) => decodeURIComponent(String(value)),
+      getCookie: () => '',
       lang: {
         System: {
           currentTimeMillis: () => Date.now(),

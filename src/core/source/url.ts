@@ -131,8 +131,8 @@ function splitOptions(value: string): {
   if (marker < 0) return { base: value, options: {} };
 
   const tail = value.slice(marker + 1);
-  try {
-    const parsed = JSON.parse(tail) as Record<string, unknown>;
+  const parsed = parseOptionsJson(tail);
+  if (parsed) {
     const method = String(parsed.method ?? 'GET').toUpperCase() === 'POST' ? 'POST' : 'GET';
     return {
       base: value.slice(0, marker),
@@ -142,8 +142,24 @@ function splitOptions(value: string): {
         headers: isStringRecord(parsed.headers) ? parsed.headers : undefined,
       },
     };
+  }
+  return { base: value, options: {} };
+}
+
+/** 书源选项后缀有时是单引号 JS 字面量（{'method':'POST'}），按宽松 JSON 解析。 */
+function parseOptionsJson(text: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
   } catch {
-    return { base: value, options: {} };
+    // 继续用宽松解析
+  }
+  const normalized = text.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_match, inner: string) =>
+    JSON.stringify(inner.replace(/\\'/g, "'")),
+  );
+  try {
+    return JSON.parse(normalized) as Record<string, unknown>;
+  } catch {
+    return null;
   }
 }
 

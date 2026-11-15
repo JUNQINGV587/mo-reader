@@ -11,3 +11,6 @@ design/
 *.tmp
 *.temp
 .DS_Store
+
+# 探针与临时产物
+.scratch/

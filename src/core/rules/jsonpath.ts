@@ -68,6 +68,10 @@ export class JsonPathAnalyzer {
     if (!path.startsWith('$')) path = `$.${path}`;
     try {
       const result = JSONPath({ path, json: this.value as never, wrap: true }) as unknown;
+      // jsonpath-plus 的 wrap 会把数组结果再包一层；书源规则拿的是数组元素本身。
+      if (Array.isArray(result) && result.length === 1 && Array.isArray(result[0])) {
+        return result[0] as unknown[];
+      }
       if (Array.isArray(result)) return result;
       return result === undefined ? [] : [result];
     } catch {
