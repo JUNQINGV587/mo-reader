@@ -1,164 +1,445 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref, computed } from 'vue'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
-const tabs = [
-  { id: 'shelf', label: '书架' },
-  { id: 'discover', label: '发现' },
-  { id: 'subscribe', label: '订阅' },
-  { id: 'mine', label: '我的' },
-]
-
-const active = ref('shelf')
-const status = ref('正在连接服务…')
+type View = 'shelf' | 'sources' | 'search' | 'reader'
+const view = ref<View>('sources')
 const version = ref('')
-const activeLabel = computed(() => tabs.find((tab) => tab.id === active.value)?.label ?? '')
+const status = ref('')
+const busy = ref(false)
 
-onMounted(async () => {
+const sources = ref<any[]>([])
+const importText = ref('')
+const importMessage = ref('')
+
+const searchKey = ref('')
+const searching = ref(false)
+const books = ref<any[]>([])
+const searchErrors = ref<any[]>([])
+
+const currentBook = ref<any>(null)
+const chapters = ref<any[]>([])
+const currentChapter = ref<any>(null)
+const content = ref('')
+const readerTitle = ref('')
+
+const enabledCount = computed(() => sources.value.filter((source) => source.enabled !== false).length)
+
+async function call(method: string, args?: any) {
+  const fn = props.remote?.[method]
+  if (typeof fn !== 'function') throw new Error(`Remote 未就绪：${method}`)
+  return args === undefined ? fn.call(props.remote) : fn.call(props.remote, args)
+}
+
+async function refresh() {
+  busy.value = true
   try {
-    const res = await props.remote?.state?.({})
-    version.value = res?.version ?? ''
-    status.value = res?.ok ? `服务已连接 · ${res.version}` : '服务未就绪'
-  } catch (error: any) {
-    status.value = `服务未连接：${error?.message ?? String(error)}`
+    const state = await call('state')
+    version.value = state?.version ?? ''
+    const result = await call('listSources')
+    sources.value = result?.sources ?? []
+    status.value = `书源 ${sources.value.length} 个 · 启用 ${enabledCount.value}`
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    busy.value = false
   }
-})
+}
+
+async function importSources() {
+  if (!importText.value.trim()) return
+  busy.value = true
+  importMessage.value = ''
+  try {
+    const result = await call('importSources', { payload: importText.value })
+    importMessage.value = `导入 ${result.total} 条：新增 ${result.added}，更新 ${result.updated}` +
+      (result.errors?.length ? `，失败 ${result.errors.length}（${result.errors[0].message}）` : '')
+    importText.value = ''
+    await refresh()
+  } catch (error) {
+    importMessage.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function toggleSource(source: any) {
+  try {
+    const next = { ...source, enabled: source.enabled === false }
+    const result = await call('saveSource', { source: next })
+    Object.assign(source, result.source)
+  } catch (error) {
+    status.value = errorText(error)
+  }
+}
+
+async function removeSource(source: any) {
+  try {
+    await call('deleteSources', { urls: [source.bookSourceUrl] })
+    await refresh()
+  } catch (error) {
+    status.value = errorText(error)
+  }
+}
+
+async function search() {
+  const key = searchKey.value.trim()
+  if (!key) return
+  searching.value = true
+  books.value = []
+  searchErrors.value = []
+  try {
+    const result = await call('searchBooks', { key, page: 1 })
+    books.value = result.books ?? []
+    searchErrors.value = result.errors ?? []
+    status.value = `搜索到 ${books.value.length} 本，失败 ${searchErrors.value.length} 个源`
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    searching.value = false
+  }
+}
+
+async function openBook(book: any) {
+  busy.value = true
+  try {
+    const info = await call('getBookInfo', { sourceUrl: book.origin, bookUrl: book.bookUrl })
+    currentBook.value = { ...book, ...info.info }
+    const toc = await call('getToc', { sourceUrl: book.origin, tocUrl: info.info.tocUrl })
+    chapters.value = toc.chapters ?? []
+    view.value = 'search'
+    status.value = `${currentBook.value.name} · ${chapters.value.length} 章`
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function openChapter(chapter: any) {
+  if (chapter.isVolume || !chapter.url) return
+  busy.value = true
+  try {
+    const result = await call('getContent', {
+      sourceUrl: currentBook.value.origin ?? currentBook.value.bookSourceUrl,
+      chapterUrl: chapter.url,
+    })
+    currentChapter.value = chapter
+    content.value = result.content ?? ''
+    readerTitle.value = chapter.title
+    view.value = 'reader'
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+function errorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+onMounted(refresh)
 </script>
 
 <template>
-  <div class="mo-app">
+  <div class="mo">
     <header class="mo-head">
-      <div class="mo-brand">
-        <span class="mo-seal">墨</span>
-        <span class="mo-name">墨读</span>
-        <span class="mo-tag">复刻「阅读」</span>
-      </div>
-      <span class="mo-version">{{ version || 'M0' }}</span>
+      <div class="mo-brand">墨读</div>
+      <div class="mo-status">{{ status || (busy ? '加载中…' : '') }}</div>
+      <button class="mo-btn ghost" data-testid="refresh" @click="refresh">刷新</button>
     </header>
 
-    <div class="mo-body">
-      <nav class="mo-nav" aria-label="墨读导航">
-        <button
-          v-for="tab in tabs"
-          :key="tab.id"
-          class="mo-nav-item"
-          :class="{ active: tab.id === active }"
-          @click="active = tab.id"
-        >
-          {{ tab.label }}
-        </button>
-      </nav>
+    <nav class="mo-nav">
+      <button :class="{ on: view === 'shelf' }" data-testid="nav-shelf" @click="view = 'shelf'">书架</button>
+      <button :class="{ on: view === 'sources' }" data-testid="nav-sources" @click="view = 'sources'">书源</button>
+      <button :class="{ on: view === 'search' }" data-testid="nav-search" @click="view = 'search'">搜索</button>
+      <span class="mo-version">v{{ version }}</span>
+    </nav>
 
-      <main class="mo-main">
-        <div class="mo-card">
-          <h2 class="mo-title">{{ activeLabel }}</h2>
-          <p class="mo-status">{{ status }}</p>
-          <p class="mo-hint">M0 只验证 DSH 面板、Remote 与存储骨架；书架、发现、订阅与阅读页从 M1 起接入。</p>
+    <main class="mo-body">
+      <section v-if="view === 'shelf'" class="mo-pane">
+        <div class="mo-empty">
+          <p>书架还是空的。</p>
+          <p class="muted">先在「书源」导入书源，再在「搜索」里找书。</p>
         </div>
-      </main>
-    </div>
+      </section>
+
+      <section v-if="view === 'sources'" class="mo-pane">
+        <div class="mo-block">
+          <h3>导入书源</h3>
+          <p class="muted">粘贴「阅读」书源 JSON（单个或数组）。</p>
+          <textarea v-model="importText" data-testid="import-text" rows="5" placeholder='[{"bookSourceUrl":"https://…","bookSourceName":"…"}]' />
+          <div class="mo-row">
+            <button class="mo-btn" :disabled="busy || !importText.trim()" data-testid="import" @click="importSources">导入</button>
+            <span class="muted">{{ importMessage }}</span>
+          </div>
+        </div>
+
+        <div class="mo-block">
+          <h3>书源（{{ sources.length }}）</h3>
+          <div v-if="sources.length === 0" class="mo-empty">还没有书源。</div>
+          <ul class="mo-sources">
+            <li v-for="source in sources" :key="source.bookSourceUrl" data-testid="source-row">
+              <label class="mo-switch">
+                <input type="checkbox" :checked="source.enabled !== false" @change="toggleSource(source)" />
+                <span>{{ source.bookSourceName || source.bookSourceUrl }}</span>
+              </label>
+              <span class="mo-url">{{ source.bookSourceUrl }}</span>
+              <button class="mo-btn ghost danger" @click="removeSource(source)">删除</button>
+            </li>
+          </ul>
+        </div>
+      </section>
+
+      <section v-if="view === 'search'" class="mo-pane">
+        <div class="mo-row">
+          <input v-model="searchKey" data-testid="search-key" placeholder="书名 / 作者" @keyup.enter="search" />
+          <button class="mo-btn" :disabled="searching || !searchKey.trim()" data-testid="search" @click="search">
+            {{ searching ? '搜索中…' : '搜索' }}
+          </button>
+        </div>
+
+        <div v-if="books.length" class="mo-results">
+          <button v-for="book in books" :key="book.origin + book.bookUrl" class="mo-book" data-testid="book" @click="openBook(book)">
+            <span class="mo-book-name">{{ book.name }}</span>
+            <span class="muted">{{ book.author || '未知作者' }} · {{ book.originName || book.origin }}</span>
+          </button>
+        </div>
+
+        <div v-if="currentBook" class="mo-bookinfo">
+          <h3>{{ currentBook.name }}</h3>
+          <p class="muted">{{ currentBook.author }} · {{ currentBook.kind }} · {{ chapters.length }} 章</p>
+          <p v-if="currentBook.intro" class="mo-intro">{{ currentBook.intro }}</p>
+          <ol class="mo-toc">
+            <li v-for="chapter in chapters" :key="chapter.url || chapter.title" :class="{ volume: chapter.isVolume }">
+              <button v-if="!chapter.isVolume" data-testid="chapter" @click="openChapter(chapter)">{{ chapter.title }}</button>
+              <span v-else>{{ chapter.title }}</span>
+            </li>
+          </ol>
+        </div>
+
+        <div v-if="searchErrors.length" class="mo-errors">
+          <p v-for="error in searchErrors" :key="error.sourceUrl" class="muted">{{ error.sourceUrl }}：{{ error.message }}</p>
+        </div>
+      </section>
+
+      <section v-if="view === 'reader'" class="mo-pane reader">
+        <div class="mo-row">
+          <button class="mo-btn ghost" data-testid="reader-back" @click="view = 'search'">返回</button>
+          <strong>{{ readerTitle }}</strong>
+        </div>
+        <article class="mo-content" data-testid="reader-content">{{ content || '（空）' }}</article>
+      </section>
+    </main>
   </div>
 </template>
 
-<style scoped>
-.mo-app {
+<style>
+.mo {
   display: flex;
   flex-direction: column;
-  min-height: 320px;
   height: 100%;
-  font-family: system-ui, -apple-system, 'PingFang SC', 'Noto Sans SC', sans-serif;
-  color: var(--dsw-alias-label-primary, #1f2421);
-  background: var(--dsw-alias-bg-layer-1, #faf9f6);
+  min-height: 480px;
+  color: var(--dsh-text-primary, #24292f);
+  font: 14px/1.6 -apple-system, 'Noto Sans SC', 'PingFang SC', sans-serif;
 }
 .mo-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 14px 20px;
-  border-bottom: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.08));
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--dsh-border, #d8dee4);
 }
 .mo-brand {
+  font: 700 18px/1 'Songti SC', 'Noto Serif SC', serif;
+  letter-spacing: 0.12em;
+}
+.mo-status {
+  flex: 1;
+  color: var(--dsh-text-secondary, #57606a);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mo-nav {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--dsh-border, #d8dee4);
+}
+.mo-nav button {
+  border: 0;
+  background: none;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--dsh-text-secondary, #57606a);
+}
+.mo-nav button.on {
+  background: var(--dsh-fill, #eaeef2);
+  color: var(--dsh-text-primary, #24292f);
+  font-weight: 600;
+}
+.mo-version {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--dsh-text-tertiary, #8c959f);
+}
+.mo-body {
+  flex: 1;
+  overflow: auto;
+}
+.mo-pane {
+  padding: 16px;
+  max-width: 880px;
+}
+.mo-block {
+  margin-bottom: 20px;
+}
+.mo-block h3,
+.mo-bookinfo h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+.mo-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+.mo-row input[type='text'],
+.mo-row input:not([type]),
+.mo-row input {
+  flex: 1;
+}
+input,
+textarea {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--dsh-border, #d0d7de);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+textarea {
+  resize: vertical;
+}
+.mo-btn {
+  padding: 7px 14px;
+  border: 1px solid var(--dsh-border, #d0d7de);
+  border-radius: 6px;
+  background: var(--dsh-fill, #f6f8fa);
+  color: inherit;
+  cursor: pointer;
+}
+.mo-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.mo-btn.ghost {
+  background: transparent;
+  border-color: transparent;
+}
+.mo-btn.danger {
+  color: #b42318;
+}
+.mo-sources {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.mo-sources li {
   display: flex;
   align-items: center;
   gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--dsh-border-subtle, #eaeef2);
 }
-.mo-seal {
-  display: inline-flex;
-  width: 26px;
-  height: 26px;
-  align-items: center;
-  justify-content: center;
-  border-radius: 6px;
-  background: #a8402e;
-  color: #f8f1e4;
-  font-size: 15px;
-  font-weight: 700;
-}
-.mo-name {
-  font-size: 16px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-}
-.mo-tag,
-.mo-version {
-  font-size: 12px;
-  color: var(--dsw-alias-label-secondary, #7b8078);
-}
-.mo-body {
+.mo-switch {
   display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 150px;
+}
+.mo-switch input {
+  width: auto;
+}
+.mo-url {
   flex: 1;
-  min-height: 0;
+  font-size: 12px;
+  color: var(--dsh-text-tertiary, #8c959f);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.mo-nav {
-  flex: none;
-  width: 148px;
-  padding: 12px 10px;
-  border-right: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.08));
+.mo-empty {
+  padding: 24px 0;
+  color: var(--dsh-text-secondary, #57606a);
 }
-.mo-nav-item {
-  display: block;
-  width: 100%;
-  margin-bottom: 4px;
-  padding: 8px 12px;
+.mo-results {
+  display: flex;
+  flex-direction: column;
+}
+.mo-book {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 0;
   border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: inherit;
-  font-size: 13px;
-  text-align: left;
+  border-bottom: 1px solid var(--dsh-border-subtle, #eaeef2);
+  background: none;
   cursor: pointer;
+  text-align: left;
+  color: inherit;
 }
-.mo-nav-item.active {
-  background: rgba(61, 107, 83, 0.12);
-  color: #2c5140;
+.mo-book-name {
   font-weight: 600;
 }
-.mo-main {
-  flex: 1;
-  min-width: 0;
-  padding: 20px;
-  overflow: auto;
-}
-.mo-card {
-  max-width: 560px;
-  padding: 20px;
-  border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.08));
-  border-radius: 12px;
-}
-.mo-title {
-  margin: 0 0 8px;
-  font-size: 18px;
-}
-.mo-status {
-  margin: 0 0 10px;
-  font-size: 13px;
-  color: #2c5140;
-}
-.mo-hint {
-  margin: 0;
+.muted {
+  color: var(--dsh-text-secondary, #57606a);
   font-size: 12px;
-  line-height: 1.7;
-  color: var(--dsw-alias-label-secondary, #7b8078);
+}
+.mo-intro {
+  color: var(--dsh-text-secondary, #57606a);
+  white-space: pre-wrap;
+}
+.mo-toc {
+  margin: 12px 0 0;
+  padding-left: 20px;
+  columns: 2 220px;
+}
+.mo-toc li {
+  padding: 3px 0;
+}
+.mo-toc li.volume {
+  font-weight: 600;
+  list-style: none;
+  margin-left: -20px;
+  margin-top: 8px;
+}
+.mo-toc button {
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.mo-content {
+  white-space: pre-wrap;
+  font-size: 16px;
+  line-height: 1.9;
+  max-width: 720px;
+}
+.reader {
+  max-width: 800px;
 }
 </style>
