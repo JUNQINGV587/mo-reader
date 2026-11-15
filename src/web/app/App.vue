@@ -8,6 +8,25 @@ type View = 'shelf' | 'sources' | 'search' | 'detail' | 'reader'
 type Theme = 'light' | 'sepia' | 'dark'
 type Turn = 'none' | 'cover' | 'slide'
 
+/** 旧数据里存的是原始 HTML 简介，展示前转成纯文本。 */
+function plainText(input?: string | null): string {
+  if (!input) return ''
+  return input
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|h[1-6]|li|blockquote)>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lrm;|&rlm;/g, '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 const view = ref<View>('shelf')
 const version = ref('')
 const status = ref('')
@@ -26,6 +45,7 @@ const books = ref<any[]>([])
 const searchErrors = ref<any[]>([])
 
 const currentBook = ref<any>(null)
+const introText = computed(() => plainText(currentBook.value?.intro))
 const chapters = ref<any[]>([])
 const currentChapter = ref<any>(null)
 const content = ref('')
@@ -528,7 +548,7 @@ onMounted(refresh)
           </div>
         </div>
 
-        <p v-if="currentBook.intro" class="mo-intro">{{ currentBook.intro }}</p>
+        <p v-if="introText" class="mo-intro">{{ introText }}</p>
 
         <div class="mo-toc-block">
           <div class="mo-section-head">
