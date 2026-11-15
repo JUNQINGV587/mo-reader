@@ -94,6 +94,20 @@ async function importSources() {
   }
 }
 
+async function onImportFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  try {
+    importText.value = await file.text()
+    await importSources()
+  } catch (error) {
+    importMessage.value = errorText(error)
+  } finally {
+    input.value = ''
+  }
+}
+
 async function toggleSource(source: any) {
   try {
     const result = await call('saveSource', {
@@ -345,9 +359,13 @@ onMounted(refresh)
       <section v-if="view === 'sources'" class="mo-pane">
         <div class="mo-block">
           <h3>导入书源</h3>
-          <p class="muted">粘贴「阅读」书源 JSON（单个或数组）。</p>
+          <p class="muted">粘贴「阅读」书源 JSON，或直接选择书源文件（.json，单个或数组）。</p>
           <textarea v-model="importText" data-testid="import-text" rows="5" placeholder='[{"bookSourceUrl":"https://…","bookSourceName":"…"}]' />
           <div class="mo-row">
+            <label class="mo-file" title="选择 Legado 书源 JSON 文件">
+              <input type="file" accept=".json,application/json" data-testid="import-file" @change="onImportFile" />
+              <span class="mo-btn ghost">选择文件</span>
+            </label>
             <button class="mo-btn" :disabled="busy || !importText.trim()" data-testid="import" @click="importSources">导入</button>
             <span class="muted">{{ importMessage }}</span>
           </div>
@@ -756,5 +774,13 @@ select {
 }
 .reader {
   max-width: 800px;
+}
+
+.mo-file {
+  display: inline-flex;
+  cursor: pointer;
+}
+.mo-file input {
+  display: none;
 }
 </style>
