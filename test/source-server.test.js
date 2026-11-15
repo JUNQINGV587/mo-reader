@@ -25,6 +25,8 @@ async function makeService() {
   const sources = fakeTable()
   const books = fakeTable()
   const readRecords = fakeTable()
+  const notes = fakeTable()
+  const bookmarks = fakeTable()
   let settingsValue = { theme: 'system', fontSize: 24, lineSpacing: 0.5 }
   const settings = {
     get: () => settingsValue,
@@ -33,8 +35,15 @@ async function makeService() {
     },
   }
   const service = Object.create(ReaderService.prototype)
-  service.db = { sources, books, readRecords, settings }
-  return { service, map: sources.map, books: books.map, readRecords: readRecords.map }
+  service.db = { sources, books, readRecords, notes, bookmarks, settings }
+  return {
+    service,
+    map: sources.map,
+    books: books.map,
+    readRecords: readRecords.map,
+    notes: notes.map,
+    bookmarks: bookmarks.map,
+  }
 }
 
 const A = { bookSourceUrl: 'https://a.example.com', bookSourceName: '甲源' }
@@ -168,4 +177,37 @@ test('设置：读取默认值与合并保存', async () => {
 
   const again = await service.getSettings()
   assert.equal(again.settings.fontSize, 28)
+})
+
+test('笔记与划线：保存、列表、删除', async () => {
+  const { service, notes } = await makeService()
+  const saved = await service.saveNote({
+    bookId: 'b1',
+    chapterIndex: 1,
+    chapterTitle: '第一章',
+    page: 0,
+    type: 'note',
+    quote: '引用一句',
+    content: '我的笔记',
+  })
+  assert.equal(saved.note.bookId, 'b1')
+  assert.equal(saved.note.type, 'note')
+  assert.equal(notes.size, 1)
+
+  await service.saveNote({
+    bookId: 'b1',
+    chapterIndex: 1,
+    chapterTitle: '第一章',
+    page: 0,
+    type: 'underline',
+    quote: '划线的这一行',
+    content: '',
+  })
+  const list = await service.listNotes({ bookId: 'b1' })
+  assert.equal(list.notes.length, 2)
+  assert.equal(list.notes.filter((item) => item.type === 'underline').length, 1)
+
+  const deleted = await service.deleteNote({ id: saved.note.id })
+  assert.equal(deleted.deleted, 1)
+  assert.equal((await service.listNotes({ bookId: 'b1' })).notes.length, 1)
 })

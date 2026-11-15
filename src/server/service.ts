@@ -432,6 +432,55 @@ export class ReaderService extends TypertRemoteService {
     return { deleted }
   }
 
+  async listNotes(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const notes: Array<Record<string, unknown>> = []
+    for (const [, value] of this.requireDb().notes.entries()) {
+      const record = value as Record<string, unknown>
+      if (record.bookId === bookId) notes.push(record)
+    }
+    notes.sort((a, b) => {
+      const chapter = Number(a.chapterIndex ?? 0) - Number(b.chapterIndex ?? 0)
+      if (chapter !== 0) return chapter
+      return Number(a.page ?? 0) - Number(b.page ?? 0)
+    })
+    return { notes }
+  }
+
+  async saveNote(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const chapterIndex = Number(args?.chapterIndex ?? 0) || 0
+    const page = Number(args?.page ?? 0) || 0
+    const type = typeof args?.type === 'string' && args.type ? args.type : 'note'
+    const quote = typeof args?.quote === 'string' ? args.quote : ''
+    const content = typeof args?.content === 'string' ? args.content : ''
+    const id = createHash('sha1')
+      .update(`${bookId}|${chapterIndex}|${page}|${type}|${quote}`)
+      .digest('hex')
+      .slice(0, 24)
+    const existing = this.requireDb().notes.get(id) as Record<string, unknown> | undefined
+    const record = {
+      id,
+      bookId,
+      type,
+      chapterIndex,
+      chapterTitle: typeof args?.chapterTitle === 'string' ? args.chapterTitle : '',
+      chapterUrl: typeof args?.chapterUrl === 'string' ? args.chapterUrl : '',
+      page,
+      quote,
+      content,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+    }
+    await this.requireDb().notes.put(id, record)
+    return { note: record }
+  }
+
+  async deleteNote(args: Args) {
+    const id = stringArg(args, 'id')
+    const deleted = await this.requireDb().notes.delete(id)
+    return { deleted: deleted ? 1 : 0 }
+  }
+
   async getSettings() {
     return { settings: this.requireDb().settings.get() }
   }

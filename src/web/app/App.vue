@@ -147,6 +147,12 @@ const chrome = ref(true)
 const settingsOpen = ref(false)
 const bookmarksOpen = ref(false)
 const bookmarks = ref<any[]>([])
+const notesOpen = ref(false)
+const notes = ref<any[]>([])
+const noteDraft = ref('')
+const underlineOpen = ref(false)
+const underlineLines = ref<string[]>([])
+const selectedUnderlines = ref<string[]>([])
 const speaking = ref(false)
 const highlightText = ref('')
 let speechSegments: Array<{ text: string; start: number }> = []
@@ -163,6 +169,15 @@ const debugResult = ref<any>(null)
 const enabledCount = computed(() => sources.value.filter((source) => source.enabled !== false).length)
 const chapterIndex = computed(() =>
   currentChapter.value ? chapters.value.indexOf(currentChapter.value) : -1,
+)
+const chapterNotes = computed(() =>
+  notes.value.filter((item) => Number(item.chapterIndex) === chapterIndex.value),
+)
+const underlineQuotes = computed(() =>
+  chapterNotes.value
+    .filter((item) => item.type === 'underline')
+    .map((item) => String(item.quote ?? ''))
+    .filter(Boolean),
 )
 const theme = computed<Theme>(() =>
   settings.value.theme === 'system' ? 'light' : (settings.value.theme as Theme),
@@ -542,6 +557,7 @@ async function openBook(book: any) {
     currentBook.value = { ...book, ...info.info, tocUrl: info.info.tocUrl || book.bookUrl }
     await loadToc(currentBook.value, book.bookUrl)
     await loadBookmarks()
+    await loadNotes()
     progress.value = null
     tocFilter.value = ''
     tocPage.value = 1
@@ -561,6 +577,7 @@ async function openShelfBook(book: any) {
   try {
     await loadToc(currentBook.value, book.bookUrl)
     await loadBookmarks()
+    await loadNotes()
     const result = await call('getProgress', { bookId: book.id })
     progress.value = result?.progress ?? null
     tocFilter.value = ''
@@ -813,6 +830,19 @@ async function loadBookmarks() {
   }
 }
 
+async function loadNotes() {
+  if (!currentBook.value?.id) {
+    notes.value = []
+    return
+  }
+  try {
+    const result = await call('listNotes', { bookId: currentBook.value.id })
+    notes.value = result.notes ?? []
+  } catch {
+    notes.value = []
+  }
+}
+
 const bookmarkedHere = computed(() =>
   bookmarks.value.some(
     (item) =>
@@ -845,6 +875,7 @@ async function toggleBookmark() {
       status.value = '已加书签'
     }
     await loadBookmarks()
+    await loadNotes()
   } catch (error) {
     status.value = errorText(error)
   }
@@ -854,7 +885,78 @@ async function removeBookmark(bookmark: any) {
   try {
     await call('deleteBookmark', { id: bookmark.id })
     await loadBookmarks()
+    await loadNotes()
     status.value = '已删除书签'
+  } catch (error) {
+    status.value = errorText(error)
+  }
+}
+
+async function addNote() {
+  const text = noteDraft.value.trim()
+  if (!text || !currentBook.value?.id) return
+  try {
+    await call('saveNote', {
+      bookId: currentBook.value.id,
+      chapterIndex: chapterIndex.value,
+      chapterTitle: currentChapter.value?.title ?? '',
+      chapterUrl: currentChapter.value?.url ?? '',
+      page: initialPage.value,
+      type: 'note',
+      quote: (readerRef.value?.currentPageLines?.() ?? [])[0] ?? '',
+      content: text,
+    })
+    noteDraft.value = ''
+    await loadNotes()
+    status.value = '笔记已保存'
+  } catch (error) {
+    status.value = errorText(error)
+  }
+}
+
+async function removeNote(note: any) {
+  try {
+    await call('deleteNote', { id: note.id })
+    await loadNotes()
+    status.value = '已删除笔记'
+  } catch (error) {
+    status.value = errorText(error)
+  }
+}
+
+async function jumpNote(note: any) {
+  const chapter = chapters.value[Number(note.chapterIndex)]
+  if (!chapter) return
+  notesOpen.value = false
+  underlineOpen.value = false
+  await openChapter(chapter, Number(note.page ?? 0))
+}
+
+function openUnderlines() {
+  underlineLines.value = (readerRef.value?.currentPageLines?.() ?? []).slice(0, 40)
+  selectedUnderlines.value = []
+  underlineOpen.value = true
+}
+
+async function saveUnderlines() {
+  if (!currentBook.value?.id || selectedUnderlines.value.length === 0) return
+  try {
+    for (const line of selectedUnderlines.value) {
+      await call('saveNote', {
+        bookId: currentBook.value.id,
+        chapterIndex: chapterIndex.value,
+        chapterTitle: currentChapter.value?.title ?? '',
+        chapterUrl: currentChapter.value?.url ?? '',
+        page: initialPage.value,
+        type: 'underline',
+        quote: line,
+        content: '',
+      })
+    }
+    selectedUnderlines.value = []
+    await loadNotes()
+    underlineOpen.value = false
+    status.value = '已加划线'
   } catch (error) {
     status.value = errorText(error)
   }
@@ -1465,6 +1567,7 @@ onMounted(async () => {
             :padding="settings.padding"
             :initial-page="initialPage"
             :highlight="highlightText"
+            :underlines="underlineQuotes"
             :theme="theme"
             :animation="settings.pageAnimation"
             :header-mode="settings.headerMode"
@@ -1490,6 +1593,7 @@ onMounted(async () => {
               </div>
               <button class="mo-icon-btn" :title="bookmarkedHere ? '删除书签' : '加书签'" data-testid="reader-bookmark" @click="toggleBookmark">{{ bookmarkedHere ? '★' : '☆' }}</button>
               <button class="mo-icon-btn" title="书签列表" data-testid="reader-bookmarks" @click="bookmarksOpen = true">🔖</button>
+              <button class="mo-icon-btn" title="笔记与划线" data-testid="reader-notes" @click="notesOpen = true">✎</button>
               <button class="mo-icon-btn" title="目录" data-testid="reader-toc" @click="tocOpen = true">☰</button>
             </div>
             <div class="mo-chrome-bottom">
@@ -1606,6 +1710,55 @@ onMounted(async () => {
                   <button class="mo-icon-btn" title="删除" @click="removeBookmark(item)">✕</button>
                 </li>
               </ul>
+            </div>
+          </div>
+        </transition>
+
+        <transition name="mo-fade">
+          <div v-if="notesOpen" class="mo-sheet-mask" @click.self="notesOpen = false">
+            <div class="mo-sheet mo-sheet-scroll">
+              <div class="mo-sheet-head">
+                <strong>笔记</strong>
+                <span class="muted">{{ chapterNotes.length }} 条</span>
+                <button class="mo-icon-btn" @click="notesOpen = false">✕</button>
+              </div>
+              <div class="mo-note-form">
+                <textarea v-model="noteDraft" placeholder="写点什么…"></textarea>
+                <div class="mo-note-actions">
+                  <button class="mo-btn" data-testid="note-save" :disabled="!noteDraft.trim()" @click="addNote">保存笔记</button>
+                  <button class="mo-btn" data-testid="note-underline" @click="openUnderlines">划线本页</button>
+                </div>
+              </div>
+              <p v-if="chapterNotes.length === 0" class="muted">本章还没有笔记或划线。</p>
+              <ul v-else class="mo-bookmarks">
+                <li v-for="item in chapterNotes" :key="item.id">
+                  <button class="mo-bookmark-jump" @click="jumpNote(item)">
+                    <template v-if="item.type === 'underline'">划线：{{ item.quote }}</template>
+                    <template v-else>{{ item.quote || '笔记' }}<span class="muted"> · {{ item.content }}</span></template>
+                    <span class="muted"> · 第 {{ Number(item.page) + 1 }} 页</span>
+                  </button>
+                  <button class="mo-icon-btn" title="删除" @click="removeNote(item)">✕</button>
+                </li>
+              </ul>
+            </div>
+          </div>
+        </transition>
+
+        <transition name="mo-fade">
+          <div v-if="underlineOpen" class="mo-sheet-mask" @click.self="underlineOpen = false">
+            <div class="mo-sheet mo-sheet-scroll">
+              <div class="mo-sheet-head">
+                <strong>划线本页</strong>
+                <span class="muted">已选 {{ selectedUnderlines.length }} 行</span>
+                <button class="mo-icon-btn" @click="underlineOpen = false">✕</button>
+              </div>
+              <p v-if="underlineLines.length === 0" class="muted">当前页没有可划线的文字。</p>
+              <ul v-else class="mo-underline-lines">
+                <li v-for="(line, index) in underlineLines" :key="index">
+                  <label class="mo-switch"><input v-model="selectedUnderlines" type="checkbox" :value="line" />{{ line }}</label>
+                </li>
+              </ul>
+              <button class="mo-btn" :disabled="selectedUnderlines.length === 0" @click="saveUnderlines">保存划线</button>
             </div>
           </div>
         </transition>
@@ -2625,5 +2778,44 @@ textarea {
 .mo-fade-enter-from,
 .mo-fade-leave-to {
   opacity: 0;
+}
+.mo-note-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.mo-note-form textarea {
+  width: 100%;
+  min-height: 72px;
+  resize: vertical;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1.7;
+}
+.mo-note-actions {
+  display: flex;
+  gap: 8px;
+}
+.mo-underline-lines {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 46vh;
+  overflow: auto;
+}
+.mo-underline-lines label {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  line-height: 1.7;
+  font-size: 14px;
 }
 </style>

@@ -27,6 +27,7 @@ const props = withDefaults(
     bookPercent?: number
     batteryPercent?: number | null
     highlight?: string
+  underlines?: string[]
   }>(),
   {
     title: '',
@@ -47,6 +48,7 @@ const props = withDefaults(
     bookPercent: 0,
     batteryPercent: null,
     highlight: '',
+    underlines: () => [],
   },
 )
 
@@ -212,6 +214,24 @@ function render() {
   lines.forEach((value, lineIndex) => {
     if (value) ctx!.fillText(value, pad.left, baseY + lineIndex * lineHeight)
   })
+
+  // 划线：按行文本匹配
+  if (props.underlines?.length) {
+    ctx.save()
+    ctx.strokeStyle = props.theme === 'dark' ? 'rgba(214,193,148,0.55)' : 'rgba(61,107,83,0.45)'
+    ctx.lineWidth = 2
+    lines.forEach((value, lineIndex) => {
+      if (!value) return
+      if (!props.underlines!.some((quote) => quote && value.includes(quote))) return
+      const textWidth = ctx!.measureText(value).width
+      const y = baseY + lineIndex * lineHeight + lineHeight - 5
+      ctx!.beginPath()
+      ctx!.moveTo(pad.left, y)
+      ctx!.lineTo(pad.left + textWidth, y)
+      ctx!.stroke()
+    })
+    ctx.restore()
+  }
 
   // 页脚
   if (footerText) {
@@ -438,7 +458,17 @@ watch(
   () => render(),
 )
 
-defineExpose({ next, prev, total, page, goto, findPageFor })
+watch(
+  () => props.underlines,
+  () => render(),
+  { deep: true },
+)
+
+function currentPageLines() {
+  return (pages.value[page.value] ?? []).filter(Boolean)
+}
+
+defineExpose({ next, prev, total, page, goto, findPageFor, currentPageLines })
 </script>
 
 <template>
