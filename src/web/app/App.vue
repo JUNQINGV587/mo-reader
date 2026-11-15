@@ -27,6 +27,10 @@ const currentChapter = ref<any>(null)
 const content = ref('')
 const readerTitle = ref('')
 const progress = ref<any>(null)
+const settings = ref({ fontSize: 24, lineSpacing: 1.8 })
+const showSettings = ref(false)
+const initialPage = ref(0)
+let pageTimer: ReturnType<typeof setTimeout> | undefined
 
 const editing = ref<any>(null)
 const editingJson = ref('')
@@ -58,6 +62,12 @@ async function refresh() {
     const [sourceResult, bookResult] = await Promise.all([call('listSources'), call('listBooks')])
     sources.value = sourceResult?.sources ?? []
     shelfBooks.value = bookResult?.books ?? []
+    try {
+      const stored = await call('getSettings')
+      if (stored?.settings) settings.value = { ...settings.value, ...stored.settings }
+    } catch {
+      // 设置读取失败不阻塞主流程
+    }
     status.value = `书源 ${sources.value.length} 个（启用 ${enabledCount.value}） · 书架 ${shelfBooks.value.length} 本`
   } catch (error) {
     status.value = errorText(error)
@@ -237,6 +247,8 @@ async function addToShelf() {
 async function openChapter(chapter: any) {
   if (chapter.isVolume || !chapter.url) return
   busy.value = true
+  initialPage.value =
+    progress.value?.chapterUrl === chapter.url ? Number(progress.value.position ?? 0) : 0
   try {
     const result = await call('getContent', {
       sourceUrl: currentBook.value.origin,
@@ -260,6 +272,35 @@ async function openChapter(chapter: any) {
     status.value = errorText(error)
   } finally {
     busy.value = false
+  }
+}
+
+function onPage(payload: { page: number; total: number }) {
+  initialPage.value = payload.page
+  if (!currentBook.value?.id) return
+  if (pageTimer) clearTimeout(pageTimer)
+  pageTimer = setTimeout(() => {
+    if (!currentBook.value?.id || !currentChapter.value) return
+    call('saveProgress', {
+      bookId: currentBook.value.id,
+      chapterIndex: chapterIndex.value,
+      chapterTitle: currentChapter.value.title,
+      chapterUrl: currentChapter.value.url,
+      position: payload.page,
+    }).catch(() => undefined)
+  }, 600)
+}
+
+async function persistSettings() {
+  try {
+    await call('saveSettings', {
+      settings: {
+        fontSize: settings.value.fontSize,
+        lineSpacing: settings.value.lineSpacing,
+      },
+    })
+  } catch (error) {
+    status.value = errorText(error)
   }
 }
 
@@ -415,9 +456,30 @@ onMounted(refresh)
           <button class="mo-btn ghost" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
           <strong class="mo-reader-title">{{ readerTitle }}</strong>
           <button class="mo-btn ghost" @click="openAdjacent(1)">下一章</button>
+          <button class="mo-btn ghost" data-testid="reader-settings" @click="showSettings = !showSettings">Aa</button>
+        </div>
+        <div v-if="showSettings" class="mo-settings">
+          <label>
+            字号
+            <input v-model.number="settings.fontSize" type="range" min="14" max="32" step="1" @change="persistSettings" />
+            <span>{{ settings.fontSize }}</span>
+          </label>
+          <label>
+            行距
+            <input v-model.number="settings.lineSpacing" type="range" min="1.2" max="2.6" step="0.1" @change="persistSettings" />
+            <span>{{ settings.lineSpacing.toFixed(1) }}</span>
+          </label>
         </div>
         <div data-testid="reader-content">
-          <CanvasReader v-if="content" :text="content" :title="readerTitle" />
+          <CanvasReader
+            v-if="content"
+            :text="content"
+            :title="readerTitle"
+            :font-size="settings.fontSize"
+            :line-height="settings.lineSpacing"
+            :initial-page="initialPage"
+            @page="onPage"
+          />
           <p v-else class="muted">（空）</p>
         </div>
       </section>
@@ -653,6 +715,21 @@ textarea {
 }
 .mo-debug {
   margin-top: 12px;
+}
+.mo-settings {
+  display: flex;
+  gap: 24px;
+  padding: 8px 0;
+  font-size: 12px;
+  color: var(--dsh-text-secondary, #57606a);
+}
+.mo-settings label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.mo-settings input[type='range'] {
+  width: 120px;
 }
 .mo-debug-out {
   max-height: 320px;

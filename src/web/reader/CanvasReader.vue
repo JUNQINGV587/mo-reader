@@ -8,9 +8,12 @@ const props = withDefaults(
     title?: string
     fontSize?: number
     lineHeight?: number
+    initialPage?: number
   }>(),
-  { title: '', fontSize: 19, lineHeight: 1.8 },
+  { title: '', fontSize: 19, lineHeight: 1.8, initialPage: 0 },
 )
+
+const emit = defineEmits<{ page: [payload: { page: number; total: number }] }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const pages = ref<string[][]>([['']])
@@ -89,6 +92,7 @@ function render() {
   ctx.fillText(`${page.value + 1} / ${pages.value.length}`, width - padding, height - padding)
   ctx.globalAlpha = 1
   ctx.textAlign = 'left'
+  emit('page', { page: page.value, total: pages.value.length })
 }
 
 function next() {
@@ -141,11 +145,16 @@ onBeforeUnmount(() => {
 })
 
 watch(
-  () => [props.text, props.title, props.fontSize, props.lineHeight],
+  () => props.text,
   () => {
-    page.value = 0
+    page.value = Math.min(props.initialPage, pages.value.length - 1)
     layout()
   },
+)
+
+watch(
+  () => [props.title, props.fontSize, props.lineHeight],
+  () => layout(),
 )
 </script>
 

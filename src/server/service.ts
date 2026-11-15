@@ -292,6 +292,19 @@ export class ReaderService extends TypertRemoteService {
     return { progress: this.requireDb().readRecords.get(bookId) ?? null }
   }
 
+  async getSettings() {
+    return { settings: this.requireDb().settings.get() }
+  }
+
+  async saveSettings(args: Args) {
+    const patch = args?.settings
+    if (!patch || typeof patch !== 'object') throw new Error('缺少参数 settings')
+    const current = this.requireDb().settings.get()
+    const next = { ...current, ...(patch as Record<string, unknown>) }
+    await this.requireDb().settings.set(next)
+    return { settings: next }
+  }
+
   private requireDb(): any {
     if (!this.db) throw new Error('存储尚未就绪')
     return this.db

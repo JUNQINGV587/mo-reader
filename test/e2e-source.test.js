@@ -46,7 +46,14 @@ test('E2E：导入书源 → 搜索 → 详情 → 目录 → 正文', async (t)
 
   const { ReaderService } = await import('../dist/server/service.js')
   const service = Object.create(ReaderService.prototype)
-  service.db = { sources: fakeTable(), books: fakeTable(), readRecords: fakeTable() }
+  let settingsValue = { theme: 'system', fontSize: 24, lineSpacing: 0.5 }
+  const settings = {
+    get: () => settingsValue,
+    set: async (value) => {
+      settingsValue = value
+    },
+  }
+  service.db = { sources: fakeTable(), books: fakeTable(), readRecords: fakeTable(), settings }
 
   const source = {
     bookSourceUrl: origin,

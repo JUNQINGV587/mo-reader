@@ -16,10 +16,10 @@ export const ReaderDomain = defineDomain({
       .object({
         theme: z.enum(['light', 'dark', 'system']).default('system'),
         fontSize: z.number().int().min(12).max(48).default(24),
-        lineSpacing: z.number().min(0).max(3).default(0.5),
+        lineSpacing: z.number().min(1).max(3).default(1.8),
       })
       .passthrough(),
-    initial: { theme: 'system', fontSize: 24, lineSpacing: 0.5 },
+    initial: { theme: 'system', fontSize: 24, lineSpacing: 1.8 },
   },
   tables: {
     books: domainTable(identified),

@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import test from 'node:test'
 import { JSDOM } from 'jsdom'
+import { act, createElement } from 'react'
+import { createRoot } from 'react-dom/client'
 
 const require = createRequire(import.meta.url)
 
@@ -73,7 +75,20 @@ test('client：bundle 可加载并注册 main 与 sidebar', async () => {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { url: 'http://localhost/' })
   globalThis.window = dom.window
   globalThis.document = dom.window.document
-  for (const key of ['HTMLElement', 'Element', 'Node', 'MutationObserver']) {
+  for (const key of [
+    'HTMLElement',
+    'Element',
+    'Node',
+    'MutationObserver',
+    'SVGElement',
+    'DocumentFragment',
+    'HTMLInputElement',
+    'HTMLTextAreaElement',
+    'HTMLSelectElement',
+    'getComputedStyle',
+    'requestAnimationFrame',
+    'cancelAnimationFrame',
+  ]) {
     if (!(key in globalThis)) {
       Object.defineProperty(globalThis, key, { value: dom.window[key], configurable: true })
     }
@@ -99,6 +114,14 @@ test('client：bundle 可加载并注册 main 与 sidebar', async () => {
 
   const registered = []
   let mounts = 0
+  const reader = {
+    state: async () => ({ ok: true, version: 'test', methods: [] }),
+    listSources: async () => ({
+      sources: [{ bookSourceUrl: 'https://example.com', bookSourceName: '示例源', enabled: true }],
+    }),
+    listBooks: async () => ({ books: [] }),
+    getSettings: async () => ({ settings: { fontSize: 24, lineSpacing: 1.8 } }),
+  }
   const ctx = {
     remote: {
       $mount: async () => {
@@ -108,7 +131,7 @@ test('client：bundle 可加载并注册 main 与 sidebar', async () => {
     },
     inject(_deps, fn) {
       const inner = {
-        remote: { reader: {} },
+        remote: { reader },
         layout: {},
         slots: {
           inject(_name, cb) {
@@ -132,5 +155,19 @@ test('client：bundle 可加载并注册 main 与 sidebar', async () => {
   assert.equal(registered[1].options.name, 'sidebar.panellist')
   assert.equal(registered[1].options.id, 'reader')
   assert.equal(typeof registered[0].component, 'function')
+
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true
+  const host = dom.window.document.createElement('div')
+  dom.window.document.body.appendChild(host)
+  const root = createRoot(host)
+  await act(async () => {
+    root.render(createElement(registered[0].component))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  })
+  const text = dom.window.document.body.textContent ?? ''
+  assert.match(text, /书架/)
+  assert.match(text, /书源/)
+  assert.match(text, /启用 1/)
+  await act(async () => root.unmount())
   await dispose()
 })

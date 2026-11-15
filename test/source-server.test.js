@@ -25,8 +25,15 @@ async function makeService() {
   const sources = fakeTable()
   const books = fakeTable()
   const readRecords = fakeTable()
+  let settingsValue = { theme: 'system', fontSize: 24, lineSpacing: 0.5 }
+  const settings = {
+    get: () => settingsValue,
+    set: async (value) => {
+      settingsValue = value
+    },
+  }
   const service = Object.create(ReaderService.prototype)
-  service.db = { sources, books, readRecords }
+  service.db = { sources, books, readRecords, settings }
   return { service, map: sources.map, books: books.map, readRecords: readRecords.map }
 }
 
@@ -127,4 +134,17 @@ test('书架：加入、排序、进度与删除', async () => {
   assert.equal(removed.deleted, 1)
   assert.equal(books.size, 0)
   assert.equal(readRecords.size, 0)
+})
+
+test('设置：读取默认值与合并保存', async () => {
+  const { service } = await makeService()
+  const initial = await service.getSettings()
+  assert.equal(initial.settings.fontSize, 24)
+
+  const saved = await service.saveSettings({ settings: { fontSize: 28 } })
+  assert.equal(saved.settings.fontSize, 28)
+  assert.equal(saved.settings.theme, 'system')
+
+  const again = await service.getSettings()
+  assert.equal(again.settings.fontSize, 28)
 })
