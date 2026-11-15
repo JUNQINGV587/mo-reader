@@ -14,6 +14,8 @@ import { isPrivateAddress, parseHttpUrl, UnsafeUrlError } from '../net/guard.js'
 export interface JsEnv {
   result?: unknown;
   baseUrl?: string;
+  key?: string;
+  page?: number;
   book?: unknown;
   chapter?: unknown;
   source?: unknown;
@@ -27,10 +29,21 @@ export function evalJs(script: string, env: JsEnv): unknown {
   const sandbox = createSandbox(env);
   const context = vm.createContext(sandbox);
   try {
-    return vm.runInContext(script, context, {
-      timeout: 2000,
-      filename: 'mo-reader-source.js',
-    });
+    // 书源 JS 有两种写法：表达式（result.replace(...)）和带 return 的语句块。
+    // 先按表达式执行；语法错误时按函数体再执行一次。
+    try {
+      return vm.runInContext(`(${script}\n)`, context, {
+        timeout: 2000,
+        filename: 'mo-reader-source.js',
+      });
+    } catch (error) {
+      // vm 里抛出的 SyntaxError 来自另一个 realm，不能用 instanceof 判断。
+      if ((error as { name?: string } | null)?.name !== 'SyntaxError') throw error;
+      return vm.runInContext(`(function(){\n${script}\n})()`, context, {
+        timeout: 2000,
+        filename: 'mo-reader-source.js',
+      });
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`书源 JS 执行失败：${message}`);
@@ -44,6 +57,8 @@ function createSandbox(env: JsEnv): Record<string, unknown> {
   return {
     result: env.result,
     baseUrl: env.baseUrl ?? '',
+    key: env.key ?? '',
+    page: env.page ?? 1,
     book,
     chapter: env.chapter,
     source,
