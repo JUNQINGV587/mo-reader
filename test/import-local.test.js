@@ -105,6 +105,7 @@ test('EPUB 解析与本地导入 Remote', async () => {
   assert.equal(parsed.author, '作者甲')
   assert.equal(parsed.chapters.length, 2)
   assert.equal(parsed.chapters[0].title, '第一章 开端')
+  assert.equal(parsed.chapters[0].content, '第一章\n正文一。\n第二段。')
 
   const { service } = await makeService()
   const buffer = Buffer.from(TXT, 'utf8')

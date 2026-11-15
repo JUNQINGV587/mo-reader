@@ -174,13 +174,16 @@ function decodeEntities(value: string): string {
  * 其余标签剥掉，并解码常见实体（`&nbsp;`/`&lrm;` 等）。
  */
 export function htmlToText(value: string): string {
-  const text = /<([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>/.test(value)
-    ? value
-        .replace(/<br\s*\/?>/gi, '\n')
-        .replace(/<\/p>/gi, '\n\n')
-        .replace(/<\/div>/gi, '\n')
-        .replace(/<[^>]+>/g, '')
-    : value;
+  let source = value;
+  const body = /<body\b[^>]*>([\s\S]*?)<\/body>/i.exec(source);
+  if (body) source = body[1];
+  else source = source.replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, '');
+  if (!/<([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>/.test(source)) return trimText(decodeEntities(source));
+  const text = source
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<hr\s*\/?>/gi, '\n\n')
+    .replace(/<\/(p|div|h[1-6]|li|tr|section|article|blockquote|dd|dt)>/gi, '\n\n')
+    .replace(/<[^>]+>/g, '');
   return trimText(decodeEntities(text).replace(/[ \t]+\n/g, '\n'));
 }
 
