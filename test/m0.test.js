@@ -65,7 +65,8 @@ test('server：storage 域与 Remote 契约', async () => {
   const mod = await import('../dist/server/index.js')
   assert.equal(typeof mod.default, 'function')
   assert.ok(mod.default.inject.includes('storageDomain'))
-  assert.deepEqual([...mod.REMOTE_METHODS], ['state'])
+  assert.ok(mod.REMOTE_METHODS.includes('state'))
+  assert.ok(mod.REMOTE_METHODS.includes('searchBooks'))
 })
 
 test('client：bundle 可加载并注册 main 与 sidebar', async () => {
