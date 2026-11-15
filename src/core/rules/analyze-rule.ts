@@ -230,6 +230,10 @@ export class AnalyzeRule {
       chapter: this.chapter,
       source: this.source,
       variables: Object.fromEntries(this.variables),
+      getStringByRule: (rule) => this.getString(rule),
+      getStringListByRule: (rule) => this.getStringList(rule) ?? [],
+      getElementByRule: (rule) => this.getElement(rule),
+      getElementsByRule: (rule) => this.getElements(rule),
     });
   }
 

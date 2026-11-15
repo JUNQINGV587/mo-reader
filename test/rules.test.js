@@ -131,3 +131,13 @@ test('RegexAnalyzer 与 XPathAnalyzer 基础语义', async () => {
   assert.deepEqual(xpath.getStringList('/html/body/div[1]/text()'), ['x'])
   assert.deepEqual(xpath.getStringList('//div[@data-x]/text()'), [])
 })
+
+test('AnalyzeRule：java.getString 回查当前内容', async () => {
+  const { AnalyzeRule } = await import('../dist/core/rules/analyze-rule.js')
+
+  const rule = new AnalyzeRule('<div class="a">hi</div><a href="/x">link</a>', {
+    baseUrl: 'https://example.com/',
+  })
+  assert.equal(rule.getString('@js: java.getString("class.a@text")'), 'hi')
+  assert.equal(rule.getString('@js: java.getString("a@href")'), '/x')
+})

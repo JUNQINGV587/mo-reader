@@ -20,6 +20,11 @@ export interface JsEnv {
   chapter?: unknown;
   source?: unknown;
   variables?: Record<string, string>;
+  /** 供 java.getString / getStringList 回查当前规则上下文 */
+  getStringByRule?: (rule: string) => string;
+  getStringListByRule?: (rule: string) => string[];
+  getElementByRule?: (rule: string) => unknown;
+  getElementsByRule?: (rule: string) => unknown[];
 }
 
 const USER_AGENT = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/124.0 Mobile';
@@ -105,6 +110,10 @@ function createSandbox(env: JsEnv): Record<string, unknown> {
         variables[String(key)] = String(value)
       },
       getVariable: (key: string) => variables[String(key)],
+      getString: (rule: string) => env.getStringByRule?.(String(rule)) ?? '',
+      getStringList: (rule: string) => env.getStringListByRule?.(String(rule)) ?? [],
+      getElement: (rule: string) => env.getElementByRule?.(String(rule)) ?? null,
+      getElements: (rule: string) => env.getElementsByRule?.(String(rule)) ?? [],
       longToast: () => {},
       toast: () => {},
       log: (value: unknown) => console.log('[mo-reader/source]', value),
