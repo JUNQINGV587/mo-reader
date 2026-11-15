@@ -10,6 +10,8 @@ export interface PaginateOptions {
   padding?: number
   headerHeight?: number
   footerHeight?: number
+  /** 段首缩进两个全角空格（默认开） */
+  indent?: boolean
   measure: (text: string) => number
 }
 
@@ -26,7 +28,7 @@ export function paginate(text: string, options: PaginateOptions): PaginateResult
   const maxWidth = Math.max(40, options.width - padding * 2)
   const maxHeight = Math.max(options.lineHeight, options.height - headerHeight - footerHeight)
   const linesPerPage = Math.max(1, Math.floor(maxHeight / options.lineHeight))
-  const indent = options.fontSize * 2
+  const prefix = options.indent === false ? '' : '　　'
 
   const paragraphs = text.replace(/\r\n?/g, '\n').split('\n')
   const lines: string[] = []
@@ -38,10 +40,9 @@ export function paginate(text: string, options: PaginateOptions): PaginateResult
       continue
     }
     let current = ''
-    for (const char of content) {
+    for (const char of prefix + content) {
       const candidate = current + char
-      const extra = current === '' ? indent : 0
-      if (current !== '' && options.measure(candidate) + extra > maxWidth) {
+      if (current !== '' && options.measure(candidate) > maxWidth) {
         lines.push(current)
         current = char
       } else {
