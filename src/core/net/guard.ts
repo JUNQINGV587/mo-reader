@@ -65,6 +65,14 @@ export function isPrivateAddress(address: string): boolean {
   return false
 }
 
+/**
+ * 仅供本地集成测试：显式设置 MO_READER_INSECURE_ALLOW_PRIVATE=1 时放行私网。
+ * 生产环境不要设置；异步抓取链路仍会在建连时做 DNS 复检（M1 后续补）。
+ */
+function allowPrivateHosts(): boolean {
+  return process.env.MO_READER_INSECURE_ALLOW_PRIVATE === '1'
+}
+
 function assertNotPrivate(hostname: string): void {
   let host = hostname.toLowerCase().replace(/\.$/, '')
   if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1)
@@ -89,7 +97,7 @@ export function parseHttpUrl(raw: string): URL {
     throw new UnsafeUrlError(`只允许 http/https：${url.protocol}`)
   }
   if (url.username || url.password) throw new UnsafeUrlError('URL 不允许携带凭据。')
-  assertNotPrivate(url.hostname)
+  if (!allowPrivateHosts()) assertNotPrivate(url.hostname)
   return url
 }
 
@@ -99,6 +107,7 @@ export function parseHttpUrl(raw: string): URL {
  */
 export async function assertPublicHttpUrl(raw: string): Promise<URL> {
   const url = parseHttpUrl(raw)
+  if (allowPrivateHosts()) return url
   if (isIP(url.hostname)) return url
 
   let addresses: Array<{ address: string; family: number }>
