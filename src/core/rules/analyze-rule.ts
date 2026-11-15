@@ -165,14 +165,14 @@ export class AnalyzeRule {
       case 'WebJs':
         throw new Error('@webjs 在 Web 版不可用');
       case 'Json':
-        return new JsonPathAnalyzer(content).getString(rule) ?? '';
+        return new JsonPathAnalyzer(this.jsonContent(content)).getString(rule) ?? '';
       case 'XPath':
         return new XPathAnalyzer(this.toHtmlString(content)).getString(rule) ?? '';
       case 'Regex':
         return rule;
       default:
-        if (this.isStructured(content)) {
-          return new JsonPathAnalyzer(content).getString(rule) ?? '';
+        if (this.isStructured(this.jsonContent(content))) {
+          return new JsonPathAnalyzer(this.jsonContent(content)).getString(rule) ?? '';
         }
         if (isUrl) return new JsoupAnalyzer(this.toHtml(content)).getString0(rule);
         return new JsoupAnalyzer(this.toHtml(content)).getString(rule) ?? '';
@@ -186,14 +186,14 @@ export class AnalyzeRule {
       case 'WebJs':
         throw new Error('@webjs 在 Web 版不可用');
       case 'Json':
-        return new JsonPathAnalyzer(content).getStringList(rule);
+        return new JsonPathAnalyzer(this.jsonContent(content)).getStringList(rule);
       case 'XPath':
         return new XPathAnalyzer(this.toHtmlString(content)).getStringList(rule) ?? [];
       case 'Regex':
         return rule;
       default:
-        if (this.isStructured(content)) {
-          return new JsonPathAnalyzer(content).getStringList(rule);
+        if (this.isStructured(this.jsonContent(content))) {
+          return new JsonPathAnalyzer(this.jsonContent(content)).getStringList(rule);
         }
         return new JsoupAnalyzer(this.toHtml(content)).getStringList(rule);
     }
@@ -206,14 +206,14 @@ export class AnalyzeRule {
       case 'WebJs':
         throw new Error('@webjs 在 Web 版不可用');
       case 'Json':
-        return new JsonPathAnalyzer(content).getList(rule);
+        return new JsonPathAnalyzer(this.jsonContent(content)).getList(rule);
       case 'XPath':
         return new XPathAnalyzer(this.toHtmlString(content)).getElements(rule);
       case 'Regex':
         return new RegexAnalyzer(stringify(content)).getElements(rule);
       default:
-        if (this.isStructured(content)) {
-          return new JsonPathAnalyzer(content).getList(rule);
+        if (this.isStructured(this.jsonContent(content))) {
+          return new JsonPathAnalyzer(this.jsonContent(content)).getList(rule);
         }
         return new JsoupAnalyzer(this.toHtml(content)).getElements(rule);
     }
@@ -266,6 +266,18 @@ export class AnalyzeRule {
 
   private getContent(mContent?: unknown): unknown {
     return mContent == null ? this.content : mContent;
+  }
+
+  /** 响应是 JSON 文本时（书源内容接口常见），按结构化内容处理。 */
+  private jsonContent(content: unknown): unknown {
+    if (typeof content !== 'string') return content;
+    const text = content.trim();
+    if (!text.startsWith('{') && !text.startsWith('[')) return content;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return content;
+    }
   }
 
   private isStructured(content: unknown): boolean {

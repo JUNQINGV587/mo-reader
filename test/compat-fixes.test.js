@@ -35,3 +35,26 @@ test('java 对象上可直接调用 ajax / put / longToast 等 JsExtensions 函�
   assert.equal(value, 'v')
   assert.equal(variables.k, 'v')
 })
+
+test('URL 尾部内联选项（percent-encode）解析为 POST/body/headers', async () => {
+  const { splitUrlOptions } = await import('../dist/core/source/url.js')
+  const raw =
+    'https://novel.html5.qq.com/be-api/content/ads-read,%7B%22method%22%3A%20%22POST%22%2C%22body%22%3A%20%7B%22a%22%3A1%7D%2C%22headers%22%3A%20%7B%22Q-GUID%22%3A%22g%22%7D%7D'
+  const parsed = splitUrlOptions(raw)
+  assert.equal(parsed.url, 'https://novel.html5.qq.com/be-api/content/ads-read')
+  assert.equal(parsed.method, 'POST')
+  assert.equal(parsed.body, '{"a":1}')
+  assert.equal(parsed.headers?.['Q-GUID'], 'g')
+  assert.equal(parsed.headers?.['Content-Type'], 'application/json')
+})
+
+test('JSON 文本内容按结构化解析（<p>{{$.data...}}</p>）', () => {
+  const rule = new AnalyzeRule('{"data":{"Content":[{"Content":"正文内容"}]}}')
+  assert.equal(rule.getString('<p>{{$.data.Content[0].Content}}</p>'), '<p>正文内容</p>')
+})
+
+test('java.timeFormat 输出 yyyy/MM/dd HH:mm', async () => {
+  const { evalJs } = await import('../dist/core/rules/js.js')
+  const value = evalJs('java.timeFormat(0)', {})
+  assert.match(String(value), /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}$/)
+})

@@ -138,12 +138,53 @@ function splitOptions(value: string): {
       base: value.slice(0, marker),
       options: {
         method,
-        body: typeof parsed.body === 'string' ? parsed.body : undefined,
+        body: serializeBody(parsed.body),
         headers: isStringRecord(parsed.headers) ? parsed.headers : undefined,
       },
     };
   }
   return { base: value, options: {} };
+}
+
+/**
+ * 从完整 URL 里拆出请求选项：书源目录/正文常把 `,{...}` 附在 URL 尾部，
+ * 且可能被 percent-encode（`,%7B...`）。返回去掉后缀的 URL 与选项。
+ */
+export function splitUrlOptions(rawUrl: string): {
+  url: string;
+  method: 'GET' | 'POST';
+  body?: string;
+  headers?: Record<string, string>;
+} {
+  const plain = rawUrl.lastIndexOf(',{');
+  const encoded = rawUrl.toLowerCase().lastIndexOf(',%7b');
+  const marker = Math.max(plain, encoded);
+  if (marker < 0) return { url: rawUrl, method: 'GET' };
+
+  let tail = rawUrl.slice(marker + 1);
+  try {
+    tail = decodeURIComponent(tail);
+  } catch {
+    // 保留原样再试
+  }
+  const parsed = parseOptionsJson(tail);
+  if (!parsed) return { url: rawUrl, method: 'GET' };
+  const headers = isStringRecord(parsed.headers) ? { ...parsed.headers } : {};
+  if (parsed.body && typeof parsed.body === 'object' && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json';
+  }
+  return {
+    url: rawUrl.slice(0, marker),
+    method: String(parsed.method ?? 'GET').toUpperCase() === 'POST' ? 'POST' : 'GET',
+    body: serializeBody(parsed.body),
+    headers: Object.keys(headers).length ? headers : undefined,
+  };
+}
+
+function serializeBody(body: unknown): string | undefined {
+  if (typeof body === 'string') return body;
+  if (body && typeof body === 'object') return JSON.stringify(body);
+  return undefined;
 }
 
 /** 书源选项后缀有时是单引号 JS 字面量（{'method':'POST'}），按宽松 JSON 解析。 */

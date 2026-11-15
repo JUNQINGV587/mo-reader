@@ -4,7 +4,7 @@ import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { VERSION } from '../core/version.js'
 import { parseSource, type BookSource } from '../core/model/source.js'
 import { fetchText } from '../core/net/http.js'
-import { buildRequest, buildSearchRequest, parseHeaders, type RequestSpec } from '../core/source/url.js'
+import { buildRequest, buildSearchRequest, parseHeaders, splitUrlOptions, type RequestSpec } from '../core/source/url.js'
 import {
   analyzeBookInfo,
   analyzeContent,
@@ -318,10 +318,12 @@ export class ReaderService extends TypertRemoteService {
   }
 
   private async fetch(request: RequestSpec, source: BookSource) {
-    return fetchText(request.url, {
-      method: request.method,
-      body: request.body,
-      headers: { ...parseHeaders(source.header), ...request.headers },
+    // URL 自带 `,{...}` 选项（目录/正文常见，且可能 percent-encode）优先。
+    const inline = splitUrlOptions(request.url)
+    return fetchText(inline.url, {
+      method: inline.method !== 'GET' ? inline.method : request.method,
+      body: inline.body ?? request.body,
+      headers: { ...parseHeaders(source.header), ...inline.headers, ...request.headers },
     })
   }
 }

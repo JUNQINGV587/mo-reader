@@ -103,13 +103,13 @@ function createSandbox(env: JsEnv): Record<string, unknown> {
       // 阅读的 JsExtensions 把常用函数也挂在 java 上（书源里常见 java.md5Encode / java.ajax）。
       ajax: (url: string, options?: RequestOptions) => request(url, options),
       connect: (url: string, options?: RequestOptions) => request(url, options),
-      get: (url: string, options?: RequestOptions) => request(url, { ...options, method: 'GET' }),
       post: (url: string, body?: string) => request(url, { method: 'POST', body: body ?? '' }),
       head: (url: string, options?: RequestOptions) => request(url, { ...options, method: 'HEAD' }),
       put: (key: string, value: unknown) => {
         variables[String(key)] = String(value)
       },
       getVariable: (key: string) => variables[String(key)],
+      get: (key: string) => variables[String(key)],
       getString: (rule: string) => env.getStringByRule?.(String(rule)) ?? '',
       getStringList: (rule: string) => env.getStringListByRule?.(String(rule)) ?? [],
       getElement: (rule: string) => env.getElementByRule?.(String(rule)) ?? null,
@@ -128,6 +128,13 @@ function createSandbox(env: JsEnv): Record<string, unknown> {
       base64Decode: (value: string) => Buffer.from(String(value), 'base64').toString('utf8'),
       hexEncode: (value: string) => Buffer.from(String(value), 'utf8').toString('hex'),
       hexDecode: (value: string) => Buffer.from(String(value), 'hex').toString('utf8'),
+      hexDecodeToString: (value: string) => Buffer.from(String(value), 'hex').toString('utf8'),
+      timeFormat: (value: number | string) => {
+        const date = new Date(Number(value));
+        const pad = (n: number) => String(n).padStart(2, '0');
+        return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+      },
+      setContent: () => {},
       urlEncode: (value: string) => encodeURIComponent(String(value)),
       urlDecode: (value: string) => decodeURIComponent(String(value)),
       getCookie: () => '',

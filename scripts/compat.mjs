@@ -105,18 +105,24 @@ async function probe(index) {
   }
   const chapters = (toc.value.chapters ?? []).filter((c) => c.url)
   out.toc.count = chapters.length
-  const chapter = chapters[0]
-  if (!chapter) return out
+  if (!chapters.length) return out
 
-  const content = await stage(() => service.getContent({ sourceUrl: out.url, chapterUrl: chapter.url }))
-  out.content = { ok: content.ok, ms: content.ms }
-  if (content.ok) {
+  // 首章常是「感言/公告」空章：依次试首章、第二章、中间章、末章，取正文最长的一个。
+  const candidates = [...new Set([0, 1, Math.floor(chapters.length / 2), chapters.length - 1])]
+    .filter((index) => index >= 0 && index < chapters.length)
+    .map((index) => ({ index, chapter: chapters[index] }))
+  const tried = []
+  let best = null
+  for (const { index, chapter } of candidates) {
+    const content = await stage(() => service.getContent({ sourceUrl: out.url, chapterUrl: chapter.url }))
+    tried.push({ index, ok: content.ok, ms: content.ms })
+    if (!content.ok) continue
     const text = String(content.value.content ?? '')
-    out.content.length = text.length
-    out.content.preview = text.slice(0, 60)
-  } else {
-    out.content.error = content.error
+    const attempt = { ok: true, ms: content.ms, index, title: chapter.title, length: text.length, preview: text.slice(0, 60) }
+    if (!best || attempt.length > best.length) best = attempt
+    if (best.length >= 200) break
   }
+  out.content = best ? { ...best, tried } : { ok: false, ms: 0, tried }
   return out
 }
 
