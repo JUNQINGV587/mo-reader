@@ -28,6 +28,13 @@ const content = ref('')
 const readerTitle = ref('')
 const progress = ref<any>(null)
 
+const editing = ref<any>(null)
+const editingJson = ref('')
+const debugType = ref('search')
+const debugInput = ref('')
+const debugBusy = ref(false)
+const debugResult = ref<any>(null)
+
 const enabledCount = computed(() => sources.value.filter((source) => source.enabled !== false).length)
 const chapterIndex = computed(() =>
   currentChapter.value ? chapters.value.indexOf(currentChapter.value) : -1,
@@ -94,6 +101,52 @@ async function removeSource(source: any) {
     await refresh()
   } catch (error) {
     status.value = errorText(error)
+  }
+}
+
+function beginEdit(source: any) {
+  editing.value = JSON.parse(JSON.stringify(source))
+  editingJson.value = JSON.stringify(source, null, 2)
+  debugResult.value = null
+  debugInput.value = ''
+}
+
+async function saveEditing() {
+  if (!editing.value) return
+  try {
+    const parsed = JSON.parse(editingJson.value)
+    const merged = {
+      ...parsed,
+      bookSourceName: editing.value.bookSourceName,
+      bookSourceUrl: editing.value.bookSourceUrl,
+      bookSourceGroup: editing.value.bookSourceGroup,
+      bookSourceType: editing.value.bookSourceType,
+      enabled: editing.value.enabled,
+      enabledExplore: editing.value.enabledExplore,
+    }
+    const result = await call('saveSource', { source: merged })
+    editing.value = JSON.parse(JSON.stringify(result.source))
+    editingJson.value = JSON.stringify(result.source, null, 2)
+    await refresh()
+    status.value = '书源已保存'
+  } catch (error) {
+    status.value = errorText(error)
+  }
+}
+
+async function runDebug() {
+  if (!editing.value) return
+  debugBusy.value = true
+  debugResult.value = null
+  try {
+    const args: any = { sourceUrl: editing.value.bookSourceUrl, type: debugType.value }
+    if (debugType.value === 'search') args.key = debugInput.value.trim() || '测试'
+    else args.url = debugInput.value.trim()
+    debugResult.value = await call('debugSource', args)
+  } catch (error) {
+    debugResult.value = { error: errorText(error) }
+  } finally {
+    debugBusy.value = false
   }
 }
 
@@ -269,9 +322,50 @@ onMounted(refresh)
                 <span>{{ source.bookSourceName || source.bookSourceUrl }}</span>
               </label>
               <span class="mo-url">{{ source.bookSourceUrl }}</span>
+              <button class="mo-btn ghost" data-testid="source-edit" @click="beginEdit(source)">编辑</button>
               <button class="mo-btn ghost danger" @click="removeSource(source)">删除</button>
             </li>
           </ul>
+        </div>
+
+        <div v-if="editing" class="mo-block" data-testid="source-editor">
+          <h3>编辑书源：{{ editing.bookSourceName || editing.bookSourceUrl }}</h3>
+          <div class="mo-row">
+            <input v-model="editing.bookSourceName" placeholder="名称" data-testid="source-name" />
+            <input v-model="editing.bookSourceUrl" placeholder="地址" />
+          </div>
+          <div class="mo-row">
+            <input v-model="editing.bookSourceGroup" placeholder="分组" />
+            <select v-model.number="editing.bookSourceType">
+              <option :value="0">文本</option>
+              <option :value="1">音频</option>
+              <option :value="2">图片</option>
+              <option :value="3">文件</option>
+              <option :value="4">视频</option>
+            </select>
+            <label class="mo-switch"><input type="checkbox" v-model="editing.enabled" />启用</label>
+            <label class="mo-switch"><input type="checkbox" v-model="editing.enabledExplore" />发现</label>
+          </div>
+          <textarea v-model="editingJson" class="mo-json" rows="14" data-testid="source-json" />
+          <div class="mo-row">
+            <button class="mo-btn" data-testid="source-save" @click="saveEditing">保存</button>
+            <button class="mo-btn ghost" @click="editing = null">收起</button>
+            <span class="muted">全字段可改 JSON；名称/地址/分组/类型以表单为准。</span>
+          </div>
+          <div class="mo-debug">
+            <div class="mo-row">
+              <select v-model="debugType">
+                <option value="search">搜索</option>
+                <option value="bookInfo">详情</option>
+                <option value="toc">目录</option>
+                <option value="content">正文</option>
+              </select>
+              <input v-model="debugInput" :placeholder="debugType === 'search' ? '搜索词（默认「测试」）' : '页面 URL'" data-testid="debug-input" />
+              <button class="mo-btn" :disabled="debugBusy" data-testid="debug-run" @click="runDebug">{{ debugBusy ? '调试中…' : '调试' }}</button>
+            </div>
+            <p class="muted">调试使用已保存的书源，改完先保存。</p>
+            <pre v-if="debugResult" class="mo-debug-out" data-testid="debug-output">{{ JSON.stringify(debugResult, null, 2).slice(0, 20000) }}</pre>
+          </div>
         </div>
       </section>
 
@@ -551,6 +645,31 @@ textarea {
 .mo-reader-title {
   flex: 1;
   text-align: center;
+}
+.mo-json {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.mo-debug {
+  margin-top: 12px;
+}
+.mo-debug-out {
+  max-height: 320px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--dsh-border, #d8dee4);
+  border-radius: 6px;
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+select {
+  padding: 7px 9px;
+  border: 1px solid var(--dsh-border, #d0d7de);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
 }
 .mo-content {
   white-space: pre-wrap;
