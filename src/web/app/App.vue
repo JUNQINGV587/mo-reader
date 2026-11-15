@@ -47,7 +47,13 @@ const chapterIndex = computed(() =>
 async function call(method: string, args?: any) {
   const fn = props.remote?.[method]
   if (typeof fn !== 'function') throw new Error(`Remote 未就绪：${method}`)
-  return args === undefined ? fn.call(props.remote) : fn.call(props.remote, args)
+  const result = args === undefined ? await fn.call(props.remote) : await fn.call(props.remote, args)
+  // DSH Remote 成功时返回 { ok: true, value }，失败时返回 { ok: false, error }。
+  if (result && result.ok === false) {
+    const error = result.error
+    throw new Error(typeof error === 'string' ? error : error?.message || '操作失败')
+  }
+  return result && result.ok === true ? result.value : result
 }
 
 function errorText(error: unknown) {
