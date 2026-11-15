@@ -385,6 +385,53 @@ export class ReaderService extends TypertRemoteService {
     return { progress: this.requireDb().readRecords.get(bookId) ?? null }
   }
 
+  async listBookmarks(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const bookmarks: Array<Record<string, unknown>> = []
+    for (const [, value] of this.requireDb().bookmarks.entries()) {
+      const record = value as Record<string, unknown>
+      if (record.bookId === bookId) bookmarks.push(record)
+    }
+    bookmarks.sort((a, b) => {
+      const chapter = Number(a.chapterIndex ?? 0) - Number(b.chapterIndex ?? 0)
+      if (chapter !== 0) return chapter
+      return Number(a.page ?? 0) - Number(b.page ?? 0)
+    })
+    return { bookmarks }
+  }
+
+  async saveBookmark(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const chapterIndex = Number(args?.chapterIndex ?? 0) || 0
+    const page = Number(args?.page ?? 0) || 0
+    const type = typeof args?.type === 'string' && args.type ? args.type : 'bookmark'
+    const id = createHash('sha1')
+      .update(`${bookId}|${chapterIndex}|${page}|${type}`)
+      .digest('hex')
+      .slice(0, 24)
+    const existing = this.requireDb().bookmarks.get(id) as Record<string, unknown> | undefined
+    const record = {
+      id,
+      bookId,
+      type,
+      chapterIndex,
+      chapterTitle: typeof args?.chapterTitle === 'string' ? args.chapterTitle : '',
+      chapterUrl: typeof args?.chapterUrl === 'string' ? args.chapterUrl : '',
+      page,
+      text: typeof args?.text === 'string' ? args.text : '',
+      note: typeof args?.note === 'string' ? args.note : '',
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+    }
+    await this.requireDb().bookmarks.put(id, record)
+    return { bookmark: record }
+  }
+
+  async deleteBookmark(args: Args) {
+    const id = stringArg(args, 'id')
+    const deleted = await this.requireDb().bookmarks.delete(id)
+    return { deleted }
+  }
+
   async getSettings() {
     return { settings: this.requireDb().settings.get() }
   }

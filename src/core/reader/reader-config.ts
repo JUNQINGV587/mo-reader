@@ -40,13 +40,13 @@ export const TAP_ACTIONS: TapAction[] = [
   { code: 4, label: '上一章', available: true },
   { code: 5, label: '朗读上段', available: false },
   { code: 6, label: '朗读下段', available: false },
-  { code: 7, label: '加书签', available: false },
+  { code: 7, label: '加书签', available: true },
   { code: 8, label: '正文编辑', available: false },
   { code: 9, label: '替换开关', available: false },
   { code: 10, label: '目录', available: true },
   { code: 11, label: '全文搜索', available: false },
   { code: 12, label: '同步进度', available: false },
-  { code: 13, label: '朗读暂停', available: false },
+  { code: 13, label: '朗读暂停', available: true },
 ]
 
 export const tapActionLabel = (code: number): string =>

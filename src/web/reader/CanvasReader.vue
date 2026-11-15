@@ -26,6 +26,7 @@ const props = withDefaults(
     tapZones?: number[]
     bookPercent?: number
     batteryPercent?: number | null
+    highlight?: string
   }>(),
   {
     title: '',
@@ -45,6 +46,7 @@ const props = withDefaults(
     tapZones: () => DEFAULT_TAP_ZONES,
     bookPercent: 0,
     batteryPercent: null,
+    highlight: '',
   },
 )
 
@@ -174,16 +176,42 @@ function render() {
   }
 
   // 正文
-  ctx.fillStyle = color
   ctx.textAlign = 'left'
   ctx.textBaseline = 'top'
   ctx.font = measureFont()
   const lines = pages.value[page.value] ?? []
-  let y = 44 + pad.top + 8
-  for (const value of lines) {
-    if (value) ctx.fillText(value, pad.left, y)
-    y += lineHeight
+  const baseY = 44 + pad.top + 8
+
+  // 朗读高亮：在当前页里按字符区间画底色
+  if (props.highlight) {
+    const pageText = lines.join('\n')
+    const index = pageText.indexOf(props.highlight)
+    if (index >= 0) {
+      ctx.save()
+      ctx.fillStyle = props.theme === 'dark' ? 'rgba(214,193,148,0.24)' : 'rgba(61,107,83,0.18)'
+      let offset = 0
+      lines.forEach((line, lineIndex) => {
+        const start = offset
+        const end = offset + line.length
+        offset = end + 1
+        const from = Math.max(index, start)
+        const to = Math.min(index + (props.highlight ?? '').length, end)
+        if (to > from && line) {
+          const before = line.slice(0, from - start)
+          const hit = line.slice(from - start, to - start)
+          const x1 = ctx!.measureText(before).width
+          const x2 = x1 + ctx!.measureText(hit).width
+          ctx!.fillRect(pad.left + x1, baseY + lineIndex * lineHeight - 2, x2 - x1, lineHeight - 2)
+        }
+      })
+      ctx.restore()
+    }
   }
+
+  ctx.fillStyle = color
+  lines.forEach((value, lineIndex) => {
+    if (value) ctx!.fillText(value, pad.left, baseY + lineIndex * lineHeight)
+  })
 
   // 页脚
   if (footerText) {
@@ -389,7 +417,28 @@ watch(
   { deep: true },
 )
 
-defineExpose({ next, prev, total, page })
+function goto(target: number) {
+  const nextPage = Math.max(0, Math.min(total.value - 1, target))
+  if (nextPage === page.value) {
+    render()
+    return
+  }
+  page.value = nextPage
+  render()
+  emit('page', { page: nextPage, total: total.value })
+}
+
+function findPageFor(text: string): number {
+  if (!text) return -1
+  return pages.value.findIndex((lines) => lines.join('\n').includes(text))
+}
+
+watch(
+  () => props.highlight,
+  () => render(),
+)
+
+defineExpose({ next, prev, total, page, goto, findPageFor })
 </script>
 
 <template>

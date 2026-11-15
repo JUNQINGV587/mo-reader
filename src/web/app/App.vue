@@ -79,6 +79,19 @@ const introText = computed(() => plainText(currentBook.value?.intro))
 const chapters = ref<any[]>([])
 const currentChapter = ref<any>(null)
 const content = ref('')
+const replacedContent = computed(() => {
+  let text = content.value
+  for (const rule of settings.value.replaceRules) {
+    if (!rule.enabled || !rule.pattern) continue
+    try {
+      if (rule.regex) text = text.replace(new RegExp(rule.pattern, 'g'), rule.replacement ?? '')
+      else text = text.split(rule.pattern).join(rule.replacement ?? '')
+    } catch {
+      // 非法正则跳过
+    }
+  }
+  return text
+})
 const readerTitle = ref('')
 const progress = ref<any>(null)
 const batteryPercent = ref<number | null>(null)
@@ -118,6 +131,13 @@ const settings = ref({
   showFooterLine: true,
   tapZones: [...DEFAULT_TAP_ZONES] as number[],
   menuItems: [...DEFAULT_MENU_ITEMS] as string[],
+  replaceRules: [] as Array<{
+    id: string
+    pattern: string
+    replacement: string
+    regex: boolean
+    enabled: boolean
+  }>,
 })
 const readerRef = ref<any>(null)
 const initialPage = ref(0)
@@ -125,6 +145,12 @@ const tocFilter = ref('')
 const tocOpen = ref(false)
 const chrome = ref(true)
 const settingsOpen = ref(false)
+const bookmarksOpen = ref(false)
+const bookmarks = ref<any[]>([])
+const speaking = ref(false)
+const highlightText = ref('')
+let speechSegments: Array<{ text: string; start: number }> = []
+let speechIndex = 0
 let pageTimer: ReturnType<typeof setTimeout> | undefined
 
 const editing = ref<any>(null)
@@ -515,6 +541,7 @@ async function openBook(book: any) {
     const info = await call('getBookInfo', { sourceUrl: book.origin, bookUrl: book.bookUrl })
     currentBook.value = { ...book, ...info.info, tocUrl: info.info.tocUrl || book.bookUrl }
     await loadToc(currentBook.value, book.bookUrl)
+    await loadBookmarks()
     progress.value = null
     tocFilter.value = ''
     tocPage.value = 1
@@ -533,6 +560,7 @@ async function openShelfBook(book: any) {
   chapters.value = []
   try {
     await loadToc(currentBook.value, book.bookUrl)
+    await loadBookmarks()
     const result = await call('getProgress', { bookId: book.id })
     progress.value = result?.progress ?? null
     tocFilter.value = ''
@@ -733,13 +761,19 @@ async function addToShelf() {
   }
 }
 
-async function openChapter(chapter: any) {
+async function openChapter(chapter: any, page?: number) {
   if (!chapter || chapter.isVolume || !chapter.url) return
   tocOpen.value = false
+  bookmarksOpen.value = false
+  stopSpeech()
   busy.value = true
   chrome.value = false
   initialPage.value =
-    progress.value?.chapterUrl === chapter.url ? Number(progress.value.position ?? 0) : 0
+    typeof page === 'number'
+      ? page
+      : progress.value?.chapterUrl === chapter.url
+        ? Number(progress.value.position ?? 0)
+        : 0
   try {
     const result = await call('getContent', {
       sourceUrl: currentBook.value.origin,
@@ -764,6 +798,73 @@ async function openChapter(chapter: any) {
   } finally {
     busy.value = false
   }
+}
+
+async function loadBookmarks() {
+  if (!currentBook.value?.id) {
+    bookmarks.value = []
+    return
+  }
+  try {
+    const result = await call('listBookmarks', { bookId: currentBook.value.id })
+    bookmarks.value = result.bookmarks ?? []
+  } catch {
+    bookmarks.value = []
+  }
+}
+
+const bookmarkedHere = computed(() =>
+  bookmarks.value.some(
+    (item) =>
+      (item.type ?? 'bookmark') === 'bookmark' &&
+      Number(item.chapterIndex) === chapterIndex.value &&
+      Number(item.page) === initialPage.value,
+  ),
+)
+
+async function toggleBookmark() {
+  if (!currentBook.value?.id || !currentChapter.value) return
+  try {
+    const existing = bookmarks.value.find(
+      (item) =>
+        (item.type ?? 'bookmark') === 'bookmark' &&
+        Number(item.chapterIndex) === chapterIndex.value &&
+        Number(item.page) === initialPage.value,
+    )
+    if (existing) {
+      await call('deleteBookmark', { id: existing.id })
+      status.value = '已删除书签'
+    } else {
+      await call('saveBookmark', {
+        bookId: currentBook.value.id,
+        chapterIndex: chapterIndex.value,
+        chapterTitle: currentChapter.value.title,
+        chapterUrl: currentChapter.value.url,
+        page: initialPage.value,
+      })
+      status.value = '已加书签'
+    }
+    await loadBookmarks()
+  } catch (error) {
+    status.value = errorText(error)
+  }
+}
+
+async function removeBookmark(bookmark: any) {
+  try {
+    await call('deleteBookmark', { id: bookmark.id })
+    await loadBookmarks()
+    status.value = '已删除书签'
+  } catch (error) {
+    status.value = errorText(error)
+  }
+}
+
+async function jumpBookmark(bookmark: any) {
+  const chapter = chapters.value[Number(bookmark.chapterIndex)]
+  if (!chapter) return
+  bookmarksOpen.value = false
+  await openChapter(chapter, Number(bookmark.page ?? 0))
 }
 
 function continueReading() {
@@ -795,6 +896,99 @@ function onPage(payload: { page: number; total: number }) {
   }, 600)
 }
 
+function splitSpeech(text: string) {
+  const list: Array<{ text: string; start: number }> = []
+  const pattern = /[^。！？!?…\n]+[。！？!?…]*/g
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(text))) {
+    const value = match[0].trim()
+    if (value) list.push({ text: value, start: match.index })
+  }
+  return list
+}
+
+function pickVoice(): SpeechSynthesisVoice | null {
+  const voices = window.speechSynthesis?.getVoices?.() ?? []
+  return voices.find((voice) => voice.lang?.toLowerCase().startsWith('zh')) ?? null
+}
+
+function speakNext() {
+  if (!speaking.value) return
+  if (speechIndex >= speechSegments.length) {
+    stopSpeech()
+    return
+  }
+  const segment = speechSegments[speechIndex]
+  const synth = window.speechSynthesis
+  if (!synth) {
+    stopSpeech()
+    status.value = '当前浏览器不支持朗读'
+    return
+  }
+  const utterance = new SpeechSynthesisUtterance(segment.text)
+  utterance.lang = 'zh-CN'
+  utterance.rate = 1
+  const voice = pickVoice()
+  if (voice) utterance.voice = voice
+  utterance.onstart = () => {
+    highlightText.value = segment.text
+    const target = readerRef.value?.findPageFor?.(segment.text)
+    if (typeof target === 'number' && target >= 0) readerRef.value?.goto?.(target)
+  }
+  utterance.onend = () => {
+    if (!speaking.value) return
+    speechIndex += 1
+    speakNext()
+  }
+  utterance.onerror = () => {
+    if (!speaking.value) return
+    speechIndex += 1
+    speakNext()
+  }
+  synth.speak(utterance)
+}
+
+function startSpeech() {
+  if (!('speechSynthesis' in window)) {
+    status.value = '当前浏览器不支持朗读'
+    return
+  }
+  if (!replacedContent.value.trim()) return
+  window.speechSynthesis.cancel()
+  speechSegments = splitSpeech(replacedContent.value)
+  if (speechSegments.length === 0) return
+  speechIndex = 0
+  speaking.value = true
+  speakNext()
+}
+
+function stopSpeech() {
+  speaking.value = false
+  highlightText.value = ''
+  if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+}
+
+function toggleSpeech() {
+  if (speaking.value) stopSpeech()
+  else startSpeech()
+}
+
+function addReplaceRule() {
+  settings.value.replaceRules.push({
+    id: `r-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    pattern: '',
+    replacement: '',
+    regex: false,
+    enabled: true,
+  })
+  persistSettings()
+}
+
+function removeReplaceRule(rule: { id: string }) {
+  settings.value.replaceRules = settings.value.replaceRules.filter((item) => item.id !== rule.id)
+  persistSettings()
+}
+
 function onTapAction(code: number) {
   if (code === -1) return
   if (code === 0) {
@@ -815,6 +1009,14 @@ function onTapAction(code: number) {
   }
   if (code === 4) {
     openAdjacent(-1)
+    return
+  }
+  if (code === 7) {
+    void toggleBookmark()
+    return
+  }
+  if (code === 13) {
+    toggleSpeech()
     return
   }
   if (code === 10) {
@@ -1253,7 +1455,7 @@ onMounted(async () => {
           <CanvasReader
             v-if="content"
             ref="readerRef"
-            :text="content"
+            :text="replacedContent"
             :title="readerTitle"
             :book-name="currentBook?.name || ''"
             :font-size="settings.fontSize"
@@ -1262,6 +1464,7 @@ onMounted(async () => {
             :indent="settings.indent"
             :padding="settings.padding"
             :initial-page="initialPage"
+            :highlight="highlightText"
             :theme="theme"
             :animation="settings.pageAnimation"
             :header-mode="settings.headerMode"
@@ -1285,11 +1488,14 @@ onMounted(async () => {
                 <strong>{{ currentBook?.name }}</strong>
                 <span>{{ readerTitle }}</span>
               </div>
+              <button class="mo-icon-btn" :title="bookmarkedHere ? '删除书签' : '加书签'" data-testid="reader-bookmark" @click="toggleBookmark">{{ bookmarkedHere ? '★' : '☆' }}</button>
+              <button class="mo-icon-btn" title="书签列表" data-testid="reader-bookmarks" @click="bookmarksOpen = true">🔖</button>
               <button class="mo-icon-btn" title="目录" data-testid="reader-toc" @click="tocOpen = true">☰</button>
             </div>
             <div class="mo-chrome-bottom">
               <button v-if="settings.menuItems.includes('prev')" class="mo-chrome-btn" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
               <button v-if="settings.menuItems.includes('settings')" class="mo-chrome-btn" data-testid="reader-settings" @click="settingsOpen = true">Aa</button>
+              <button class="mo-chrome-btn" data-testid="reader-speak" @click="toggleSpeech">{{ speaking ? '暂停' : '朗读' }}</button>
               <button v-if="settings.menuItems.includes('toc')" class="mo-chrome-btn" @click="tocOpen = true">目录</button>
               <button v-if="settings.menuItems.includes('next')" class="mo-chrome-btn" :disabled="chapterIndex >= chapters.length - 1" @click="openAdjacent(1)">下一章</button>
             </div>
@@ -1366,6 +1572,40 @@ onMounted(async () => {
                   <input type="checkbox" :checked="settings.menuItems.includes(item.key)" @change="toggleMenuItem(item.key)" />{{ item.label }}
                 </label>
               </div>
+              <div class="mo-theme-row">
+                <span>替换</span>
+                <button class="mo-btn" data-testid="replace-add" @click="addReplaceRule">加规则</button>
+                <span class="muted">按顺序作用于正文</span>
+              </div>
+              <div v-for="rule in settings.replaceRules" :key="rule.id" class="mo-replace-rule">
+                <input v-model="rule.pattern" class="mo-input" placeholder="查找内容" @change="persistSettings" />
+                <input v-model="rule.replacement" class="mo-input" placeholder="替换为" @change="persistSettings" />
+                <label class="mo-switch"><input v-model="rule.regex" type="checkbox" @change="persistSettings" />正则</label>
+                <label class="mo-switch"><input v-model="rule.enabled" type="checkbox" @change="persistSettings" />启用</label>
+                <button class="mo-icon-btn" @click="removeReplaceRule(rule)">✕</button>
+              </div>
+            </div>
+          </div>
+        </transition>
+
+        <transition name="mo-fade">
+          <div v-if="bookmarksOpen" class="mo-sheet-mask" @click.self="bookmarksOpen = false">
+            <div class="mo-sheet mo-sheet-scroll">
+              <div class="mo-sheet-head">
+                <strong>书签</strong>
+                <span class="muted">{{ bookmarks.length }} 个</span>
+                <button class="mo-icon-btn" @click="bookmarksOpen = false">✕</button>
+              </div>
+              <p v-if="bookmarks.length === 0" class="muted">还没有书签。阅读时点右上角 ☆，或把九宫格某个区域设为「加书签」。</p>
+              <ul v-else class="mo-bookmarks">
+                <li v-for="item in bookmarks" :key="item.id">
+                  <button class="mo-bookmark-jump" @click="jumpBookmark(item)">
+                    {{ item.chapterTitle || `第 ${Number(item.chapterIndex) + 1} 章` }}
+                    <span class="muted">· 第 {{ Number(item.page) + 1 }} 页</span>
+                  </button>
+                  <button class="mo-icon-btn" title="删除" @click="removeBookmark(item)">✕</button>
+                </li>
+              </ul>
             </div>
           </div>
         </transition>
@@ -2298,6 +2538,42 @@ textarea {
   background: var(--mo-accent);
   color: #f6f2e6;
 }
+.mo-replace-rule {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 4px 0;
+}
+.mo-replace-rule .mo-input {
+  flex: 1;
+  min-width: 120px;
+}
+
+.mo-bookmarks {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mo-bookmarks li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px dashed var(--mo-line);
+}
+.mo-bookmark-jump {
+  flex: 1;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: var(--mo-ink);
+  padding: 10px 4px;
+  cursor: pointer;
+}
+
 .mo-drawer {
   position: absolute;
   top: 0;

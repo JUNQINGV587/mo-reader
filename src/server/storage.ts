@@ -35,6 +35,19 @@ export const ReaderDomain = defineDomain({
         showFooterLine: z.boolean().default(true),
         tapZones: z.array(z.number().int().min(-1).max(13)).length(9).default(DEFAULT_TAP_ZONES),
         menuItems: z.array(z.string()).default(DEFAULT_MENU_ITEMS),
+        replaceRules: z
+          .array(
+            z
+              .object({
+                id: z.string().min(1),
+                pattern: z.string().default(''),
+                replacement: z.string().default(''),
+                regex: z.boolean().default(false),
+                enabled: z.boolean().default(true),
+              })
+              .passthrough(),
+          )
+          .default([]),
       })
       .passthrough(),
     initial: {
@@ -51,6 +64,7 @@ export const ReaderDomain = defineDomain({
       showFooterLine: true,
       tapZones: DEFAULT_TAP_ZONES,
       menuItems: DEFAULT_MENU_ITEMS,
+      replaceRules: [],
     },
   },
   tables: {

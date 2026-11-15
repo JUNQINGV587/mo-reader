@@ -18,6 +18,9 @@ export const REMOTE_METHODS = Object.freeze([
   'removeBooks',
   'saveProgress',
   'getProgress',
+  'listBookmarks',
+  'saveBookmark',
+  'deleteBookmark',
   'getSettings',
   'saveSettings',
 ])
