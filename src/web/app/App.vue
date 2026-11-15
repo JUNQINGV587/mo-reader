@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import CanvasReader from '../reader/CanvasReader.vue'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
@@ -321,7 +322,10 @@ onMounted(refresh)
           <strong class="mo-reader-title">{{ readerTitle }}</strong>
           <button class="mo-btn ghost" @click="openAdjacent(1)">下一章</button>
         </div>
-        <article class="mo-content" data-testid="reader-content">{{ content || '（空）' }}</article>
+        <div data-testid="reader-content">
+          <CanvasReader v-if="content" :text="content" :title="readerTitle" />
+          <p v-else class="muted">（空）</p>
+        </div>
       </section>
     </main>
   </div>
