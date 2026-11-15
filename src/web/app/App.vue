@@ -46,11 +46,18 @@ const checkReport = ref<{ total: number; ok: number; problems: Array<{ name: str
 const sourceTypeNames: Record<number, string> = { 0: '文本', 1: '音频', 2: '图片', 3: '文件', 4: '视频' }
 
 const shelfBooks = ref<any[]>([])
+const shelfSort = ref<'recent' | 'name' | 'progress'>('recent')
+const shelfSelecting = ref(false)
+const selectedBookIds = ref<Set<string>>(new Set())
 
 const searchKey = ref('')
 const searching = ref(false)
 const books = ref<any[]>([])
 const searchErrors = ref<any[]>([])
+const searchScope = ref('')
+const searchExact = ref(false)
+const searchHistory = ref<string[]>([])
+const SEARCH_HISTORY_KEY = 'mo-reader-search-history'
 
 const currentBook = ref<any>(null)
 const introText = computed(() => plainText(currentBook.value?.intro))
@@ -136,6 +143,24 @@ watch(
     if (sourcePage.value > sourcePageCount.value) sourcePage.value = sourcePageCount.value
   },
 )
+const enabledSources = computed(() => sources.value.filter((source) => source.enabled !== false))
+const scopedSourceUrls = computed<string[] | null>(() => {
+  if (searchScope.value.startsWith('group:')) {
+    const group = searchScope.value.slice(6)
+    return enabledSources.value.filter((source) => source.bookSourceGroup === group).map((source) => source.bookSourceUrl)
+  }
+  if (searchScope.value.startsWith('source:')) return [searchScope.value.slice(7)]
+  return null
+})
+const searchScopeLabel = computed(() => {
+  if (searchScope.value.startsWith('group:')) return `分组「${searchScope.value.slice(6)}」`
+  if (searchScope.value.startsWith('source:')) {
+    const url = searchScope.value.slice(7)
+    const source = sources.value.find((item) => item.bookSourceUrl === url)
+    return source?.bookSourceName || url
+  }
+  return `${enabledSources.value.length} 个启用源`
+})
 
 const filteredChapters = computed(() => {
   const key = tocFilter.value.trim()
@@ -190,6 +215,19 @@ function shelfProgress(book: any) {
   const percent = total > 0 ? Math.min(100, Math.round(((record.chapterIndex + 1) / total) * 100)) : 0
   return { percent, text: record.chapterTitle ? `读至 ${record.chapterTitle}` : `第 ${record.chapterIndex + 1} 章` }
 }
+
+const shelfSortedBooks = computed(() => {
+  const list = [...shelfBooks.value]
+  if (shelfSort.value === 'name') {
+    list.sort((a, b) => String(a.name ?? '').localeCompare(String(b.name ?? ''), 'zh'))
+  } else if (shelfSort.value === 'progress') {
+    list.sort((a, b) => Number(b.progress?.chapterIndex ?? -1) - Number(a.progress?.chapterIndex ?? -1))
+  } else {
+    list.sort((a, b) => Number(b.lastReadAt ?? b.updatedAt ?? 0) - Number(a.lastReadAt ?? a.updatedAt ?? 0))
+  }
+  return list
+})
+const selectedBookCount = computed(() => selectedBookIds.value.size)
 
 function coverStyle(book: any) {
   const name = String(book?.name ?? '')
@@ -357,15 +395,35 @@ async function search() {
   books.value = []
   searchErrors.value = []
   try {
-    const result = await call('searchBooks', { key, page: 1 })
-    books.value = result.books ?? []
+    const args: any = { key, page: 1 }
+    if (scopedSourceUrls.value) args.sourceUrls = scopedSourceUrls.value
+    const result = await call('searchBooks', args)
+    let list = result.books ?? []
+    if (searchExact.value) list = list.filter((book: any) => String(book.name ?? '').includes(key))
+    books.value = list
     searchErrors.value = result.errors ?? []
+    rememberSearch(key)
     status.value = `搜索到 ${books.value.length} 本，失败 ${searchErrors.value.length} 个源`
   } catch (error) {
     status.value = errorText(error)
   } finally {
     searching.value = false
   }
+}
+
+function rememberSearch(key: string) {
+  const next = [key, ...searchHistory.value.filter((item) => item !== key)].slice(0, 10)
+  searchHistory.value = next
+  try {
+    localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(next))
+  } catch {
+    // 隐私模式下 localStorage 可能不可用
+  }
+}
+
+function useHistory(key: string) {
+  searchKey.value = key
+  void search()
 }
 
 async function loadToc(book: any, tocUrlFallback: string) {
@@ -404,6 +462,44 @@ async function openShelfBook(book: any) {
     tocFilter.value = ''
     view.value = 'detail'
     status.value = `${book.name} · ${chapters.value.length} 章`
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+function toggleShelfSelect(book: any) {
+  const next = new Set(selectedBookIds.value)
+  if (next.has(book.id)) next.delete(book.id)
+  else next.add(book.id)
+  selectedBookIds.value = next
+}
+
+function startShelfSelect() {
+  shelfSelecting.value = true
+  selectedBookIds.value = new Set()
+}
+
+function exitShelfSelect() {
+  shelfSelecting.value = false
+  selectedBookIds.value = new Set()
+}
+
+function onShelfBookClick(book: any) {
+  if (shelfSelecting.value) toggleShelfSelect(book)
+  else void openShelfBook(book)
+}
+
+async function removeSelectedBooks() {
+  const ids = [...selectedBookIds.value]
+  if (!ids.length) return
+  busy.value = true
+  try {
+    await call('removeBooks', { ids })
+    exitShelfSelect()
+    await refresh()
+    status.value = `移出书架 ${ids.length} 本`
   } catch (error) {
     status.value = errorText(error)
   } finally {
@@ -523,7 +619,20 @@ function backFromDetail() {
   refresh()
 }
 
-onMounted(refresh)
+onMounted(async () => {
+  try {
+    const raw = localStorage.getItem(SEARCH_HISTORY_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        searchHistory.value = parsed.filter((item): item is string => typeof item === 'string').slice(0, 10)
+      }
+    }
+  } catch {
+    // 隐私模式下 localStorage 可能不可用
+  }
+  await refresh()
+})
 </script>
 
 <template>
@@ -551,6 +660,26 @@ onMounted(refresh)
         <div class="mo-section-head">
           <h2>书架</h2>
           <span class="muted">{{ shelfBooks.length }} 本 · {{ enabledCount }} 个书源启用</span>
+          <div class="mo-shelf-tools">
+            <select v-model="shelfSort" class="mo-select" aria-label="书架排序">
+              <option value="recent">最近阅读</option>
+              <option value="name">按书名</option>
+              <option value="progress">按进度</option>
+            </select>
+            <button v-if="!shelfSelecting" class="mo-btn" data-testid="shelf-manage" @click="startShelfSelect">管理</button>
+            <template v-else>
+              <span class="muted">已选 {{ selectedBookCount }} 本</span>
+              <button
+                class="mo-btn danger"
+                data-testid="shelf-remove"
+                :disabled="selectedBookCount === 0 || busy"
+                @click="removeSelectedBooks"
+              >
+                移出书架
+              </button>
+              <button class="mo-btn" @click="exitShelfSelect">取消</button>
+            </template>
+          </div>
         </div>
 
         <div v-if="shelfBooks.length === 0" class="mo-empty">
@@ -562,16 +691,20 @@ onMounted(refresh)
 
         <div v-else class="mo-shelf" data-testid="shelf">
           <button
-            v-for="book in shelfBooks"
+            v-for="book in shelfSortedBooks"
             :key="book.id"
             class="mo-cover-card"
+            :class="{ selected: selectedBookIds.has(book.id) }"
             data-testid="shelf-book"
-            @click="openShelfBook(book)"
+            @click="onShelfBookClick(book)"
           >
             <span class="mo-cover" :style="coverStyle(book)">
               <img v-if="book.coverUrl" :src="book.coverUrl" alt="" loading="lazy" />
               <span v-else class="mo-cover-glyph">{{ String(book.name || '书').slice(0, 1) }}</span>
               <span v-if="book.originName" class="mo-cover-origin">{{ book.originName }}</span>
+              <span v-if="shelfSelecting" class="mo-cover-check" :class="{ on: selectedBookIds.has(book.id) }">
+                {{ selectedBookIds.has(book.id) ? '✓' : '' }}
+              </span>
             </span>
             <span class="mo-cover-name">{{ book.name }}</span>
             <span class="mo-cover-meta">{{ book.author || '未知作者' }}</span>
@@ -586,7 +719,7 @@ onMounted(refresh)
       <section v-if="view === 'search'" class="mo-pane">
         <div class="mo-section-head">
           <h2>搜索</h2>
-          <span class="muted">在 {{ enabledCount }} 个启用的书源里找书</span>
+          <span class="muted">在 {{ searchScopeLabel }} 里找书</span>
         </div>
         <div class="mo-searchbar">
           <input
@@ -598,6 +731,25 @@ onMounted(refresh)
           <button class="mo-btn primary" :disabled="searching || !searchKey.trim()" data-testid="search" @click="search">
             {{ searching ? '搜索中…' : '搜索' }}
           </button>
+        </div>
+        <div class="mo-search-scope">
+          <select v-model="searchScope" class="mo-select" aria-label="搜索范围">
+            <option value="">全部启用源</option>
+            <optgroup label="按分组">
+              <option v-for="group in sourceGroups" :key="`g-${group}`" :value="`group:${group}`">分组：{{ group }}</option>
+            </optgroup>
+            <optgroup label="按书源">
+              <option v-for="source in enabledSources" :key="`s-${source.id}`" :value="`source:${source.bookSourceUrl}`">
+                书源：{{ source.bookSourceName || source.bookSourceUrl }}
+              </option>
+            </optgroup>
+          </select>
+          <label class="mo-switch"><input v-model="searchExact" type="checkbox" />精确书名</label>
+          <span class="muted">范围：{{ searchScopeLabel }}</span>
+        </div>
+        <div v-if="searchHistory.length" class="mo-history">
+          <span class="muted">最近：</span>
+          <button v-for="item in searchHistory" :key="item" class="mo-chip" @click="useHistory(item)">{{ item }}</button>
         </div>
 
         <div v-if="books.length" class="mo-results">
@@ -1045,6 +1197,44 @@ onMounted(refresh)
   grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
   gap: 22px 18px;
 }
+.mo-shelf-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.mo-cover-card.selected .mo-cover {
+  outline: 2px solid var(--mo-accent);
+  outline-offset: 2px;
+}
+.mo-cover-check {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid rgba(255, 255, 255, 0.75);
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.28);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1;
+}
+.mo-cover-check.on {
+  border-color: var(--mo-accent);
+  background: var(--mo-accent);
+}
+.mo-btn.danger {
+  border-color: #a8402e;
+  color: #a8402e;
+}
+.mo-btn.danger:hover {
+  background: #a8402e;
+  color: #fff;
+}
 .mo-cover-card {
   display: flex;
   flex-direction: column;
@@ -1138,6 +1328,36 @@ onMounted(refresh)
   background: var(--mo-paper-2);
   color: inherit;
   font: inherit;
+}
+.mo-search-scope {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: -6px 0 12px;
+  color: var(--mo-ink-2);
+  font-size: 12px;
+}
+.mo-history {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 16px;
+  font-size: 12px;
+}
+.mo-chip {
+  padding: 4px 10px;
+  border: 1px solid var(--mo-line);
+  border-radius: 999px;
+  background: var(--mo-paper-2);
+  color: var(--mo-ink-2);
+  font: inherit;
+  cursor: pointer;
+}
+.mo-chip:hover {
+  border-color: var(--mo-accent);
+  color: var(--mo-accent);
 }
 .mo-results {
   display: flex;
