@@ -12,6 +12,14 @@ import {
   analyzeToc,
 } from '../core/source/analyze.js'
 import { openReaderStorage } from './storage.js'
+import {
+  importLocalBuffer,
+  localBookId,
+  localContent,
+  localToc,
+  readLocalBook,
+  removeLocalBook,
+} from './local.js'
 
 export { REMOTE_METHODS } from '../core/remote-methods.js'
 import { REMOTE_METHODS } from '../core/remote-methods.js'
@@ -206,24 +214,40 @@ export class ReaderService extends TypertRemoteService {
   }
 
   async getBookInfo(args: Args) {
-    const source = this.getSource(stringArg(args, 'sourceUrl'))
     const bookUrl = stringArg(args, 'bookUrl')
+    if (bookUrl.startsWith('local://')) {
+      const record = await readLocalBook(localBookId(bookUrl))
+      if (!record) throw new Error('本地书不存在')
+      return { info: record.book, url: bookUrl }
+    }
+    const source = this.getSource(stringArg(args, 'sourceUrl'))
     const raw = await this.fetch({ url: bookUrl, method: 'GET', headers: {} }, source)
     const info = analyzeBookInfo(raw.text, source, raw.url, raw.url)
     return { info, url: raw.url }
   }
 
   async getToc(args: Args) {
-    const source = this.getSource(stringArg(args, 'sourceUrl'))
     const tocUrl = stringArg(args, 'tocUrl')
+    if (tocUrl.startsWith('local://')) {
+      const chapters = await localToc(localBookId(tocUrl))
+      if (chapters.length === 0) throw new Error('本地书不存在或没有章节')
+      return { chapters, url: tocUrl }
+    }
+    const source = this.getSource(stringArg(args, 'sourceUrl'))
     const raw = await this.fetch({ url: tocUrl, method: 'GET', headers: {} }, source)
     const chapters = analyzeToc(raw.text, source, raw.url)
     return { chapters, url: raw.url }
   }
 
   async getContent(args: Args) {
-    const source = this.getSource(stringArg(args, 'sourceUrl'))
     const chapterUrl = stringArg(args, 'chapterUrl')
+    const localMatch = /^local:\/\/([^/]+)\/(\d+)/.exec(chapterUrl)
+    if (localMatch) {
+      const chapter = await localContent(localMatch[1]!, Number(localMatch[2]))
+      if (!chapter) throw new Error('本地章节不存在')
+      return { content: chapter.content, url: chapterUrl }
+    }
+    const source = this.getSource(stringArg(args, 'sourceUrl'))
     const raw = await this.fetch({ url: chapterUrl, method: 'GET', headers: {} }, source)
     const content = analyzeContent(raw.text, source, raw.url)
     return { content, url: raw.url }
@@ -261,6 +285,19 @@ export class ReaderService extends TypertRemoteService {
       raw: raw.text.slice(0, 200_000),
       result,
     }
+  }
+
+  async importLocalBook(args: Args) {
+    const fileName = stringArg(args, 'fileName')
+    const data = stringArg(args, 'dataBase64')
+    const buffer = Buffer.from(data, 'base64')
+    if (buffer.length === 0) throw new Error('文件为空')
+    const { book, chapters } = await importLocalBuffer(fileName, buffer)
+    const id = String(book.id)
+    const existing = this.requireDb().books.get(id) as Record<string, unknown> | undefined
+    const record = { ...book, createdAt: existing?.createdAt ?? book.createdAt }
+    await this.requireDb().books.put(id, record)
+    return { book: record, chapters: chapters.length }
   }
 
   async addBook(args: Args) {
@@ -314,8 +351,13 @@ export class ReaderService extends TypertRemoteService {
     const ids = args?.ids
     if (!Array.isArray(ids) || ids.length === 0) throw new Error('缺少参数 ids')
     const keys = ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
+    const localIds = keys.filter((id) => {
+      const book = this.requireDb().books.get(id) as Record<string, unknown> | undefined
+      return book?.origin === 'local'
+    })
     const deleted = await this.requireDb().books.deleteMany(keys)
     for (const id of keys) await this.requireDb().readRecords.delete(id)
+    for (const id of localIds) await removeLocalBook(id).catch(() => undefined)
     return { deleted }
   }
 

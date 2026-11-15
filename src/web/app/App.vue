@@ -61,6 +61,7 @@ const shelfGroup = ref('')
 const shelfGroupInput = ref('')
 const shelfSelecting = ref(false)
 const selectedBookIds = ref<Set<string>>(new Set())
+const localInput = ref<HTMLInputElement | null>(null)
 let longPressTimer: ReturnType<typeof setTimeout> | undefined
 let longPressFired = false
 
@@ -568,6 +569,37 @@ async function applyGroupToSelected() {
   }
 }
 
+function toBase64(bytes: Uint8Array): string {
+  let binary = ''
+  const chunk = 0x8000
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk))
+  }
+  return btoa(binary)
+}
+
+async function importLocalFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  busy.value = true
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    const result = await call('importLocalBook', {
+      fileName: file.name,
+      dataBase64: toBase64(bytes),
+    })
+    await refresh()
+    status.value = `已导入《${result.book?.name ?? file.name}》${result.chapters} 章`
+    if (result.book) await openShelfBook(result.book)
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
 function startShelfSelect() {
   shelfSelecting.value = true
   selectedBookIds.value = new Set()
@@ -906,7 +938,15 @@ onMounted(async () => {
               <option value="name">按书名</option>
               <option value="progress">按进度</option>
             </select>
+            <input
+              ref="localInput"
+              type="file"
+              accept=".txt,.epub"
+              style="display: none"
+              @change="importLocalFile"
+            />
             <button v-if="!shelfSelecting" class="mo-btn" data-testid="shelf-manage" @click="startShelfSelect">管理</button>
+            <button v-if="!shelfSelecting" class="mo-btn" data-testid="shelf-import" @click="localInput?.click()">导入本地</button>
             <template v-else>
               <span class="muted">已选 {{ selectedBookCount }} 本</span>
               <input v-model="shelfGroupInput" class="mo-group-input" placeholder="分组名" />

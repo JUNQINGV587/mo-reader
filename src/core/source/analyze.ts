@@ -173,7 +173,7 @@ function decodeEntities(value: string): string {
  * 把书源规则返回的 HTML 片段转成纯文本：`<br>` 换行、`</p>` 分段，
  * 其余标签剥掉，并解码常见实体（`&nbsp;`/`&lrm;` 等）。
  */
-function htmlToText(value: string): string {
+export function htmlToText(value: string): string {
   const text = /<([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>/.test(value)
     ? value
         .replace(/<br\s*\/?>/gi, '\n')
@@ -198,7 +198,7 @@ function toAbsolute(value: string, baseUrl: string): string {
   }
 }
 
-function trimText(value: string): string {
+export function trimText(value: string): string {
   return value
     .replace(/\r\n/g, '\n')
     .split('\n')
