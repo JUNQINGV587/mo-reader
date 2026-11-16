@@ -349,6 +349,7 @@ async function saveSimulate() {
     simulateStartDate: simulateDraft.value.startDate,
     simulateStartChapter: Math.max(0, Number(simulateDraft.value.startChapter) || 0),
     simulateDailyChapters: Math.max(1, Number(simulateDraft.value.dailyChapters) || 1),
+    totalChapterNum: Math.max(Number(book.totalChapterNum) || 0, chapters.value.length),
   }
   try {
     const result = await call('updateBook', { id: book.id, patch })
