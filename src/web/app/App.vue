@@ -44,6 +44,14 @@ const busy = ref(false)
 
 const sources = ref<any[]>([])
 const importText = ref('')
+const rssSources = ref<any[]>([])
+const rssImportText = ref('')
+const rssMessage = ref('')
+const rssBusy = ref(false)
+const rssActive = ref<any>(null)
+const rssFeed = ref<any>(null)
+const rssArticles = ref<any[]>([])
+const article = ref<any>(null)
 const importMessage = ref('')
 const sourceFilter = ref('')
 const sourceGroup = ref('')
@@ -1194,6 +1202,72 @@ function backFromDetail() {
   refresh()
 }
 
+async function loadRssSources() {
+  try {
+    const result = await call('listRssSources')
+    rssSources.value = result.rssSources ?? []
+  } catch {
+    rssSources.value = []
+  }
+}
+
+async function onRssImportFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  rssImportText.value = await file.text()
+  input.value = ''
+}
+
+async function importRssSources() {
+  if (!rssImportText.value.trim()) return
+  rssBusy.value = true
+  try {
+    const result = await call('importRssSources', { sources: rssImportText.value })
+    rssMessage.value = `导入 ${Number(result.added ?? 0) + Number(result.updated ?? 0)} 个：新增 ${result.added ?? 0}，更新 ${result.updated ?? 0}`
+    rssImportText.value = ''
+    await loadRssSources()
+  } catch (error) {
+    rssMessage.value = errorText(error)
+  } finally {
+    rssBusy.value = false
+  }
+}
+
+async function removeRssSource(source: any) {
+  try {
+    await call('deleteRssSource', { id: source.id })
+    if (rssActive.value?.id === source.id) {
+      rssActive.value = null
+      rssArticles.value = []
+    }
+    await loadRssSources()
+    rssMessage.value = '已删除订阅源'
+  } catch (error) {
+    rssMessage.value = errorText(error)
+  }
+}
+
+async function openRssSource(source: any) {
+  rssActive.value = source
+  rssBusy.value = true
+  try {
+    const result = await call('getRssArticles', { id: source.id })
+    rssFeed.value = result.feed ?? null
+    rssArticles.value = result.feed?.articles ?? []
+  } catch (error) {
+    rssFeed.value = null
+    rssArticles.value = []
+    rssMessage.value = errorText(error)
+  } finally {
+    rssBusy.value = false
+  }
+}
+
+function openArticle(item: any) {
+  article.value = item
+}
+
 onMounted(async () => {
   try {
     const raw = localStorage.getItem(SEARCH_HISTORY_KEY)
@@ -1208,6 +1282,7 @@ onMounted(async () => {
   }
   void loadBattery()
   await refresh()
+  void loadRssSources()
 })
 </script>
 
@@ -1227,6 +1302,7 @@ onMounted(async () => {
         <button :class="{ on: view === 'shelf' }" data-testid="nav-shelf" @click="view = 'shelf'">书架</button>
         <button :class="{ on: view === 'search' || view === 'detail' }" data-testid="nav-search" @click="view = 'search'">搜索</button>
         <button :class="{ on: view === 'sources' }" data-testid="nav-sources" @click="view = 'sources'">书源</button>
+        <button :class="{ on: view === 'rss' }" data-testid="nav-rss" @click="view = 'rss'">订阅</button>
         <span class="mo-version">v{{ version }}</span>
       </nav>
     </template>
@@ -1550,6 +1626,69 @@ onMounted(async () => {
             <pre v-if="debugResult" class="mo-debug-out" data-testid="debug-output">{{ JSON.stringify(debugResult, null, 2).slice(0, 20000) }}</pre>
           </div>
         </div>
+      </section>
+
+      <section v-if="view === 'rss'" class="mo-pane">
+        <div class="mo-section-head">
+          <h2>订阅</h2>
+          <span class="muted">{{ rssSources.length }} 个</span>
+        </div>
+
+        <div class="mo-card">
+          <h3 class="mo-card-title">导入订阅源</h3>
+          <p class="muted">粘贴「阅读」RssSource JSON，或选择文件；当前支持 RSS 2.0 / Atom。</p>
+          <textarea v-model="rssImportText" rows="4" placeholder='[{"sourceUrl":"https://…/rss.xml","sourceName":"…"}]' />
+          <div class="mo-row">
+            <label class="mo-file" title="选择订阅源 JSON">
+              <input type="file" accept=".json,application/json" data-testid="rss-import-file" @change="onRssImportFile" />
+              <span class="mo-btn">选择文件</span>
+            </label>
+            <button class="mo-btn primary" :disabled="rssBusy || !rssImportText.trim()" data-testid="rss-import" @click="importRssSources">导入</button>
+            <span class="muted">{{ rssMessage }}</span>
+          </div>
+        </div>
+
+        <div class="mo-card">
+          <h3 class="mo-card-title">订阅源</h3>
+          <p v-if="rssSources.length === 0" class="muted">还没有订阅源。</p>
+          <ul v-else class="mo-sources">
+            <li v-for="source in rssSources" :key="source.id" data-testid="rss-source">
+              <button class="mo-source-name" @click="openRssSource(source)">{{ source.sourceName }}</button>
+              <span class="muted">{{ source.sourceGroup || '未分组' }}</span>
+              <button class="mo-icon-btn" title="删除" @click="removeRssSource(source)">✕</button>
+            </li>
+          </ul>
+        </div>
+
+        <div v-if="rssActive" class="mo-card">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">{{ rssFeed?.title || rssActive.sourceName }}</h3>
+            <span class="muted">{{ rssArticles.length }} 篇</span>
+            <button class="mo-btn" @click="openRssSource(rssActive)">刷新</button>
+          </div>
+          <p v-if="rssBusy" class="muted">加载中…</p>
+          <p v-else-if="rssArticles.length === 0" class="muted">没有解析到文章。</p>
+          <ul v-else class="mo-articles">
+            <li v-for="(item, index) in rssArticles" :key="index">
+              <button class="mo-article-title" @click="openArticle(item)">{{ item.title || '（无标题）' }}</button>
+              <span class="muted">{{ item.date }}</span>
+            </li>
+          </ul>
+        </div>
+
+        <transition name="mo-fade">
+          <div v-if="article" class="mo-sheet-mask" @click.self="article = null">
+            <div class="mo-sheet mo-sheet-scroll">
+              <div class="mo-sheet-head">
+                <strong>{{ article.title || '（无标题）' }}</strong>
+                <button class="mo-icon-btn" @click="article = null">✕</button>
+              </div>
+              <p class="muted">{{ article.date }}<span v-if="article.author"> · {{ article.author }}</span></p>
+              <p class="mo-article-body">{{ article.summary || '（无摘要）' }}</p>
+              <a v-if="article.link" class="mo-btn" :href="article.link" target="_blank" rel="noreferrer">原文</a>
+            </div>
+          </div>
+        </transition>
       </section>
 
       <section v-if="view === 'reader'" class="mo-reader">
@@ -2817,5 +2956,34 @@ textarea {
   align-items: flex-start;
   line-height: 1.7;
   font-size: 14px;
+}
+.mo-articles {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mo-articles li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+}
+.mo-article-title {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.mo-article-body {
+  white-space: pre-wrap;
+  line-height: 1.9;
+  font-size: 15px;
 }
 </style>

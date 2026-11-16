@@ -3,6 +3,8 @@ import { Service } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { VERSION } from '../core/version.js'
 import { parseSource, type BookSource } from '../core/model/source.js'
+import { parseRssSources } from '../core/rss/source.js'
+import { parseFeed } from '../core/rss/feed.js'
 import { fetchText } from '../core/net/http.js'
 import { buildRequest, buildSearchRequest, parseHeaders, splitUrlOptions, type RequestSpec } from '../core/source/url.js'
 import {
@@ -479,6 +481,59 @@ export class ReaderService extends TypertRemoteService {
     const id = stringArg(args, 'id')
     const deleted = await this.requireDb().notes.delete(id)
     return { deleted: deleted ? 1 : 0 }
+  }
+
+  async listRssSources() {
+    const rssSources: Array<Record<string, unknown>> = []
+    for (const [, value] of this.requireDb().subscriptions.entries()) {
+      rssSources.push(value as Record<string, unknown>)
+    }
+    rssSources.sort((a, b) => String(a.sourceName ?? '').localeCompare(String(b.sourceName ?? ''), 'zh'))
+    return { rssSources }
+  }
+
+  async importRssSources(args: Args) {
+    const list = parseRssSources(args?.sources ?? args?.payload ?? args)
+    if (list.length === 0) throw new Error('没有可导入的订阅源')
+    let added = 0
+    let updated = 0
+    const errors: Array<{ name: string; message: string }> = []
+    for (const source of list) {
+      try {
+        const id = `src-${createHash('sha1').update(source.sourceUrl).digest('hex').slice(0, 24)}`
+        const existing = this.requireDb().subscriptions.get(id) as Record<string, unknown> | undefined
+        const record = {
+          ...source,
+          id,
+          sourceGroup: source.sourceGroup ?? '',
+          enabled: source.enabled !== false,
+          updatedAt: new Date().toISOString(),
+          createdAt: existing?.createdAt ?? new Date().toISOString(),
+        }
+        await this.requireDb().subscriptions.put(id, record)
+        if (existing) updated += 1
+        else added += 1
+      } catch (error) {
+        errors.push({ name: source.sourceName, message: (error as Error).message })
+      }
+    }
+    return { added, updated, errors }
+  }
+
+  async deleteRssSource(args: Args) {
+    const id = stringArg(args, 'id')
+    const deleted = await this.requireDb().subscriptions.delete(id)
+    return { deleted: deleted ? 1 : 0 }
+  }
+
+  async getRssArticles(args: Args) {
+    const id = stringArg(args, 'id')
+    const record = this.requireDb().subscriptions.get(id) as Record<string, unknown> | undefined
+    if (!record) throw new Error('订阅源不存在')
+    const headers = parseHeaders(typeof record.header === 'string' ? record.header : '')
+    const result = await fetchText(String(record.sourceUrl), { headers })
+    const feed = parseFeed(result.text, result.url)
+    return { feed, sourceName: String(record.sourceName ?? '') }
   }
 
   async getSettings() {

@@ -24,6 +24,10 @@ export const REMOTE_METHODS = Object.freeze([
   'listNotes',
   'saveNote',
   'deleteNote',
+  'listRssSources',
+  'importRssSources',
+  'deleteRssSource',
+  'getRssArticles',
   'getSettings',
   'saveSettings',
 ])
