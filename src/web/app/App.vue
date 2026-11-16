@@ -1989,22 +1989,6 @@ onMounted(async () => {
         </transition>
 
         <transition name="mo-fade">
-          <div v-if="simulateOpen" class="mo-sheet-mask" @click.self="simulateOpen = false">
-            <div class="mo-sheet mo-sheet-scroll">
-              <div class="mo-sheet-head">
-                <strong>模拟阅读</strong>
-                <button class="mo-icon-btn" @click="simulateOpen = false">✕</button>
-              </div>
-              <label class="mo-switch"><input v-model="simulateDraft.enabled" type="checkbox" />启用模拟阅读（按日期解锁章节）</label>
-              <div class="mo-form-row"><span>起始日期</span><input v-model="simulateDraft.startDate" type="date" /></div>
-              <div class="mo-form-row"><span>起始章节（0 起）</span><input v-model.number="simulateDraft.startChapter" type="number" min="0" /></div>
-              <div class="mo-form-row"><span>每日章节数</span><input v-model.number="simulateDraft.dailyChapters" type="number" min="1" /></div>
-              <button class="mo-btn primary" data-testid="simulate-save" @click="saveSimulate">保存</button>
-            </div>
-          </div>
-        </transition>
-
-        <transition name="mo-fade">
           <div v-if="reviewOpen" class="mo-sheet-mask" @click.self="reviewOpen = false">
             <div class="mo-sheet mo-sheet-scroll">
               <div class="mo-sheet-head">
@@ -2043,6 +2027,22 @@ onMounted(async () => {
           </aside>
         </transition>
       </section>
+        <transition name="mo-fade">
+          <div v-if="simulateOpen" class="mo-sheet-mask" @click.self="simulateOpen = false">
+            <div class="mo-sheet mo-sheet-scroll">
+              <div class="mo-sheet-head">
+                <strong>模拟阅读</strong>
+                <button class="mo-icon-btn" @click="simulateOpen = false">✕</button>
+              </div>
+              <label class="mo-switch"><input v-model="simulateDraft.enabled" type="checkbox" />启用模拟阅读（按日期解锁章节）</label>
+              <div class="mo-form-row"><span>起始日期</span><input v-model="simulateDraft.startDate" type="date" /></div>
+              <div class="mo-form-row"><span>起始章节（0 起）</span><input v-model.number="simulateDraft.startChapter" type="number" min="0" /></div>
+              <div class="mo-form-row"><span>每日章节数</span><input v-model.number="simulateDraft.dailyChapters" type="number" min="1" /></div>
+              <button class="mo-btn primary" data-testid="simulate-save" @click="saveSimulate">保存</button>
+            </div>
+          </div>
+        </transition>
+
     </main>
   </div>
 </template>
