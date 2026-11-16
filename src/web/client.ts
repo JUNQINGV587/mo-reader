@@ -7,7 +7,7 @@ import { createReaderShell } from './shell'
 const jsonCodec = () => ({ mode: 'strict' as const, typeSymbol: '@local/mo-reader#Json', create: () => z.json() })
 
 /** 无参数方法；其余方法统一接收一个 args 对象。 */
-const ZERO_ARG = new Set(['state', 'listSources', 'listBooks', 'getSettings'])
+const ZERO_ARG = new Set(['state', 'listSources', 'listBooks', 'listRssSources', 'getSettings'])
 
 /** 与 README / service 的 REMOTE_METHODS 一一对应，宿主据此生成 ctx.remote.reader 的方法。 */
 export const readerContribution = {
