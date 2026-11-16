@@ -66,6 +66,24 @@ const RuleContentSchema = z
   })
   .passthrough();
 
+const RuleReviewSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    reviewUrl: z.string().optional(),
+    reviewSummaryUrl: z.string().optional(),
+    summaryListRule: z.string().optional(),
+    summaryParagraphIndexRule: z.string().optional(),
+    summaryParagraphDataRule: z.string().optional(),
+    summaryCountRule: z.string().optional(),
+    reviewQuoteUrl: z.string().optional(),
+    reviewDetailUrl: z.string().optional(),
+    detailListRule: z.string().optional(),
+    contentRule: z.string().optional(),
+    postTimeRule: z.string().optional(),
+    avatarRule: z.string().optional(),
+  })
+  .passthrough();
+
 const RuleExploreSchema = z
   .object({
     bookList: z.string().optional(),
@@ -107,7 +125,7 @@ export const BookSourceSchema = z
     ruleBookInfo: RuleBookInfoSchema.optional(),
     ruleToc: RuleTocSchema.optional(),
     ruleContent: RuleContentSchema.optional(),
-    ruleReview: z.unknown().optional(),
+    ruleReview: RuleReviewSchema.optional(),
   })
   .passthrough();
 
@@ -116,6 +134,7 @@ export type RuleSearch = z.infer<typeof RuleSearchSchema>;
 export type RuleBookInfo = z.infer<typeof RuleBookInfoSchema>;
 export type RuleToc = z.infer<typeof RuleTocSchema>;
 export type RuleContent = z.infer<typeof RuleContentSchema>;
+export type RuleReview = z.infer<typeof RuleReviewSchema>;
 
 export const BookSchema = z
   .object({

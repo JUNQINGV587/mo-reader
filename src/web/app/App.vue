@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import CanvasReader from '../reader/CanvasReader.vue'
+import { simulatedChapterCount, simulatedProgress } from '../../core/reader/simulate'
 import {
   DEFAULT_MENU_ITEMS,
   DEFAULT_TAP_ZONES,
@@ -320,9 +321,91 @@ function bookStatus(book: any) {
 function shelfProgress(book: any) {
   const record = book?.progress
   if (!record) return null
-  const total = Number(book.totalChapterNum ?? 0)
-  const percent = total > 0 ? Math.min(100, Math.round(((record.chapterIndex + 1) / total) * 100)) : 0
-  return { percent, text: record.chapterTitle ? `读至 ${record.chapterTitle}` : `第 ${record.chapterIndex + 1} 章` }
+  const simulated = Boolean(book?.simulateEnabled)
+  const percent = Math.round(simulatedProgress(book, Number(record.chapterIndex ?? 0)) * 100)
+  const text = record.chapterTitle ? `读至 ${record.chapterTitle}` : `第 ${record.chapterIndex + 1} 章`
+  return { percent, text: simulated ? `${text} · 模拟` : text }
+}
+
+const simulateOpen = ref(false)
+const simulateDraft = ref({ enabled: false, startDate: '', startChapter: 0, dailyChapters: 3 })
+
+function openSimulate() {
+  const book = currentBook.value as any
+  simulateDraft.value = {
+    enabled: Boolean(book?.simulateEnabled),
+    startDate: typeof book?.simulateStartDate === 'string' ? book.simulateStartDate : new Date().toISOString().slice(0, 10),
+    startChapter: Number(book?.simulateStartChapter ?? 0),
+    dailyChapters: Number(book?.simulateDailyChapters ?? 3),
+  }
+  simulateOpen.value = true
+}
+
+async function saveSimulate() {
+  const book = currentBook.value as any
+  if (!book?.id) return
+  const patch = {
+    simulateEnabled: Boolean(simulateDraft.value.enabled),
+    simulateStartDate: simulateDraft.value.startDate,
+    simulateStartChapter: Math.max(0, Number(simulateDraft.value.startChapter) || 0),
+    simulateDailyChapters: Math.max(1, Number(simulateDraft.value.dailyChapters) || 1),
+  }
+  try {
+    const result = await call('updateBook', { id: book.id, patch })
+    Object.assign(currentBook.value as any, result.book ?? patch)
+    simulateOpen.value = false
+    status.value = patch.simulateEnabled ? `模拟阅读已开启，当前模拟至第 ${simulatedChapterCount(currentBook.value as any)} 章` : '模拟阅读已关闭'
+    await refresh()
+  } catch (error) {
+    status.value = errorText(error)
+  }
+}
+
+const reviewOpen = ref(false)
+const reviewBusy = ref(false)
+const reviewRows = ref<Array<{ index: number; count: number; data: string }>>([])
+const reviewMessage = ref('')
+
+async function openReview() {
+  const book = currentBook.value as any
+  if (!book) return
+  if (String(book.origin ?? '').startsWith('local')) {
+    status.value = '本地书没有段评'
+    return
+  }
+  const chapter = chapters.value[chapterIndex.value]
+  if (!chapter) return
+  reviewOpen.value = true
+  reviewBusy.value = true
+  reviewRows.value = []
+  reviewMessage.value = ''
+  try {
+    const result = await call('getReviewSummary', {
+      sourceUrl: book.origin,
+      bookUrl: book.bookUrl,
+      bookName: book.name,
+      bookAuthor: book.author,
+      chapterUrl: chapter.url,
+      chapterTitle: chapter.title,
+      chapterIndex: chapter.index ?? chapterIndex.value,
+    })
+    if (!result?.supported) {
+      reviewMessage.value = result?.reason || '该源未配置段评'
+    } else {
+      const counts = (result.counts ?? {}) as Record<string, number>
+      const keys = (result.keys ?? {}) as Record<string, string>
+      reviewRows.value = Object.keys(counts)
+        .map((key) => Number(key))
+        .filter((index) => Number(counts[index]) > 0)
+        .sort((a, b) => a - b)
+        .map((index) => ({ index, count: Number(counts[index]), data: String(keys[index] ?? '') }))
+      if (reviewRows.value.length === 0) reviewMessage.value = '本章没有段评'
+    }
+  } catch (error) {
+    reviewMessage.value = errorText(error)
+  } finally {
+    reviewBusy.value = false
+  }
 }
 
 const shelfGroups = computed(() => {
@@ -1475,6 +1558,8 @@ onMounted(async () => {
               </button>
               <button v-if="!currentBook.id" class="mo-btn" data-testid="add-shelf" @click="addToShelf">加入书架</button>
               <span v-else class="mo-tag">已在书架</span>
+              <button class="mo-btn" data-testid="simulate" @click="openSimulate">模拟阅读</button>
+              <span v-if="currentBook.simulateEnabled" class="mo-tag soft">模拟至 {{ simulatedChapterCount(currentBook) }} 章</span>
               <span v-if="progress" class="muted">
                 {{ progress.chapterTitle || `第 ${progress.chapterIndex + 1} 章` }}
               </span>
@@ -1733,6 +1818,7 @@ onMounted(async () => {
               <button class="mo-icon-btn" :title="bookmarkedHere ? '删除书签' : '加书签'" data-testid="reader-bookmark" @click="toggleBookmark">{{ bookmarkedHere ? '★' : '☆' }}</button>
               <button class="mo-icon-btn" title="书签列表" data-testid="reader-bookmarks" @click="bookmarksOpen = true">🔖</button>
               <button class="mo-icon-btn" title="笔记与划线" data-testid="reader-notes" @click="notesOpen = true">✎</button>
+              <button class="mo-icon-btn" title="段评" data-testid="reader-review" @click="openReview">💬</button>
               <button class="mo-icon-btn" title="目录" data-testid="reader-toc" @click="tocOpen = true">☰</button>
             </div>
             <div class="mo-chrome-bottom">
@@ -1898,6 +1984,42 @@ onMounted(async () => {
                 </li>
               </ul>
               <button class="mo-btn" :disabled="selectedUnderlines.length === 0" @click="saveUnderlines">保存划线</button>
+            </div>
+          </div>
+        </transition>
+
+        <transition name="mo-fade">
+          <div v-if="simulateOpen" class="mo-sheet-mask" @click.self="simulateOpen = false">
+            <div class="mo-sheet mo-sheet-scroll">
+              <div class="mo-sheet-head">
+                <strong>模拟阅读</strong>
+                <button class="mo-icon-btn" @click="simulateOpen = false">✕</button>
+              </div>
+              <label class="mo-switch"><input v-model="simulateDraft.enabled" type="checkbox" />启用模拟阅读（按日期解锁章节）</label>
+              <div class="mo-form-row"><span>起始日期</span><input v-model="simulateDraft.startDate" type="date" /></div>
+              <div class="mo-form-row"><span>起始章节（0 起）</span><input v-model.number="simulateDraft.startChapter" type="number" min="0" /></div>
+              <div class="mo-form-row"><span>每日章节数</span><input v-model.number="simulateDraft.dailyChapters" type="number" min="1" /></div>
+              <button class="mo-btn primary" data-testid="simulate-save" @click="saveSimulate">保存</button>
+            </div>
+          </div>
+        </transition>
+
+        <transition name="mo-fade">
+          <div v-if="reviewOpen" class="mo-sheet-mask" @click.self="reviewOpen = false">
+            <div class="mo-sheet mo-sheet-scroll">
+              <div class="mo-sheet-head">
+                <strong>段评</strong>
+                <span class="muted">{{ reviewRows.length }} 段</span>
+                <button class="mo-icon-btn" @click="reviewOpen = false">✕</button>
+              </div>
+              <p v-if="reviewBusy" class="muted">加载中…</p>
+              <p v-else-if="reviewMessage" class="muted">{{ reviewMessage }}</p>
+              <ul v-else class="mo-bookmarks">
+                <li v-for="row in reviewRows" :key="row.index">
+                  <span class="mo-tag soft">第 {{ row.index }} 段 · {{ row.count }} 条</span>
+                  <span class="muted"> {{ row.data }}</span>
+                </li>
+              </ul>
             </div>
           </div>
         </transition>
@@ -2594,6 +2716,28 @@ textarea {
 }
 .mo-sources li:last-child {
   border-bottom: 0;
+}
+.mo-form-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 10px 0;
+}
+.mo-form-row span {
+  width: 132px;
+  flex-shrink: 0;
+  color: var(--mo-muted);
+  font-size: 14px;
+}
+.mo-form-row input {
+  flex: 1;
+  padding: 6px 9px;
+  border: 1px solid var(--mo-line);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 14px;
 }
 .mo-switch {
   display: flex;

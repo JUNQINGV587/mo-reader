@@ -10,6 +10,7 @@ export const REMOTE_METHODS = Object.freeze([
   'getBookInfo',
   'getToc',
   'getContent',
+  'getReviewSummary',
   'debugSource',
   'addBook',
   'importLocalBook',

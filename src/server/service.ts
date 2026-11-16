@@ -13,6 +13,7 @@ import {
   analyzeSearch,
   analyzeToc,
 } from '../core/source/analyze.js'
+import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
 import { openReaderStorage } from './storage.js'
 import {
   importLocalBuffer,
@@ -253,6 +254,32 @@ export class ReaderService extends TypertRemoteService {
     const raw = await this.fetch({ url: chapterUrl, method: 'GET', headers: {} }, source)
     const content = analyzeContent(raw.text, source, raw.url)
     return { content, url: raw.url }
+  }
+
+  async getReviewSummary(args: Args) {
+    const source = this.getSource(stringArg(args, 'sourceUrl'))
+    const rule = reviewRule(source)
+    if (!rule || !summaryIsConfigured(rule)) {
+      return { supported: false, counts: {}, keys: {}, reason: '该源未配置段评' }
+    }
+    const book = {
+      bookUrl: stringArg(args, 'bookUrl'),
+      name: typeof args?.bookName === 'string' ? args.bookName : '',
+      author: typeof args?.bookAuthor === 'string' ? args.bookAuthor : '',
+    }
+    const chapter = {
+      url: stringArg(args, 'chapterUrl'),
+      title: typeof args?.chapterTitle === 'string' ? args.chapterTitle : '',
+      index: typeof args?.chapterIndex === 'number' ? args.chapterIndex : 0,
+    }
+    const request = buildReviewSummaryRequest(rule, source, book, chapter)
+    if (!request) {
+      return { supported: false, counts: {}, keys: {}, reason: '该源未配置段评' }
+    }
+    const raw = await this.fetch(request, source)
+    const parsed = parseReviewSummary(raw.text, rule, source, book, chapter, raw.url)
+    if (!parsed) return { supported: true, counts: {}, keys: {}, url: raw.url }
+    return { supported: true, counts: parsed.counts, keys: parsed.keys, url: raw.url }
   }
 
   async debugSource(args: Args) {
