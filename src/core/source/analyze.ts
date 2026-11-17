@@ -170,6 +170,17 @@ export function analyzeChapterContent(
   return { kind: 'text', text: analyzeContent(content, source, baseUrl), images: [], mediaUrl: '' }
 }
 
+
+function decodeUrlEntities(value: string): string {
+  return value
+    .replace(/&amp;/gi, '&')
+    .replace(/&#0*38;/g, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;/g, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+}
+
 function extractImages(content: unknown, source: BookSource, baseUrl: string): string[] {
   const rule = source.ruleContent?.content ?? ''
   const images: string[] = []
@@ -185,7 +196,7 @@ function extractImages(content: unknown, source: BookSource, baseUrl: string): s
       for (const line of value.split('\n')) candidates.push(line)
     }
     for (const item of candidates) {
-      const url = toAbsolute(item.trim(), baseUrl)
+      const url = toAbsolute(decodeUrlEntities(item.trim()), baseUrl)
       if (!url || /^(data:|blob:)/i.test(url) || images.includes(url)) continue
       images.push(url)
     }
