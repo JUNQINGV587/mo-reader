@@ -45,6 +45,8 @@ const view = ref<View>('shelf')
 const version = ref('')
 const status = ref('')
 const busy = ref(false)
+const cacheBusy = ref(false)
+const exportBusy = ref(false)
 
 const sources = ref<any[]>([])
 const importText = ref('')
@@ -365,6 +367,44 @@ async function saveSimulate() {
     await refresh()
   } catch (error) {
     status.value = errorText(error)
+  }
+}
+
+async function cacheBookChapters() {
+  const book = currentBook.value as any
+  if (!book?.id) return
+  cacheBusy.value = true
+  try {
+    const result: any = await call('cacheBook', { bookId: book.id, limit: 20 })
+    status.value = result?.message || `已缓存 ${result?.cached ?? 0} 章，失败 ${result?.failed ?? 0} 章`
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    cacheBusy.value = false
+  }
+}
+
+async function exportBookTxt() {
+  const book = currentBook.value as any
+  if (!book?.id) return
+  exportBusy.value = true
+  try {
+    const result: any = await call('exportBook', { bookId: book.id, limit: 50 })
+    const binary = atob(result.dataBase64)
+    const bytes = new Uint8Array(binary.length)
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+    const blob = new Blob([bytes], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = result.fileName || 'book.txt'
+    link.click()
+    URL.revokeObjectURL(url)
+    status.value = `已导出 ${result.chapters} 章`
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    exportBusy.value = false
   }
 }
 
@@ -1587,6 +1627,8 @@ onMounted(async () => {
               <button v-if="!currentBook.id" class="mo-btn" data-testid="add-shelf" @click="addToShelf">加入书架</button>
               <span v-else class="mo-tag">已在书架</span>
               <button class="mo-btn" data-testid="simulate" @click="openSimulate">模拟阅读</button>
+              <button class="mo-btn" :disabled="cacheBusy" data-testid="cache-book" @click="cacheBookChapters">{{ cacheBusy ? '缓存中…' : '缓存 20 章' }}</button>
+              <button class="mo-btn" :disabled="exportBusy" data-testid="export-book" @click="exportBookTxt">{{ exportBusy ? '导出中…' : '导出 TXT' }}</button>
               <span v-if="currentBook.simulateEnabled" class="mo-tag soft">模拟至 {{ simulatedChapterCount(currentBook) }} 章</span>
               <span v-if="progress" class="muted">
                 {{ progress.chapterTitle || `第 ${progress.chapterIndex + 1} 章` }}

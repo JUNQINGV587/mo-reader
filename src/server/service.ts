@@ -17,6 +17,7 @@ import {
 } from '../core/source/analyze.js'
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
 import { openReaderStorage } from './storage.js'
+import { hasCachedChapter, readCachedChapter, writeCachedChapter } from './cache.js'
 import {
   importLocalBuffer,
   localBookId,
@@ -252,8 +253,15 @@ export class ReaderService extends TypertRemoteService {
       if (!chapter) throw new Error('本地章节不存在')
       return { content: chapter.content, url: chapterUrl }
     }
-    const source = this.getSource(stringArg(args, 'sourceUrl'))
+    const sourceUrl = stringArg(args, 'sourceUrl')
+    const source = this.getSource(sourceUrl)
     const kind = contentKindOf(source)
+    if (kind === 'text') {
+      const cached = await readCachedChapter(sourceUrl, chapterUrl)
+      if (cached !== null) {
+        return { kind, content: cached, images: [], mediaUrl: '', url: chapterUrl, cached: true }
+      }
+    }
     if (kind === 'audio' || kind === 'video') {
       const mediaRule = source.ruleContent?.content ?? ''
       if (!mediaRule) {
@@ -266,6 +274,82 @@ export class ReaderService extends TypertRemoteService {
     const raw = await this.fetch({ url: chapterUrl, method: 'GET', headers: {} }, source)
     const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
     return { ...parsed, content: parsed.text, url: raw.url }
+  }
+
+  async cacheBook(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const limit = Math.max(1, Math.min(200, Number(args?.limit ?? 20) || 20))
+    const book = this.requireDb().books.get(bookId) as Record<string, unknown> | undefined
+    if (!book) throw new Error('书不存在')
+    if (String(book.origin) === 'local') {
+      return { cached: 0, failed: 0, bytes: 0, total: 0, message: '本地书无需缓存' }
+    }
+    const sourceUrl = String(book.origin || '')
+    const toc = await (this as any).getToc({ tocUrl: String(book.tocUrl || book.bookUrl || ''), sourceUrl })
+    const chapters = (toc?.chapters ?? []) as Array<{ url?: string; title?: string }>
+    const start = Number(book.durChapterIndex ?? 0) || 0
+    let cached = 0
+    let failed = 0
+    let bytes = 0
+    for (let i = start; i < chapters.length && cached + failed < limit; i += 1) {
+      const url = chapters[i]?.url
+      if (!url) continue
+      try {
+        if (await hasCachedChapter(sourceUrl, url)) {
+          cached += 1
+          continue
+        }
+        const content = await (this as any).getContent({ sourceUrl, chapterUrl: url })
+        if (content?.kind && content.kind !== 'text') {
+          failed += 1
+          continue
+        }
+        const text = String(content?.content ?? '')
+        if (!text) {
+          failed += 1
+          continue
+        }
+        bytes += await writeCachedChapter(sourceUrl, url, text)
+        cached += 1
+      } catch {
+        failed += 1
+      }
+    }
+    return { cached, failed, bytes, total: chapters.length, start }
+  }
+
+  async exportBook(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const limit = Math.max(1, Math.min(2000, Number(args?.limit ?? 50) || 50))
+    const book = this.requireDb().books.get(bookId) as Record<string, unknown> | undefined
+    if (!book) throw new Error('书不存在')
+    const sourceUrl = String(book.origin || '')
+    const toc = await (this as any).getToc({ tocUrl: String(book.tocUrl || book.bookUrl || ''), sourceUrl })
+    const chapters = (toc?.chapters ?? []) as Array<{ url?: string; title?: string }>
+    const parts: string[] = []
+    for (const chapter of chapters) {
+      if (!chapter.url || parts.length >= limit) continue
+      const cached = await readCachedChapter(sourceUrl, chapter.url)
+      let text = cached ?? ''
+      if (!text) {
+        try {
+          const content = await (this as any).getContent({ sourceUrl, chapterUrl: chapter.url })
+          if (content?.kind && content.kind !== 'text') continue
+          text = String(content?.content ?? '')
+        } catch {
+          continue
+        }
+      }
+      if (!text) continue
+      parts.push(`${chapter.title || `第${parts.length + 1}章`}\n\n${text}`)
+    }
+    if (!parts.length) throw new Error('没有可导出的章节')
+    const body = `${String(book.name || '未命名')}\n作者：${String(book.author || '')}\n\n${parts.join('\n\n')}`
+    return {
+      fileName: `${String(book.name || 'book')}.txt`,
+      chapters: parts.length,
+      dataBase64: Buffer.from(body, 'utf8').toString('base64'),
+    }
   }
 
   async getReviewSummary(args: Args) {
