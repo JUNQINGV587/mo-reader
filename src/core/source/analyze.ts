@@ -2,6 +2,7 @@
  * 书源解析：把抓到的 HTML/JSON 按 BookSource 的 ruleSearch / ruleBookInfo /
  * ruleToc / ruleContent 变成结构化结果。纯函数，便于用本地 fixture 测试。
  */
+import { load } from 'cheerio';
 import { AnalyzeRule } from '../rules/analyze-rule.js';
 import type { BookSource } from '../model/source.js';
 
@@ -118,7 +119,9 @@ export function analyzeToc(
   for (const element of elements) {
     const item = new AnalyzeRule(element, { baseUrl, source });
     const title = clean(item.getString(rule.chapterName ?? ''));
-    const url = toAbsolute(item.getString(rule.chapterUrl ?? ''), baseUrl);
+    const urlRule = rule.chapterUrl ?? '';
+    const rawUrl = urlRule === 'href' || urlRule === 'src' ? elementAttr((element as any).outerHtml ?? String(element), urlRule) : item.getString(urlRule);
+    const url = toAbsolute(rawUrl, baseUrl);
     if (!title) continue;
 
     const volumeRule = rule.isVolume ?? '';
@@ -138,6 +141,15 @@ export function analyzeContent(
   const contentRule = rule.content ?? '';
   if (!contentRule) return '';
   return htmlToText(new AnalyzeRule(content, { baseUrl, source }).getString(contentRule));
+}
+
+/** 阅读里 chapterUrl 常写成裸 `href`/`src`，表示取当前元素的属性。 */
+function elementAttr(html: string, name: string): string {
+  try {
+    return load(html, null, false)('*').first().attr(name) ?? '';
+  } catch {
+    return '';
+  }
 }
 
 const ENTITIES: Record<string, string> = {

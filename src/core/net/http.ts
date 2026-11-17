@@ -25,7 +25,7 @@ export interface FetchResult {
 }
 
 export async function fetchText(rawUrl: string, options: FetchOptions = {}): Promise<FetchResult> {
-  let url = await assertPublicHttpUrl(rawUrl);
+  let url = await assertPublicHttpUrl(normalizeDuplicateSlashes(rawUrl));
   const method = options.method ?? 'GET';
   const headers: Record<string, string> = {
     'User-Agent': DEFAULT_UA,
@@ -45,7 +45,7 @@ export async function fetchText(rawUrl: string, options: FetchOptions = {}): Pro
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       if (!location) return finish(response, url);
-      url = await assertPublicHttpUrl(new URL(location, url).toString());
+      url = await assertPublicHttpUrl(normalizeDuplicateSlashes(new URL(location, url).toString()));
       continue;
     }
     return finish(response, url);
@@ -75,4 +75,16 @@ function normalizeCharset(name: string): string {
   if (value === 'gb2312' || value === 'gbk' || value === 'gb18030') return 'gb18030';
   if (value === 'utf8') return 'utf-8';
   return iconv.encodingExists(value) ? value : 'utf-8';
+}
+
+/** 部分站点（如起点）对路径里的 `//` 会 404；只规整 pathname，保留 scheme 与 query。 */
+export function normalizeDuplicateSlashes(raw: string): string {
+  try {
+    const url = new URL(raw);
+    const path = url.pathname.replace(/\/{2,}/g, '/');
+    if (path !== url.pathname) url.pathname = path;
+    return url.toString();
+  } catch {
+    return raw;
+  }
 }

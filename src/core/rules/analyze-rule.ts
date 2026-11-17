@@ -223,7 +223,9 @@ export class AnalyzeRule {
 
   private evalJs(script: string, result: unknown): unknown {
     if (!script) return result;
-    return evalJs(script, {
+    const lib = (this.source as { jsLib?: string } | undefined)?.jsLib;
+    const code = lib && lib.trim() ? `${lib}\n;\n${script}` : script;
+    return evalJs(code, {
       result,
       baseUrl: this.baseUrl,
       book: this.book,

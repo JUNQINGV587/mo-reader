@@ -34,21 +34,22 @@ export function evalJs(script: string, env: JsEnv): unknown {
   const sandbox = createSandbox(env);
   const context = vm.createContext(sandbox);
   try {
-    // 书源 JS 有两种写法：表达式（result.replace(...)）和带 return 的语句块。
-    // 先按表达式执行；语法错误时按函数体再执行一次。
+    // 阅读里 @js 规则是「脚本的完成值」：多语句脚本取最后一条表达式。
+    // 先用 vm 直接执行拿到完成值；带顶层 return 的脚本再退回函数体执行。
     try {
-      return vm.runInContext(`(${script}\n)`, context, {
+      const value = vm.runInContext(script, context, {
         timeout: 2000,
         filename: 'mo-reader-source.js',
       });
+      if (value !== undefined) return value;
     } catch (error) {
       // vm 里抛出的 SyntaxError 来自另一个 realm，不能用 instanceof 判断。
       if ((error as { name?: string } | null)?.name !== 'SyntaxError') throw error;
-      return vm.runInContext(`(function(){\n${script}\n})()`, context, {
-        timeout: 2000,
-        filename: 'mo-reader-source.js',
-      });
     }
+    return vm.runInContext(`(function(){\n${script}\n})()`, context, {
+      timeout: 2000,
+      filename: 'mo-reader-source.js',
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`书源 JS 执行失败：${message}`);

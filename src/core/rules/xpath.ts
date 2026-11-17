@@ -36,8 +36,11 @@ export class XPathAnalyzer {
   }
 
   getElements(ruleStr: string): string[] {
-    const rule = ruleStr.trim();
-    if (!rule) return [];
+    const trimmed = ruleStr.trim();
+    if (!trimmed) return [];
+    // 阅读源里常见 `(//div[@class='x'])[2]//dd/a`：括号整段取第 n 个。
+    // 这里等价改写为 `//div[@class='x'][2]//dd/a`（同一父节点下语义一致）。
+    const rule = trimmed.replace(/^\(\s*(\/\/[^()]*?)\s*\)\[(\d+|last\(\))\](.*)$/, (_, inner, index, rest) => `${inner}[${index}]${rest}`);
 
     const steps = parseSteps(rule);
     if (steps.length === 0) return [];

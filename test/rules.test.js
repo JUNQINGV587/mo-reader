@@ -141,3 +141,19 @@ test('AnalyzeRule：java.getString 回查当前内容', async () => {
   assert.equal(rule.getString('@js: java.getString("class.a@text")'), 'hi')
   assert.equal(rule.getString('@js: java.getString("a@href")'), '/x')
 })
+
+test('书源 JS：多语句脚本取最后一条表达式（阅读的完成值语义）', async () => {
+  const { evalJs } = await import('../dist/core/rules/js.js')
+
+  const value = evalJs('var a = 1;\nvar b = 2;\na + b', {})
+  assert.equal(value, 3)
+})
+
+test('XPath：开头的 (//x)[n] 与 //x[n] 等价', async () => {
+  const { XPathAnalyzer } = await import('../dist/core/rules/xpath.js')
+  const html = `<div class="list"><div class="item"><a href="/1">A</a></div><div class="item"><a href="/2">B</a></div></div>`
+  const analyzer = new XPathAnalyzer(html)
+  const a = analyzer.getString('(//div[@class="item"])[2]//a')
+  const b = analyzer.getString('//div[@class="item"][2]//a')
+  assert.equal(a, b)
+})
