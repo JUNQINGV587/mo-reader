@@ -255,7 +255,13 @@ export class ReaderService extends TypertRemoteService {
     const source = this.getSource(stringArg(args, 'sourceUrl'))
     const kind = contentKindOf(source)
     if (kind === 'audio' || kind === 'video') {
-      return { kind, content: '', images: [], mediaUrl: chapterUrl, url: chapterUrl }
+      const mediaRule = source.ruleContent?.content ?? ''
+      if (!mediaRule) {
+        return { kind, content: '', images: [], mediaUrl: chapterUrl, url: chapterUrl }
+      }
+      const raw = await this.fetch({ url: chapterUrl, method: 'GET', headers: {} }, source)
+      const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
+      return { ...parsed, content: '', url: raw.url }
     }
     const raw = await this.fetch({ url: chapterUrl, method: 'GET', headers: {} }, source)
     const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)

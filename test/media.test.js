@@ -61,3 +61,17 @@ test('音频与视频源直接用章节 URL 作为媒体地址', () => {
   assert.equal(video.kind, 'video')
   assert.equal(video.mediaUrl, 'https://cdn.example.com/video.m3u8')
 })
+
+test('音视频源用 ruleContent 从章节页解析直链', () => {
+  const videoSource = { ...baseSource, bookSourceType: 4, ruleContent: { content: 'video@src' } }
+  const videoHtml = '<div class="player"><video src="https://cdn.example.com/ep1.m3u8"></video></div>'
+  const video = analyzeChapterContent(videoHtml, videoSource, 'https://example.com/ep/1', 'https://example.com/ep/1')
+  assert.equal(video.kind, 'video')
+  assert.equal(video.mediaUrl, 'https://cdn.example.com/ep1.m3u8')
+
+  const audioSource = { ...baseSource, bookSourceType: 1, ruleContent: { content: 'audio@src' } }
+  const audioHtml = '<audio src="/media/a.mp3"></audio>'
+  const audio = analyzeChapterContent(audioHtml, audioSource, 'https://example.com/ch/2')
+  assert.equal(audio.kind, 'audio')
+  assert.equal(audio.mediaUrl, 'https://example.com/media/a.mp3')
+})

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import Hls from 'hls.js'
 
 const props = defineProps<{
   src: string
@@ -15,6 +16,18 @@ const emit = defineEmits<{
 
 const audio = ref<HTMLAudioElement | null>(null)
 const failed = ref(false)
+let hls: Hls | null = null
+
+const isHls = computed(() => /\.m3u8(\?|#|$)/i.test(props.src || ''))
+const looksLikeMedia = computed(() => /\.(m3u8|mp3|m4a|aac|ogg|wav|flac)(\?|#|$)/i.test(props.src || ''))
+const externalOnly = computed(() => !!props.src && !looksLikeMedia.value && /\/player\?|jx\.|vodplay/i.test(props.src))
+
+function destroyHls() {
+  if (hls) {
+    hls.destroy()
+    hls = null
+  }
+}
 
 function seekToStart() {
   const el = audio.value
@@ -29,29 +42,46 @@ function seekToStart() {
   }
 }
 
+function attach() {
+  const el = audio.value
+  if (!el) return
+  destroyHls()
+  failed.value = false
+  el.removeAttribute('src')
+  el.load()
+  const src = props.src || ''
+  if (!src || externalOnly.value) return
+  if (isHls.value && Hls.isSupported()) {
+    hls = new Hls({ enableWorker: true })
+    hls.on(Hls.Events.ERROR, (_event, data) => {
+      if (data?.fatal) failed.value = true
+    })
+    hls.loadSource(src)
+    hls.attachMedia(el)
+  } else {
+    el.src = src
+  }
+}
+
 function onTimeUpdate() {
   const el = audio.value
   if (el) emit('progress', Math.floor(el.currentTime || 0))
 }
 
 onMounted(() => {
-  const el = audio.value
-  if (!el) return
-  el.addEventListener('loadedmetadata', seekToStart)
-  seekToStart()
+  attach()
+  audio.value?.addEventListener('loadedmetadata', seekToStart)
 })
 
 watch(
   () => props.src,
   () => {
-    failed.value = false
-    const el = audio.value
-    if (el) {
-      el.load()
-      seekToStart()
-    }
+    attach()
+    seekToStart()
   },
 )
+
+onUnmounted(destroyHls)
 </script>
 
 <template>
@@ -62,9 +92,13 @@ watch(
         <strong>{{ bookName || '音频' }}</strong>
         <span>{{ title || '当前章节' }}</span>
       </div>
+      <div v-if="externalOnly" class="mo-audio-external">
+        <p>该源返回的是网页播放器，无法内嵌播放。</p>
+        <a :href="src" target="_blank" rel="noreferrer">在浏览器打开播放页</a>
+      </div>
       <audio
+        v-else
         ref="audio"
-        :src="src"
         controls
         preload="metadata"
         @timeupdate="onTimeUpdate"
@@ -72,6 +106,7 @@ watch(
         @error="failed = true"
       />
       <p v-if="failed" class="mo-audio-error">音频加载失败：{{ src }}</p>
+      <a v-if="failed" class="mo-audio-link" :href="src" target="_blank" rel="noreferrer">在浏览器打开</a>
     </div>
   </div>
 </template>
@@ -119,6 +154,17 @@ watch(
 }
 .mo-audio audio {
   width: 100%;
+}
+.mo-audio-external {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  color: var(--mo-ink, #26231d);
+}
+.mo-audio-external a,
+.mo-audio-link {
+  color: #3d6b53;
+  font-size: 13px;
 }
 .mo-audio-error {
   margin-top: 12px;

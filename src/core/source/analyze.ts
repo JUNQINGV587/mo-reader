@@ -162,7 +162,18 @@ export function analyzeChapterContent(
 ): ChapterContent {
   const kind = contentKindOf(source)
   if (kind === 'audio' || kind === 'video') {
-    return { kind, text: '', images: [], mediaUrl: chapterUrl || baseUrl }
+    let mediaUrl = chapterUrl || baseUrl
+    const rule = source.ruleContent?.content ?? ''
+    if (rule && typeof content === 'string' && content) {
+      try {
+        const raw = new AnalyzeRule(content, { baseUrl, source }).getString(rule)
+        const candidate = toAbsolute(decodeUrlEntities(String(raw ?? '').trim()), baseUrl)
+        if (candidate) mediaUrl = candidate
+      } catch {
+        // 规则失败时退回章节地址
+      }
+    }
+    return { kind, text: '', images: [], mediaUrl }
   }
   if (kind === 'images') {
     return { kind, text: '', images: extractImages(content, source, baseUrl), mediaUrl: '' }
