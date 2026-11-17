@@ -9,9 +9,11 @@ import { fetchText } from '../core/net/http.js'
 import { buildRequest, buildSearchRequest, parseHeaders, splitUrlOptions, type RequestSpec } from '../core/source/url.js'
 import {
   analyzeBookInfo,
+  analyzeChapterContent,
   analyzeContent,
   analyzeSearch,
   analyzeToc,
+  contentKindOf,
 } from '../core/source/analyze.js'
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
 import { openReaderStorage } from './storage.js'
@@ -251,9 +253,13 @@ export class ReaderService extends TypertRemoteService {
       return { content: chapter.content, url: chapterUrl }
     }
     const source = this.getSource(stringArg(args, 'sourceUrl'))
+    const kind = contentKindOf(source)
+    if (kind === 'audio' || kind === 'video') {
+      return { kind, content: '', images: [], mediaUrl: chapterUrl, url: chapterUrl }
+    }
     const raw = await this.fetch({ url: chapterUrl, method: 'GET', headers: {} }, source)
-    const content = analyzeContent(raw.text, source, raw.url)
-    return { content, url: raw.url }
+    const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
+    return { ...parsed, content: parsed.text, url: raw.url }
   }
 
   async getReviewSummary(args: Args) {

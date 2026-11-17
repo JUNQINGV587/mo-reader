@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import CanvasReader from '../reader/CanvasReader.vue'
+import ComicReader from '../reader/ComicReader.vue'
+import AudioReader from '../reader/AudioReader.vue'
+import VideoReader from '../reader/VideoReader.vue'
 import { simulatedChapterCount, simulatedProgress } from '../../core/reader/simulate'
 import {
   DEFAULT_MENU_ITEMS,
@@ -88,6 +91,9 @@ const introText = computed(() => plainText(currentBook.value?.intro))
 const chapters = ref<any[]>([])
 const currentChapter = ref<any>(null)
 const content = ref('')
+const readerKind = ref<'text' | 'images' | 'audio' | 'video'>('text')
+const readerImages = ref<string[]>([])
+const readerMedia = ref('')
 const replacedContent = computed(() => {
   let text = content.value
   for (const rule of settings.value.replaceRules) {
@@ -889,8 +895,13 @@ async function openChapter(chapter: any, page?: number) {
       chapterUrl: chapter.url,
     })
     const index = chapters.value.indexOf(chapter)
+    const kind = (result.kind ?? 'text') as 'text' | 'images' | 'audio' | 'video'
     currentChapter.value = chapter
-    content.value = result.content ?? ''
+    readerKind.value = kind
+    content.value = kind === 'text' ? (result.content ?? '') : ''
+    readerImages.value = kind === 'images' ? (result.images ?? []) : []
+    readerMedia.value =
+      kind === 'audio' || kind === 'video' ? (result.mediaUrl ?? chapter.url) : ''
     readerTitle.value = chapter.title
     view.value = 'reader'
     if (currentBook.value?.id) {
@@ -1181,6 +1192,22 @@ function addReplaceRule() {
 function removeReplaceRule(rule: { id: string }) {
   settings.value.replaceRules = settings.value.replaceRules.filter((item) => item.id !== rule.id)
   persistSettings()
+}
+
+function onMediaProgress(seconds: number) {
+  initialPage.value = seconds
+  if (!currentBook.value?.id || !currentChapter.value) return
+  if (pageTimer) clearTimeout(pageTimer)
+  pageTimer = setTimeout(() => {
+    if (!currentBook.value?.id || !currentChapter.value) return
+    call('saveProgress', {
+      bookId: currentBook.value.id,
+      chapterIndex: chapterIndex.value,
+      chapterTitle: currentChapter.value.title,
+      chapterUrl: currentChapter.value.url,
+      position: seconds,
+    }).catch(() => undefined)
+  }, 1200)
 }
 
 function onTapAction(code: number) {
@@ -1780,7 +1807,7 @@ onMounted(async () => {
       <section v-if="view === 'reader'" class="mo-reader">
         <div class="mo-reader-canvas" data-testid="reader-content">
           <CanvasReader
-            v-if="content"
+            v-if="readerKind === 'text' && content"
             ref="readerRef"
             :text="replacedContent"
             :title="readerTitle"
@@ -1805,6 +1832,31 @@ onMounted(async () => {
             @page="onPage"
             @tap-action="onTapAction"
           />
+          <ComicReader
+            v-else-if="readerKind === 'images'"
+            :images="readerImages"
+            :title="readerTitle"
+            :initial-page="initialPage"
+            @page="onPage"
+          />
+          <AudioReader
+            v-else-if="readerKind === 'audio'"
+            :src="readerMedia"
+            :title="readerTitle"
+            :book-name="currentBook?.name || ''"
+            :initial-position="initialPage"
+            @progress="onMediaProgress"
+            @ended="openAdjacent(1)"
+          />
+          <VideoReader
+            v-else-if="readerKind === 'video'"
+            :src="readerMedia"
+            :title="readerTitle"
+            :book-name="currentBook?.name || ''"
+            :initial-position="initialPage"
+            @progress="onMediaProgress"
+            @ended="openAdjacent(1)"
+          />
           <p v-else class="muted mo-reader-loading">{{ busy ? '加载中…' : '（空章节）' }}</p>
         </div>
 
@@ -1818,14 +1870,14 @@ onMounted(async () => {
               </div>
               <button class="mo-icon-btn" :title="bookmarkedHere ? '删除书签' : '加书签'" data-testid="reader-bookmark" @click="toggleBookmark">{{ bookmarkedHere ? '★' : '☆' }}</button>
               <button class="mo-icon-btn" title="书签列表" data-testid="reader-bookmarks" @click="bookmarksOpen = true">🔖</button>
-              <button class="mo-icon-btn" title="笔记与划线" data-testid="reader-notes" @click="notesOpen = true">✎</button>
-              <button class="mo-icon-btn" title="段评" data-testid="reader-review" @click="openReview">💬</button>
+              <button v-if="readerKind === 'text'" class="mo-icon-btn" title="笔记与划线" data-testid="reader-notes" @click="notesOpen = true">✎</button>
+              <button v-if="readerKind === 'text'" class="mo-icon-btn" title="段评" data-testid="reader-review" @click="openReview">💬</button>
               <button class="mo-icon-btn" title="目录" data-testid="reader-toc" @click="tocOpen = true">☰</button>
             </div>
             <div class="mo-chrome-bottom">
               <button v-if="settings.menuItems.includes('prev')" class="mo-chrome-btn" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
-              <button v-if="settings.menuItems.includes('settings')" class="mo-chrome-btn" data-testid="reader-settings" @click="settingsOpen = true">Aa</button>
-              <button class="mo-chrome-btn" data-testid="reader-speak" @click="toggleSpeech">{{ speaking ? '暂停' : '朗读' }}</button>
+              <button v-if="settings.menuItems.includes('settings') && readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-settings" @click="settingsOpen = true">Aa</button>
+              <button v-if="readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-speak" @click="toggleSpeech">{{ speaking ? '暂停' : '朗读' }}</button>
               <button v-if="settings.menuItems.includes('toc')" class="mo-chrome-btn" @click="tocOpen = true">目录</button>
               <button v-if="settings.menuItems.includes('next')" class="mo-chrome-btn" :disabled="chapterIndex >= chapters.length - 1" @click="openAdjacent(1)">下一章</button>
             </div>

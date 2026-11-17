@@ -132,6 +132,76 @@ export function analyzeToc(
   return chapters;
 }
 
+export type ContentKind = 'text' | 'images' | 'audio' | 'video'
+
+export interface ChapterContent {
+  kind: ContentKind
+  text: string
+  images: string[]
+  mediaUrl: string
+}
+
+/** 阅读 BookSourceType：0 文本、1 音频、2 图片、3 文件、4 视频。 */
+export function contentKindOf(source: BookSource): ContentKind {
+  const type = Number((source as any).bookSourceType ?? 0)
+  if (type === 1) return 'audio'
+  if (type === 2) return 'images'
+  if (type === 4) return 'video'
+  return 'text'
+}
+
+/**
+ * 按书源类型解析一章：文本返回纯文本；图片源从 ruleContent 里取出图片 URL 列表；
+ * 音频/视频源的章节 URL 本身就是媒体地址（阅读同样直接用 chapter.url 播放）。
+ */
+export function analyzeChapterContent(
+  content: unknown,
+  source: BookSource,
+  baseUrl: string,
+  chapterUrl = '',
+): ChapterContent {
+  const kind = contentKindOf(source)
+  if (kind === 'audio' || kind === 'video') {
+    return { kind, text: '', images: [], mediaUrl: chapterUrl || baseUrl }
+  }
+  if (kind === 'images') {
+    return { kind, text: '', images: extractImages(content, source, baseUrl), mediaUrl: '' }
+  }
+  return { kind: 'text', text: analyzeContent(content, source, baseUrl), images: [], mediaUrl: '' }
+}
+
+function extractImages(content: unknown, source: BookSource, baseUrl: string): string[] {
+  const rule = source.ruleContent?.content ?? ''
+  const images: string[] = []
+  const push = (raw: string) => {
+    const value = raw.trim()
+    if (!value) return
+    const candidates: string[] = []
+    if (/<img\b/i.test(value)) {
+      const re = /<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi
+      let match: RegExpExecArray | null
+      while ((match = re.exec(value))) candidates.push(match[1] ?? '')
+    } else {
+      for (const line of value.split('\n')) candidates.push(line)
+    }
+    for (const item of candidates) {
+      const url = toAbsolute(item.trim(), baseUrl)
+      if (!url || /^(data:|blob:)/i.test(url) || images.includes(url)) continue
+      images.push(url)
+    }
+  }
+  if (rule) {
+    try {
+      const values = new AnalyzeRule(content, { baseUrl, source }).getStringList(rule) ?? []
+      for (const value of values) push(typeof value === 'string' ? value : String(value))
+    } catch {
+      // 规则失败时退回整页图片兜底
+    }
+  }
+  if (!images.length && typeof content === 'string') push(content)
+  return images
+}
+
 export function analyzeContent(
   content: unknown,
   source: BookSource,
