@@ -18,6 +18,7 @@ import {
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
 import { openReaderStorage } from './storage.js'
 import { hasCachedChapter, readCachedChapter, writeCachedChapter } from './cache.js'
+import { buildEpub } from './epub-export.js'
 import {
   importLocalBuffer,
   localBookId,
@@ -326,7 +327,9 @@ export class ReaderService extends TypertRemoteService {
     const sourceUrl = String(book.origin || '')
     const toc = await (this as any).getToc({ tocUrl: String(book.tocUrl || book.bookUrl || ''), sourceUrl })
     const chapters = (toc?.chapters ?? []) as Array<{ url?: string; title?: string }>
+    const format = args?.format === 'epub' ? 'epub' : 'txt'
     const parts: string[] = []
+    const entries: Array<{ title: string; text: string }> = []
     for (const chapter of chapters) {
       if (!chapter.url || parts.length >= limit) continue
       const cached = await readCachedChapter(sourceUrl, chapter.url)
@@ -341,13 +344,29 @@ export class ReaderService extends TypertRemoteService {
         }
       }
       if (!text) continue
-      parts.push(`${chapter.title || `第${parts.length + 1}章`}\n\n${text}`)
+      const title = chapter.title || `第${parts.length + 1}章`
+      entries.push({ title, text })
+      parts.push(`${title}\n\n${text}`)
     }
     if (!parts.length) throw new Error('没有可导出的章节')
+    if (format === 'epub') {
+      const data = await buildEpub({
+        title: String(book.name || '未命名'),
+        author: String(book.author || ''),
+        chapters: entries,
+      })
+      return {
+        fileName: `${String(book.name || 'book')}.epub`,
+        chapters: entries.length,
+        format: 'epub',
+        dataBase64: data.toString('base64'),
+      }
+    }
     const body = `${String(book.name || '未命名')}\n作者：${String(book.author || '')}\n\n${parts.join('\n\n')}`
     return {
       fileName: `${String(book.name || 'book')}.txt`,
       chapters: parts.length,
+      format: 'txt',
       dataBase64: Buffer.from(body, 'utf8').toString('base64'),
     }
   }

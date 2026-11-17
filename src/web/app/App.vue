@@ -384,23 +384,24 @@ async function cacheBookChapters() {
   }
 }
 
-async function exportBookTxt() {
+async function exportBook(format: 'txt' | 'epub') {
   const book = currentBook.value as any
   if (!book?.id) return
   exportBusy.value = true
   try {
-    const result: any = await call('exportBook', { bookId: book.id, limit: 50 })
+    const result: any = await call('exportBook', { bookId: book.id, limit: 50, format })
     const binary = atob(result.dataBase64)
     const bytes = new Uint8Array(binary.length)
     for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
-    const blob = new Blob([bytes], { type: 'text/plain;charset=utf-8' })
+    const mime = format === 'epub' ? 'application/epub+zip' : 'text/plain;charset=utf-8'
+    const blob = new Blob([bytes], { type: mime })
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
-    link.download = result.fileName || 'book.txt'
+    link.download = result.fileName || `book.${format}`
     link.click()
     URL.revokeObjectURL(url)
-    status.value = `已导出 ${result.chapters} 章`
+    status.value = `已导出 ${result.chapters} 章（${format.toUpperCase()}）`
   } catch (error) {
     status.value = errorText(error)
   } finally {
@@ -1628,7 +1629,8 @@ onMounted(async () => {
               <span v-else class="mo-tag">已在书架</span>
               <button class="mo-btn" data-testid="simulate" @click="openSimulate">模拟阅读</button>
               <button class="mo-btn" :disabled="cacheBusy" data-testid="cache-book" @click="cacheBookChapters">{{ cacheBusy ? '缓存中…' : '缓存 20 章' }}</button>
-              <button class="mo-btn" :disabled="exportBusy" data-testid="export-book" @click="exportBookTxt">{{ exportBusy ? '导出中…' : '导出 TXT' }}</button>
+              <button class="mo-btn" :disabled="exportBusy" data-testid="export-book" @click="exportBook('txt')">{{ exportBusy ? '导出中…' : '导出 TXT' }}</button>
+              <button class="mo-btn" :disabled="exportBusy" data-testid="export-epub" @click="exportBook('epub')">{{ exportBusy ? '导出中…' : '导出 EPUB' }}</button>
               <span v-if="currentBook.simulateEnabled" class="mo-tag soft">模拟至 {{ simulatedChapterCount(currentBook) }} 章</span>
               <span v-if="progress" class="muted">
                 {{ progress.chapterTitle || `第 ${progress.chapterIndex + 1} 章` }}

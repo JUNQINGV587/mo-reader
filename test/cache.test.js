@@ -51,3 +51,35 @@ test('本地书导出 TXT 与缓存提示', async () => {
   assert.match(body, /起点正文内容/)
   assert.match(body, /风起正文内容/)
 })
+
+test('本地书导出 EPUB（含 mimetype/opf/章节正文）', async () => {
+  process.env.MO_READER_LOCAL_ROOT = await mkdtemp(path.join(tmpdir(), 'mo-local-'))
+  process.env.MO_READER_CACHE_ROOT = await mkdtemp(path.join(tmpdir(), 'mo-cache-'))
+
+  const JSZip = (await import('jszip')).default
+  const { ReaderService } = await import('../dist/server/service.js')
+  const books = fakeTable()
+  const service = Object.create(ReaderService.prototype)
+  service.db = { books, sources: fakeTable(), chapters: fakeTable(), settings: { get: () => ({}), set: async () => {} } }
+
+  const text = '第一章 起点\n\n起点正文内容。\n\n第二章 风起\n\n风起正文内容。'
+  const imported = await service.importLocalBook({
+    fileName: 'demo.txt',
+    dataBase64: Buffer.from(text, 'utf8').toString('base64'),
+  })
+
+  const exported = await service.exportBook({ bookId: imported.book.id, format: 'epub' })
+  assert.equal(exported.fileName, 'demo.epub')
+  assert.equal(exported.format, 'epub')
+  assert.ok(exported.chapters >= 2)
+  const buffer = Buffer.from(exported.dataBase64, 'base64')
+  assert.equal(buffer.subarray(0, 2).toString(), 'PK')
+
+  const zip = await JSZip.loadAsync(buffer)
+  assert.equal(await zip.file('mimetype').async('string'), 'application/epub+zip')
+  assert.ok(zip.file('META-INF/container.xml'))
+  const opf = await zip.file('OEBPS/content.opf').async('string')
+  assert.match(opf, /demo/)
+  const chapter = await zip.file('OEBPS/chapter1.xhtml').async('string')
+  assert.match(chapter, /起点正文内容/)
+})
