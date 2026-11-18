@@ -7,7 +7,9 @@ import iconv from 'iconv-lite'
 import JSZip from 'jszip'
 import { decodeText, parseTxt } from '../dist/core/import/txt.js'
 import { parseEpub } from '../dist/core/import/epub.js'
+import { parseMobi } from '../dist/core/import/mobi.js'
 import { parsePdf } from '../dist/core/import/pdf.js'
+import { createTestMobi } from './fixtures/mobi.js'
 
 const LOCAL_ROOT = await mkdtemp(join(tmpdir(), 'mo-reader-local-'))
 process.env.MO_READER_LOCAL_ROOT = LOCAL_ROOT
@@ -196,6 +198,73 @@ test('PDF 解析与本地导入 Remote', async () => {
   const removed = await service.removeBooks({ ids: [imported.book.id] })
   assert.equal(removed.deleted, 1)
   await rm(join(LOCAL_ROOT, imported.book.id), { recursive: true, force: true })
+})
+
+test('MOBI 解析与本地导入 Remote', async () => {
+  const mobi = Buffer.from(
+    createTestMobi({
+      title: '合成 MOBI 样本',
+      author: '墨读测试',
+      description: '一本用于验收的小书',
+    }),
+  )
+  const original = Buffer.from(mobi)
+  const parsed = await parseMobi(mobi, 'fallback.mobi')
+  assert.equal(parsed.name, '合成 MOBI 样本')
+  assert.equal(parsed.author, '墨读测试')
+  assert.equal(parsed.intro, '一本用于验收的小书')
+  assert.equal(parsed.chapters.length, 2)
+  assert.equal(parsed.chapters[0].title, '第一章')
+  assert.equal(parsed.chapters[0].content, '第一章\n\n第一段正文。')
+  assert.equal(parsed.chapters[1].title, '第二章')
+  assert.equal(parsed.chapters[1].content, '第二章\n\n第二段正文。')
+  assert.deepEqual(Buffer.from(mobi), original)
+
+  const { service } = await makeService()
+  const imported = await service.importLocalBook({
+    fileName: '合成.mobi',
+    dataBase64: mobi.toString('base64'),
+  })
+  assert.equal(imported.book.name, '合成 MOBI 样本')
+  assert.equal(imported.book.author, '墨读测试')
+  assert.equal(imported.chapters, 2)
+
+  const toc = await service.getToc({ tocUrl: imported.book.bookUrl })
+  assert.equal(toc.chapters[0].title, '第一章')
+  const content = await service.getContent({ chapterUrl: toc.chapters[1].url })
+  assert.equal(content.content, '第二章\n\n第二段正文。')
+
+  const removed = await service.removeBooks({ ids: [imported.book.id] })
+  assert.equal(removed.deleted, 1)
+  await rm(join(LOCAL_ROOT, imported.book.id), { recursive: true, force: true })
+})
+
+test('MOBI 正文清理软连字符与不换行空格', async () => {
+  const mobi = Buffer.from(
+    createTestMobi({
+      sections: ['<html><body><h1>特殊字符</h1><p>soft\u00adhyphen\u00a0ok</p></body></html>'],
+    }),
+  )
+  const parsed = await parseMobi(mobi, 'special.mobi')
+  assert.equal(parsed.chapters[0].content, '特殊字符\n\nsofthyphen ok')
+})
+
+test('MOBI 与未知格式的失败导入不写书架', async () => {
+  const { service, books } = await makeService()
+  await assert.rejects(
+    service.importLocalBook({ fileName: 'fake.mobi', dataBase64: Buffer.from('not mobi').toString('base64') }),
+    /不是有效的 MOBI 文件/,
+  )
+  const blank = createTestMobi({ sections: ['<html><body><p>  </p></body></html>'] })
+  await assert.rejects(
+    service.importLocalBook({ fileName: 'blank.mobi', dataBase64: Buffer.from(blank).toString('base64') }),
+    /MOBI 中没有可读取的正文/,
+  )
+  await assert.rejects(
+    service.importLocalBook({ fileName: 'notes.md', dataBase64: Buffer.from('# notes').toString('base64') }),
+    /暂不支持的本地格式：\.md/,
+  )
+  assert.equal(books.map.size, 0)
 })
 
 test('PDF 与未知格式的失败导入不写书架', async () => {
