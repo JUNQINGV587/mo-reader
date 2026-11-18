@@ -1473,7 +1473,7 @@ onMounted(async () => {
             <input
               ref="localInput"
               type="file"
-              accept=".txt,.epub"
+              accept=".txt,.epub,.pdf"
               style="display: none"
               @change="importLocalFile"
             />

@@ -3,6 +3,7 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { extname, join } from 'node:path'
 import { parseEpub } from '../core/import/epub.js'
+import { parsePdf } from '../core/import/pdf.js'
 import { parseTxt, type ImportedBook, type ImportedChapter } from '../core/import/txt.js'
 
 export interface LocalBookRecord {
@@ -26,8 +27,11 @@ export async function importLocalBuffer(
   buffer: Uint8Array,
 ): Promise<{ book: Record<string, unknown>; chapters: ImportedChapter[] }> {
   const ext = extname(fileName).toLowerCase()
-  const parsed: ImportedBook =
-    ext === '.epub' ? await parseEpub(buffer, fileName) : parseTxt(buffer, fileName)
+  let parsed: ImportedBook
+  if (ext === '.txt') parsed = parseTxt(buffer, fileName)
+  else if (ext === '.epub') parsed = await parseEpub(buffer, fileName)
+  else if (ext === '.pdf') parsed = await parsePdf(buffer, fileName)
+  else throw new Error(`暂不支持的本地格式：${ext || '无扩展名'}（支持 TXT、EPUB、PDF）`)
   if (parsed.chapters.length === 0) throw new Error('没有解析到章节')
 
   const id = createHash('sha1').update(Buffer.from(buffer)).digest('hex').slice(0, 24)

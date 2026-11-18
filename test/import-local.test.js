@@ -7,6 +7,7 @@ import iconv from 'iconv-lite'
 import JSZip from 'jszip'
 import { decodeText, parseTxt } from '../dist/core/import/txt.js'
 import { parseEpub } from '../dist/core/import/epub.js'
+import { parsePdf } from '../dist/core/import/pdf.js'
 
 const LOCAL_ROOT = await mkdtemp(join(tmpdir(), 'mo-reader-local-'))
 process.env.MO_READER_LOCAL_ROOT = LOCAL_ROOT
@@ -76,6 +77,40 @@ async function makeEpub() {
   return zip.generateAsync({ type: 'nodebuffer' })
 }
 
+function pdfLiteral(value) {
+  return value.replace(/([\\()])/g, '\\$1')
+}
+
+function makePdf(pages, { title = 'PDF Fixture', author = 'Author A' } = {}) {
+  const objects = []
+  objects[1] = '<< /Type /Catalog /Pages 2 0 R >>'
+  objects[2] = `<< /Type /Pages /Count ${pages.length} /Kids [${pages.map((_, index) => `${4 + index * 2} 0 R`).join(' ')}] >>`
+  objects[3] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+  pages.forEach((text, index) => {
+    const pageObject = 4 + index * 2
+    const contentObject = pageObject + 1
+    const stream = text ? `BT /F1 12 Tf 72 720 Td (${pdfLiteral(text)}) Tj ET` : ''
+    objects[pageObject] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentObject} 0 R >>`
+    objects[contentObject] = `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`
+  })
+  const infoObject = 4 + pages.length * 2
+  objects[infoObject] = `<< /Title (${pdfLiteral(title)}) /Author (${pdfLiteral(author)}) /Subject (Local import test) >>`
+
+  let pdf = '%PDF-1.4\n'
+  const offsets = [0]
+  for (let index = 1; index <= infoObject; index += 1) {
+    offsets[index] = Buffer.byteLength(pdf)
+    pdf += `${index} 0 obj\n${objects[index]}\nendobj\n`
+  }
+  const xref = Buffer.byteLength(pdf)
+  pdf += `xref\n0 ${infoObject + 1}\n0000000000 65535 f \n`
+  for (let index = 1; index <= infoObject; index += 1) {
+    pdf += `${String(offsets[index]).padStart(10, '0')} 00000 n \n`
+  }
+  pdf += `trailer\n<< /Size ${infoObject + 1} /Root 1 0 R /Info ${infoObject} 0 R >>\nstartxref\n${xref}\n%%EOF\n`
+  return Buffer.from(pdf, 'ascii')
+}
+
 test('TXT 解码与章节切分', () => {
   const chaptered = parseTxt(Buffer.from(TXT, 'utf8'), '测试书.txt')
   assert.equal(chaptered.name, '测试书')
@@ -129,6 +164,55 @@ test('EPUB 解析与本地导入 Remote', async () => {
   const removed = await service.removeBooks({ ids: [imported.book.id] })
   assert.equal(removed.deleted, 1)
   await rm(join(LOCAL_ROOT, imported.book.id), { recursive: true, force: true })
+})
+
+test('PDF 解析与本地导入 Remote', async () => {
+  const pdf = makePdf(['First page text.', 'Second page text.'])
+  const original = Buffer.from(pdf)
+  const parsed = await parsePdf(pdf, 'fallback.pdf')
+  assert.equal(parsed.name, 'PDF Fixture')
+  assert.equal(parsed.author, 'Author A')
+  assert.equal(parsed.intro, 'Local import test')
+  assert.deepEqual(parsed.chapters, [
+    { title: '第 1 页', content: 'First page text.' },
+    { title: '第 2 页', content: 'Second page text.' },
+  ])
+  assert.deepEqual(Buffer.from(pdf), original)
+
+  const { service } = await makeService()
+  const imported = await service.importLocalBook({
+    fileName: '测试.pdf',
+    dataBase64: pdf.toString('base64'),
+  })
+  assert.equal(imported.book.name, 'PDF Fixture')
+  assert.equal(imported.book.author, 'Author A')
+  assert.equal(imported.chapters, 2)
+
+  const toc = await service.getToc({ tocUrl: imported.book.bookUrl })
+  assert.equal(toc.chapters[0].title, '第 1 页')
+  const content = await service.getContent({ chapterUrl: toc.chapters[1].url })
+  assert.equal(content.content, 'Second page text.')
+
+  const removed = await service.removeBooks({ ids: [imported.book.id] })
+  assert.equal(removed.deleted, 1)
+  await rm(join(LOCAL_ROOT, imported.book.id), { recursive: true, force: true })
+})
+
+test('PDF 与未知格式的失败导入不写书架', async () => {
+  const { service, books } = await makeService()
+  await assert.rejects(
+    service.importLocalBook({ fileName: 'fake.pdf', dataBase64: Buffer.from('not a pdf').toString('base64') }),
+    /不是有效的 PDF 文件/,
+  )
+  await assert.rejects(
+    service.importLocalBook({ fileName: 'blank.pdf', dataBase64: makePdf(['']).toString('base64') }),
+    /暂不支持纯扫描件/,
+  )
+  await assert.rejects(
+    service.importLocalBook({ fileName: 'notes.md', dataBase64: Buffer.from('# notes').toString('base64') }),
+    /暂不支持的本地格式：\.md/,
+  )
+  assert.equal(books.map.size, 0)
 })
 
 test.after(async () => {
