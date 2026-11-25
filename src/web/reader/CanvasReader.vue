@@ -12,6 +12,7 @@ const props = withDefaults(
     title?: string
     bookName?: string
     fontSize?: number
+    fontFamily?: string
     lineHeight?: number
     paragraphSpacing?: number
     indent?: number
@@ -33,6 +34,7 @@ const props = withDefaults(
     title: '',
     bookName: '',
     fontSize: 22,
+    fontFamily: '',
     lineHeight: 1.9,
     paragraphSpacing: 6,
     indent: 2,
@@ -82,8 +84,10 @@ const palette = computed(() => {
   return { bg: '#f6f1e7', text: '#2b2a26', muted: '#7c7567', line: 'rgba(43,42,38,0.14)' }
 })
 
+const fontStack = computed(() => props.fontFamily ? `'${props.fontFamily.replace(/'/g, '')}', ${SERIF}` : SERIF)
+
 function measureFont() {
-  return `${props.fontSize}px ${SERIF}`
+  return `${props.fontSize}px ${fontStack.value}`
 }
 
 function lineHeightPx() {
@@ -163,7 +167,7 @@ function render() {
   // 页眉
   if (headerText) {
     ctx.fillStyle = muted
-    ctx.font = `${Math.max(11, props.fontSize - 9)}px ${SERIF}`
+    ctx.font = `${Math.max(11, props.fontSize - 9)}px ${fontStack.value}`
     ctx.textAlign = 'center'
     ctx.textBaseline = 'top'
     ctx.fillText(headerText, width / 2, 18, width - pad.left - pad.right)
@@ -236,7 +240,7 @@ function render() {
   // 页脚
   if (footerText) {
     ctx.fillStyle = muted
-    ctx.font = `${Math.max(10, props.fontSize - 10)}px ${SERIF}`
+    ctx.font = `${Math.max(10, props.fontSize - 10)}px ${fontStack.value}`
     ctx.textAlign = 'right'
     ctx.textBaseline = 'alphabetic'
     ctx.fillText(footerText, width - pad.right, height - 20 - pad.bottom)
@@ -423,6 +427,7 @@ watch(
     props.title,
     props.bookName,
     props.fontSize,
+    props.fontFamily,
     props.lineHeight,
     props.paragraphSpacing,
     props.indent,

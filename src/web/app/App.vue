@@ -136,6 +136,7 @@ async function loadBattery() {
 }
 const settings = ref({
   fontSize: 22,
+  fontId: '',
   lineSpacing: 1.9,
   paragraphSpacing: 6,
   indent: 2,
@@ -162,6 +163,10 @@ const tocFilter = ref('')
 const tocOpen = ref(false)
 const chrome = ref(true)
 const settingsOpen = ref(false)
+const customFonts = ref<Array<{ id: string; name: string; fileName: string; size: number }>>([])
+const activeFontFamily = ref('')
+const fontMessage = ref('')
+const loadedFonts = new Map<string, FontFace>()
 const bookmarksOpen = ref(false)
 const bookmarks = ref<any[]>([])
 const notesOpen = ref(false)
@@ -310,6 +315,13 @@ async function refresh() {
       if (stored?.settings) settings.value = { ...settings.value, ...stored.settings }
     } catch {
       // 设置读取失败不阻塞主流程
+    }
+    try {
+      const fontResult = await call('listFonts')
+      customFonts.value = fontResult?.fonts ?? []
+      if (settings.value.fontId) await applyCustomFont(settings.value.fontId)
+    } catch (error) {
+      fontMessage.value = `字体加载失败：${errorText(error)}`
     }
     status.value = `书源 ${sources.value.length} 个（启用 ${enabledCount.value}） · 书架 ${shelfBooks.value.length} 本`
   } catch (error) {
@@ -760,6 +772,98 @@ function toBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.subarray(i, i + chunk))
   }
   return btoa(binary)
+}
+
+function fromBase64(value: string): Uint8Array {
+  const binary = atob(value)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+function fontFaceName(id: string): string {
+  return `MoReaderFont_${id.replace(/[^a-zA-Z0-9]/g, '')}`
+}
+
+async function applyCustomFont(id: string) {
+  if (!id) {
+    activeFontFamily.value = ''
+    return
+  }
+  const cached = loadedFonts.get(id)
+  if (cached) {
+    activeFontFamily.value = cached.family
+    return
+  }
+  try {
+    const result = await call('getFont', { id })
+    const bytes = fromBase64(result.dataBase64)
+    const face = new FontFace(fontFaceName(id), bytes.buffer as ArrayBuffer)
+    await face.load()
+    document.fonts.add(face)
+    loadedFonts.set(id, face)
+    activeFontFamily.value = face.family
+    fontMessage.value = ''
+  } catch (error) {
+    activeFontFamily.value = ''
+    settings.value.fontId = ''
+    fontMessage.value = `字体加载失败，已回退默认字体：${errorText(error)}`
+  }
+}
+
+async function selectFont(event: Event) {
+  const id = (event.target as HTMLSelectElement).value
+  settings.value.fontId = id
+  await applyCustomFont(id)
+  await persistSettings()
+}
+
+async function uploadFontFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  if (file.size > 20 * 1024 * 1024) {
+    fontMessage.value = '字体文件不能超过 20MB'
+    return
+  }
+  busy.value = true
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    const result = await call('uploadFont', { fileName: file.name, dataBase64: toBase64(bytes) })
+    const list = await call('listFonts')
+    customFonts.value = list?.fonts ?? []
+    settings.value.fontId = result.font.id
+    await applyCustomFont(settings.value.fontId)
+    await persistSettings()
+    fontMessage.value = result.created ? `已上传并应用「${result.font.name}」` : `字体已存在，直接应用「${result.font.name}」`
+  } catch (error) {
+    fontMessage.value = `字体上传失败：${errorText(error)}`
+  } finally {
+    busy.value = false
+  }
+}
+
+async function deleteFont(font: { id: string; name: string }) {
+  busy.value = true
+  try {
+    await call('deleteFont', { id: font.id })
+    const loaded = loadedFonts.get(font.id)
+    if (loaded) document.fonts.delete(loaded)
+    loadedFonts.delete(font.id)
+    if (settings.value.fontId === font.id) {
+      settings.value.fontId = ''
+      activeFontFamily.value = ''
+      await persistSettings()
+    }
+    const list = await call('listFonts')
+    customFonts.value = list?.fonts ?? []
+    fontMessage.value = `已删除「${font.name}」`
+  } catch (error) {
+    fontMessage.value = `字体删除失败：${errorText(error)}`
+  } finally {
+    busy.value = false
+  }
 }
 
 async function importLocalFile(event: Event) {
@@ -1325,6 +1429,7 @@ async function persistSettings() {
     await call('saveSettings', {
       settings: {
         fontSize: settings.value.fontSize,
+        fontId: settings.value.fontId,
         lineSpacing: settings.value.lineSpacing,
         paragraphSpacing: settings.value.paragraphSpacing,
         indent: settings.value.indent,
@@ -1857,6 +1962,7 @@ onMounted(async () => {
             :title="readerTitle"
             :book-name="currentBook?.name || ''"
             :font-size="settings.fontSize"
+            :font-family="activeFontFamily"
             :line-height="settings.lineSpacing"
             :paragraph-spacing="settings.paragraphSpacing"
             :indent="settings.indent"
@@ -1944,6 +2050,25 @@ onMounted(async () => {
                 <input v-model.number="settings.fontSize" type="range" min="14" max="34" step="1" @change="persistSettings" />
                 <b>{{ settings.fontSize }}</b>
               </label>
+              <div class="mo-theme-row">
+                <span>字体</span>
+                <select class="mo-select" data-testid="font-select" :value="settings.fontId" @change="selectFont">
+                  <option value="">默认宋体</option>
+                  <option v-for="font in customFonts" :key="font.id" :value="font.id">{{ font.name }}</option>
+                </select>
+                <label class="mo-font-upload" data-testid="font-upload">
+                  上传
+                  <input type="file" accept=".ttf,.otf,.woff,.woff2" @change="uploadFontFile" />
+                </label>
+              </div>
+              <div v-if="customFonts.length" class="mo-font-list" data-testid="font-list">
+                <div v-for="font in customFonts" :key="font.id" class="mo-font-item">
+                  <span>{{ font.name }}</span>
+                  <small>{{ (font.size / 1024 / 1024).toFixed(1) }} MB</small>
+                  <button class="mo-icon-btn" data-testid="font-delete" title="删除字体" @click="deleteFont(font)">✕</button>
+                </div>
+              </div>
+              <p v-if="fontMessage" class="mo-font-status" data-testid="font-status">{{ fontMessage }}</p>
               <label class="mo-slider">
                 <span>行距</span>
                 <input v-model.number="settings.lineSpacing" type="range" min="1.2" max="2.6" step="0.1" @change="persistSettings" />
@@ -3070,6 +3195,43 @@ textarea {
   border-color: var(--mo-accent);
   background: var(--mo-accent);
   color: #f6f2e6;
+}
+.mo-theme-row .mo-select {
+  min-width: 130px;
+}
+.mo-font-upload {
+  padding: 6px 14px;
+  border: 1px solid var(--mo-line);
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.mo-font-upload input {
+  display: none;
+}
+.mo-font-list {
+  margin: 8px 0 0 44px;
+  border-top: 1px solid var(--mo-line);
+}
+.mo-font-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--mo-line);
+  font-size: 13px;
+}
+.mo-font-item span {
+  flex: 1;
+  color: var(--mo-ink);
+}
+.mo-font-item small {
+  color: var(--mo-ink-2);
+}
+.mo-font-status {
+  margin: 8px 0 0 44px;
+  font-size: 12px;
+  color: var(--mo-ink-2);
 }
 .mo-replace-rule {
   display: flex;

@@ -17,6 +17,7 @@ export const ReaderDomain = defineDomain({
       .object({
         theme: z.enum(['light', 'sepia', 'dark', 'system']).default('light'),
         fontSize: z.number().int().min(12).max(48).default(24),
+        fontId: z.string().max(80).default(''),
         lineSpacing: z.number().min(1).max(3).default(1.8),
         paragraphSpacing: z.number().int().min(0).max(40).default(6),
         indent: z.number().int().min(0).max(2).default(2),
@@ -53,6 +54,7 @@ export const ReaderDomain = defineDomain({
     initial: {
       theme: 'light',
       fontSize: 22,
+      fontId: '',
       lineSpacing: 1.9,
       paragraphSpacing: 6,
       indent: 2,

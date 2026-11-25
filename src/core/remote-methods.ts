@@ -33,4 +33,8 @@ export const REMOTE_METHODS = Object.freeze([
   'getRssArticles',
   'getSettings',
   'saveSettings',
+  'listFonts',
+  'uploadFont',
+  'getFont',
+  'deleteFont',
 ])

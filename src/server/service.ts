@@ -19,6 +19,7 @@ import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsCon
 import { openReaderStorage } from './storage.js'
 import { hasCachedChapter, readCachedChapter, writeCachedChapter } from './cache.js'
 import { buildEpub } from './epub-export.js'
+import { listCustomFonts, readCustomFont, removeCustomFont, saveCustomFont } from './fonts.js'
 import {
   importLocalBuffer,
   localBookId,
@@ -686,9 +687,44 @@ export class ReaderService extends TypertRemoteService {
     const patch = args?.settings
     if (!patch || typeof patch !== 'object') throw new Error('缺少参数 settings')
     const current = this.requireDb().settings.get()
+    const changedFont = typeof (patch as any).fontId === 'string' && (patch as any).fontId !== current.fontId
+    if (changedFont && (patch as any).fontId) {
+      const fonts = await listCustomFonts()
+      if (!fonts.some((font) => font.id === (patch as any).fontId)) throw new Error('字体不存在')
+    }
     const next = { ...current, ...(patch as Record<string, unknown>) }
     await this.requireDb().settings.set(next)
     return { settings: next }
+  }
+
+  async listFonts() {
+    return { fonts: await listCustomFonts() }
+  }
+
+  async uploadFont(args: Args) {
+    const fileName = stringArg(args, 'fileName')
+    const data = stringArg(args, 'dataBase64')
+    if (data.length > 28 * 1024 * 1024) throw new Error('字体文件不能超过 20MB')
+    const buffer = Buffer.from(data, 'base64')
+    if (buffer.length === 0) throw new Error('字体文件为空')
+    const result = await saveCustomFont(fileName, buffer)
+    return result
+  }
+
+  async getFont(args: Args) {
+    const id = stringArg(args, 'id')
+    const { font, data, mime } = await readCustomFont(id)
+    return { font, mime, dataBase64: data.toString('base64') }
+  }
+
+  async deleteFont(args: Args) {
+    const id = stringArg(args, 'id')
+    const result = await removeCustomFont(id)
+    const current = this.requireDb().settings.get()
+    if (result.deleted && current.fontId === id) {
+      await this.requireDb().settings.set({ ...current, fontId: '' })
+    }
+    return result
   }
 
   private requireDb(): any {
