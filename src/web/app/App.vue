@@ -27,6 +27,7 @@ import {
   type CustomTheme,
   type ThemeColors,
 } from '../../core/reader/theme'
+import { exportFullShelf, exportLegadoShelf } from '../../core/reader/shelf-transfer'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
@@ -88,6 +89,8 @@ const shelfGroupInput = ref('')
 const shelfSelecting = ref(false)
 const selectedBookIds = ref<Set<string>>(new Set())
 const localInput = ref<HTMLInputElement | null>(null)
+const shelfInput = ref<HTMLInputElement | null>(null)
+const shelfMessage = ref('')
 let longPressTimer: ReturnType<typeof setTimeout> | undefined
 let longPressFired = false
 
@@ -368,6 +371,8 @@ function bookStatus(book: any) {
 }
 
 function shelfProgress(book: any) {
+  if (book?.localMissing) return { percent: 0, text: '本地文件缺失' }
+  if (book?.metadataOnly) return { percent: 0, text: '仅书目' }
   const record = book?.progress
   if (!record) return null
   const simulated = Boolean(book?.simulateEnabled)
@@ -1046,6 +1051,44 @@ async function importLocalFile(event: Event) {
   }
 }
 
+async function importShelfFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  busy.value = true
+  shelfMessage.value = ''
+  try {
+    const result = await call('importBooks', { payload: await file.text() })
+    await refresh()
+    const extras = [
+      result.skipped ? `跳过重复 ${result.skipped} 本` : '',
+      result.localMissing ? `${result.localMissing} 本本地文件缺失` : '',
+    ].filter(Boolean)
+    shelfMessage.value =
+      `导入 ${result.total} 本：新增 ${result.added} 本` + (extras.length ? `，${extras.join('，')}` : '')
+  } catch (error) {
+    shelfMessage.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+function exportShelf(kind: 'legado' | 'full') {
+  if (!shelfBooks.value.length) {
+    shelfMessage.value = '书架还是空的，没有可导出的书目'
+    return
+  }
+  const suffix = new Date().toISOString().slice(0, 10)
+  if (kind === 'legado') {
+    downloadJson(`mo-reader-books-legado-${suffix}.json`, exportLegadoShelf(shelfBooks.value))
+    shelfMessage.value = `已导出 Legado 兼容版（${shelfBooks.value.length} 本，仅书目与进度）`
+  } else {
+    downloadJson(`mo-reader-books-${suffix}.json`, exportFullShelf(shelfBooks.value))
+    shelfMessage.value = `已导出墨读全量版（${shelfBooks.value.length} 本，仅书目与进度）`
+  }
+}
+
 function startShelfSelect() {
   shelfSelecting.value = true
   selectedBookIds.value = new Set()
@@ -1061,8 +1104,19 @@ function onShelfBookClick(book: any) {
     longPressFired = false
     return
   }
-  if (shelfSelecting.value) toggleShelfSelect(book)
-  else void openShelfBook(book)
+  if (shelfSelecting.value) {
+    toggleShelfSelect(book)
+    return
+  }
+  if (book?.localMissing) {
+    status.value = '本地文件缺失，仅保留书目信息'
+    return
+  }
+  if (book?.metadataOnly) {
+    status.value = '仅导入了书目信息，不能直接阅读'
+    return
+  }
+  void openShelfBook(book)
 }
 
 async function removeSelectedBooks() {
@@ -1761,6 +1815,30 @@ onMounted(async () => {
               <button class="mo-btn" @click="exitShelfSelect">取消</button>
             </template>
           </div>
+        </div>
+
+        <div class="mo-shelf-transfer">
+          <span class="muted">书架迁移</span>
+          <input
+            ref="shelfInput"
+            type="file"
+            accept=".json,application/json"
+            style="display: none"
+            data-testid="shelf-import-input"
+            @change="importShelfFile"
+          />
+          <button class="mo-btn" :disabled="busy" data-testid="shelf-import-meta" @click="shelfInput?.click()">
+            导入书目
+          </button>
+          <button class="mo-btn" :disabled="busy" data-testid="shelf-export-legado" @click="exportShelf('legado')">
+            导出兼容版
+          </button>
+          <button class="mo-btn" :disabled="busy" data-testid="shelf-export-full" @click="exportShelf('full')">
+            导出全量版
+          </button>
+          <span v-if="shelfMessage" class="muted mo-shelf-message" data-testid="shelf-transfer-status">
+            {{ shelfMessage }}
+          </span>
         </div>
 
         <div v-if="shelfGroups.length" class="mo-shelf-groups">
@@ -2641,6 +2719,22 @@ onMounted(async () => {
   align-items: center;
   gap: 8px;
   margin-left: auto;
+}
+.mo-shelf-transfer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  margin: 10px 0 2px;
+  border: 1px solid var(--mo-line);
+  border-radius: 10px;
+  background: var(--mo-paper-2);
+  font-size: 12px;
+}
+.mo-shelf-message {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .mo-cover-card.selected .mo-cover {
   outline: 2px solid var(--mo-accent);

@@ -21,6 +21,7 @@ import { hasCachedChapter, readCachedChapter, writeCachedChapter } from './cache
 import { buildEpub } from './epub-export.js'
 import { listCustomFonts, readCustomFont, removeCustomFont, saveCustomFont } from './fonts.js'
 import { isKnownTheme, normalizeCustomThemes } from '../core/reader/theme.js'
+import { parseShelfImport, shelfDedupKeys } from '../core/reader/shelf-transfer.js'
 import {
   importLocalBuffer,
   localBookId,
@@ -461,6 +462,90 @@ export class ReaderService extends TypertRemoteService {
     const record = { ...source, id, createdAt: existing?.createdAt ?? now, updatedAt: now }
     await this.requireDb().books.put(id, record)
     return { book: record }
+  }
+
+  async importBooks(args: Args) {
+    const payload = stringArg(args, 'payload')
+    // 先完成整批解析和校验，再落任何一本书。
+    const parsed = parseShelfImport(payload)
+    const existingKeys = new Set<string>()
+    for (const [, value] of this.requireDb().books.entries()) {
+      const record = value as Record<string, unknown>
+      const identity = {
+        name: typeof record.name === 'string' ? record.name : '',
+        author: typeof record.author === 'string' ? record.author : '',
+        origin: typeof record.origin === 'string' ? record.origin : '',
+        bookUrl: typeof record.bookUrl === 'string' ? record.bookUrl : '',
+      }
+      for (const key of shelfDedupKeys(identity)) existingKeys.add(key)
+    }
+
+    const now = new Date().toISOString()
+    const pending: Array<{
+      record: Record<string, unknown>
+      progress: Record<string, unknown> | null
+    }> = []
+    let skipped = parsed.duplicates
+
+    for (const book of parsed.books) {
+      const keys = shelfDedupKeys(book)
+      if (keys.some((key) => existingKeys.has(key))) {
+        skipped += 1
+        continue
+      }
+
+      const localId = book.origin === 'local' ? localBookId(book.bookUrl) : ''
+      let localMissing = false
+      if (book.origin === 'local') {
+        const local = localId ? await readLocalBook(localId) : null
+        localMissing = !local
+      }
+      const metadataOnly = book.metadataOnly || localMissing
+      const id =
+        localId ||
+        createHash('sha1')
+          .update(`${book.origin}|${book.bookUrl}`)
+          .digest('hex')
+
+      const { progress, ...meta } = book
+      const record: Record<string, unknown> = {
+        ...meta,
+        id,
+        metadataOnly,
+        localMissing,
+        createdAt: meta.createdAt || now,
+        updatedAt: now,
+      }
+      const pendingProgress =
+        progress && (progress.chapterIndex > 0 || progress.chapterTitle || progress.chapterUrl || progress.position > 0)
+          ? {
+              id,
+              bookId: id,
+              chapterIndex: progress.chapterIndex,
+              chapterTitle: progress.chapterTitle,
+              chapterUrl: progress.chapterUrl,
+              position: progress.position,
+              updatedAt: progress.updatedAt || now,
+            }
+          : null
+
+      pending.push({ record, progress: pendingProgress })
+      for (const key of keys) existingKeys.add(key)
+      existingKeys.add(`url:${book.origin}|${book.bookUrl}`)
+    }
+
+    for (const item of pending) {
+      await this.requireDb().books.put(String(item.record.id), item.record)
+      if (item.progress) await this.requireDb().readRecords.put(String(item.progress.id), item.progress)
+    }
+
+    return {
+      total: parsed.books.length + parsed.duplicates,
+      added: pending.length,
+      skipped,
+      duplicates: parsed.duplicates,
+      localMissing: pending.filter((item) => item.record.localMissing === true).length,
+    }
   }
 
   async updateBook(args: Args) {
