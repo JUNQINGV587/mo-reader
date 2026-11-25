@@ -15,6 +15,18 @@ import {
   TIP_MODES,
   tapActionLabel,
 } from '../../core/reader/reader-config'
+import {
+  BUILTIN_THEMES,
+  createCustomTheme,
+  exportFullThemes,
+  exportLegadoThemes,
+  isBuiltinThemeName,
+  parseThemeImport,
+  resolveThemeColors,
+  toHexColor,
+  type CustomTheme,
+  type ThemeColors,
+} from '../../core/reader/theme'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
@@ -141,7 +153,8 @@ const settings = ref({
   paragraphSpacing: 6,
   indent: 2,
   padding: { left: 22, top: 5, right: 22, bottom: 4 },
-  theme: 'light' as Theme | 'system',
+  theme: 'light' as string,
+  customThemes: [] as CustomTheme[],
   pageAnimation: 'cover' as Turn,
   headerMode: 1,
   footerMode: 6,
@@ -166,6 +179,15 @@ const settingsOpen = ref(false)
 const customFonts = ref<Array<{ id: string; name: string; fileName: string; size: number }>>([])
 const activeFontFamily = ref('')
 const fontMessage = ref('')
+const themeMessage = ref('')
+const themeDraft = ref<{
+  id: string
+  name: string
+  bg: string
+  text: string
+  muted: string
+  line: string
+} | null>(null)
 const loadedFonts = new Map<string, FontFace>()
 const bookmarksOpen = ref(false)
 const bookmarks = ref<any[]>([])
@@ -201,8 +223,15 @@ const underlineQuotes = computed(() =>
     .map((item) => String(item.quote ?? ''))
     .filter(Boolean),
 )
-const theme = computed<Theme>(() =>
-  settings.value.theme === 'system' ? 'light' : (settings.value.theme as Theme),
+const theme = computed<Theme>(() => {
+  const value = settings.value.theme === 'system' ? 'light' : settings.value.theme
+  return isBuiltinThemeName(value) ? value : 'light'
+})
+const activeThemeColors = computed<ThemeColors>(() =>
+  resolveThemeColors(settings.value.theme, settings.value.customThemes),
+)
+const activeCustomTheme = computed<CustomTheme | undefined>(() =>
+  settings.value.customThemes.find((item) => item.id === settings.value.theme),
 )
 function hostOf(url?: string) {
   try {
@@ -866,6 +895,135 @@ async function deleteFont(font: { id: string; name: string }) {
   }
 }
 
+async function commitThemeState(themeId: string, themes: CustomTheme[], message: string) {
+  try {
+    await call('saveSettings', { settings: { theme: themeId, customThemes: themes } })
+    settings.value.theme = themeId
+    settings.value.customThemes = themes
+    themeMessage.value = message
+    return true
+  } catch (error) {
+    themeMessage.value = `主题保存失败：${errorText(error)}`
+    return false
+  }
+}
+
+async function selectTheme(themeId: string) {
+  if (settings.value.theme === themeId) return
+  const name = isBuiltinThemeName(themeId)
+    ? BUILTIN_THEMES[themeId].name
+    : settings.value.customThemes.find((item) => item.id === themeId)?.name ?? '主题'
+  await commitThemeState(themeId, settings.value.customThemes, `已应用「${name}」`)
+}
+
+function startThemeCreate() {
+  const colors = activeThemeColors.value
+  themeDraft.value = {
+    id: '',
+    name: '我的主题',
+    bg: toHexColor(colors.bg, '#f6f1e7'),
+    text: toHexColor(colors.text, '#2b2a26'),
+    muted: toHexColor(colors.muted, '#7c7567'),
+    line: toHexColor(colors.line, '#d6cec0'),
+  }
+  themeMessage.value = ''
+}
+
+function startThemeEdit() {
+  if (!activeCustomTheme.value) return
+  const theme = activeCustomTheme.value
+  themeDraft.value = {
+    id: theme.id,
+    name: theme.name,
+    bg: toHexColor(theme.bg, '#f6f1e7'),
+    text: toHexColor(theme.text, '#2b2a26'),
+    muted: toHexColor(theme.muted, '#7c7567'),
+    line: toHexColor(theme.line, '#d6cec0'),
+  }
+  themeMessage.value = ''
+}
+
+async function saveThemeDraft() {
+  if (!themeDraft.value) return
+  try {
+    const existing = settings.value.customThemes.find((item) => item.id === themeDraft.value?.id)
+    const theme = createCustomTheme(
+      {
+        name: themeDraft.value.name,
+        bg: themeDraft.value.bg,
+        text: themeDraft.value.text,
+        muted: themeDraft.value.muted,
+        line: themeDraft.value.line,
+      },
+      existing ? { id: existing.id, createdAt: existing.createdAt } : {},
+    )
+    const themes = existing
+      ? settings.value.customThemes.map((item) => (item.id === theme.id ? theme : item))
+      : [theme, ...settings.value.customThemes]
+    if (await commitThemeState(theme.id, themes, `已保存并应用「${theme.name}」`)) themeDraft.value = null
+  } catch (error) {
+    themeMessage.value = `主题保存失败：${errorText(error)}`
+  }
+}
+
+async function deleteActiveTheme() {
+  if (!activeCustomTheme.value) return
+  const theme = activeCustomTheme.value
+  const themes = settings.value.customThemes.filter((item) => item.id !== theme.id)
+  const nextTheme = settings.value.theme === theme.id ? 'light' : settings.value.theme
+  if (await commitThemeState(nextTheme, themes, `已删除「${theme.name}」`)) themeDraft.value = null
+}
+
+async function importThemeFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  if (file.size > 1024 * 1024) {
+    themeMessage.value = '主题文件不能超过 1MB'
+    return
+  }
+  try {
+    const result = parseThemeImport(await file.text())
+    const existingIds = new Set(settings.value.customThemes.map((item) => item.id))
+    const imported = result.themes.map((theme) =>
+      existingIds.has(theme.id) ? createCustomTheme(theme) : theme,
+    )
+    const themes = [...imported, ...settings.value.customThemes]
+    if (await commitThemeState(imported[0].id, themes, `已导入并应用「${imported[0].name}」，共 ${imported.length} 个主题`)) {
+      themeDraft.value = null
+    }
+  } catch (error) {
+    themeMessage.value = errorText(error)
+  }
+}
+
+function downloadJson(fileName: string, data: unknown) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = fileName
+  link.click()
+  URL.revokeObjectURL(url)
+}
+
+function exportThemes(kind: 'legado' | 'full') {
+  const themes = settings.value.customThemes
+  if (!themes.length) {
+    themeMessage.value = '还没有自定义主题，先新建或导入'
+    return
+  }
+  const suffix = new Date().toISOString().slice(0, 10)
+  if (kind === 'legado') {
+    downloadJson(`mo-reader-themes-legado-${suffix}.json`, exportLegadoThemes(themes))
+    themeMessage.value = `已导出 Legado 兼容版（${themes.length} 个主题）`
+  } else {
+    downloadJson(`mo-reader-themes-${suffix}.json`, exportFullThemes(themes))
+    themeMessage.value = `已导出墨读全量版（${themes.length} 个主题）`
+  }
+}
+
 async function importLocalFile(event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
@@ -1435,6 +1593,7 @@ async function persistSettings() {
         indent: settings.value.indent,
         padding: settings.value.padding,
         theme: settings.value.theme,
+        customThemes: settings.value.customThemes,
         pageAnimation: settings.value.pageAnimation,
         headerMode: settings.value.headerMode,
         footerMode: settings.value.footerMode,
@@ -1971,6 +2130,7 @@ onMounted(async () => {
             :highlight="highlightText"
             :underlines="underlineQuotes"
             :theme="theme"
+            :theme-colors="activeThemeColors"
             :animation="settings.pageAnimation"
             :header-mode="settings.headerMode"
             :footer-mode="settings.footerMode"
@@ -2086,7 +2246,47 @@ onMounted(async () => {
               </div>
               <div class="mo-theme-row">
                 <span>主题</span>
-                <button v-for="item in [{ value: 'light', label: '纸白' }, { value: 'sepia', label: '米黄' }, { value: 'dark', label: '夜读' }]" :key="item.value" :class="{ on: theme === item.value }" @click="settings.theme = item.value as any; persistSettings()">{{ item.label }}</button>
+                <button v-for="item in [{ value: 'light', label: '纸白' }, { value: 'sepia', label: '米黄' }, { value: 'dark', label: '夜读' }]" :key="item.value" :class="{ on: settings.theme === item.value }" @click="selectTheme(item.value)">{{ item.label }}</button>
+              </div>
+              <div v-if="settings.customThemes.length" class="mo-theme-row mo-theme-wrap">
+                <span>自定义</span>
+                <button v-for="item in settings.customThemes" :key="item.id" data-testid="theme-custom" :class="{ on: settings.theme === item.id }" @click="selectTheme(item.id)">{{ item.name }}</button>
+              </div>
+              <div class="mo-theme-row">
+                <span>管理</span>
+                <button data-testid="theme-new" @click="startThemeCreate">新建</button>
+                <button v-if="activeCustomTheme" data-testid="theme-edit" @click="startThemeEdit">编辑</button>
+                <button v-if="activeCustomTheme" data-testid="theme-delete" @click="deleteActiveTheme">删除</button>
+              </div>
+              <div class="mo-theme-row">
+                <span>迁移</span>
+                <label class="mo-font-upload" data-testid="theme-import">
+                  导入
+                  <input type="file" accept=".json,application/json" @change="importThemeFile" />
+                </label>
+                <button data-testid="theme-export-legado" @click="exportThemes('legado')">兼容版</button>
+                <button data-testid="theme-export-full" @click="exportThemes('full')">全量版</button>
+              </div>
+              <p v-if="themeMessage" class="mo-font-status" data-testid="theme-status">{{ themeMessage }}</p>
+              <div v-if="themeDraft" class="mo-theme-editor" data-testid="theme-editor">
+                <div class="mo-theme-editor-head">
+                  <strong>{{ themeDraft.id ? '编辑主题' : '新建主题' }}</strong>
+                  <button class="mo-icon-btn" data-testid="theme-cancel" title="取消" @click="themeDraft = null">✕</button>
+                </div>
+                <label class="mo-theme-field">
+                  <span>名称</span>
+                  <input v-model="themeDraft.name" class="mo-input" data-testid="theme-name" maxlength="32" placeholder="主题名称" />
+                </label>
+                <div class="mo-color-grid">
+                  <label class="mo-color-field"><span>背景</span><input v-model="themeDraft.bg" type="color" data-testid="theme-bg" /></label>
+                  <label class="mo-color-field"><span>正文</span><input v-model="themeDraft.text" type="color" data-testid="theme-text" /></label>
+                  <label class="mo-color-field"><span>辅助</span><input v-model="themeDraft.muted" type="color" data-testid="theme-muted" /></label>
+                  <label class="mo-color-field"><span>分隔</span><input v-model="themeDraft.line" type="color" data-testid="theme-line" /></label>
+                </div>
+                <div class="mo-theme-editor-actions">
+                  <button class="mo-btn primary" data-testid="theme-save" @click="saveThemeDraft">保存</button>
+                  <button class="mo-btn" @click="themeDraft = null">取消</button>
+                </div>
               </div>
               <div class="mo-theme-row">
                 <span>翻页</span>
@@ -3198,6 +3398,67 @@ textarea {
 }
 .mo-theme-row .mo-select {
   min-width: 130px;
+}
+.mo-theme-wrap {
+  flex-wrap: wrap;
+}
+.mo-theme-editor {
+  margin: 12px 0 0 44px;
+  padding: 12px;
+  border: 1px solid var(--mo-line);
+  border-radius: 12px;
+  background: var(--mo-paper-2);
+}
+.mo-theme-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+.mo-theme-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0;
+  font-size: 13px;
+  color: var(--mo-ink-2);
+}
+.mo-theme-field > span {
+  width: 34px;
+}
+.mo-theme-field .mo-input {
+  flex: 1;
+}
+.mo-color-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 10px 0;
+}
+.mo-color-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--mo-line);
+  border-radius: 10px;
+  font-size: 13px;
+  color: var(--mo-ink-2);
+}
+.mo-color-field input[type='color'] {
+  width: 42px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+.mo-theme-editor-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 10px;
 }
 .mo-font-upload {
   padding: 6px 14px;

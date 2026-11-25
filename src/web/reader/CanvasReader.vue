@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { paginate } from '../../core/reader/paginate'
 import { DEFAULT_TAP_ZONES, tapZoneIndex, tipText } from '../../core/reader/reader-config'
+import { isDarkColor, type ThemeColors } from '../../core/reader/theme'
 
 type Theme = 'light' | 'sepia' | 'dark'
 type Turn = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
@@ -19,6 +20,7 @@ const props = withDefaults(
     padding?: { left: number; top: number; right: number; bottom: number }
     initialPage?: number
     theme?: Theme
+    themeColors?: ThemeColors | null
     animation?: Turn
     headerMode?: number
     footerMode?: number
@@ -41,6 +43,7 @@ const props = withDefaults(
     padding: () => ({ left: 22, top: 5, right: 22, bottom: 4 }),
     initialPage: 0,
     theme: 'light',
+    themeColors: null,
     animation: 'cover',
     headerMode: 1,
     footerMode: 6,
@@ -75,6 +78,7 @@ const SERIF = "'Noto Serif SC', 'Songti SC', 'Noto Sans SC', serif"
 const ACCENT = '#3d6b53'
 
 const palette = computed(() => {
+  if (props.themeColors) return props.themeColors
   if (props.theme === 'dark') {
     return { bg: '#141518', text: '#d8d4c8', muted: '#8f897b', line: 'rgba(255,255,255,0.14)' }
   }
@@ -85,6 +89,9 @@ const palette = computed(() => {
 })
 
 const fontStack = computed(() => props.fontFamily ? `'${props.fontFamily.replace(/'/g, '')}', ${SERIF}` : SERIF)
+const darkTheme = computed(() =>
+  props.themeColors ? isDarkColor(props.themeColors.bg) : props.theme === 'dark',
+)
 
 function measureFont() {
   return `${props.fontSize}px ${fontStack.value}`
@@ -194,7 +201,7 @@ function render() {
     const index = pageText.indexOf(props.highlight)
     if (index >= 0) {
       ctx.save()
-      ctx.fillStyle = props.theme === 'dark' ? 'rgba(214,193,148,0.24)' : 'rgba(61,107,83,0.18)'
+      ctx.fillStyle = darkTheme.value ? 'rgba(214,193,148,0.24)' : 'rgba(61,107,83,0.18)'
       let offset = 0
       lines.forEach((line, lineIndex) => {
         const start = offset
@@ -222,7 +229,7 @@ function render() {
   // 划线：按行文本匹配
   if (props.underlines?.length) {
     ctx.save()
-    ctx.strokeStyle = props.theme === 'dark' ? 'rgba(214,193,148,0.55)' : 'rgba(61,107,83,0.45)'
+    ctx.strokeStyle = darkTheme.value ? 'rgba(214,193,148,0.55)' : 'rgba(61,107,83,0.45)'
     ctx.lineWidth = 2
     lines.forEach((value, lineIndex) => {
       if (!value) return
@@ -432,6 +439,7 @@ watch(
     props.paragraphSpacing,
     props.indent,
     props.theme,
+    props.themeColors,
     props.headerMode,
     props.footerMode,
     props.showHeaderLine,

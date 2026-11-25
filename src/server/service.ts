@@ -20,6 +20,7 @@ import { openReaderStorage } from './storage.js'
 import { hasCachedChapter, readCachedChapter, writeCachedChapter } from './cache.js'
 import { buildEpub } from './epub-export.js'
 import { listCustomFonts, readCustomFont, removeCustomFont, saveCustomFont } from './fonts.js'
+import { isKnownTheme, normalizeCustomThemes } from '../core/reader/theme.js'
 import {
   importLocalBuffer,
   localBookId,
@@ -692,7 +693,23 @@ export class ReaderService extends TypertRemoteService {
       const fonts = await listCustomFonts()
       if (!fonts.some((font) => font.id === (patch as any).fontId)) throw new Error('字体不存在')
     }
-    const next = { ...current, ...(patch as Record<string, unknown>) }
+    const patchRecord = patch as Record<string, unknown>
+    const customThemes =
+      patchRecord.customThemes === undefined
+        ? current.customThemes ?? []
+        : normalizeCustomThemes(patchRecord.customThemes)
+    const requestedTheme = patchRecord.theme
+    if (requestedTheme !== undefined) {
+      if (typeof requestedTheme !== 'string' || !requestedTheme) throw new Error('主题无效')
+      if (!isKnownTheme(requestedTheme, customThemes)) throw new Error('主题不存在')
+    }
+    const nextTheme =
+      typeof requestedTheme === 'string' && isKnownTheme(requestedTheme, customThemes)
+        ? requestedTheme
+        : isKnownTheme(current.theme, customThemes)
+          ? current.theme
+          : 'light'
+    const next = { ...current, ...patchRecord, theme: nextTheme, customThemes }
     await this.requireDb().settings.set(next)
     return { settings: next }
   }

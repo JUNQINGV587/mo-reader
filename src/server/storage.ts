@@ -15,7 +15,23 @@ export const ReaderDomain = defineDomain({
   global: {
     schema: z
       .object({
-        theme: z.enum(['light', 'sepia', 'dark', 'system']).default('light'),
+        theme: z.string().min(1).max(80).default('light'),
+        customThemes: z
+          .array(
+            z
+              .object({
+                id: z.string().min(1).max(80),
+                name: z.string().min(1).max(32),
+                bg: z.string().min(1).max(80),
+                text: z.string().min(1).max(80),
+                muted: z.string().min(1).max(80),
+                line: z.string().min(1).max(80),
+                createdAt: z.string().min(1).max(80),
+              })
+              .passthrough(),
+          )
+          .max(100)
+          .default([]),
         fontSize: z.number().int().min(12).max(48).default(24),
         fontId: z.string().max(80).default(''),
         lineSpacing: z.number().min(1).max(3).default(1.8),
@@ -53,6 +69,7 @@ export const ReaderDomain = defineDomain({
       .passthrough(),
     initial: {
       theme: 'light',
+      customThemes: [],
       fontSize: 22,
       fontId: '',
       lineSpacing: 1.9,
