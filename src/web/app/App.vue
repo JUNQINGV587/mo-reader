@@ -82,6 +82,19 @@ const selectedSourceIds = ref<Set<string>>(new Set())
 const checkReport = ref<{ total: number; ok: number; problems: Array<{ name: string; message: string }> } | null>(null)
 const sourceTypeNames: Record<number, string> = { 0: '文本', 1: '音频', 2: '图片', 3: '文件', 4: '视频' }
 
+const dictRules = ref<any[]>([])
+const dictEditing = ref<any>(null)
+const dictImportText = ref('')
+const dictMessage = ref('')
+const dictQuery = ref('')
+const dictTrialBusy = ref(false)
+const dictResults = ref<Array<{ id: string; name: string; ok: boolean; text?: string; url?: string; error?: string }>>([])
+const dictActiveTab = ref('')
+const dictEnabledCount = computed(() => dictRules.value.filter((item) => item.enabled !== false).length)
+const dictActiveResult = computed(
+  () => dictResults.value.find((item) => item.id === dictActiveTab.value) ?? dictResults.value[0] ?? null,
+)
+
 const shelfBooks = ref<any[]>([])
 const shelfSort = ref<'recent' | 'name' | 'progress'>('recent')
 const shelfGroup = ref('')
@@ -342,6 +355,7 @@ async function refresh() {
     const [sourceResult, bookResult] = await Promise.all([call('listSources'), call('listBooks')])
     sources.value = sourceResult?.sources ?? []
     shelfBooks.value = bookResult?.books ?? []
+    await loadDictRules()
     try {
       const stored = await call('getSettings')
       if (stored?.settings) settings.value = { ...settings.value, ...stored.settings }
@@ -570,6 +584,190 @@ async function onImportFile(event: Event) {
   } finally {
     input.value = ''
   }
+}
+
+async function loadDictRules() {
+  try {
+    const result = await call('listDictRules')
+    dictRules.value = result?.rules ?? []
+  } catch (error) {
+    dictMessage.value = `字典加载失败：${errorText(error)}`
+  }
+}
+
+function beginDictEdit(rule?: any) {
+  const draft = rule
+    ? JSON.parse(JSON.stringify(rule))
+    : { name: '', url: '', rule: '', group: '', enabled: true, header: '' }
+  if (draft.header && typeof draft.header !== 'string') draft.header = JSON.stringify(draft.header)
+  dictEditing.value = draft
+  dictMessage.value = ''
+}
+
+async function saveDict() {
+  if (!dictEditing.value) return
+  busy.value = true
+  try {
+    await call('saveDictRule', { rule: { ...dictEditing.value } })
+    dictEditing.value = null
+    await loadDictRules()
+    dictMessage.value = '字典已保存'
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function toggleDictRule(rule: any) {
+  try {
+    await call('saveDictRule', { rule: { ...rule, enabled: rule.enabled === false } })
+    await loadDictRules()
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  }
+}
+
+async function removeDictRule(rule: any) {
+  try {
+    await call('deleteDictRules', { ids: [rule.id] })
+    dictResults.value = dictResults.value.filter((item) => item.id !== rule.id)
+    if (dictActiveTab.value === rule.id) dictActiveTab.value = dictResults.value[0]?.id ?? ''
+    await loadDictRules()
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  }
+}
+
+async function moveDictRule(rule: any, delta: number) {
+  const list = dictRules.value
+  const index = list.findIndex((item) => item.id === rule.id)
+  const target = index + delta
+  if (index < 0 || target < 0 || target >= list.length) return
+  const current = list[index]
+  const other = list[target]
+  try {
+    await call('saveDictRule', { rule: { ...current, customOrder: target + 1 } })
+    await call('saveDictRule', { rule: { ...other, customOrder: index + 1 } })
+    await loadDictRules()
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  }
+}
+
+async function importDicts() {
+  if (!dictImportText.value.trim()) return
+  busy.value = true
+  dictMessage.value = ''
+  try {
+    const result = await call('importDictRules', { payload: dictImportText.value })
+    dictMessage.value =
+      `导入 ${result.total} 条：新增 ${result.added}，更新 ${result.updated}` +
+      (result.errors?.length ? `，失败 ${result.errors.length}（${result.errors[0].message}）` : '')
+    dictImportText.value = ''
+    await loadDictRules()
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function onImportDictFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  try {
+    dictImportText.value = await file.text()
+    await importDicts()
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  } finally {
+    input.value = ''
+  }
+}
+
+async function exportDicts() {
+  try {
+    const rules = await call('exportDictRules')
+    if (!Array.isArray(rules) || rules.length === 0) {
+      dictMessage.value = '还没有字典，先新增或导入'
+      return
+    }
+    const suffix = new Date().toISOString().slice(0, 10)
+    downloadJson(`mo-reader-dicts-${suffix}.json`, rules)
+    dictMessage.value = `已导出 ${rules.length} 条字典`
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  }
+}
+
+async function runDictLookup() {
+  const key = dictQuery.value.trim()
+  if (!key) {
+    dictMessage.value = '请输入要查的词'
+    return
+  }
+  const enabled = dictRules.value.filter((item) => item.enabled !== false)
+  if (enabled.length === 0) {
+    dictMessage.value = '还没有可用的字典'
+    return
+  }
+  dictTrialBusy.value = true
+  dictMessage.value = ''
+  try {
+    const settled = await Promise.allSettled(
+      enabled.map((item) => call('lookupDict', { ruleId: item.id, key })),
+    )
+    dictResults.value = settled.map((result, index) => {
+      const item = enabled[index]
+      if (result.status === 'fulfilled') {
+        return {
+          id: item.id,
+          name: result.value?.name || item.name || '未命名字典',
+          ok: true,
+          text: result.value?.text ?? '',
+          url: result.value?.url ?? '',
+        }
+      }
+      return {
+        id: item.id,
+        name: item.name || '未命名字典',
+        ok: false,
+        error: errorText(result.reason),
+      }
+    })
+    dictActiveTab.value = dictResults.value[0]?.id ?? ''
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  } finally {
+    dictTrialBusy.value = false
+  }
+}
+
+async function copyDictResult(result: any) {
+  if (!result?.text) return
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(result.text)
+    } else {
+      const area = document.createElement('textarea')
+      area.value = result.text
+      area.style.position = 'fixed'
+      area.style.opacity = '0'
+      document.body.appendChild(area)
+      area.select()
+      document.execCommand('copy')
+      area.remove()
+    }
+    dictMessage.value = `已复制「${result.name}」的释义`
+  } catch (error) {
+    dictMessage.value = `复制失败：${errorText(error)}`
+  }
+}
+
+function openDictResult(result: any) {
+  if (result?.url) window.open(result.url, '_blank', 'noopener')
 }
 
 async function toggleSource(source: any) {
@@ -2086,6 +2284,123 @@ onMounted(async () => {
           </div>
         </div>
 
+        <div class="mo-card" data-testid="dict-card">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">字典规则</h3>
+            <span class="muted">{{ dictRules.length }} 条 · 启用 {{ dictEnabledCount }}</span>
+            <div class="mo-dict-actions">
+              <button class="mo-btn tiny" data-testid="dict-add" @click="beginDictEdit()">新增</button>
+              <button class="mo-btn tiny" :disabled="busy" data-testid="dict-export" @click="exportDicts">导出</button>
+            </div>
+          </div>
+          <p v-pre class="muted">网址里用 {{key}} 占位，试查时替换成要查的词。</p>
+
+          <div v-if="dictRules.length" class="mo-dict-list">
+            <div v-for="(item, index) in dictRules" :key="item.id" class="mo-dict-row" data-testid="dict-row">
+              <label class="mo-switch">
+                <input type="checkbox" :checked="item.enabled !== false" @change="toggleDictRule(item)" />
+                <span class="mo-source-name">{{ item.name || '未命名字典' }}</span>
+              </label>
+              <span v-if="item.group" class="mo-tag soft">{{ item.group }}</span>
+              <span class="mo-url">{{ item.url }}</span>
+              <button class="mo-btn tiny" :disabled="index === 0" title="上移" @click="moveDictRule(item, -1)">上移</button>
+              <button class="mo-btn tiny" :disabled="index === dictRules.length - 1" title="下移" @click="moveDictRule(item, 1)">下移</button>
+              <button class="mo-btn tiny" :disabled="busy" @click="beginDictEdit(item)">编辑</button>
+              <button class="mo-btn tiny danger" :disabled="busy" @click="removeDictRule(item)">删除</button>
+            </div>
+          </div>
+          <div v-else class="mo-empty small">
+            <p>还没有字典规则</p>
+            <p class="muted">导入阅读的字典 JSON，或新增一条试试。</p>
+            <button class="mo-btn tiny primary" @click="beginDictEdit()">新增字典</button>
+          </div>
+
+          <textarea
+            v-model="dictImportText"
+            class="mo-json"
+            rows="3"
+            data-testid="dict-import-text"
+            placeholder='粘贴字典 JSON，如 [{"name":"…","url":"https://…/{{key}}","rule":"class.…@text"}]'
+          />
+          <div class="mo-row">
+            <label class="mo-file" title="选择字典 JSON 文件">
+              <input type="file" accept=".json,application/json" data-testid="dict-import-file" @change="onImportDictFile" />
+              <span class="mo-btn tiny">选择文件</span>
+            </label>
+            <button class="mo-btn tiny" :disabled="busy || !dictImportText.trim()" data-testid="dict-import" @click="importDicts">导入</button>
+            <span class="muted">{{ dictMessage }}</span>
+          </div>
+
+          <div class="mo-dict-trial">
+            <div class="mo-row">
+              <input v-model="dictQuery" placeholder="输入要查的词" data-testid="dict-query" @keyup.enter="runDictLookup" />
+              <button
+                class="mo-btn primary"
+                :disabled="dictTrialBusy || !dictQuery.trim()"
+                data-testid="dict-lookup"
+                @click="runDictLookup"
+              >
+                {{ dictTrialBusy ? '查询中…' : '试查' }}
+              </button>
+              <span class="muted">{{ dictEnabledCount ? `同时查询 ${dictEnabledCount} 本字典` : '先新增并启用字典' }}</span>
+            </div>
+            <div v-if="dictEnabledCount === 0" class="mo-empty small">
+              <p>还没有启用的字典</p>
+              <p class="muted">新增一条字典后，这里会同时查询所有启用的字典。</p>
+              <button class="mo-btn tiny primary" @click="beginDictEdit()">新增字典</button>
+            </div>
+            <template v-else-if="dictResults.length">
+              <div class="mo-dict-tabs" role="tablist">
+                <button
+                  v-for="item in dictResults"
+                  :key="item.id"
+                  :class="{ on: item.id === dictActiveResult?.id }"
+                  role="tab"
+                  @click="dictActiveTab = item.id"
+                >
+                  {{ item.name }}<span v-if="!item.ok" class="mo-dict-fail">失败</span>
+                </button>
+              </div>
+              <div v-if="dictActiveResult" class="mo-dict-result" data-testid="dict-result">
+                <template v-if="dictActiveResult.ok">
+                  <pre class="mo-dict-text" data-testid="dict-result-text">{{ dictActiveResult.text || '（没有提取到释义）' }}</pre>
+                  <div class="mo-row">
+                    <button class="mo-btn tiny" @click="copyDictResult(dictActiveResult)">复制</button>
+                    <button class="mo-btn tiny" :disabled="!dictActiveResult.url" @click="openDictResult(dictActiveResult)">打开</button>
+                    <span class="mo-url">{{ dictActiveResult.url }}</span>
+                  </div>
+                </template>
+                <p v-else class="muted">查询失败：{{ dictActiveResult.error }}</p>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <div v-if="dictEditing" class="mo-card" data-testid="dict-editor">
+          <h3 class="mo-card-title">编辑字典：{{ dictEditing.name || '新字典' }}</h3>
+          <div class="mo-row">
+            <input v-model="dictEditing.name" placeholder="名称" data-testid="dict-name" />
+            <input v-model="dictEditing.group" placeholder="分组（可选）" />
+            <label class="mo-switch"><input type="checkbox" v-model="dictEditing.enabled" />启用</label>
+          </div>
+          <div class="mo-row">
+            <input v-model="dictEditing.url" placeholder="地址，必须含 {{key}}" data-testid="dict-url" />
+          </div>
+          <div class="mo-row">
+            <input v-model="dictEditing.rule" placeholder="提取规则，如 class.meaning@text" data-testid="dict-rule" />
+          </div>
+          <textarea
+            v-model="dictEditing.header"
+            class="mo-json"
+            rows="2"
+            placeholder='请求头 JSON（可选），如 {"Referer":"https://…"}'
+          />
+          <div class="mo-row">
+            <button class="mo-btn primary" :disabled="busy" data-testid="dict-save" @click="saveDict">保存</button>
+            <button class="mo-btn" @click="dictEditing = null">取消</button>
+          </div>
+        </div>
+
         <div v-if="editing" class="mo-card" data-testid="source-editor">
           <h3 class="mo-card-title">编辑书源：{{ editing.bookSourceName || editing.bookSourceUrl }}</h3>
           <div class="mo-row">
@@ -3301,6 +3616,79 @@ textarea {
   background: var(--mo-paper);
   font-size: 11px;
   white-space: pre-wrap;
+}
+
+/* 字典规则 */
+.mo-btn.tiny {
+  padding: 3px 9px;
+  font-size: 12px;
+}
+.mo-dict-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+.mo-dict-list {
+  margin: 4px 0 10px;
+}
+.mo-dict-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--mo-line);
+}
+.mo-dict-row:last-child {
+  border-bottom: 0;
+}
+.mo-dict-row .mo-url {
+  flex: 1 1 180px;
+}
+.mo-dict-trial {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--mo-line);
+}
+.mo-dict-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 8px;
+}
+.mo-dict-tabs button {
+  padding: 4px 12px;
+  border: 1px solid var(--mo-line);
+  border-radius: 999px;
+  background: var(--mo-paper);
+  color: var(--mo-ink-2);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.mo-dict-tabs button.on {
+  border-color: var(--mo-accent);
+  background: var(--mo-accent-soft);
+  color: var(--mo-accent);
+}
+.mo-dict-fail {
+  margin-left: 5px;
+  color: #a8402e;
+  font-size: 11px;
+}
+.mo-dict-result {
+  padding: 10px 12px;
+  border: 1px solid var(--mo-line);
+  border-radius: 8px;
+  background: var(--mo-paper);
+}
+.mo-dict-text {
+  margin: 0 0 8px;
+  max-height: 280px;
+  overflow: auto;
+  font: 13px/1.8 -apple-system, 'Noto Sans SC', 'PingFang SC', sans-serif;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* 阅读页 */

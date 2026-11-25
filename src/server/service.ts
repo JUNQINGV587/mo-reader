@@ -3,6 +3,8 @@ import { Service } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { VERSION } from '../core/version.js'
 import { parseSource, type BookSource } from '../core/model/source.js'
+import { dictRuleKey, parseDictRule, type DictRule } from '../core/model/dict.js'
+import { AnalyzeRule } from '../core/rules/analyze-rule.js'
 import { parseRssSources } from '../core/rss/source.js'
 import { parseFeed } from '../core/rss/feed.js'
 import { fetchText } from '../core/net/http.js'
@@ -14,6 +16,7 @@ import {
   analyzeSearch,
   analyzeToc,
   contentKindOf,
+  htmlToText,
 } from '../core/source/analyze.js'
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
 import { openReaderStorage } from './storage.js'
@@ -181,6 +184,120 @@ export class ReaderService extends TypertRemoteService {
       updated += 1
     }
     return { updated }
+  }
+
+  async listDictRules() {
+    const rules: DictRule[] = []
+    for (const [, value] of this.requireDb().dictRules.entries()) {
+      rules.push(value as DictRule)
+    }
+    rules.sort((a, b) => {
+      const left = typeof a.customOrder === 'number' ? a.customOrder : Number.MAX_SAFE_INTEGER
+      const right = typeof b.customOrder === 'number' ? b.customOrder : Number.MAX_SAFE_INTEGER
+      if (left !== right) return left - right
+      return (a.name ?? '').localeCompare(b.name ?? '', 'zh')
+    })
+    return { rules }
+  }
+
+  /** 新增或更新一条字典规则：id 由名称+地址稳定生成，编辑时沿用旧 id。 */
+  async saveDictRule(args: Args) {
+    const raw = args?.rule
+    if (!raw || typeof raw !== 'object') throw new Error('缺少参数 rule')
+    const rule = parseDictRule(raw)
+    const db = this.requireDb()
+    const incoming = raw as Record<string, unknown>
+    const requestedId = typeof incoming.id === 'string' && incoming.id.trim() ? incoming.id.trim() : ''
+    const key = requestedId && db.dictRules.get(requestedId) !== undefined ? requestedId : dictRuleKey(rule.name, rule.url)
+    const existing = db.dictRules.get(key) as DictRule | undefined
+    const customOrder =
+      typeof incoming.customOrder === 'number' && Number.isFinite(incoming.customOrder)
+        ? incoming.customOrder
+        : existing && typeof existing.customOrder === 'number'
+          ? existing.customOrder
+          : this.nextDictOrder()
+    const saved = { ...rule, id: key, customOrder } as DictRule
+    await db.dictRules.put(key, saved)
+    return { rule: saved }
+  }
+
+  async deleteDictRules(args: Args) {
+    const ids = Array.isArray(args?.ids)
+      ? (args!.ids as unknown[]).filter((id): id is string => typeof id === 'string' && id.length > 0)
+      : []
+    if (ids.length === 0) throw new Error('缺少参数 ids')
+    const deleted = await this.requireDb().dictRules.deleteMany(ids)
+    return { deleted }
+  }
+
+  /** 导入 Legado 字典数组或 { dictRules: [...] }；单条失败只记错误，不中断整批。 */
+  async importDictRules(args: Args) {
+    const payload = stringArg(args, 'payload')
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(payload)
+    } catch {
+      throw new Error('不是合法的 JSON')
+    }
+    const list = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === 'object' && Array.isArray((parsed as any).dictRules)
+        ? ((parsed as any).dictRules as unknown[])
+        : null
+    if (!list) throw new Error('字典数据格式不正确')
+
+    const db = this.requireDb()
+    let added = 0
+    let updated = 0
+    const errors: Array<{ name: string; message: string }> = []
+    for (const item of list) {
+      try {
+        if (!item || typeof item !== 'object') throw new Error('字典规则格式不正确')
+        const rule = parseDictRule(item)
+        const key = dictRuleKey(rule.name, rule.url)
+        const existing = db.dictRules.get(key) as DictRule | undefined
+        const incoming = item as Record<string, unknown>
+        const customOrder =
+          typeof incoming.customOrder === 'number' && Number.isFinite(incoming.customOrder)
+            ? incoming.customOrder
+            : existing && typeof existing.customOrder === 'number'
+              ? existing.customOrder
+              : this.nextDictOrder()
+        await db.dictRules.put(key, { ...rule, id: key, customOrder })
+        if (existing) updated += 1
+        else added += 1
+      } catch (error) {
+        errors.push({
+          name: typeof (item as any)?.name === 'string' ? (item as any).name : '',
+          message: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return { added, updated, total: list.length, errors }
+  }
+
+  /** 导出 Legado 兼容数组（去掉内部 id，保留自定义字段）。 */
+  async exportDictRules() {
+    const { rules } = await this.listDictRules()
+    return rules.map((rule) => {
+      const out: Record<string, unknown> = { ...rule }
+      delete out.id
+      return out
+    })
+  }
+
+  /** 服务端代查字典：替换 {{key}}，透传 header，按规则提取纯文本。 */
+  async lookupDict(args: Args) {
+    const ruleId = stringArg(args, 'ruleId')
+    const key = stringArg(args, 'key')
+    const record = this.requireDb().dictRules.get(ruleId) as DictRule | undefined
+    if (!record) throw new Error(`字典不存在：${ruleId}`)
+    if (record.enabled === false) throw new Error('字典未启用')
+    const headers = parseHeaders(typeof record.header === 'string' ? record.header : '')
+    const target = record.url.split('{{key}}').join(encodeURIComponent(key))
+    const raw = await fetchText(target, { headers })
+    const extracted = new AnalyzeRule(raw.text, { baseUrl: raw.url }).getString(record.rule)
+    return { name: record.name, text: htmlToText(extracted), url: raw.url }
   }
 
   async searchBooks(args: Args) {
@@ -832,6 +949,15 @@ export class ReaderService extends TypertRemoteService {
   private requireDb(): any {
     if (!this.db) throw new Error('存储尚未就绪')
     return this.db
+  }
+
+  private nextDictOrder(): number {
+    let max = 0
+    for (const [, value] of this.requireDb().dictRules.entries()) {
+      const order = typeof (value as any).customOrder === 'number' ? (value as any).customOrder : 0
+      if (order > max) max = order
+    }
+    return max + 1
   }
 
   private getSource(url: string): BookSource {
