@@ -28,12 +28,14 @@ import {
   type ThemeColors,
 } from '../../core/reader/theme'
 import { exportFullShelf, exportLegadoShelf } from '../../core/reader/shelf-transfer'
+import { enabledDictRules, lookupAll, type DictLookupOutcome } from '../../core/dict/lookup-all'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
 type View = 'shelf' | 'sources' | 'search' | 'detail' | 'reader'
 type Theme = 'light' | 'sepia' | 'dark'
 type Turn = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
+type DictResult = DictLookupOutcome
 
 /** 旧数据里存的是原始 HTML 简介，展示前转成纯文本。 */
 function plainText(input?: string | null): string {
@@ -88,12 +90,28 @@ const dictImportText = ref('')
 const dictMessage = ref('')
 const dictQuery = ref('')
 const dictTrialBusy = ref(false)
-const dictResults = ref<Array<{ id: string; name: string; ok: boolean; text?: string; url?: string; error?: string }>>([])
+const dictResults = ref<DictResult[]>([])
 const dictActiveTab = ref('')
 const dictEnabledCount = computed(() => dictRules.value.filter((item) => item.enabled !== false).length)
 const dictActiveResult = computed(
   () => dictResults.value.find((item) => item.id === dictActiveTab.value) ?? dictResults.value[0] ?? null,
 )
+
+// 阅读页长按选词：独立于「书源 → 字典规则」的试查，互不覆盖。
+const dictCardRef = ref<HTMLElement | null>(null)
+const dictPanelOpen = ref(false)
+const dictPanelText = ref('')
+const dictPanelLine = ref('')
+const dictPanelFallback = ref(false)
+const dictPanelBusy = ref(false)
+const dictPanelError = ref('')
+const dictPanelCopied = ref('')
+const dictPanelResults = ref<DictResult[]>([])
+const dictPanelActive = ref('')
+const dictPanelActiveResult = computed(
+  () => dictPanelResults.value.find((item) => item.id === dictPanelActive.value) ?? dictPanelResults.value[0] ?? null,
+)
+let dictPanelToken = 0
 
 const shelfBooks = ref<any[]>([])
 const shelfSort = ref<'recent' | 'name' | 'progress'>('recent')
@@ -299,6 +317,9 @@ watch(
     if (sourcePage.value > sourcePageCount.value) sourcePage.value = sourcePageCount.value
   },
 )
+watch(view, (value) => {
+  if (value !== 'reader') closeReaderDict()
+})
 const enabledSources = computed(() => sources.value.filter((source) => source.enabled !== false))
 const scopedSourceUrls = computed<string[] | null>(() => {
   if (searchScope.value.startsWith('group:')) {
@@ -702,13 +723,20 @@ async function exportDicts() {
   }
 }
 
+/** 单本字典查询：把 Remote 的错误统一成 Error，交给 lookupAll 做隔离。 */
+function lookupOne(ruleId: string, key: string) {
+  return call('lookupDict', { ruleId, key }).catch((error: unknown) => {
+    throw new Error(errorText(error))
+  })
+}
+
 async function runDictLookup() {
   const key = dictQuery.value.trim()
   if (!key) {
     dictMessage.value = '请输入要查的词'
     return
   }
-  const enabled = dictRules.value.filter((item) => item.enabled !== false)
+  const enabled = enabledDictRules(dictRules.value)
   if (enabled.length === 0) {
     dictMessage.value = '还没有可用的字典'
     return
@@ -716,27 +744,7 @@ async function runDictLookup() {
   dictTrialBusy.value = true
   dictMessage.value = ''
   try {
-    const settled = await Promise.allSettled(
-      enabled.map((item) => call('lookupDict', { ruleId: item.id, key })),
-    )
-    dictResults.value = settled.map((result, index) => {
-      const item = enabled[index]
-      if (result.status === 'fulfilled') {
-        return {
-          id: item.id,
-          name: result.value?.name || item.name || '未命名字典',
-          ok: true,
-          text: result.value?.text ?? '',
-          url: result.value?.url ?? '',
-        }
-      }
-      return {
-        id: item.id,
-        name: item.name || '未命名字典',
-        ok: false,
-        error: errorText(result.reason),
-      }
-    })
+    dictResults.value = await lookupAll(enabled, key, lookupOne)
     dictActiveTab.value = dictResults.value[0]?.id ?? ''
   } catch (error) {
     dictMessage.value = errorText(error)
@@ -745,29 +753,102 @@ async function runDictLookup() {
   }
 }
 
-async function copyDictResult(result: any) {
+async function writeClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+  const area = document.createElement('textarea')
+  area.value = text
+  area.style.position = 'fixed'
+  area.style.opacity = '0'
+  document.body.appendChild(area)
+  area.select()
+  document.execCommand('copy')
+  area.remove()
+}
+
+async function copyDictResult(result: DictResult) {
   if (!result?.text) return
   try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(result.text)
-    } else {
-      const area = document.createElement('textarea')
-      area.value = result.text
-      area.style.position = 'fixed'
-      area.style.opacity = '0'
-      document.body.appendChild(area)
-      area.select()
-      document.execCommand('copy')
-      area.remove()
-    }
+    await writeClipboard(result.text)
     dictMessage.value = `已复制「${result.name}」的释义`
   } catch (error) {
     dictMessage.value = `复制失败：${errorText(error)}`
   }
 }
 
-function openDictResult(result: any) {
+function openDictResult(result: DictResult) {
   if (result?.url) window.open(result.url, '_blank', 'noopener')
+}
+
+/** 阅读页长按选词：打开查词面板，有启用字典时立即并发查询。 */
+function onReaderSelect(payload: any) {
+  if (readerKind.value !== 'text') return
+  dictPanelOpen.value = true
+  dictPanelText.value = String(payload?.text || '').trim()
+  dictPanelLine.value = String(payload?.line || '').trim()
+  dictPanelFallback.value = Boolean(payload?.fallback)
+  dictPanelError.value = ''
+  dictPanelCopied.value = ''
+  dictPanelResults.value = []
+  dictPanelActive.value = ''
+  if (!dictPanelText.value) {
+    dictPanelError.value = '没有选中文字，请输入要查的词'
+    return
+  }
+  void runReaderLookup()
+}
+
+async function runReaderLookup() {
+  const key = dictPanelText.value.trim()
+  dictPanelCopied.value = ''
+  dictPanelError.value = ''
+  if (!key) {
+    dictPanelError.value = '请输入要查的词'
+    return
+  }
+  const enabled = enabledDictRules(dictRules.value)
+  if (enabled.length === 0) {
+    dictPanelResults.value = []
+    dictPanelActive.value = ''
+    return
+  }
+  const token = ++dictPanelToken
+  dictPanelBusy.value = true
+  try {
+    const results = await lookupAll(enabled, key, lookupOne)
+    if (token !== dictPanelToken) return
+    dictPanelResults.value = results
+    dictPanelActive.value = results[0]?.id ?? ''
+  } catch (error) {
+    if (token === dictPanelToken) dictPanelError.value = errorText(error)
+  } finally {
+    if (token === dictPanelToken) dictPanelBusy.value = false
+  }
+}
+
+function closeReaderDict() {
+  dictPanelOpen.value = false
+  dictPanelToken += 1
+  dictPanelBusy.value = false
+}
+
+async function copyReaderDict(result: DictResult) {
+  if (!result?.text) return
+  try {
+    await writeClipboard(result.text)
+    dictPanelCopied.value = `已复制「${result.name}」`
+  } catch (error) {
+    dictPanelError.value = `复制失败：${errorText(error)}`
+  }
+}
+
+/** 没有可用字典时，把读者带到「书源 → 字典规则」。 */
+function openDictManage() {
+  closeReaderDict()
+  view.value = 'sources'
+  nextTick(() => dictCardRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
 }
 
 async function toggleSource(source: any) {
@@ -1435,6 +1516,7 @@ async function openChapter(chapter: any, page?: number) {
   if (!chapter || chapter.isVolume || !chapter.url) return
   tocOpen.value = false
   bookmarksOpen.value = false
+  closeReaderDict()
   stopSpeech()
   busy.value = true
   chrome.value = false
@@ -2284,7 +2366,7 @@ onMounted(async () => {
           </div>
         </div>
 
-        <div class="mo-card" data-testid="dict-card">
+        <div ref="dictCardRef" class="mo-card" data-testid="dict-card">
           <div class="mo-card-head">
             <h3 class="mo-card-title">字典规则</h3>
             <span class="muted">{{ dictRules.length }} 条 · 启用 {{ dictEnabledCount }}</span>
@@ -2534,6 +2616,7 @@ onMounted(async () => {
             :battery-percent="batteryPercent"
             @page="onPage"
             @tap-action="onTapAction"
+            @select="onReaderSelect"
           />
           <ComicReader
             v-else-if="readerKind === 'images'"
@@ -2583,6 +2666,68 @@ onMounted(async () => {
               <button v-if="readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-speak" @click="toggleSpeech">{{ speaking ? '暂停' : '朗读' }}</button>
               <button v-if="settings.menuItems.includes('toc')" class="mo-chrome-btn" @click="tocOpen = true">目录</button>
               <button v-if="settings.menuItems.includes('next')" class="mo-chrome-btn" :disabled="chapterIndex >= chapters.length - 1" @click="openAdjacent(1)">下一章</button>
+            </div>
+          </div>
+        </transition>
+
+        <transition name="mo-fade">
+          <div v-if="dictPanelOpen" class="mo-sheet-mask" data-testid="reader-dict-mask" @click.self="closeReaderDict">
+            <div class="mo-sheet mo-sheet-scroll mo-reader-dict" data-testid="reader-dict-panel" @pointerdown.stop @click.stop>
+              <div class="mo-sheet-head">
+                <strong>查字典</strong>
+                <span v-if="dictPanelFallback" class="muted">未定位到词，已取整行</span>
+                <button class="mo-icon-btn" data-testid="reader-dict-close" title="关闭" @click="closeReaderDict">✕</button>
+              </div>
+              <p v-if="dictPanelLine" class="muted mo-dict-line">「{{ dictPanelLine }}」</p>
+              <div class="mo-row">
+                <input
+                  v-model="dictPanelText"
+                  placeholder="要查的词"
+                  data-testid="reader-dict-query"
+                  @keyup.enter="runReaderLookup"
+                />
+                <button
+                  class="mo-btn primary"
+                  :disabled="dictPanelBusy || !dictPanelText.trim()"
+                  data-testid="reader-dict-lookup"
+                  @click="runReaderLookup"
+                >
+                  {{ dictPanelBusy ? '查询中…' : '查询' }}
+                </button>
+              </div>
+              <p v-if="dictPanelError" class="muted" data-testid="reader-dict-error">{{ dictPanelError }}</p>
+              <div v-if="dictEnabledCount === 0" class="mo-empty small" data-testid="reader-dict-empty">
+                <p>还没有启用的字典</p>
+                <p class="muted">添加并启用字典后，长按选词会同时查询所有字典。</p>
+                <button class="mo-btn tiny primary" data-testid="reader-dict-manage" @click="openDictManage">去添加字典</button>
+              </div>
+              <template v-else-if="dictPanelResults.length">
+                <div class="mo-dict-tabs" role="tablist">
+                  <button
+                    v-for="item in dictPanelResults"
+                    :key="item.id"
+                    :class="{ on: item.id === dictPanelActiveResult?.id }"
+                    role="tab"
+                    data-testid="reader-dict-tab"
+                    @click="dictPanelActive = item.id"
+                  >
+                    {{ item.name }}<span v-if="!item.ok" class="mo-dict-fail">失败</span>
+                  </button>
+                </div>
+                <div v-if="dictPanelActiveResult" class="mo-dict-result" data-testid="reader-dict-result">
+                  <template v-if="dictPanelActiveResult.ok">
+                    <pre class="mo-dict-text" data-testid="reader-dict-result-text">{{ dictPanelActiveResult.text || '（没有提取到释义）' }}</pre>
+                    <div class="mo-row">
+                      <button class="mo-btn tiny" data-testid="reader-dict-copy" @click="copyReaderDict(dictPanelActiveResult)">复制</button>
+                      <button class="mo-btn tiny" :disabled="!dictPanelActiveResult.url" data-testid="reader-dict-open" @click="openDictResult(dictPanelActiveResult)">打开原页</button>
+                      <span class="mo-url">{{ dictPanelActiveResult.url }}</span>
+                    </div>
+                  </template>
+                  <p v-else class="muted">查询失败：{{ dictPanelActiveResult.error }}</p>
+                </div>
+              </template>
+              <p v-else-if="!dictPanelBusy && !dictPanelError" class="muted">输入词后查询。</p>
+              <p v-if="dictPanelCopied" class="muted" data-testid="reader-dict-copied">{{ dictPanelCopied }}</p>
             </div>
           </div>
         </transition>
@@ -3689,6 +3834,13 @@ textarea {
   font: 13px/1.8 -apple-system, 'Noto Sans SC', 'PingFang SC', sans-serif;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.mo-reader-dict .mo-dict-line {
+  margin: 4px 0 10px;
+  overflow-wrap: anywhere;
+}
+.mo-reader-dict .mo-dict-text {
+  max-height: 180px;
 }
 
 /* 阅读页 */
