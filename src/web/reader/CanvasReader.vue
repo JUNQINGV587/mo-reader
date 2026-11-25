@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { hitTest } from '../../core/reader/hit-test'
 import { paginate } from '../../core/reader/paginate'
 import { DEFAULT_TAP_ZONES, tapZoneIndex, tipText } from '../../core/reader/reader-config'
 import { isDarkColor, type ThemeColors } from '../../core/reader/theme'
@@ -57,9 +58,28 @@ const props = withDefaults(
   },
 )
 
+/** 长按选中的结果：正文文本 + 画布/视口坐标，供查词面板使用。 */
+interface ReaderSelection {
+  /** 选中的词；定位不到词时是整行回退文本。 */
+  text: string
+  /** 选中所在行的文本（已去掉首尾空白）。 */
+  line: string
+  /** true 表示没有定位到词，text 是整行回退。 */
+  fallback: boolean
+  lineIndex: number
+  charIndex: number
+  /** 画布内的 CSS 坐标（左上角为 0）。 */
+  x: number
+  y: number
+  /** 视口坐标，浮层定位用。 */
+  clientX: number
+  clientY: number
+}
+
 const emit = defineEmits<{
   page: [payload: { page: number; total: number }]
   tapAction: [code: number]
+  select: [selection: ReaderSelection]
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -73,6 +93,23 @@ let dpr = 1
 let width = 0
 let height = 0
 let animating = false
+
+/** 长按判定：按住 500ms、位移不超过 10px。 */
+const LONG_PRESS_MS = 500
+const LONG_PRESS_TOLERANCE = 10
+
+interface PressState {
+  pointerId: number
+  startX: number
+  startY: number
+  x: number
+  y: number
+  timer: number
+}
+
+let press: PressState | null = null
+/** 长按已经触发时，吞掉随后的合成 click，避免误翻页/弹菜单。 */
+let swallowClick = false
 
 const SERIF = "'Noto Serif SC', 'Songti SC', 'Noto Sans SC', serif"
 const ACCENT = '#3d6b53'
@@ -373,6 +410,10 @@ function prev() {
 function onCanvasClick(event: MouseEvent) {
   const canvas = canvasRef.value
   if (!canvas) return
+  if (swallowClick) {
+    swallowClick = false
+    return
+  }
   const rect = canvas.getBoundingClientRect()
   const x = (event.clientX - rect.left) / rect.width
   const y = (event.clientY - rect.top) / rect.height
@@ -381,7 +422,92 @@ function onCanvasClick(event: MouseEvent) {
   emit('tapAction', zones[index] ?? 0)
 }
 
+/** 长按落点换算成词；拿不到可读文本返回 null。 */
+function selectionAt(clientX: number, clientY: number): ReaderSelection | null {
+  const canvas = canvasRef.value
+  if (!canvas || !ctx) return null
+  const rect = canvas.getBoundingClientRect()
+  if (!rect.width || !rect.height) return null
+  const pad = props.padding
+  // render 末尾可能把 ctx.font 切到页脚字体，测量前必须恢复正文字体。
+  ctx.font = measureFont()
+  const hit = hitTest(
+    pages.value[page.value] ?? [],
+    { x: clientX - rect.left, y: clientY - rect.top },
+    {
+      left: pad.left,
+      top: 44 + pad.top + 8,
+      lineHeight: lineHeightPx(),
+      measure: (value) => ctx?.measureText(value).width ?? 0,
+    },
+  )
+  if (!hit || !hit.word) return null
+  return {
+    text: hit.word,
+    line: hit.line.trim(),
+    fallback: hit.fallback,
+    lineIndex: hit.lineIndex,
+    charIndex: hit.charIndex,
+    x: clientX - rect.left,
+    y: clientY - rect.top,
+    clientX,
+    clientY,
+  }
+}
+
+function clearPress() {
+  if (press) window.clearTimeout(press.timer)
+  press = null
+}
+
+function finishLongPress() {
+  const active = press
+  if (!active) return
+  clearPress()
+  // 长按即使没命中文字也不翻页；命中时把选中的词抛给查词面板。
+  swallowClick = true
+  const selection = selectionAt(active.x, active.y)
+  if (selection) emit('select', selection)
+}
+
+function onCanvasPointerDown(event: PointerEvent) {
+  if (!event.isPrimary) return
+  if (event.pointerType === 'mouse' && event.button !== 0) return
+  clearPress()
+  swallowClick = false
+  press = {
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    x: event.clientX,
+    y: event.clientY,
+    timer: window.setTimeout(finishLongPress, LONG_PRESS_MS),
+  }
+}
+
+function onWindowPointerMove(event: PointerEvent) {
+  if (!press || event.pointerId !== press.pointerId) return
+  if (Math.hypot(event.clientX - press.startX, event.clientY - press.startY) > LONG_PRESS_TOLERANCE) {
+    clearPress()
+    return
+  }
+  press.x = event.clientX
+  press.y = event.clientY
+}
+
+function onWindowPointerEnd(event: PointerEvent) {
+  if (!press || event.pointerId !== press.pointerId) return
+  clearPress()
+}
+
+function onCanvasContextMenu(event: MouseEvent) {
+  // 长按/右键都不弹浏览器菜单，避免打断选词。
+  event.preventDefault()
+}
+
 function onKey(event: KeyboardEvent) {
+  const target = event.target as HTMLElement | null
+  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return
   if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
     event.preventDefault()
     next()
@@ -403,11 +529,18 @@ onMounted(() => {
   observer = new ResizeObserver(() => layout())
   if (canvas.parentElement) observer.observe(canvas.parentElement)
   window.addEventListener('keydown', onKey)
+  window.addEventListener('pointermove', onWindowPointerMove)
+  window.addEventListener('pointerup', onWindowPointerEnd)
+  window.addEventListener('pointercancel', onWindowPointerEnd)
 })
 
 onBeforeUnmount(() => {
   observer?.disconnect()
+  clearPress()
   window.removeEventListener('keydown', onKey)
+  window.removeEventListener('pointermove', onWindowPointerMove)
+  window.removeEventListener('pointerup', onWindowPointerEnd)
+  window.removeEventListener('pointercancel', onWindowPointerEnd)
 })
 
 watch(
@@ -486,7 +619,13 @@ defineExpose({ next, prev, total, page, goto, findPageFor, currentPageLines })
 
 <template>
   <div class="mo-canvas-host" data-testid="canvas-reader" :style="{ background: palette.bg }">
-    <canvas ref="canvasRef" class="mo-canvas" @click="onCanvasClick" />
+    <canvas
+      ref="canvasRef"
+      class="mo-canvas"
+      @click="onCanvasClick"
+      @pointerdown="onCanvasPointerDown"
+      @contextmenu="onCanvasContextMenu"
+    />
   </div>
 </template>
 
@@ -502,5 +641,9 @@ defineExpose({ next, prev, total, page, goto, findPageFor, currentPageLines })
   width: 100%;
   height: 100%;
   cursor: pointer;
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 </style>
