@@ -138,6 +138,8 @@ export const ReaderDomain = defineDomain({
               .passthrough(),
           )
           .default([]),
+        /** 媒体缓存配额（字节）；0 表示跟随环境变量或默认 50GB。 */
+        mediaQuotaBytes: z.number().int().min(0).default(0),
       })
       .passthrough(),
     initial: {
@@ -157,6 +159,7 @@ export const ReaderDomain = defineDomain({
       tapZones: DEFAULT_TAP_ZONES,
       menuItems: DEFAULT_MENU_ITEMS,
       replaceRules: [],
+      mediaQuotaBytes: 0,
     },
   },
   tables: {

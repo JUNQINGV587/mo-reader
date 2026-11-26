@@ -36,7 +36,7 @@ import { groupExploreBySourceGroup } from '../../core/source/group'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
-type View = 'shelf' | 'sources' | 'search' | 'explore' | 'detail' | 'reader'
+type View = 'shelf' | 'sources' | 'search' | 'explore' | 'detail' | 'reader' | 'storage'
 type Theme = 'light' | 'sepia' | 'dark'
 type Turn = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
 type DictResult = DictLookupOutcome
@@ -695,8 +695,102 @@ function formatBytes(value: number) {
   const size = Number(value) || 0
   if (size < 1024) return `${size} B`
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
-  return `${(size / 1024 / 1024).toFixed(1)} MB`
+  if (size < 1024 ** 3) return `${(size / 1024 / 1024).toFixed(1)} MB`
+  if (size < 1024 ** 4) return `${(size / 1024 ** 3).toFixed(1)} GB`
+  return `${(size / 1024 ** 4).toFixed(2)} TB`
 }
+
+// 存储页：三类缓存用量、媒体配额与按书清理。
+const storageUsage = ref<any>(null)
+const storageBusy = ref(false)
+const storageMessage = ref('')
+const quotaDraft = ref(0)
+const quotaSaving = ref(false)
+const storageClearBook = ref('')
+const storageClearing = ref('')
+const storageClearAllOpen = ref(false)
+const storageClearAllBusy = ref(false)
+
+const storageBooks = computed<any[]>(() =>
+  Array.isArray(storageUsage.value?.books) ? storageUsage.value.books : [],
+)
+
+const quotaSourceText = computed(() => {
+  const source = storageUsage.value?.quota?.source
+  if (source === 'env') return '环境变量'
+  if (source === 'settings') return '设置'
+  return '默认'
+})
+
+async function loadStorageUsage() {
+  storageBusy.value = true
+  try {
+    const result = await call('getStorageUsage')
+    storageUsage.value = result
+    // 设置里存 0 表示跟随默认，界面也回填 0。
+    const settingsBytes = Number(result?.quota?.settingsBytes ?? 0)
+    quotaDraft.value = Math.round((settingsBytes / 1024 ** 3) * 10) / 10
+    storageMessage.value = ''
+  } catch (error) {
+    storageMessage.value = `统计失败：${errorText(error)}`
+  } finally {
+    storageBusy.value = false
+  }
+}
+
+async function saveMediaQuota() {
+  const gb = Number(quotaDraft.value)
+  if (!Number.isFinite(gb) || gb < 0) {
+    storageMessage.value = '配额要填 0 或更大的数'
+    return
+  }
+  quotaSaving.value = true
+  try {
+    await call('setMediaQuota', { bytes: Math.round(gb * 1024 ** 3) })
+    storageMessage.value = gb > 0 ? `配额已设为 ${gb} GB` : '已改用默认配额'
+    await loadStorageUsage()
+  } catch (error) {
+    storageMessage.value = `保存失败：${errorText(error)}`
+  } finally {
+    quotaSaving.value = false
+  }
+}
+
+async function clearStorageForBook(bookId: string) {
+  storageClearing.value = bookId
+  try {
+    const result = await call('clearBookStorage', { bookId })
+    const textBytes = formatBytes(Number(result?.text?.bytes ?? 0))
+    const mediaBytes = formatBytes(Number(result?.media?.bytes ?? 0))
+    storageMessage.value = `已清理文字 ${textBytes}、媒体 ${mediaBytes}`
+    await loadStorageUsage()
+  } catch (error) {
+    storageMessage.value = `清理失败：${errorText(error)}`
+  } finally {
+    storageClearing.value = ''
+    storageClearBook.value = ''
+  }
+}
+
+async function clearAllMediaStorage() {
+  storageClearAllBusy.value = true
+  try {
+    const result = await call('clearAllMedia')
+    const bytes = formatBytes(Number(result?.bytes ?? 0))
+    storageMessage.value = `已清空媒体 ${bytes}（${Number(result?.removed ?? 0)} 章）`
+    await loadStorageUsage()
+  } catch (error) {
+    storageMessage.value = `清理失败：${errorText(error)}`
+  } finally {
+    storageClearAllBusy.value = false
+    storageClearAllOpen.value = false
+  }
+}
+
+// 切到存储页时刷新一次，配额或清理改动后也会再刷。
+watch(view, (next) => {
+  if (next === 'storage') void loadStorageUsage()
+})
 
 function isDownloadRunning(job: any) {
   return job?.status === 'running' || job?.status === 'queued'
@@ -3220,6 +3314,7 @@ onMounted(async () => {
         <button :class="{ on: view === 'explore' }" data-testid="nav-explore" @click="openExplore">发现</button>
         <button :class="{ on: view === 'sources' }" data-testid="nav-sources" @click="view = 'sources'">书源</button>
         <button :class="{ on: view === 'rss' }" data-testid="nav-rss" @click="view = 'rss'">订阅</button>
+        <button :class="{ on: view === 'storage' }" data-testid="nav-storage" @click="view = 'storage'">存储</button>
         <span class="mo-version">v{{ version }}</span>
       </nav>
     </template>
@@ -4192,6 +4287,117 @@ onMounted(async () => {
         </transition>
       </section>
 
+      <section v-if="view === 'storage'" class="mo-pane" data-testid="storage-pane">
+        <div class="mo-section-head">
+          <h2>存储</h2>
+          <span class="muted">文字缓存 · 媒体缓存 · 导出文件</span>
+          <button class="mo-btn" :disabled="storageBusy" data-testid="storage-refresh" @click="loadStorageUsage">刷新</button>
+        </div>
+        <p v-if="storageBusy && !storageUsage" class="muted">统计中…</p>
+        <p v-if="storageMessage" class="muted" data-testid="storage-message">{{ storageMessage }}</p>
+
+        <div class="mo-card" data-testid="storage-overview">
+          <h3 class="mo-card-title">占用</h3>
+          <div class="mo-storage-grid">
+            <div class="mo-storage-item">
+              <span class="muted">总量</span>
+              <strong>{{ formatBytes(storageUsage?.total?.bytes || 0) }}</strong>
+              <span class="muted">{{ storageUsage?.total?.files || 0 }} 个文件</span>
+            </div>
+            <div class="mo-storage-item">
+              <span class="muted">文字缓存</span>
+              <strong>{{ formatBytes(storageUsage?.text?.bytes || 0) }}</strong>
+              <span class="muted">{{ storageUsage?.text?.files || 0 }} 个文件</span>
+            </div>
+            <div class="mo-storage-item">
+              <span class="muted">媒体缓存</span>
+              <strong>{{ formatBytes(storageUsage?.media?.bytes || 0) }}</strong>
+              <span class="muted">{{ storageUsage?.media?.entries || 0 }} 章 · {{ storageUsage?.media?.books || 0 }} 本</span>
+            </div>
+            <div class="mo-storage-item">
+              <span class="muted">导出文件</span>
+              <strong>{{ formatBytes(storageUsage?.exports?.bytes || 0) }}</strong>
+              <span class="muted">{{ storageUsage?.exports?.files || 0 }} 个文件</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="mo-card" data-testid="storage-quota">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">媒体配额</h3>
+            <span class="mo-tag" data-testid="quota-source">{{ quotaSourceText }}</span>
+          </div>
+          <p class="muted">当前生效 {{ formatBytes(storageUsage?.quota?.bytes || 0) }}，超过后按最久未读整本清理。</p>
+          <div class="mo-row">
+            <input v-model.number="quotaDraft" type="number" min="0" step="1" data-testid="quota-input" aria-label="媒体配额（GB）" />
+            <span class="muted">GB</span>
+            <button class="mo-btn primary" :disabled="quotaSaving" data-testid="quota-save" @click="saveMediaQuota">
+              {{ quotaSaving ? '保存中…' : '保存' }}
+            </button>
+            <span class="muted">填 0 用默认或环境变量</span>
+          </div>
+        </div>
+
+        <div class="mo-card" data-testid="storage-books">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">按书清理</h3>
+            <span class="muted">{{ storageBooks.length }} 本有缓存</span>
+          </div>
+          <p v-if="storageBooks.length === 0" class="muted">还没有缓存内容。</p>
+          <div
+            v-for="book in storageBooks"
+            :key="book.bookId"
+            class="mo-storage-book"
+            :data-testid="`storage-book-${book.bookId}`"
+          >
+            <span class="mo-storage-name">
+              {{ book.name }}
+              <span v-if="book.pinned" class="mo-tag soft">置顶</span>
+            </span>
+            <span class="muted">文字 {{ formatBytes(book.textBytes) }} · {{ book.textCount }} 章</span>
+            <span class="muted">媒体 {{ formatBytes(book.mediaBytes) }} · {{ book.mediaCount }} 章</span>
+            <template v-if="storageClearBook === book.bookId">
+              <button
+                class="mo-btn danger"
+                :disabled="storageClearing === book.bookId"
+                :data-testid="`clear-book-confirm-${book.bookId}`"
+                @click="clearStorageForBook(book.bookId)"
+              >
+                {{ storageClearing === book.bookId ? '清理中…' : '确认清理' }}
+              </button>
+              <button class="mo-btn" :disabled="storageClearing === book.bookId" @click="storageClearBook = ''">取消</button>
+            </template>
+            <button
+              v-else
+              class="mo-btn"
+              :data-testid="`clear-book-${book.bookId}`"
+              @click="storageClearBook = book.bookId"
+            >
+              清理
+            </button>
+          </div>
+        </div>
+
+        <div class="mo-card" data-testid="storage-clear-media">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">清空媒体</h3>
+            <span class="muted">文字缓存与书架不受影响</span>
+          </div>
+          <div v-if="storageClearAllOpen" class="mo-row">
+            <span class="muted">会删掉全部媒体文件与索引，确认吗？</span>
+            <button
+              class="mo-btn danger"
+              :disabled="storageClearAllBusy"
+              data-testid="clear-all-media-confirm"
+              @click="clearAllMediaStorage"
+            >
+              {{ storageClearAllBusy ? '清理中…' : '确认清空' }}
+            </button>
+            <button class="mo-btn" :disabled="storageClearAllBusy" @click="storageClearAllOpen = false">取消</button>
+          </div>
+          <button v-else class="mo-btn danger" data-testid="clear-all-media" @click="storageClearAllOpen = true">清空媒体</button>
+        </div>
+      </section>
       <section v-if="view === 'reader'" class="mo-reader">
         <p
           v-if="readerMediaNotice"
@@ -5443,6 +5649,36 @@ onMounted(async () => {
 .mo-card-title {
   margin: 0 0 10px;
   font: 600 16px/1.3 'Songti SC', 'Noto Serif SC', serif;
+}
+/* 存储页：分项与按书明细用网格对齐，窄屏自动折行。 */
+.mo-storage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 8px 0 0;
+}
+.mo-storage-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mo-storage-item strong {
+  font-size: 15px;
+}
+.mo-storage-book {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 0;
+  border-top: 1px solid var(--mo-line);
+}
+.mo-storage-name {
+  flex: 1 1 160px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
 }
 .mo-card-head {
   display: flex;

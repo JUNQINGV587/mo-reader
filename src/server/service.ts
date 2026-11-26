@@ -60,6 +60,7 @@ import {
 } from './media-download.js'
 import {
   clearMediaDir,
+  clearMediaRoot,
   mediaEntryKey,
   mediaFileName,
   mediaFileIdOf,
@@ -69,6 +70,15 @@ import {
   prepareMediaDir,
   saveMediaStream,
 } from './media-cache.js'
+import {
+  MAX_MEDIA_QUOTA_BYTES,
+  exportUsage,
+  formatQuotaBytes,
+  mediaUsage,
+  resolveMediaQuota,
+  textCacheUsage,
+  type QuotaSource,
+} from './storage-usage.js'
 import { downloadHlsChapter } from './hls.js'
 import { buildEpub } from './epub-export.js'
 import { assertEmbeddableFont } from './pdf-export.js'
@@ -271,6 +281,9 @@ export class ReaderService extends TypertRemoteService {
   mediaStreamOpener: ((url: string, options: MediaStreamOptions) => Promise<MediaStreamResult>) | null = null
 
   downloadRetryBaseMs = DEFAULT_RETRY_BASE_MS
+
+  /** 配额读改串行：并发章节发布会同时触发淘汰，排队执行避免重复删同一本书。 */
+  storageLock: Promise<unknown> | null = null
 
   constructor(ctx: any, _options: any = {}) {
     super(ctx, 'reader')
@@ -1109,6 +1122,13 @@ export class ReaderService extends TypertRemoteService {
     if (args?.toIndex !== undefined && args?.toIndex !== null && args?.toIndex !== '') {
       options.toIndex = Number(args.toIndex)
     }
+    // 开新作业前先腾地方：淘汰不动正在下载与置顶的书，还不达标就直接拒绝，别建必然失败的作业。
+    const quota = await this.ensureMediaQuota()
+    if (quota.usage > quota.quota) {
+      throw new Error(
+        `媒体缓存已满且没有可清理的作品，请先清理媒体缓存或调大配额（当前配额 ${formatQuotaBytes(quota.quota)}）`,
+      )
+    }
     return this.mediaManager().start(bookId, options)
   }
 
@@ -1332,6 +1352,82 @@ export class ReaderService extends TypertRemoteService {
     await clearChapterCache('')
     if (keys.length) await db.downloadEntries.deleteMany(keys)
     return { removed: keys.length }
+  }
+
+  /** 存储页总览：三类缓存的实际占用 + 配额 + 按书明细（索引口径）。 */
+  async getStorageUsage() {
+    const db = this.requireDb()
+    const [text, media, exportsUsage] = await Promise.all([
+      textCacheUsage(),
+      mediaUsage(),
+      exportUsage(),
+    ])
+    const books = this.storageBookUsage()
+    books.sort(
+      (left, right) =>
+        right.textBytes + right.mediaBytes - (left.textBytes + left.mediaBytes) ||
+        left.name.localeCompare(right.name, 'zh'),
+    )
+    return {
+      text: { bytes: text.bytes, files: text.files },
+      media: {
+        bytes: media.bytes,
+        files: media.files,
+        entries: media.dirs,
+        books: books.filter((book) => book.mediaCount > 0).length,
+      },
+      exports: { bytes: exportsUsage.bytes, files: exportsUsage.files },
+      total: {
+        bytes: text.bytes + media.bytes + exportsUsage.bytes,
+        files: text.files + media.files + exportsUsage.files,
+      },
+      quota: resolveMediaQuota(db.settings?.get?.() as Record<string, unknown> | undefined),
+      books,
+    }
+  }
+
+  /** 设置媒体配额（字节）；传 0 表示回到环境变量或默认 50GB。 */
+  async setMediaQuota(args: Args) {
+    const raw = Number(args?.bytes)
+    if (!Number.isSafeInteger(raw) || raw < 0 || raw > MAX_MEDIA_QUOTA_BYTES) {
+      throw new Error('配额无效：请输入 0 到 10TB 之间的整数（字节）')
+    }
+    const db = this.requireDb()
+    // 与 saveSettings 同样整条合并：只改配额，别的设置原样保留。
+    const next = { ...db.settings.get(), mediaQuotaBytes: raw }
+    await db.settings.set(next)
+    return { settings: next }
+  }
+
+  /** 按书清理文字与媒体缓存：取消该书活动作业并等在途收尾，索引与占用同步更新。 */
+  async clearBookStorage(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    this.requireDb()
+    const text = await this.deleteDownloads({ bookId })
+    const media = await this.deleteMediaDownloads({ bookId })
+    return {
+      text: { removed: text.removed, bytes: text.bytes },
+      media: { removed: media.removed, bytes: media.bytes },
+    }
+  }
+
+  /** 清空全部媒体缓存（含索引）：存储页的「清空媒体」用，文字缓存不动。 */
+  async clearAllMedia() {
+    this.requireDb()
+    const active = this.mediaManager()
+      .list({ kind: MEDIA_DOWNLOAD_KIND })
+      .filter((job) => isActiveJob(job.status))
+    for (const job of active) await this.mediaManager().cancel(job.id)
+    if (active.length) await this.mediaManager().waitIdle()
+    const table = this.mediaEntriesTable()
+    const keys = table ? (Array.from(table.keys()) as string[]) : []
+    let bytes = 0
+    if (table) {
+      for (const [, value] of table.entries()) bytes += Number((value as any)?.bytes) || 0
+    }
+    await clearMediaRoot()
+    if (keys.length && table) await table.deleteMany(keys)
+    return { removed: keys.length, bytes }
   }
 
   async exportBook(args: Args) {
@@ -2316,7 +2412,16 @@ export class ReaderService extends TypertRemoteService {
       retryBaseMs: () => this.downloadRetryBaseMs,
       mediaKind: (_bookId, book) => this.mediaKindOfBook(book),
       downloadChapterMedia: (args) => this.downloadChapterMediaForJob(args),
-      recordMediaDownload: (entry) => this.putMediaEntry(entry),
+      recordMediaDownload: async (entry) => {
+        await this.putMediaEntry(entry)
+        // 每章落盘后复查配额：仍超（剩下的全是置顶或正在下载的书）就以明确文案失败，已下内容保留。
+        const quota = await this.ensureMediaQuota()
+        if (quota.usage > quota.quota) {
+          throw new PermanentMediaError(
+            `媒体缓存已满且没有可清理的作品，请先清理媒体缓存或调大配额（当前配额 ${formatQuotaBytes(quota.quota)}）`,
+          )
+        }
+      },
       chapterMediaBytes: (bookId, chapterIndex, kind) =>
         this.mediaChapterBytes(bookId, chapterIndex, kind),
       discardChapterMedia: async (bookId, chapterIndex) => {
@@ -2373,6 +2478,143 @@ export class ReaderService extends TypertRemoteService {
       createdAt: Number(existing?.createdAt ?? 0) || now,
       updatedAt: now,
     })
+  }
+
+  /** 按书聚合缓存索引：文字来自下载索引，媒体来自媒体索引；书名取不到就用 bookId。 */
+  private storageBookUsage(): Array<{
+    bookId: string
+    name: string
+    pinned: boolean
+    lastReadAt: number
+    textBytes: number
+    textCount: number
+    mediaBytes: number
+    mediaCount: number
+  }> {
+    const db = this.requireDb()
+    const map = new Map<
+      string,
+      {
+        bookId: string
+        name: string
+        pinned: boolean
+        lastReadAt: number
+        textBytes: number
+        textCount: number
+        mediaBytes: number
+        mediaCount: number
+      }
+    >()
+    const ensure = (bookId: string) => {
+      let record = map.get(bookId)
+      if (!record) {
+        const book = db.books?.get?.(bookId) as Record<string, unknown> | undefined
+        record = {
+          bookId,
+          name: String(book?.name ?? '') || bookId,
+          pinned: book?.pinned === true,
+          lastReadAt: Number(book?.lastReadAt) || 0,
+          textBytes: 0,
+          textCount: 0,
+          mediaBytes: 0,
+          mediaCount: 0,
+        }
+        map.set(bookId, record)
+      }
+      return record
+    }
+    const textRows = (this.downloadEntriesTable()?.entries() ?? []) as Iterable<[string, unknown]>
+    for (const [, value] of textRows) {
+      const entry = value as Record<string, unknown>
+      const bookId = String(entry.bookId ?? '')
+      if (!bookId) continue
+      const record = ensure(bookId)
+      record.textBytes += Number(entry.bytes) || 0
+      record.textCount += 1
+    }
+    const mediaRows = (this.mediaEntriesTable()?.entries() ?? []) as Iterable<[string, unknown]>
+    for (const [, value] of mediaRows) {
+      const entry = value as Record<string, unknown>
+      const bookId = String(entry.bookId ?? '')
+      if (!bookId) continue
+      const record = ensure(bookId)
+      record.mediaBytes += Number(entry.bytes) || 0
+      record.mediaCount += 1
+    }
+    return [...map.values()]
+  }
+
+  /** 正在下载媒体的书：作业表里有活动作业即可；协调器内存里刚建、还没落盘的也算。 */
+  private mediaBusyBookIds(): Set<string> {
+    const busy = new Set<string>()
+    const jobs = (this.requireDb().jobs as any)?.entries?.()
+    if (jobs) {
+      for (const [, value] of jobs as Iterable<[string, unknown]>) {
+        const job = value as Record<string, unknown>
+        if (String(job.kind ?? '') !== MEDIA_DOWNLOAD_KIND) continue
+        if (!isActiveJob(String(job.status ?? ''))) continue
+        const bookId = String(job.bookId ?? '')
+        if (bookId) busy.add(bookId)
+      }
+    }
+    try {
+      for (const job of this.mediaManager().list({ kind: MEDIA_DOWNLOAD_KIND })) {
+        if (isActiveJob(job.status) && job.bookId) busy.add(String(job.bookId))
+      }
+    } catch {
+      // 协调器尚未初始化或旧假 db 没有作业表：只按落盘作业判断。
+    }
+    return busy
+  }
+
+  /**
+   * 配额执行：串行排队，算用量、超限就按「整本作品最久未读」淘汰，返回淘汰后的用量。
+   * 淘汰只删媒体目录与索引；pinned 的书、正在下载的书一律不动。
+   */
+  private ensureMediaQuota(): Promise<{
+    evicted: string[]
+    bytes: number
+    usage: number
+    quota: number
+    source: QuotaSource
+  }> {
+    const previous = this.storageLock ?? Promise.resolve()
+    const next = previous.catch(() => undefined).then(() => this.evictMediaToQuota())
+    this.storageLock = next.catch(() => undefined)
+    return next
+  }
+
+  private async evictMediaToQuota(): Promise<{
+    evicted: string[]
+    bytes: number
+    usage: number
+    quota: number
+    source: QuotaSource
+  }> {
+    const db = this.requireDb()
+    const quota = resolveMediaQuota(db.settings?.get?.() as Record<string, unknown> | undefined)
+    let usage = (await mediaUsage()).bytes
+    const evicted: string[] = []
+    let freed = 0
+    if (usage > quota.bytes) {
+      const busy = this.mediaBusyBookIds()
+      const candidates = this.storageBookUsage()
+        .filter((book) => book.mediaCount > 0 && !book.pinned && !busy.has(book.bookId))
+        .sort(
+          (left, right) =>
+            left.lastReadAt - right.lastReadAt || left.bookId.localeCompare(right.bookId),
+        )
+      for (const book of candidates) {
+        if (usage <= quota.bytes) break
+        const result = await this.deleteMediaDownloads({ bookId: book.bookId })
+        if (result.removed > 0) {
+          evicted.push(book.bookId)
+          freed += result.bytes
+        }
+        usage = (await mediaUsage()).bytes
+      }
+    }
+    return { evicted, bytes: freed, usage, quota: quota.bytes, source: quota.source }
   }
 
   /**
