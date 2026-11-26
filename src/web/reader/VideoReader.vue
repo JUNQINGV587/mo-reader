@@ -7,16 +7,29 @@ const props = defineProps<{
   title?: string
   bookName?: string
   initialPosition?: number
+  /** 当前播放的是本地离线文件还是在线代理。 */
+  local?: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'progress', seconds: number): void
   (e: 'ended'): void
+  (e: 'mediaError'): void
 }>()
 
 const video = ref<HTMLVideoElement | null>(null)
 const failed = ref(false)
 let hls: Hls | null = null
+/** 一次播放只上报一次错误，避免在线回退也失败时反复触发。 */
+let reported = false
+
+function markFailed() {
+  failed.value = true
+  if (!reported) {
+    reported = true
+    emit('mediaError')
+  }
+}
 
 const isHls = computed(() => /\.m3u8(\?|#|$)/i.test(props.src || ''))
 const looksLikeMedia = computed(() => /\.(m3u8|mp4|webm|ogg|flv|mkv)(\?|#|$)/i.test(props.src || ''))
@@ -47,6 +60,7 @@ function attach() {
   if (!el) return
   destroyHls()
   failed.value = false
+  reported = false
   el.removeAttribute('src')
   el.load()
   const src = props.src || ''
@@ -54,7 +68,7 @@ function attach() {
   if (isHls.value && Hls.isSupported()) {
     hls = new Hls({ enableWorker: true })
     hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (data?.fatal) failed.value = true
+      if (data?.fatal) markFailed()
     })
     hls.loadSource(src)
     hls.attachMedia(el)
@@ -89,6 +103,7 @@ onUnmounted(destroyHls)
     <div class="mo-video-head">
       <strong>{{ bookName || '视频' }}</strong>
       <span>{{ title || '当前章节' }}</span>
+      <em class="mo-video-source" data-testid="media-source-label">{{ local ? '本地' : '在线' }}</em>
     </div>
     <div v-if="externalOnly" class="mo-video-external">
       <p>该源返回的是网页播放器，无法内嵌播放。</p>
@@ -102,9 +117,9 @@ onUnmounted(destroyHls)
       preload="metadata"
       @timeupdate="onTimeUpdate"
       @ended="emit('ended')"
-      @error="failed = true"
+      @error="markFailed"
     />
-    <p v-if="failed" class="mo-video-error">视频加载失败：{{ src }}</p>
+    <p v-if="failed" class="mo-video-error" data-testid="video-error">视频加载失败（代理播放失败或网络异常）：{{ src }}</p>
     <a v-if="failed" class="mo-video-link" :href="src" target="_blank" rel="noreferrer">在浏览器打开</a>
   </div>
 </template>
@@ -129,6 +144,15 @@ onUnmounted(destroyHls)
 }
 .mo-video-head span {
   font-size: 12px;
+  color: #9a958c;
+}
+.mo-video-source {
+  margin-left: auto;
+  padding: 1px 10px;
+  border: 1px solid #3a3d44;
+  border-radius: 999px;
+  font-size: 12px;
+  font-style: normal;
   color: #9a958c;
 }
 .mo-video video {

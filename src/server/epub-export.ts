@@ -5,10 +5,17 @@ export interface EpubChapter {
   text: string
 }
 
+export interface EpubCover {
+  data: Buffer
+  mediaType: string
+  extension: 'jpg' | 'png' | 'webp'
+}
+
 export interface EpubOptions {
   title: string
-  author: string
+  author?: string
   chapters: EpubChapter[]
+  cover?: EpubCover | null
 }
 
 function escapeXml(value: string): string {
@@ -38,8 +45,22 @@ ${paragraphHtml(text)}
 </body></html>`
 }
 
+function coverXhtml(extension: EpubCover['extension']): string {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>封面</title><meta charset="utf-8"/></head>
+<body><div style="text-align:center"><img src="cover.${extension}" alt="封面"/></div></body></html>`
+}
+
+/** EPUB3 要求 dcterms:modified 为 UTC 秒级时间，形如 2026-01-02T03:04:05Z。 */
+function modifiedTime(): string {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
+}
+
 export async function buildEpub(options: EpubOptions): Promise<Buffer> {
   const chapters = options.chapters.length ? options.chapters : [{ title: '正文', text: '（无内容）' }]
+  const cover = options.cover ?? null
   const zip = new JSZip()
   zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' })
   zip.file(
@@ -63,16 +84,35 @@ export async function buildEpub(options: EpubOptions): Promise<Buffer> {
   })
 
   const bookTitle = options.title || '未命名'
-  const author = options.author || '未知作者'
+  const author = options.author?.trim() ?? ''
+  const metadata: string[] = [
+    `    <dc:identifier id="book-id">urn:uuid:mo-reader-${Date.now()}</dc:identifier>`,
+    `    <dc:title>${escapeXml(bookTitle)}</dc:title>`,
+  ]
+  // 缺作者时不留空的 dc:creator，否则阅读器会显示空白作者行。
+  if (author) metadata.push(`    <dc:creator>${escapeXml(author)}</dc:creator>`)
+  metadata.push('    <dc:language>zh-CN</dc:language>')
+  metadata.push(`    <meta property="dcterms:modified">${modifiedTime()}</meta>`)
+
+  const coverItems: string[] = []
+  if (cover) {
+    zip.file(`OEBPS/cover.${cover.extension}`, cover.data, { binary: true })
+    zip.file('OEBPS/cover.xhtml', coverXhtml(cover.extension))
+    manifest.push(
+      `<item id="cover-image" href="cover.${cover.extension}" media-type="${escapeXml(cover.mediaType)}" properties="cover-image"/>`,
+    )
+    manifest.push('<item id="cover-page" href="cover.xhtml" media-type="application/xhtml+xml"/>')
+    spine.unshift('<itemref idref="cover-page"/>')
+    coverItems.push('    <meta name="cover" content="cover-image"/>')
+  }
+
   zip.file(
     'OEBPS/content.opf',
     `<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:identifier id="book-id">urn:uuid:mo-reader-${Date.now()}</dc:identifier>
-    <dc:title>${escapeXml(bookTitle)}</dc:title>
-    <dc:creator>${escapeXml(author)}</dc:creator>
-    <dc:language>zh-CN</dc:language>
+${metadata.join('\n')}
+${coverItems.join('\n')}
   </metadata>
   <manifest>
     <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>

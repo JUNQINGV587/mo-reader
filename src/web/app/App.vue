@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import CanvasReader from '../reader/CanvasReader.vue'
 import ComicReader from '../reader/ComicReader.vue'
+import PdfReader from '../reader/PdfReader.vue'
 import AudioReader from '../reader/AudioReader.vue'
 import VideoReader from '../reader/VideoReader.vue'
 import { simulatedChapterCount, simulatedProgress } from '../../core/reader/simulate'
@@ -35,7 +36,7 @@ import { groupExploreBySourceGroup } from '../../core/source/group'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
-type View = 'shelf' | 'sources' | 'search' | 'explore' | 'detail' | 'reader'
+type View = 'shelf' | 'sources' | 'search' | 'explore' | 'detail' | 'reader' | 'storage'
 type Theme = 'light' | 'sepia' | 'dark'
 type Turn = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
 type DictResult = DictLookupOutcome
@@ -165,9 +166,14 @@ const introText = computed(() => plainText(currentBook.value?.intro))
 const chapters = ref<any[]>([])
 const currentChapter = ref<any>(null)
 const content = ref('')
-const readerKind = ref<'text' | 'images' | 'audio' | 'video'>('text')
+const readerKind = ref<'text' | 'images' | 'audio' | 'video' | 'pdf'>('text')
 const readerImages = ref<string[]>([])
 const readerMedia = ref('')
+/** 当前章节是否来自本地离线缓存；播放器据此显示「本地 / 在线」。 */
+const readerLocal = ref(false)
+/** 本地文件损坏/缺失时回退在线的提示，留在阅读页不解散。 */
+const readerMediaNotice = ref('')
+let mediaFallbackBusy = false
 const replacedContent = computed(() => {
   let text = content.value
   for (const rule of settings.value.replaceRules) {
@@ -183,6 +189,17 @@ const replacedContent = computed(() => {
 })
 const readerTitle = ref('')
 const progress = ref<any>(null)
+const localPdfStatus = ref<any>(null)
+// PDF 原版阅读：地址、初始页/缩放与加载错误都由阅读页接管。
+const pdfOriginalUrl = ref('')
+const pdfInitialPage = ref(0)
+const pdfInitialZoom = ref(100)
+const pdfInitialFitWidth = ref(false)
+const pdfError = ref('')
+let pdfTimer: ReturnType<typeof setTimeout> | undefined
+const isPdfBook = computed(() => Boolean(localPdfStatus.value?.isPdf))
+const isPdfReadable = computed(() => Boolean(localPdfStatus.value?.isPdf && localPdfStatus.value?.hasOriginal && localPdfStatus.value?.originalUrl))
+const hasPdfProgress = computed(() => progress.value?.pdfPage !== undefined || progress.value?.pdfZoom !== undefined)
 const batteryPercent = ref<number | null>(null)
 const bookPercent = computed(() => {
   const total = chapters.value.length
@@ -436,6 +453,7 @@ async function refresh() {
     try {
       const fontResult = await call('listFonts')
       customFonts.value = fontResult?.fonts ?? []
+      syncExportFont()
       if (settings.value.fontId) await applyCustomFont(settings.value.fontId)
     } catch (error) {
       fontMessage.value = `字体加载失败：${errorText(error)}`
@@ -515,30 +533,645 @@ async function cacheBookChapters() {
   }
 }
 
-async function exportBook(format: 'txt' | 'epub') {
+const exportJob = ref<any>(null)
+const exportDownload = ref<{ url: string; fileName: string } | null>(null)
+/** PDF 导出用的中文字体 id；空值交给服务端提示「请先上传中文字体」。 */
+const exportFontId = ref('')
+const exportMessage = ref('')
+let exportTimer: ReturnType<typeof setInterval> | null = null
+
+function isExportRunning(job: any) {
+  return job?.status === 'running' || job?.status === 'queued'
+}
+
+function exportStatusText(job: any) {
+  if (!job) return ''
+  if (job.status === 'paused') return job.error === '宿主重启' ? '已暂停（宿主重启）' : '已暂停'
+  if (job.status === 'queued') return '排队中'
+  if (job.status === 'running') return '导出中'
+  if (job.status === 'done') return '已完成'
+  if (job.status === 'cancelled') return '已取消'
+  return job.status === 'failed' ? '失败' : String(job.status)
+}
+
+function exportFailedChapters(job: any) {
+  const list = Array.isArray(job?.failedChapters) ? job.failedChapters : []
+  if (!list.length) return ''
+  const shown = list.slice(0, 8).join('、')
+  return list.length > 8 ? `${shown} 等 ${list.length} 章` : shown
+}
+
+const storageQuotaWarning = computed(() => {
+  const used = Number(storageUsage.value?.media?.bytes ?? 0)
+  const quota = Number(storageUsage.value?.quota?.bytes ?? 0)
+  if (!quota || used / quota < 0.8) return ''
+  return `媒体缓存已用 ${Math.round((used / quota) * 100)}%，接近配额，建议按书清理`
+})
+
+function exportPercent(job: any) {
+  const total = Number(job?.total) || 0
+  if (!total) return 0
+  const handled = Number(job.completed) + Number(job.failed) + Number(job.skipped)
+  return Math.max(0, Math.min(100, Math.round((handled / total) * 100)))
+}
+
+function stopExportTimer() {
+  if (exportTimer !== null) {
+    clearInterval(exportTimer)
+    exportTimer = null
+  }
+}
+
+function syncExportTimer() {
+  if (isExportRunning(exportJob.value)) {
+    if (exportTimer === null) exportTimer = setInterval(refreshExportJob, 600)
+  } else {
+    stopExportTimer()
+  }
+}
+
+async function loadExportDownload() {
+  const job = exportJob.value
+  if (!job?.id || job.status !== 'done') {
+    exportDownload.value = null
+    return
+  }
+  try {
+    const result: any = await call('getExportDownload', { jobId: job.id })
+    exportDownload.value = { url: String(result?.url ?? ''), fileName: String(result?.fileName ?? '') }
+  } catch (error) {
+    exportDownload.value = null
+    status.value = errorText(error)
+  }
+}
+
+async function refreshExportJob() {
+  const job = exportJob.value
+  if (!job?.id) return
+  try {
+    const result: any = await call('getJob', { id: job.id })
+    exportJob.value = result?.job ?? exportJob.value
+  } catch (error) {
+    status.value = errorText(error)
+  }
+  if (exportJob.value?.status === 'done') await loadExportDownload()
+  syncExportTimer()
+}
+
+async function loadActiveExport() {
+  exportJob.value = null
+  exportDownload.value = null
+  exportBusy.value = false
+  const book = currentBook.value as any
+  if (!book?.id) {
+    stopExportTimer()
+    return
+  }
+  try {
+    const result: any = await call('listJobs', { bookId: book.id, kind: 'export' })
+    const jobs: any[] = Array.isArray(result?.jobs) ? result.jobs : []
+    const active = jobs.find((job) => ['queued', 'running', 'paused'].includes(job.status))
+    exportJob.value = active ?? jobs[0] ?? null
+  } catch {
+    exportJob.value = null
+  }
+  if (exportJob.value?.status === 'done') await loadExportDownload()
+  syncExportTimer()
+}
+
+/** 导出字体默认跟随阅读字体，没设过就用列表第一个；是否可嵌入由服务端开工前校验。 */
+function syncExportFont() {
+  if (exportFontId.value && customFonts.value.some((font) => font.id === exportFontId.value)) return
+  const preferred = settings.value.fontId
+  exportFontId.value =
+    preferred && customFonts.value.some((font) => font.id === preferred)
+      ? preferred
+      : (customFonts.value[0]?.id ?? '')
+}
+
+async function startExport(format: 'txt' | 'epub' | 'pdf' = 'txt', fontId = '') {
   const book = currentBook.value as any
   if (!book?.id) return
   exportBusy.value = true
+  exportDownload.value = null
+  exportMessage.value = ''
   try {
-    const result: any = await call('exportBook', { bookId: book.id, limit: 50, format })
-    const binary = atob(result.dataBase64)
-    const bytes = new Uint8Array(binary.length)
-    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
-    const mime = format === 'epub' ? 'application/epub+zip' : 'text/plain;charset=utf-8'
-    const blob = new Blob([bytes], { type: mime })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = result.fileName || `book.${format}`
-    link.click()
-    URL.revokeObjectURL(url)
-    status.value = `已导出 ${result.chapters} 章（${format.toUpperCase()}）`
+    const payload: Record<string, unknown> = { bookId: book.id, format }
+    if (format === 'pdf') {
+      payload.fontId = fontId || exportFontId.value || settings.value.fontId || customFonts.value[0]?.id || ''
+    }
+    const result: any = await call('startExport', payload)
+    exportJob.value = result?.job ?? null
+    status.value = result?.existing ? '已有进行中的导出' : '已开始导出'
+    syncExportTimer()
   } catch (error) {
-    status.value = errorText(error)
+    const message = errorText(error)
+    status.value = message
+    // 面板里也要能看到缺字体一类的失败原因。
+    if (format === 'pdf') exportMessage.value = message
   } finally {
     exportBusy.value = false
   }
 }
+
+async function cancelExport() {
+  const job = exportJob.value
+  if (!job?.id) return
+  exportBusy.value = true
+  try {
+    const result: any = await call('cancelJob', { id: job.id })
+    exportJob.value = result?.job ?? exportJob.value
+    exportDownload.value = null
+    status.value = '已取消导出'
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    exportBusy.value = false
+    syncExportTimer()
+  }
+}
+
+
+type DownloadScope = 'rest' | 'all' | 'range'
+const downloadScope = ref<DownloadScope>('rest')
+const downloadFrom = ref(1)
+const downloadTo = ref(1)
+const downloadJob = ref<any>(null)
+const downloadSummary = ref<any>(null)
+const downloadBusy = ref(false)
+const downloadDeleting = ref(false)
+const deleteConfirmOpen = ref(false)
+const chapterError = ref('')
+let downloadTimer: ReturnType<typeof setInterval> | null = null
+let downloadSummaryAt = 0
+
+function formatBytes(value: number) {
+  const size = Number(value) || 0
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  if (size < 1024 ** 3) return `${(size / 1024 / 1024).toFixed(1)} MB`
+  if (size < 1024 ** 4) return `${(size / 1024 ** 3).toFixed(1)} GB`
+  return `${(size / 1024 ** 4).toFixed(2)} TB`
+}
+
+// 存储页：三类缓存用量、媒体配额与按书清理。
+const storageUsage = ref<any>(null)
+const storageBusy = ref(false)
+const storageMessage = ref('')
+const quotaDraft = ref(0)
+const quotaSaving = ref(false)
+const storageClearBook = ref('')
+const storageClearing = ref('')
+const storageClearAllOpen = ref(false)
+const storageClearAllBusy = ref(false)
+
+const storageBooks = computed<any[]>(() =>
+  Array.isArray(storageUsage.value?.books) ? storageUsage.value.books : [],
+)
+
+const quotaSourceText = computed(() => {
+  const source = storageUsage.value?.quota?.source
+  if (source === 'env') return '环境变量'
+  if (source === 'settings') return '设置'
+  return '默认'
+})
+
+async function loadStorageUsage() {
+  storageBusy.value = true
+  try {
+    const result = await call('getStorageUsage')
+    storageUsage.value = result
+    // 设置里存 0 表示跟随默认，界面也回填 0。
+    const settingsBytes = Number(result?.quota?.settingsBytes ?? 0)
+    quotaDraft.value = Math.round((settingsBytes / 1024 ** 3) * 10) / 10
+    storageMessage.value = ''
+  } catch (error) {
+    storageMessage.value = `统计失败：${errorText(error)}`
+  } finally {
+    storageBusy.value = false
+  }
+}
+
+async function saveMediaQuota() {
+  const gb = Number(quotaDraft.value)
+  if (!Number.isFinite(gb) || gb < 0) {
+    storageMessage.value = '配额要填 0 或更大的数'
+    return
+  }
+  quotaSaving.value = true
+  try {
+    await call('setMediaQuota', { bytes: Math.round(gb * 1024 ** 3) })
+    storageMessage.value = gb > 0 ? `配额已设为 ${gb} GB` : '已改用默认配额'
+    await loadStorageUsage()
+  } catch (error) {
+    storageMessage.value = `保存失败：${errorText(error)}`
+  } finally {
+    quotaSaving.value = false
+  }
+}
+
+async function clearStorageForBook(bookId: string) {
+  storageClearing.value = bookId
+  try {
+    const result = await call('clearBookStorage', { bookId })
+    const textBytes = formatBytes(Number(result?.text?.bytes ?? 0))
+    const mediaBytes = formatBytes(Number(result?.media?.bytes ?? 0))
+    storageMessage.value = `已清理文字 ${textBytes}、媒体 ${mediaBytes}`
+    await loadStorageUsage()
+  } catch (error) {
+    storageMessage.value = `清理失败：${errorText(error)}`
+  } finally {
+    storageClearing.value = ''
+    storageClearBook.value = ''
+  }
+}
+
+async function clearAllMediaStorage() {
+  storageClearAllBusy.value = true
+  try {
+    const result = await call('clearAllMedia')
+    const bytes = formatBytes(Number(result?.bytes ?? 0))
+    storageMessage.value = `已清空媒体 ${bytes}（${Number(result?.removed ?? 0)} 章）`
+    await loadStorageUsage()
+  } catch (error) {
+    storageMessage.value = `清理失败：${errorText(error)}`
+  } finally {
+    storageClearAllBusy.value = false
+    storageClearAllOpen.value = false
+  }
+}
+
+// 切到存储页时刷新一次，配额或清理改动后也会再刷。
+watch(view, (next) => {
+  if (next === 'storage') void loadStorageUsage()
+})
+
+function isDownloadRunning(job: any) {
+  return job?.status === 'running' || job?.status === 'queued'
+}
+
+function downloadStatusText(job: any) {
+  if (!job) return ''
+  if (job.status === 'paused') return job.error === '宿主重启' ? '已暂停（宿主重启）' : '已暂停'
+  if (job.status === 'queued') return '排队中'
+  if (job.status === 'running') return '下载中'
+  if (job.status === 'done') return '已完成'
+  if (job.status === 'cancelled') return '已取消'
+  return job.status === 'failed' ? '失败' : String(job.status)
+}
+
+function downloadPercent(job: any) {
+  const total = Number(job?.total) || 0
+  if (!total) return 0
+  const handled = Number(job.completed) + Number(job.failed) + Number(job.skipped)
+  return Math.max(0, Math.min(100, Math.round((handled / total) * 100)))
+}
+
+function stopDownloadTimer() {
+  if (downloadTimer !== null) {
+    clearInterval(downloadTimer)
+    downloadTimer = null
+  }
+}
+
+function syncDownloadTimer() {
+  if (isDownloadRunning(downloadJob.value)) {
+    if (downloadTimer === null) downloadTimer = setInterval(refreshDownloadJob, 600)
+  } else {
+    stopDownloadTimer()
+  }
+}
+
+async function refreshDownloadJob() {
+  const job = downloadJob.value
+  if (!job?.id) return
+  try {
+    const result: any = await call('getJob', { id: job.id })
+    downloadJob.value = result?.job ?? downloadJob.value
+  } catch (error) {
+    status.value = errorText(error)
+  }
+  // 下载中每 5 秒刷新一次聚合（索引随完成章增长）；结束/暂停时立即刷新。
+  if (!isDownloadRunning(downloadJob.value) || Date.now() - downloadSummaryAt > 5000) {
+    void refreshDownloadSummary()
+  }
+  syncDownloadTimer()
+}
+
+/** 详情页的下载统计：索引聚合在服务端算好，这里只负责显示。 */
+async function refreshDownloadSummary() {
+  const book = currentBook.value as any
+  if (!book?.id) {
+    downloadSummary.value = null
+    return
+  }
+  try {
+    const result: any = await call('getDownloadSummary', {
+      bookId: book.id,
+      total: chapters.value.length,
+    })
+    downloadSummary.value = result?.summary ?? null
+    downloadSummaryAt = Date.now()
+  } catch {
+    // 统计失败不影响下载/阅读，按无索引显示。
+    downloadSummary.value = null
+  }
+}
+
+async function loadActiveDownload() {
+  downloadJob.value = null
+  downloadSummary.value = null
+  deleteConfirmOpen.value = false
+  const book = currentBook.value as any
+  downloadFrom.value = 1
+  downloadTo.value = Math.max(1, chapters.value.length)
+  if (!book?.id) {
+    syncDownloadTimer()
+    return
+  }
+  void refreshDownloadSummary()
+  try {
+    const result: any = await call('listJobs', { bookId: book.id, kind: 'download' })
+    const jobs: any[] = Array.isArray(result?.jobs) ? result.jobs : []
+    const active = jobs.find((job) => ['queued', 'running', 'paused'].includes(job.status))
+    downloadJob.value = active ?? jobs[0] ?? null
+  } catch {
+    downloadJob.value = null
+  }
+  syncDownloadTimer()
+}
+
+/** 按书删除已下载：只清文字缓存与索引，书、进度、书签、笔记都在。 */
+async function deleteDownloaded() {
+  const book = currentBook.value as any
+  if (!book?.id) return
+  deleteConfirmOpen.value = false
+  downloadDeleting.value = true
+  try {
+    const result: any = await call('deleteDownloads', { bookId: book.id })
+    status.value = `已删除 ${result?.removed ?? 0} 章的下载`
+    await loadActiveDownload()
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    downloadDeleting.value = false
+  }
+}
+
+async function startDownload() {
+  const book = currentBook.value as any
+  if (!book?.id) return
+  const args: any = { bookId: book.id }
+  if (downloadScope.value === 'all') {
+    args.all = true
+  } else if (downloadScope.value === 'range') {
+    const last = Math.max(1, chapters.value.length)
+    const from = Math.max(1, Math.min(last, Number(downloadFrom.value) || 1))
+    const to = Math.max(from, Math.min(last, Number(downloadTo.value) || last))
+    args.fromIndex = from - 1
+    args.toIndex = to - 1
+  } else {
+    args.fromIndex = Math.max(0, Number(progress.value?.chapterIndex ?? 0) || 0)
+  }
+  downloadBusy.value = true
+  try {
+    const result: any = await call('startDownload', args)
+    downloadJob.value = result?.job ?? null
+    status.value = result?.existing ? '已有进行中的下载' : '已开始下载'
+    void refreshDownloadSummary()
+    syncDownloadTimer()
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    downloadBusy.value = false
+  }
+}
+
+async function controlDownload(method: string, message: string) {
+  const job = downloadJob.value
+  if (!job?.id) return
+  downloadBusy.value = true
+  try {
+    const result: any = await call(method, { id: job.id })
+    downloadJob.value = result?.job ?? downloadJob.value
+    status.value = message
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    downloadBusy.value = false
+    void refreshDownloadSummary()
+    syncDownloadTimer()
+  }
+}
+
+function pauseDownload() {
+  void controlDownload('pauseJob', '已暂停下载')
+}
+
+function resumeDownload() {
+  void controlDownload('resumeJob', '继续下载')
+}
+
+function cancelDownload() {
+  void controlDownload('cancelJob', '已取消下载')
+}
+
+function retryDownload() {
+  void controlDownload('retryDownload', '重试失败章节')
+}
+
+type MediaScope = 'current' | 'all' | 'range'
+const mediaScope = ref<MediaScope>('current')
+const mediaFrom = ref(1)
+const mediaTo = ref(1)
+const mediaJob = ref<any>(null)
+const mediaQuotaWarning = ref('')
+const mediaSummary = ref<any>(null)
+const mediaBusy = ref(false)
+const mediaDeleting = ref(false)
+const mediaDeleteConfirmOpen = ref(false)
+let mediaTimer: ReturnType<typeof setInterval> | null = null
+let mediaSummaryAt = 0
+
+function mediaUnit() {
+  return mediaSummary.value?.kind === 'image' ? '章' : '个'
+}
+
+function stopMediaTimer() {
+  if (mediaTimer !== null) {
+    clearInterval(mediaTimer)
+    mediaTimer = null
+  }
+}
+
+function syncMediaTimer() {
+  if (isDownloadRunning(mediaJob.value)) {
+    if (mediaTimer === null) mediaTimer = setInterval(refreshMediaJob, 600)
+  } else {
+    stopMediaTimer()
+  }
+}
+
+/** 媒体作业与文字作业共用 jobs 表结构，进度文案复用同一套函数。 */
+async function refreshMediaJob() {
+  const job = mediaJob.value
+  if (!job?.id) return
+  try {
+    const result: any = await call('getJob', { id: job.id })
+    mediaJob.value = result?.job ?? mediaJob.value
+  } catch (error) {
+    status.value = errorText(error)
+  }
+  if (!isDownloadRunning(mediaJob.value) || Date.now() - mediaSummaryAt > 5000) {
+    void refreshMediaSummary()
+  }
+  syncMediaTimer()
+}
+
+/** 媒体离线统计：服务端按书聚合条目，kind 为空表示不是媒体书。 */
+async function refreshMediaSummary() {
+  const book = currentBook.value as any
+  if (!book?.id) {
+    mediaSummary.value = null
+    return
+  }
+  try {
+    const result: any = await call('getMediaDownloadSummary', {
+      bookId: book.id,
+      total: chapters.value.length,
+    })
+    mediaSummary.value = result?.summary ?? null
+    mediaSummaryAt = Date.now()
+  } catch {
+    mediaSummary.value = null
+  }
+}
+
+async function loadActiveMedia() {
+  mediaJob.value = null
+  mediaSummary.value = null
+  mediaDeleteConfirmOpen.value = false
+  mediaScope.value = 'current'
+  mediaFrom.value = 1
+  mediaTo.value = Math.max(1, chapters.value.length)
+  const book = currentBook.value as any
+  if (!book?.id) {
+    syncMediaTimer()
+    return
+  }
+  void refreshMediaSummary()
+  try {
+    const result: any = await call('listJobs', { bookId: book.id, kind: 'media-download' })
+    const jobs: any[] = Array.isArray(result?.jobs) ? result.jobs : []
+    const active = jobs.find((job) => ['queued', 'running', 'paused'].includes(job.status))
+    mediaJob.value = active ?? jobs[0] ?? null
+  } catch {
+    mediaJob.value = null
+  }
+  syncMediaTimer()
+}
+
+async function startMediaDownload() {
+  const book = currentBook.value as any
+  if (!book?.id) return
+  const args: any = { bookId: book.id }
+  if (mediaScope.value === 'all') {
+    args.all = true
+  } else if (mediaScope.value === 'range') {
+    const last = Math.max(1, chapters.value.length)
+    const from = Math.max(1, Math.min(last, Number(mediaFrom.value) || 1))
+    const to = Math.max(from, Math.min(last, Number(mediaTo.value) || last))
+    args.fromIndex = from - 1
+    args.toIndex = to - 1
+  } else {
+    // 当前章：起止都钉在同一章，避免只给起点被当作「从这章到末尾」。
+    const index = Math.max(0, Number(progress.value?.chapterIndex ?? 0) || 0)
+    args.fromIndex = index
+    args.toIndex = index
+  }
+  mediaBusy.value = true
+  mediaQuotaWarning.value = ''
+  try {
+    const result: any = await call('startMediaDownload', args)
+    mediaJob.value = result?.job ?? null
+    mediaQuotaWarning.value = String(result?.warning ?? '')
+    status.value = result?.existing ? '已有进行中的离线下载' : '已开始离线下载'
+    void refreshMediaSummary()
+    syncMediaTimer()
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    mediaBusy.value = false
+  }
+}
+
+async function controlMediaDownload(method: string, message: string) {
+  const job = mediaJob.value
+  if (!job?.id) return
+  mediaBusy.value = true
+  try {
+    const result: any = await call(method, { id: job.id })
+    mediaJob.value = result?.job ?? mediaJob.value
+    status.value = message
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    mediaBusy.value = false
+    void refreshMediaSummary()
+    syncMediaTimer()
+  }
+}
+
+function pauseMediaDownload() {
+  void controlMediaDownload('pauseJob', '已暂停离线下载')
+}
+
+function resumeMediaDownload() {
+  void controlMediaDownload('resumeJob', '继续离线下载')
+}
+
+function cancelMediaDownload() {
+  void controlMediaDownload('cancelJob', '已取消离线下载')
+}
+
+function retryMediaDownload() {
+  void controlMediaDownload('retryDownload', '重试失败章节')
+}
+
+/** 按书删除媒体离线文件与索引；文字缓存、书与进度保留。 */
+async function deleteMediaDownloaded() {
+  const book = currentBook.value as any
+  if (!book?.id) return
+  mediaDeleteConfirmOpen.value = false
+  mediaDeleting.value = true
+  try {
+    const result: any = await call('deleteMediaDownloads', { bookId: book.id })
+    status.value = `已删除 ${result?.removed ?? 0} ${mediaUnit()}离线媒体`
+    await loadActiveMedia()
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    mediaDeleting.value = false
+  }
+}
+
+watch(view, (next) => {
+  if (next === 'detail') {
+    void loadActiveDownload()
+    void loadActiveMedia()
+    void loadActiveExport()
+  } else {
+    stopDownloadTimer()
+    stopMediaTimer()
+    stopExportTimer()
+  }
+})
+
+onUnmounted(() => {
+  stopDownloadTimer()
+  stopMediaTimer()
+  stopExportTimer()
+})
 
 const reviewOpen = ref(false)
 const reviewBusy = ref(false)
@@ -1236,14 +1869,30 @@ async function loadToc(book: any, tocUrlFallback: string) {
     tocUrl: book.tocUrl || tocUrlFallback,
   })
   chapters.value = toc.chapters ?? []
+  if (currentBook.value?.id && view.value === 'detail') void refreshDownloadSummary()
+}
+
+/** 本地书详情页的 PDF 状态：旧版本导入的 PDF 没有原文件，需要提示重新导入补齐。 */
+async function loadLocalPdfStatus(book: any) {
+  localPdfStatus.value = null
+  if (!book || book.origin !== 'local' || !book.id) return
+  try {
+    localPdfStatus.value = await call('getLocalPdfStatus', { bookId: book.id })
+  } catch {
+    localPdfStatus.value = null
+  }
 }
 
 async function openBook(book: any) {
   busy.value = true
+  chapterError.value = ''
+  downloadSummary.value = null
+  localPdfStatus.value = null
   try {
     const info = await call('getBookInfo', { sourceUrl: book.origin, bookUrl: book.bookUrl })
     currentBook.value = { ...book, ...info.info, tocUrl: info.info.tocUrl || book.bookUrl }
     await loadToc(currentBook.value, book.bookUrl)
+    await loadLocalPdfStatus(currentBook.value)
     await loadBookmarks()
     await loadNotes()
     progress.value = null
@@ -1260,6 +1909,8 @@ async function openBook(book: any) {
 
 async function openShelfBook(book: any) {
   busy.value = true
+  chapterError.value = ''
+  downloadSummary.value = null
   currentBook.value = { ...book }
   chapters.value = []
   try {
@@ -1268,6 +1919,7 @@ async function openShelfBook(book: any) {
     await loadNotes()
     const result = await call('getProgress', { bookId: book.id })
     progress.value = result?.progress ?? null
+    await loadLocalPdfStatus(book)
     tocFilter.value = ''
     tocPage.value = 1
     view.value = 'detail'
@@ -1370,6 +2022,7 @@ async function uploadFontFile(event: Event) {
     const result = await call('uploadFont', { fileName: file.name, dataBase64: toBase64(bytes) })
     const list = await call('listFonts')
     customFonts.value = list?.fonts ?? []
+    exportFontId.value = result.font.id
     settings.value.fontId = result.font.id
     await applyCustomFont(settings.value.fontId)
     await persistSettings()
@@ -1395,6 +2048,7 @@ async function deleteFont(font: { id: string; name: string }) {
     }
     const list = await call('listFonts')
     customFonts.value = list?.fonts ?? []
+    syncExportFont()
     fontMessage.value = `已删除「${font.name}」`
   } catch (error) {
     fontMessage.value = `字体删除失败：${errorText(error)}`
@@ -1746,18 +2400,23 @@ async function openChapter(chapter: any, page?: number) {
   stopSpeech()
   busy.value = true
   chrome.value = false
+  chapterError.value = ''
+  pdfError.value = ''
   initialPage.value =
     typeof page === 'number'
       ? page
       : progress.value?.chapterUrl === chapter.url
         ? Number(progress.value.position ?? 0)
         : 0
+  const index = chapters.value.indexOf(chapter)
   try {
     const result = await call('getContent', {
       sourceUrl: currentBook.value.origin,
       chapterUrl: chapter.url,
+      bookId: currentBook.value?.id,
+      chapterIndex: index,
+      chapterTitle: chapter.title,
     })
-    const index = chapters.value.indexOf(chapter)
     const kind = (result.kind ?? 'text') as 'text' | 'images' | 'audio' | 'video'
     currentChapter.value = chapter
     readerKind.value = kind
@@ -1765,6 +2424,8 @@ async function openChapter(chapter: any, page?: number) {
     readerImages.value = kind === 'images' ? (result.images ?? []) : []
     readerMedia.value =
       kind === 'audio' || kind === 'video' ? (result.mediaUrl ?? chapter.url) : ''
+    readerLocal.value = result.local === true
+    readerMediaNotice.value = result.localMissing === true ? '本地文件已失效，已改用在线内容' : ''
     readerTitle.value = chapter.title
     view.value = 'reader'
     if (currentBook.value?.id) {
@@ -1777,9 +2438,40 @@ async function openChapter(chapter: any, page?: number) {
       }).catch(() => undefined)
     }
   } catch (error) {
-    status.value = errorText(error)
+    const message = errorText(error)
+    chapterError.value = `本章暂不可读：${message}。未下载的章节需要联网后阅读。`
+    status.value = message
   } finally {
     busy.value = false
+  }
+}
+
+/** 本地文件被删/损坏：同一章改用在线代理重取，只回退一次，失败只提示。 */
+async function onReaderMediaError() {
+  if (!readerLocal.value || mediaFallbackBusy) return
+  const book = currentBook.value as any
+  const chapter = currentChapter.value
+  if (!book?.id || !chapter?.url) return
+  mediaFallbackBusy = true
+  try {
+    const index = chapters.value.indexOf(chapter)
+    const result: any = await call('getContent', {
+      sourceUrl: book.origin,
+      chapterUrl: chapter.url,
+      bookId: book.id,
+      chapterIndex: index,
+      chapterTitle: chapter.title,
+      preferOnline: true,
+    })
+    const kind = result?.kind ?? 'text'
+    if (kind === 'images') readerImages.value = result?.images ?? []
+    else if (kind === 'audio' || kind === 'video') readerMedia.value = result?.mediaUrl ?? chapter.url
+    readerLocal.value = false
+    readerMediaNotice.value = '本地文件不可用，已切换到在线播放'
+  } catch (error) {
+    readerMediaNotice.value = `本地文件不可用，在线回退也失败了：${errorText(error)}`
+  } finally {
+    mediaFallbackBusy = false
   }
 }
 
@@ -1935,8 +2627,21 @@ async function jumpBookmark(bookmark: any) {
   await openChapter(chapter, Number(bookmark.page ?? 0))
 }
 
+/** 详情页主按钮：PDF 有原文件时默认进原版，其余走文本模式。 */
 function continueReading() {
-  if (!chapters.value.length) return
+  if (isPdfReadable.value) {
+    void openPdfReader()
+    return
+  }
+  continueReadingText()
+}
+
+/** 文本模式：沿用原有「继续阅读」逻辑，PDF 书也复用。 */
+function continueReadingText() {
+  if (!chapters.value.length) {
+    status.value = '这本书还没有可读章节'
+    return
+  }
   const record = progress.value
   let target = chapters.value.find((chapter) => !chapter.isVolume && chapter.url)
   if (record) {
@@ -1946,6 +2651,93 @@ function continueReading() {
       target
   }
   if (target) openChapter(target)
+}
+
+/** 打开 PDF 原版视图：页码与缩放从阅读进度里恢复。 */
+async function openPdfReader() {
+  const book = currentBook.value as any
+  if (!book?.id) {
+    status.value = '请先把这本书加入书架'
+    return
+  }
+  if (!localPdfStatus.value) await loadLocalPdfStatus(book)
+  stopSpeech()
+  closeReaderDict()
+  tocOpen.value = false
+  bookmarksOpen.value = false
+  chapterError.value = ''
+  pdfError.value = ''
+  const info = localPdfStatus.value
+  if (!info?.isPdf) pdfError.value = '这本书没有 PDF 原文件，只能阅读文本模式'
+  else if (!info.hasOriginal || !info.originalUrl) pdfError.value = '原文件缺失，重新导入同一个 PDF 即可恢复原版阅读'
+  readerKind.value = 'pdf'
+  readerTitle.value = '原版 PDF'
+  pdfOriginalUrl.value = info?.isPdf && info?.hasOriginal ? String(info.originalUrl ?? '') : ''
+  pdfInitialPage.value = Math.max(0, Math.floor(Number(progress.value?.pdfPage ?? 0) || 0))
+  pdfInitialZoom.value = Math.min(300, Math.max(50, Number(progress.value?.pdfZoom ?? 100) || 100))
+  pdfInitialFitWidth.value = Boolean(progress.value?.pdfFitWidth)
+  view.value = 'reader'
+  chrome.value = false
+  status.value = `${book.name} · 原版 PDF`
+}
+
+/** 记录原版阅读进度：本地先合并进 progress，服务端按同一字段名保存。 */
+function onPdfPage(payload: { page: number; total: number; zoom: number; fitWidth: boolean }) {
+  progress.value = {
+    ...(progress.value ?? {}),
+    bookId: currentBook.value?.id,
+    pdfPage: payload.page,
+    pdfZoom: payload.zoom,
+    pdfFitWidth: payload.fitWidth,
+  }
+  if (!currentBook.value?.id) return
+  if (pdfTimer) clearTimeout(pdfTimer)
+  pdfTimer = setTimeout(() => {
+    if (!currentBook.value?.id) return
+    call('saveProgress', {
+      bookId: currentBook.value.id,
+      pdfPage: payload.page,
+      pdfZoom: payload.zoom,
+      pdfFitWidth: payload.fitWidth,
+    }).catch(() => undefined)
+  }, 300)
+}
+
+function closePdfReader() {
+  view.value = 'detail'
+  chrome.value = true
+}
+
+/** 从原版切到文本：PDF 一章对应一页，按原页尽量落到同一章。 */
+async function switchToTextFromPdf() {
+  const readable = chapters.value.filter((chapter: any) => !chapter.isVolume && chapter.url)
+  if (!readable.length) {
+    showReaderHint('没有可读文本，请先缓存或重新导入')
+    return
+  }
+  // 文本模式有自己的章节进度，优先回到上次读的那一章；没有才按原版页码映射。
+  const recorded = progress.value?.chapterUrl
+    ? chapters.value.find((chapter: any) => !chapter.isVolume && chapter.url === progress.value.chapterUrl)
+    : null
+  if (recorded) {
+    await openChapter(recorded)
+    return
+  }
+  const index = Math.min(Math.max(0, Number(progress.value?.pdfPage ?? 0) || 0), readable.length - 1)
+  await openChapter(readable[index])
+}
+
+/** 阅读页的原版 / 文本切换入口。 */
+async function togglePdfMode() {
+  if (readerKind.value === 'pdf') {
+    await switchToTextFromPdf()
+    return
+  }
+  if (!isPdfReadable.value) {
+    showReaderHint('没有可用的 PDF 原文件')
+    return
+  }
+  await openPdfReader()
 }
 
 const switchOpen = ref(false)
@@ -2539,6 +3331,7 @@ onMounted(async () => {
         <button :class="{ on: view === 'explore' }" data-testid="nav-explore" @click="openExplore">发现</button>
         <button :class="{ on: view === 'sources' }" data-testid="nav-sources" @click="view = 'sources'">书源</button>
         <button :class="{ on: view === 'rss' }" data-testid="nav-rss" @click="view = 'rss'">订阅</button>
+        <button :class="{ on: view === 'storage' }" data-testid="nav-storage" @click="view = 'storage'">存储</button>
         <span class="mo-version">v{{ version }}</span>
       </nav>
     </template>
@@ -2637,6 +3430,7 @@ onMounted(async () => {
               <img v-if="book.coverUrl" :src="book.coverUrl" alt="" loading="lazy" />
               <span v-else class="mo-cover-glyph">{{ String(book.name || '书').slice(0, 1) }}</span>
               <span v-if="book.originName" class="mo-cover-origin">{{ book.originName }}</span>
+              <span v-if="book.download?.downloaded" class="mo-cover-badge" data-testid="shelf-download-badge">已下 {{ book.download.downloaded }} 章</span>
               <span v-if="shelfSelecting" class="mo-cover-check" :class="{ on: selectedBookIds.has(book.id) }">
                 {{ selectedBookIds.has(book.id) ? '✓' : '' }}
               </span>
@@ -2827,11 +3621,13 @@ onMounted(async () => {
               {{ currentBook.originName || currentBook.origin }} · {{ chapters.length }} 章
               <span v-if="currentBook.wordCount"> · {{ currentBook.wordCount }}</span>
               <span v-if="bookStatus(currentBook)" class="mo-tag soft">{{ bookStatus(currentBook) }}</span>
+              <span v-if="isPdfBook" class="mo-tag soft" data-testid="pdf-tag">PDF · 原版</span>
             </p>
             <div class="mo-hero-actions">
               <button class="mo-btn primary" data-testid="read-start" @click="continueReading">
-                {{ progress ? '继续阅读' : '开始阅读' }}
+                {{ isPdfReadable ? (hasPdfProgress ? '继续原版' : '原版阅读') : progress ? '继续阅读' : '开始阅读' }}
               </button>
+              <button v-if="isPdfReadable" class="mo-btn" data-testid="read-text" @click="continueReadingText">文本模式</button>
               <button v-if="!currentBook.id" class="mo-btn" data-testid="add-shelf" @click="addToShelf">加入书架</button>
               <span v-else class="mo-tag">已在书架</span>
               <button
@@ -2844,8 +3640,22 @@ onMounted(async () => {
               </button>
               <button class="mo-btn" data-testid="simulate" @click="openSimulate">模拟阅读</button>
               <button class="mo-btn" :disabled="cacheBusy" data-testid="cache-book" @click="cacheBookChapters">{{ cacheBusy ? '缓存中…' : '缓存 20 章' }}</button>
-              <button class="mo-btn" :disabled="exportBusy" data-testid="export-book" @click="exportBook('txt')">{{ exportBusy ? '导出中…' : '导出 TXT' }}</button>
-              <button class="mo-btn" :disabled="exportBusy" data-testid="export-epub" @click="exportBook('epub')">{{ exportBusy ? '导出中…' : '导出 EPUB' }}</button>
+              <button
+                class="mo-btn"
+                :disabled="exportBusy || isExportRunning(exportJob)"
+                data-testid="export-start"
+                @click="startExport('txt')"
+              >
+                {{ isExportRunning(exportJob) && exportJob?.format === 'txt' ? '导出中…' : '导出 TXT' }}
+              </button>
+              <button
+                class="mo-btn"
+                :disabled="exportBusy || isExportRunning(exportJob)"
+                data-testid="export-epub"
+                @click="startExport('epub')"
+              >
+                {{ isExportRunning(exportJob) && exportJob?.format === 'epub' ? '导出中…' : '导出 EPUB' }}
+              </button>
               <span v-if="currentBook.simulateEnabled" class="mo-tag soft">模拟至 {{ simulatedChapterCount(currentBook) }} 章</span>
               <span v-if="progress" class="muted">
                 {{ progress.chapterTitle || `第 ${progress.chapterIndex + 1} 章` }}
@@ -2853,6 +3663,285 @@ onMounted(async () => {
             </div>
           </div>
         </div>
+
+        <div v-if="currentBook.origin !== 'local'" class="mo-download" data-testid="download-panel">
+          <div class="mo-download-head">
+            <h3>离线下载</h3>
+            <span v-if="downloadJob" class="mo-tag" data-testid="download-status">{{ downloadStatusText(downloadJob) }}</span>
+          </div>
+          <p class="mo-download-summary" data-testid="download-summary">
+            已下载 {{ downloadSummary?.downloaded ?? 0 }}/{{ downloadSummary?.total || chapters.length }} 章 · 占用
+            {{ formatBytes(downloadSummary?.bytes ?? 0) }}
+            <template v-if="downloadSummary?.job"> · {{ downloadStatusText(downloadSummary.job) }}</template>
+            <template v-if="downloadSummary?.failed"> · 失败 {{ downloadSummary.failed }}</template>
+            <template v-if="downloadSummary?.skipped"> · 跳过 {{ downloadSummary.skipped }}</template>
+          </p>
+          <div v-if="!deleteConfirmOpen" class="mo-download-actions">
+            <button
+              class="mo-btn"
+              data-testid="delete-downloads"
+              :disabled="downloadDeleting || (!downloadSummary?.downloaded && !downloadSummary?.job)"
+              @click="deleteConfirmOpen = true"
+            >
+              删除已下载
+            </button>
+          </div>
+          <div v-else class="mo-download-actions">
+            <span class="muted">只清文字缓存，书与进度保留</span>
+            <button
+              class="mo-btn danger"
+              data-testid="delete-downloads-confirm"
+              :disabled="downloadDeleting"
+              @click="deleteDownloaded"
+            >
+              {{ downloadDeleting ? '删除中…' : '确认删除' }}
+            </button>
+            <button class="mo-btn" :disabled="downloadDeleting" @click="deleteConfirmOpen = false">取消</button>
+          </div>
+          <div class="mo-download-scope">
+            <label><input v-model="downloadScope" type="radio" value="rest" />从当前章到末尾</label>
+            <label><input v-model="downloadScope" type="radio" value="all" />整本</label>
+            <label><input v-model="downloadScope" type="radio" value="range" />指定起止</label>
+            <template v-if="downloadScope === 'range'">
+              <input v-model.number="downloadFrom" type="number" min="1" :max="chapters.length" aria-label="起始章" />
+              <span>至</span>
+              <input v-model.number="downloadTo" type="number" min="1" :max="chapters.length" aria-label="结束章" />
+            </template>
+            <button
+              class="mo-btn primary"
+              data-testid="download-start"
+              :disabled="downloadBusy || isDownloadRunning(downloadJob)"
+              @click="startDownload"
+            >
+              开始下载
+            </button>
+          </div>
+          <div v-if="downloadJob" class="mo-download-progress">
+            <span class="mo-download-bar"><span :style="{ width: `${downloadPercent(downloadJob)}%` }" /></span>
+            <span data-testid="download-done">已完成 {{ downloadJob.completed }} / {{ downloadJob.total }} 章</span>
+            <span>失败 {{ downloadJob.failed }}</span>
+            <span>跳过 {{ downloadJob.skipped }}</span>
+            <span>{{ formatBytes(downloadJob.bytes) }}</span>
+          </div>
+          <p v-if="downloadJob?.error && downloadJob.status !== 'paused'" class="muted">{{ downloadJob.error }}</p>
+          <div v-if="downloadJob" class="mo-download-actions">
+            <button
+              v-if="isDownloadRunning(downloadJob)"
+              class="mo-btn"
+              data-testid="download-pause"
+              :disabled="downloadBusy"
+              @click="pauseDownload"
+            >
+              暂停
+            </button>
+            <button
+              v-if="downloadJob.status === 'paused'"
+              class="mo-btn primary"
+              data-testid="download-resume"
+              :disabled="downloadBusy"
+              @click="resumeDownload"
+            >
+              继续
+            </button>
+            <button
+              v-if="['queued', 'running', 'paused'].includes(downloadJob.status)"
+              class="mo-btn danger"
+              data-testid="download-cancel"
+              :disabled="downloadBusy"
+              @click="cancelDownload"
+            >
+              取消
+            </button>
+            <button
+              v-if="downloadJob.failed > 0 && !isDownloadRunning(downloadJob)"
+              class="mo-btn"
+              data-testid="download-retry"
+              :disabled="downloadBusy"
+              @click="retryDownload"
+            >
+              重试失败章
+            </button>
+          </div>
+        </div>
+
+        <div
+          v-if="currentBook.origin !== 'local' && mediaSummary?.kind"
+          class="mo-download"
+          data-testid="media-download-panel"
+        >
+          <div class="mo-download-head">
+            <h3>离线媒体</h3>
+            <span v-if="mediaJob" class="mo-tag" data-testid="media-download-status">{{ downloadStatusText(mediaJob) }}</span>
+          </div>
+          <p class="mo-download-summary" data-testid="media-download-summary">
+            已离线 {{ mediaSummary?.downloaded ?? 0 }}/{{ mediaSummary?.total || chapters.length }} {{ mediaUnit() }} · 占用
+            {{ formatBytes(mediaSummary?.bytes ?? 0) }}
+            <template v-if="mediaSummary?.job"> · {{ downloadStatusText(mediaSummary.job) }}</template>
+            <template v-if="mediaSummary?.failed"> · 失败 {{ mediaSummary.failed }}</template>
+            <template v-if="mediaSummary?.skipped"> · 跳过 {{ mediaSummary.skipped }}</template>
+          </p>
+          <p v-if="mediaQuotaWarning" class="muted" data-testid="media-quota-warning">{{ mediaQuotaWarning }}</p>
+          <div v-if="!mediaDeleteConfirmOpen" class="mo-download-actions">
+            <button
+              class="mo-btn"
+              data-testid="media-delete-downloads"
+              :disabled="mediaDeleting || (!mediaSummary?.downloaded && !mediaSummary?.job)"
+              @click="mediaDeleteConfirmOpen = true"
+            >
+              删除离线文件
+            </button>
+          </div>
+          <div v-else class="mo-download-actions">
+            <span class="muted">只清媒体文件与索引，书与进度保留</span>
+            <button
+              class="mo-btn danger"
+              data-testid="media-delete-downloads-confirm"
+              :disabled="mediaDeleting"
+              @click="deleteMediaDownloaded"
+            >
+              {{ mediaDeleting ? '删除中…' : '确认删除' }}
+            </button>
+            <button class="mo-btn" :disabled="mediaDeleting" @click="mediaDeleteConfirmOpen = false">取消</button>
+          </div>
+          <div class="mo-download-scope">
+            <label><input v-model="mediaScope" type="radio" value="current" data-testid="media-scope-current" />当前章</label>
+            <label><input v-model="mediaScope" type="radio" value="all" data-testid="media-scope-all" />整本</label>
+            <label><input v-model="mediaScope" type="radio" value="range" data-testid="media-scope-range" />指定起止</label>
+            <template v-if="mediaScope === 'range'">
+              <input v-model.number="mediaFrom" type="number" min="1" :max="chapters.length" aria-label="起始章" />
+              <span>至</span>
+              <input v-model.number="mediaTo" type="number" min="1" :max="chapters.length" aria-label="结束章" />
+            </template>
+            <button
+              class="mo-btn primary"
+              data-testid="media-download-start"
+              :disabled="mediaBusy || isDownloadRunning(mediaJob)"
+              @click="startMediaDownload"
+            >
+              开始离线下载
+            </button>
+          </div>
+          <p class="muted">漫画按章保存整章图片；音频与视频保存当个媒体文件。HLS 会按最高码率整章下载；受版权保护（DRM）的会提示无法离线。</p>
+          <div v-if="mediaJob" class="mo-download-progress">
+            <span class="mo-download-bar"><span :style="{ width: `${downloadPercent(mediaJob)}%` }" /></span>
+            <span data-testid="media-download-done">已完成 {{ mediaJob.completed }} / {{ mediaJob.total }} {{ mediaUnit() }}</span>
+            <span>失败 {{ mediaJob.failed }}</span>
+            <span>跳过 {{ mediaJob.skipped }}</span>
+            <span>{{ formatBytes(mediaJob.bytes) }}</span>
+          </div>
+          <p v-if="mediaJob?.error && mediaJob.status !== 'paused'" class="muted" data-testid="media-download-error">{{ mediaJob.error }}</p>
+          <div v-if="mediaJob" class="mo-download-actions">
+            <button
+              v-if="isDownloadRunning(mediaJob)"
+              class="mo-btn"
+              data-testid="media-download-pause"
+              :disabled="mediaBusy"
+              @click="pauseMediaDownload"
+            >
+              暂停
+            </button>
+            <button
+              v-if="mediaJob.status === 'paused'"
+              class="mo-btn primary"
+              data-testid="media-download-resume"
+              :disabled="mediaBusy"
+              @click="resumeMediaDownload"
+            >
+              继续
+            </button>
+            <button
+              v-if="['queued', 'running', 'paused'].includes(mediaJob.status)"
+              class="mo-btn danger"
+              data-testid="media-download-cancel"
+              :disabled="mediaBusy"
+              @click="cancelMediaDownload"
+            >
+              取消
+            </button>
+            <button
+              v-if="mediaJob.failed > 0 && !isDownloadRunning(mediaJob)"
+              class="mo-btn"
+              data-testid="media-download-retry"
+              :disabled="mediaBusy"
+              @click="retryMediaDownload"
+            >
+              重试失败章
+            </button>
+          </div>
+        </div>
+
+        <div v-if="currentBook.origin !== 'local'" class="mo-download" data-testid="export-panel">
+          <div class="mo-download-head">
+            <h3>导出全本</h3>
+            <span v-if="exportJob" class="mo-tag" data-testid="export-status">{{ exportStatusText(exportJob) }}</span>
+          </div>
+          <p class="mo-download-summary">导出 TXT、EPUB 或 PDF 全本，目录多少章都导完；生成的文件保留 24 小时。</p>
+          <div class="mo-download-actions">
+            <label class="mo-export-font">
+              <span>中文字体</span>
+              <select v-model="exportFontId" class="mo-select" data-testid="export-font">
+                <option value="">未选择</option>
+                <option v-for="font in customFonts" :key="font.id" :value="font.id">{{ font.name }}</option>
+              </select>
+            </label>
+            <button
+              class="mo-btn"
+              data-testid="export-pdf"
+              :disabled="exportBusy || isExportRunning(exportJob)"
+              @click="startExport('pdf')"
+            >
+              {{ isExportRunning(exportJob) && exportJob?.format === 'pdf' ? '导出中…' : '导出 PDF' }}
+            </button>
+          </div>
+          <p v-if="!customFonts.length" class="muted">PDF 需要使用中文字体，请先在阅读设置里上传。</p>
+          <p v-if="exportMessage" class="muted" data-testid="export-error">{{ exportMessage }}</p>
+          <div v-if="exportJob" class="mo-download-progress">
+            <span class="mo-download-bar"><span :style="{ width: `${exportPercent(exportJob)}%` }" /></span>
+            <span>已完成 {{ exportJob.completed }} / {{ exportJob.total }} 章</span>
+            <span>失败 {{ exportJob.failed }}</span>
+            <span>{{ formatBytes(exportJob.bytes) }}</span>
+          </div>
+          <p v-if="exportFailedChapters(exportJob)" class="muted" data-testid="export-failed-chapters">
+            未导出章节：{{ exportFailedChapters(exportJob) }}
+          </p>
+          <p v-if="exportJob?.error && exportJob.status !== 'paused'" class="muted">{{ exportJob.error }}</p>
+          <div v-if="exportJob" class="mo-download-actions">
+            <a
+              v-if="exportDownload?.url"
+              class="mo-btn primary"
+              data-testid="export-download"
+              :href="exportDownload.url"
+              :download="exportDownload.fileName"
+            >
+              下载文件
+            </a>
+            <button
+              v-if="['queued', 'running', 'paused'].includes(exportJob.status)"
+              class="mo-btn danger"
+              data-testid="export-cancel"
+              :disabled="exportBusy"
+              @click="cancelExport"
+            >
+              取消
+            </button>
+            <button
+              v-if="!isExportRunning(exportJob) && exportJob.status !== 'done'"
+              class="mo-btn"
+              :disabled="exportBusy"
+              @click="startExport(exportJob.format, exportJob.fontId)"
+            >
+              重新导出
+            </button>
+          </div>
+        </div>
+
+        <p
+          v-if="localPdfStatus?.isPdf && localPdfStatus?.needsReimport"
+          class="muted mo-local-pdf-hint"
+          data-testid="pdf-reimport-hint"
+        >
+          这是旧版本导入的 PDF，缺少原文件；重新导入同一文件即可补齐，文字与阅读进度不受影响
+        </p>
 
         <p v-if="introText" class="mo-intro">{{ introText }}</p>
 
@@ -2862,6 +3951,7 @@ onMounted(async () => {
             <input v-model="tocFilter" class="mo-toc-filter" placeholder="搜索章节" />
           </div>
           <p v-if="tocHasMore" class="muted">已显示 {{ filteredChapters.length }} / {{ tocTotal }} 章</p>
+          <p v-if="chapterError" class="muted mo-chapter-error" data-testid="chapter-error">{{ chapterError }}</p>
           <ol class="mo-toc" data-testid="toc">
             <li v-for="chapter in filteredChapters" :key="chapter.url || chapter.title" :class="{ volume: chapter.isVolume }">
               <button v-if="!chapter.isVolume" data-testid="chapter" @click="openChapter(chapter)">{{ chapter.title }}</button>
@@ -3218,7 +4308,127 @@ onMounted(async () => {
         </transition>
       </section>
 
+      <section v-if="view === 'storage'" class="mo-pane" data-testid="storage-pane">
+        <div class="mo-section-head">
+          <h2>存储</h2>
+          <span class="muted">文字缓存 · 媒体缓存 · 导出文件</span>
+          <button class="mo-btn" :disabled="storageBusy" data-testid="storage-refresh" @click="loadStorageUsage">刷新</button>
+        </div>
+        <p v-if="storageBusy && !storageUsage" class="muted">统计中…</p>
+        <p v-if="storageMessage" class="muted" data-testid="storage-message">{{ storageMessage }}</p>
+        <p v-if="storageQuotaWarning" class="muted" data-testid="quota-warning">{{ storageQuotaWarning }}</p>
+
+        <div class="mo-card" data-testid="storage-overview">
+          <h3 class="mo-card-title">占用</h3>
+          <div class="mo-storage-grid">
+            <div class="mo-storage-item">
+              <span class="muted">总量</span>
+              <strong>{{ formatBytes(storageUsage?.total?.bytes || 0) }}</strong>
+              <span class="muted">{{ storageUsage?.total?.files || 0 }} 个文件</span>
+            </div>
+            <div class="mo-storage-item">
+              <span class="muted">文字缓存</span>
+              <strong>{{ formatBytes(storageUsage?.text?.bytes || 0) }}</strong>
+              <span class="muted">{{ storageUsage?.text?.files || 0 }} 个文件</span>
+            </div>
+            <div class="mo-storage-item">
+              <span class="muted">媒体缓存</span>
+              <strong>{{ formatBytes(storageUsage?.media?.bytes || 0) }}</strong>
+              <span class="muted">{{ storageUsage?.media?.entries || 0 }} 章 · {{ storageUsage?.media?.books || 0 }} 本</span>
+            </div>
+            <div class="mo-storage-item">
+              <span class="muted">导出文件</span>
+              <strong>{{ formatBytes(storageUsage?.exports?.bytes || 0) }}</strong>
+              <span class="muted">{{ storageUsage?.exports?.files || 0 }} 个文件</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="mo-card" data-testid="storage-quota">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">媒体配额</h3>
+            <span class="mo-tag" data-testid="quota-source">{{ quotaSourceText }}</span>
+          </div>
+          <p class="muted">当前生效 {{ formatBytes(storageUsage?.quota?.bytes || 0) }}，超过后按最久未读整本清理。</p>
+          <div class="mo-row">
+            <input v-model.number="quotaDraft" type="number" min="0" step="1" data-testid="quota-input" aria-label="媒体配额（GB）" />
+            <span class="muted">GB</span>
+            <button class="mo-btn primary" :disabled="quotaSaving" data-testid="quota-save" @click="saveMediaQuota">
+              {{ quotaSaving ? '保存中…' : '保存' }}
+            </button>
+            <span class="muted">填 0 用默认或环境变量</span>
+          </div>
+        </div>
+
+        <div class="mo-card" data-testid="storage-books">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">按书清理</h3>
+            <span class="muted">{{ storageBooks.length }} 本有缓存</span>
+          </div>
+          <p v-if="storageBooks.length === 0" class="muted">还没有缓存内容。</p>
+          <div
+            v-for="book in storageBooks"
+            :key="book.bookId"
+            class="mo-storage-book"
+            :data-testid="`storage-book-${book.bookId}`"
+          >
+            <span class="mo-storage-name">
+              {{ book.name }}
+              <span v-if="book.pinned" class="mo-tag soft">置顶</span>
+            </span>
+            <span class="muted">文字 {{ formatBytes(book.textBytes) }} · {{ book.textCount }} 章</span>
+            <span class="muted">媒体 {{ formatBytes(book.mediaBytes) }} · {{ book.mediaCount }} 章</span>
+            <template v-if="storageClearBook === book.bookId">
+              <button
+                class="mo-btn danger"
+                :disabled="storageClearing === book.bookId"
+                :data-testid="`clear-book-confirm-${book.bookId}`"
+                @click="clearStorageForBook(book.bookId)"
+              >
+                {{ storageClearing === book.bookId ? '清理中…' : '确认清理' }}
+              </button>
+              <button class="mo-btn" :disabled="storageClearing === book.bookId" @click="storageClearBook = ''">取消</button>
+            </template>
+            <button
+              v-else
+              class="mo-btn"
+              :data-testid="`clear-book-${book.bookId}`"
+              @click="storageClearBook = book.bookId"
+            >
+              清理
+            </button>
+          </div>
+        </div>
+
+        <div class="mo-card" data-testid="storage-clear-media">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">清空媒体</h3>
+            <span class="muted">文字缓存与书架不受影响</span>
+          </div>
+          <div v-if="storageClearAllOpen" class="mo-row">
+            <span class="muted">会删掉全部媒体文件与索引，确认吗？</span>
+            <button
+              class="mo-btn danger"
+              :disabled="storageClearAllBusy"
+              data-testid="clear-all-media-confirm"
+              @click="clearAllMediaStorage"
+            >
+              {{ storageClearAllBusy ? '清理中…' : '确认清空' }}
+            </button>
+            <button class="mo-btn" :disabled="storageClearAllBusy" @click="storageClearAllOpen = false">取消</button>
+          </div>
+          <button v-else class="mo-btn danger" data-testid="clear-all-media" @click="storageClearAllOpen = true">清空媒体</button>
+        </div>
+      </section>
       <section v-if="view === 'reader'" class="mo-reader">
+        <p
+          v-if="readerMediaNotice"
+          class="mo-media-notice"
+          data-testid="media-fallback-notice"
+          role="status"
+        >
+          {{ readerMediaNotice }}
+        </p>
         <div class="mo-reader-canvas" data-testid="reader-content">
           <CanvasReader
             v-if="readerKind === 'text' && content"
@@ -3249,12 +4459,32 @@ onMounted(async () => {
             @tap-action="onTapAction"
             @select="onReaderSelect"
           />
+          <PdfReader
+            v-else-if="readerKind === 'pdf' && pdfOriginalUrl && !pdfError"
+            :src="pdfOriginalUrl"
+            :title="currentBook?.name || '原版 PDF'"
+            :initial-page="pdfInitialPage"
+            :initial-zoom="pdfInitialZoom"
+            :initial-fit-width="pdfInitialFitWidth"
+            @page="onPdfPage"
+            @switch-text="switchToTextFromPdf"
+            @close="closePdfReader"
+          />
+          <div v-else-if="readerKind === 'pdf'" class="mo-pdf-unavailable" data-testid="pdf-error">
+            <p>{{ pdfError || '原版 PDF 不可用' }}</p>
+            <div class="mo-row">
+              <button class="mo-btn primary" data-testid="pdf-error-text" @click="switchToTextFromPdf">切到文本模式</button>
+              <button class="mo-btn" data-testid="pdf-error-back" @click="closePdfReader">返回详情</button>
+            </div>
+          </div>
           <ComicReader
             v-else-if="readerKind === 'images'"
             :images="readerImages"
             :title="readerTitle"
             :initial-page="initialPage"
+            :local="readerLocal"
             @page="onPage"
+            @media-error="onReaderMediaError"
           />
           <AudioReader
             v-else-if="readerKind === 'audio'"
@@ -3262,8 +4492,10 @@ onMounted(async () => {
             :title="readerTitle"
             :book-name="currentBook?.name || ''"
             :initial-position="initialPage"
+            :local="readerLocal"
             @progress="onMediaProgress"
             @ended="openAdjacent(1)"
+            @media-error="onReaderMediaError"
           />
           <VideoReader
             v-else-if="readerKind === 'video'"
@@ -3271,10 +4503,12 @@ onMounted(async () => {
             :title="readerTitle"
             :book-name="currentBook?.name || ''"
             :initial-position="initialPage"
+            :local="readerLocal"
             @progress="onMediaProgress"
             @ended="openAdjacent(1)"
+            @media-error="onReaderMediaError"
           />
-          <p v-else class="muted mo-reader-loading">{{ busy ? '加载中…' : '（空章节）' }}</p>
+          <p v-else class="muted mo-reader-loading">{{ chapterError || (busy ? '加载中…' : '（空章节）') }}</p>
         </div>
 
         <transition name="mo-fade">
@@ -3291,6 +4525,14 @@ onMounted(async () => {
               <button v-if="readerKind === 'text'" class="mo-icon-btn" title="段评" data-testid="reader-review" @click="openReview">💬</button>
               <button v-if="readerKind === 'text'" class="mo-icon-btn" title="书内搜索" aria-label="书内搜索" data-testid="reader-search" @click="openReaderSearch">🔍</button>
               <button class="mo-icon-btn" title="目录" data-testid="reader-toc" @click="tocOpen = true">☰</button>
+              <button
+                v-if="isPdfBook && isPdfReadable"
+                class="mo-chrome-btn"
+                data-testid="reader-pdf-toggle"
+                @click="togglePdfMode"
+              >
+                {{ readerKind === 'pdf' ? '文本' : '原版' }}
+              </button>
             </div>
             <div class="mo-chrome-bottom">
               <button v-if="settings.menuItems.includes('prev')" class="mo-chrome-btn" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
@@ -4052,6 +5294,16 @@ onMounted(async () => {
   font-size: 9px;
   letter-spacing: 0.04em;
 }
+.mo-cover-badge {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  padding: 1px 5px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+}
 .mo-cover-name {
   margin-top: 2px;
   font-weight: 600;
@@ -4346,6 +5598,14 @@ onMounted(async () => {
   color: var(--mo-ink);
   font-size: 12px;
 }
+.mo-local-pdf-hint {
+  margin: 0 0 20px;
+  padding: 10px 14px;
+  border: 1px solid var(--mo-line);
+  border-radius: 10px;
+  background: var(--mo-accent-soft);
+  line-height: 1.8;
+}
 .mo-intro {
   line-height: 1.9;
   letter-spacing: 0.01em;
@@ -4411,6 +5671,36 @@ onMounted(async () => {
 .mo-card-title {
   margin: 0 0 10px;
   font: 600 16px/1.3 'Songti SC', 'Noto Serif SC', serif;
+}
+/* 存储页：分项与按书明细用网格对齐，窄屏自动折行。 */
+.mo-storage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 8px 0 0;
+}
+.mo-storage-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mo-storage-item strong {
+  font-size: 15px;
+}
+.mo-storage-book {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 0;
+  border-top: 1px solid var(--mo-line);
+}
+.mo-storage-name {
+  flex: 1 1 160px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
 }
 .mo-card-head {
   display: flex;
@@ -4736,6 +6026,22 @@ textarea {
 .mo-search-errors p {
   margin: 4px 0 0;
 }
+.mo-media-notice {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  z-index: 5;
+  transform: translateX(-50%);
+  max-width: 82%;
+  margin: 0;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: rgba(20, 21, 24, 0.86);
+  color: #d8d4c8;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+}
 .mo-reader-hint {
   position: absolute;
   left: 50%;
@@ -4769,6 +6075,24 @@ textarea {
 .mo-reader-loading {
   padding: 40px;
   color: #8f897b;
+}
+/* 原版 PDF 缺失或加载失败时的兜底面板：不白屏，并给文本模式入口。 */
+.mo-pdf-unavailable {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  height: 100%;
+  padding: 40px 24px;
+  color: #d8d4c8;
+  text-align: center;
+  background: #1b1d22;
+}
+.mo-pdf-unavailable p {
+  margin: 0;
+  max-width: 420px;
+  line-height: 1.6;
 }
 .mo-chrome {
   position: absolute;
@@ -5263,4 +6587,87 @@ textarea {
   line-height: 1.9;
   font-size: 15px;
 }
+.mo-download {
+  margin: 16px 0 4px;
+  padding: 14px 16px;
+  border: 1px solid var(--mo-line);
+  border-radius: 10px;
+}
+.mo-download-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.mo-download-head h3 {
+  margin: 0;
+  font: 600 15px/1.3 'Songti SC', 'Noto Serif SC', serif;
+}
+.mo-download-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+.mo-chapter-error {
+  margin: 8px 0;
+  font-size: 13px;
+}
+.mo-download-scope {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+}
+.mo-download-scope label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.mo-download-scope input[type='number'] {
+  width: 64px;
+  padding: 4px 6px;
+  border: 1px solid var(--mo-line);
+  border-radius: 6px;
+  background: var(--mo-paper);
+  color: inherit;
+  font: inherit;
+}
+.mo-download-progress {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 0;
+  font-size: 13px;
+}
+.mo-download-bar {
+  flex: 1 1 120px;
+  min-width: 120px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--mo-line);
+  overflow: hidden;
+}
+.mo-download-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--mo-accent);
+}
+.mo-download-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.mo-export-font {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
 </style>

@@ -9,7 +9,13 @@ import { analyzeExplore, parseExploreCategories } from '../core/source/explore.j
 import { isExploreEnabled } from '../core/source/filter.js'
 import { parseRssSources } from '../core/rss/source.js'
 import { parseFeed } from '../core/rss/feed.js'
-import { fetchText } from '../core/net/http.js'
+import {
+  fetchText,
+  openMediaStream,
+  type MediaStreamOptions,
+  type MediaStreamResult,
+} from '../core/net/http.js'
+import { assertPublicHttpUrl } from '../core/net/guard.js'
 import {
   buildExploreRequest,
   buildRequest,
@@ -31,15 +37,95 @@ import {
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
 import { mapSwitchProgress, matchBookName, sameAuthorName } from '../core/source/switch.js'
 import { openReaderStorage } from './storage.js'
-import { hasCachedChapter, readCachedChapter, writeCachedChapter } from './cache.js'
+import { clearChapterCache, readCachedChapter } from './cache.js'
+import {
+  DEFAULT_RETRY_BASE_MS,
+  DOWNLOAD_KIND,
+  DownloadCoordinator,
+  downloadEntryKey,
+  ensureChapterCached,
+  isActiveJob,
+  recoverInterruptedJobs,
+  type ChapterDownload,
+  type DownloadHost,
+} from './download.js'
+import {
+  MEDIA_DOWNLOAD_KIND,
+  MediaDownloadCoordinator,
+  PermanentMediaError,
+  type MediaChapterDownload,
+  type MediaDownloadHost,
+  type MediaEntryKind,
+  type MediaFileRecord,
+} from './media-download.js'
+import {
+  clearMediaDir,
+  clearMediaRoot,
+  mediaEntryKey,
+  mediaFileName,
+  mediaFileIdOf,
+  mediaRoot,
+  mediaFilePresent,
+  mediaStoreId,
+  prepareMediaDir,
+  saveMediaStream,
+} from './media-cache.js'
+import {
+  MAX_MEDIA_QUOTA_BYTES,
+  MEDIA_QUOTA_WARN_RATIO,
+  exportUsage,
+  formatQuotaBytes,
+  mediaUsage,
+  resolveMediaQuota,
+  textCacheUsage,
+  type QuotaSource,
+} from './storage-usage.js'
+import { downloadHlsChapter } from './hls.js'
 import { buildEpub } from './epub-export.js'
+import { assertEmbeddableFont } from './pdf-export.js'
+import { loadCoverImage } from './export-cover.js'
+import {
+  EXPORT_KIND,
+  ExportCoordinator,
+  cleanupExpiredExports,
+  contentTypeOf,
+  exportArtifactExists,
+  exportRoot,
+  type ExportFormat,
+  type ExportHost,
+} from './exports.js'
+import {
+  EXPORT_ROUTE_PATH,
+  LOCAL_MEDIA_ROUTE_PATH,
+  LOCAL_PDF_ROUTE_PATH,
+  registerArtifactRoute,
+  registerProtectedFileRoute,
+  type ArtifactDescriptor,
+  type FileArtifactDescriptor,
+} from './routes.js'
+import {
+  MEDIA_ROUTE_PATH,
+  MediaRegistry,
+  contentTypeForExt,
+  defaultExtForKind,
+  extFromUrl,
+  mediaUrlOf,
+  registerMediaRoute,
+  safeMediaName,
+  type MediaEntry,
+  type MediaKind,
+} from './media.js'
 import { listCustomFonts, readCustomFont, removeCustomFont, saveCustomFont } from './fonts.js'
 import { isKnownTheme, normalizeCustomThemes } from '../core/reader/theme.js'
 import { parseShelfImport, shelfDedupKeys } from '../core/reader/shelf-transfer.js'
 import {
+  LOCAL_PDF_ORIGINAL,
+  hasLocalPdfOriginal,
   importLocalBuffer,
+  isLocalPdfRecord,
   localBookId,
   localContent,
+  localRoot,
   localToc,
   readLocalBook,
   removeLocalBook,
@@ -54,6 +140,20 @@ type Args = Record<string, unknown> | undefined
 const SEARCH_PAGE_HINT_CHARS = 800
 /** 结果片段在首个命中前后各保留的字数。 */
 const SEARCH_SNIPPET_CONTEXT = 30
+
+/** 重新导入同一文件时，这些用户侧状态要沿用旧记录，否则书架位置与阅读进度会被重置。 */
+const LOCAL_BOOK_KEEP_FIELDS = [
+  'createdAt',
+  'pinned',
+  'group',
+  'lastReadAt',
+  'simulateEnabled',
+  'simulateStartDate',
+  'simulateStartChapter',
+  'simulateDailyChapters',
+  'durChapterIndex',
+  'durChapterTitle',
+] as const
 
 function countOccurrences(value: string, key: string): number {
   if (!key) return 0
@@ -85,6 +185,19 @@ const SAFE_KEY = /^[a-z][a-z0-9_-]+$/
 
 function sameRequest(a: RequestSpec, b: RequestSpec): boolean {
   return a.url === b.url && a.method === b.method && (a.body ?? '') === (b.body ?? '')
+}
+
+/** 直链响应头声明为 HLS：改走 playlist 下载，避免把 playlist 文本当成媒体文件落盘。 */
+class HlsMediaDetected extends Error {
+  readonly url: string
+  readonly headers: Record<string, string>
+
+  constructor(url: string, headers: Record<string, string>) {
+    super('检测到 HLS 播放列表')
+    this.name = 'HlsMediaDetected'
+    this.url = url
+    this.headers = { ...headers }
+  }
 }
 
 /**
@@ -153,6 +266,26 @@ export class ReaderService extends TypertRemoteService {
 
   db: any = null
 
+  /** 下载作业协调器，按需创建；测试可直接改 downloadRetryBaseMs 缩短重试间隔。 */
+  downloadsCoordinator: DownloadCoordinator | null = null
+
+  /** 导出作业协调器，按需创建；产物落导出目录并由受保护路由下发。 */
+  exportsCoordinator: ExportCoordinator | null = null
+
+  /** 媒体离线下载协调器（#112），按需创建；与文字下载共用作业表与暂停/重试语义。 */
+  mediaDownloadsCoordinator: MediaDownloadCoordinator | null = null
+
+  /** 媒体代理登记表：token 只在内存里，服务重启即失效。 */
+  mediaRegistry: MediaRegistry | null = null
+
+  /** 上游流式抓取实现，默认 openMediaStream；测试可替换成不联网的假实现。 */
+  mediaStreamOpener: ((url: string, options: MediaStreamOptions) => Promise<MediaStreamResult>) | null = null
+
+  downloadRetryBaseMs = DEFAULT_RETRY_BASE_MS
+
+  /** 配额读改串行：并发章节发布会同时触发淘汰，排队执行避免重复删同一本书。 */
+  storageLock: Promise<unknown> | null = null
+
   constructor(ctx: any, _options: any = {}) {
     super(ctx, 'reader')
     const service: any = this
@@ -171,9 +304,40 @@ export class ReaderService extends TypertRemoteService {
 
   async [Service.init]() {
     this.db = await openReaderStorage(this.ctx)
+    // 重启后残留的 running/queued 作业没人接手：标为暂停并注明原因。
+    try {
+      await recoverInterruptedJobs(this.db.jobs)
+    } catch {
+      // 作业恢复失败不应阻止服务启动。
+    }
+    // 导出产物只保留 24 小时：启动时扫一次，导出前再顺带清（不启定时器）。
+    try {
+      await cleanupExpiredExports(this.db.jobs)
+    } catch {
+      // 清理失败不影响启动。
+    }
+    this.registerExportRoute()
+    this.registerLocalPdfRoute()
+    this.registerMediaRoute()
+    this.registerLocalMediaRoute()
     const ctx = this.ctx as any
     ctx.effect(
       () => async () => {
+        try {
+          await this.exportsCoordinator?.shutdown()
+        } finally {
+          this.exportsCoordinator = null
+        }
+        try {
+          await this.mediaDownloadsCoordinator?.shutdown()
+        } finally {
+          this.mediaDownloadsCoordinator = null
+        }
+        try {
+          await this.downloadsCoordinator?.shutdown()
+        } finally {
+          this.downloadsCoordinator = null
+        }
         await this.db?.domain?.close?.()
         this.db = null
       },
@@ -743,20 +907,59 @@ export class ReaderService extends TypertRemoteService {
     if (kind === 'text') {
       const cached = await readCachedChapter(sourceUrl, chapterUrl)
       if (cached !== null) {
+        // 老缓存可能没有索引记录：阅读命中时顺手补登，统计与「已下载」徽标才看得到。
+        await this.registerKnownDownload(args, sourceUrl, chapterUrl, Buffer.byteLength(cached, 'utf8'))
         return { kind, content: cached, images: [], mediaUrl: '', url: chapterUrl, cached: true }
       }
     }
+    // 本地优先（#112）：整章文件都在才用本地地址；缺失或损坏时清掉索引，继续走在线代理。
+    let localMissing = false
+    if (kind === 'images' || kind === 'audio' || kind === 'video') {
+      const local = await this.localMediaContent(args, kind, chapterUrl)
+      if (local?.localMissing === true) localMissing = true
+      else if (local) return local
+    }
+    // 本地索引失效时把原因带回前端，让阅读页提示「已改用在线」。
+    const localHint = localMissing ? { localMissing: true } : {}
+    // 媒体地址对外只暴露代理 token：真实地址、书源 header 都留在服务端这次登记的条目里。
+    const sourceHeaders = parseHeaders(source.header)
     if (kind === 'audio' || kind === 'video') {
       const mediaRule = source.ruleContent?.content ?? ''
       if (!mediaRule) {
-        return { kind, content: '', images: [], mediaUrl: chapterUrl, url: chapterUrl }
+        // 没有解析规则时章节地址本身就是媒体地址：Referer 优先用书籍页，拿不到再用章节页。
+        const bookUrl = typeof args?.bookUrl === 'string' ? args.bookUrl : ''
+        const proxied = await this.proxyMediaUrl(chapterUrl, {
+          headers: sourceHeaders,
+          kind,
+          referer: bookUrl || chapterUrl,
+        })
+        return { kind, content: '', images: [], mediaUrl: proxied || chapterUrl, url: chapterUrl, ...localHint }
       }
       const raw = await this.fetch({ url: chapterUrl, method: 'GET', headers: {} }, source)
       const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
-      return { ...parsed, content: '', url: raw.url }
+      const proxied = parsed.mediaUrl
+        ? await this.proxyMediaUrl(parsed.mediaUrl, { headers: sourceHeaders, kind, referer: raw.url })
+        : ''
+      return { ...parsed, mediaUrl: proxied || parsed.mediaUrl, content: '', url: raw.url, ...localHint }
     }
     const raw = await this.fetch({ url: chapterUrl, method: 'GET', headers: {} }, source)
     const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
+    if (kind === 'images') {
+      // 同一章里重复的图片地址复用 token，避免一页几十张图把登记表撑满。
+      const images = await Promise.all(
+        parsed.images.map(async (image) => {
+          const proxied = await this.proxyMediaUrl(image, {
+            headers: sourceHeaders,
+            kind: 'image',
+            referer: raw.url,
+            dedupeKey: `${raw.url}|${image}`,
+          })
+          // 代理登记失败（私网 / 非法地址 / DNS 不通过）时退回原地址，先保证能看。
+          return proxied || image
+        }),
+      )
+      return { ...parsed, images, content: parsed.text, url: raw.url, ...localHint }
+    }
     return { ...parsed, content: parsed.text, url: raw.url }
   }
 
@@ -872,6 +1075,8 @@ export class ReaderService extends TypertRemoteService {
     const toc = await (this as any).getToc({ tocUrl: String(book.tocUrl || book.bookUrl || ''), sourceUrl })
     const chapters = (toc?.chapters ?? []) as Array<{ url?: string; title?: string }>
     const start = Number(book.durChapterIndex ?? 0) || 0
+    const host = this.downloadHost()
+    const retryBase = this.retryBase()
     let cached = 0
     let failed = 0
     let bytes = 0
@@ -879,27 +1084,358 @@ export class ReaderService extends TypertRemoteService {
       const url = chapters[i]?.url
       if (!url) continue
       try {
-        if (await hasCachedChapter(sourceUrl, url)) {
-          cached += 1
-          continue
-        }
-        const content = await (this as any).getContent({ sourceUrl, chapterUrl: url })
-        if (content?.kind && content.kind !== 'text') {
-          failed += 1
-          continue
-        }
-        const text = String(content?.content ?? '')
-        if (!text) {
-          failed += 1
-          continue
-        }
-        bytes += await writeCachedChapter(sourceUrl, url, text)
+        // 与整本下载共用同一段单章逻辑：命中缓存直接计完成，否则抓取并写缓存。
+        const result = await ensureChapterCached(host, sourceUrl, url, retryBase, {
+          bookId,
+          chapterIndex: i,
+          chapterTitle: chapters[i]?.title ?? '',
+        })
+        if (!result.cached) bytes += result.bytes
         cached += 1
       } catch {
         failed += 1
       }
     }
     return { cached, failed, bytes, total: chapters.length, start }
+  }
+
+  async startDownload(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const options: { fromIndex?: number; toIndex?: number; all?: boolean } = {}
+    if (args?.all === true || args?.all === 'true') options.all = true
+    if (args?.fromIndex !== undefined && args?.fromIndex !== null && args?.fromIndex !== '') {
+      options.fromIndex = Number(args.fromIndex)
+    }
+    if (args?.toIndex !== undefined && args?.toIndex !== null && args?.toIndex !== '') {
+      options.toIndex = Number(args.toIndex)
+    }
+    return this.downloadManager().start(bookId, options)
+  }
+
+  /** 媒体离线下载（#112）：漫画按章、音视频按单个文件；与文字下载同一套作业语义。 */
+  async startMediaDownload(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const options: { fromIndex?: number; toIndex?: number; all?: boolean } = {}
+    if (args?.all === true || args?.all === 'true') options.all = true
+    if (args?.fromIndex !== undefined && args?.fromIndex !== null && args?.fromIndex !== '') {
+      options.fromIndex = Number(args.fromIndex)
+    }
+    if (args?.toIndex !== undefined && args?.toIndex !== null && args?.toIndex !== '') {
+      options.toIndex = Number(args.toIndex)
+    }
+    // 开新作业前先腾地方：淘汰不动正在下载与置顶的书，还不达标就直接拒绝，别建必然失败的作业。
+    const quota = await this.ensureMediaQuota()
+    if (quota.usage > quota.quota) {
+      throw new Error(
+        `媒体缓存已满且没有可清理的作品，请先清理媒体缓存或调大配额（当前配额 ${formatQuotaBytes(quota.quota)}）`,
+      )
+    }
+    const started = await this.mediaManager().start(bookId, options)
+    // 配额将满（≥80%）时提前提示，用户可以在这次下载把空间吃完前先清理。
+    const ratio = quota.quota > 0 ? quota.usage / quota.quota : 0
+    const warning =
+      ratio >= MEDIA_QUOTA_WARN_RATIO
+        ? `媒体缓存已用 ${Math.round(ratio * 100)}%，接近配额 ${formatQuotaBytes(quota.quota)}，可在「存储」页按书清理`
+        : ''
+    return { ...started, warning }
+  }
+
+  async pauseJob(args: Args) {
+    const id = stringArg(args, 'id')
+    switch (this.jobKindOf(id)) {
+      case 'export':
+        return this.exportManager().pause(id)
+      case 'media':
+        return this.mediaManager().pause(id)
+      default:
+        return this.downloadManager().pause(id)
+    }
+  }
+
+  async resumeJob(args: Args) {
+    const id = stringArg(args, 'id')
+    switch (this.jobKindOf(id)) {
+      case 'export':
+        return this.exportManager().resume(id)
+      case 'media':
+        return this.mediaManager().resume(id)
+      default:
+        return this.downloadManager().resume(id)
+    }
+  }
+
+  /** 取消对文字下载、媒体下载、导出三种作业通用：按 jobs 表里的 kind 分派。 */
+  async cancelJob(args: Args) {
+    const id = stringArg(args, 'id')
+    switch (this.jobKindOf(id)) {
+      case 'export':
+        return this.exportManager().cancel(id)
+      case 'media':
+        return this.mediaManager().cancel(id)
+      default:
+        return this.downloadManager().cancel(id)
+    }
+  }
+
+  async retryDownload(args: Args) {
+    const id = stringArg(args, 'id')
+    switch (this.jobKindOf(id)) {
+      case 'export':
+        return this.exportManager().retry(id)
+      case 'media':
+        return this.mediaManager().retry(id)
+      default:
+        return this.downloadManager().retry(id)
+    }
+  }
+
+  async getJob(args: Args) {
+    const id = stringArg(args, 'id')
+    const live = this.exportsCoordinator?.peek(id)
+    if (live) return { job: { ...live } }
+    const media = this.mediaDownloadsCoordinator?.peek(id)
+    if (media) return { job: { ...media } }
+    const record = this.db?.jobs?.get?.(id) as Record<string, unknown> | undefined
+    if (record?.kind === MEDIA_DOWNLOAD_KIND) return this.mediaManager().get(id)
+    return this.downloadManager().get(id)
+  }
+
+  async listJobs(args: Args) {
+    const filter = {
+      bookId: typeof args?.bookId === 'string' ? args.bookId : undefined,
+      kind: typeof args?.kind === 'string' ? args.kind : undefined,
+      status: typeof args?.status === 'string' ? args.status : undefined,
+    }
+    // 三个协调器各自的实时进度合并展示；同一作业以后写入者（更新更实时）为准。
+    const merged = new Map<string, { id: string; updatedAt?: number }>()
+    for (const job of this.downloadManager().list(filter)) merged.set(job.id, job)
+    for (const job of this.mediaManager().list(filter)) merged.set(job.id, job)
+    for (const job of this.exportsCoordinator?.list(filter) ?? []) merged.set(job.id, job)
+    return {
+      jobs: [...merged.values()].sort(
+        (left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0),
+      ),
+    }
+  }
+
+  /** 测试/关停用：等待所有下载协程收尾。 */
+  async waitForDownloads() {
+    await this.downloadManager().waitIdle()
+  }
+
+  /** 测试/关停用：等待所有媒体下载协程收尾。 */
+  async waitForMediaDownloads() {
+    await this.mediaManager().waitIdle()
+  }
+
+  /** 测试/关停用：等待所有导出协程收尾。 */
+  async waitForExports() {
+    await this.exportsCoordinator?.waitIdle()
+  }
+
+  /** 按书聚合下载结果：书架/详情只调一次就能显示进度、体积与当前作业。 */
+  async getDownloadSummary(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const book = this.requireDb().books.get(bookId) as Record<string, unknown> | undefined
+    if (!book) throw new Error('书不存在')
+    const entries = this.downloadEntriesOf(bookId)
+    const bytes = entries.reduce((sum, entry) => sum + (Number(entry.bytes) || 0), 0)
+    const job = this.downloadManager().list({ bookId, kind: DOWNLOAD_KIND })[0] ?? null
+    const requested = Number(args?.total)
+    const total = Math.max(
+      entries.length,
+      Number(book.totalChapterNum) || 0,
+      Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 0,
+    )
+    return {
+      summary: {
+        bookId,
+        total,
+        downloaded: entries.length,
+        failed: job?.failed ?? 0,
+        skipped: job?.skipped ?? 0,
+        bytes,
+        job,
+      },
+    }
+  }
+
+  /** 按书聚合媒体下载结果：详情页与阅读页据此显示「已离线 / 下载中」。 */
+  async getMediaDownloadSummary(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const book = this.requireDb().books.get(bookId) as Record<string, unknown> | undefined
+    if (!book) throw new Error('书不存在')
+    const entries = this.mediaEntriesOf(bookId)
+    const bytes = entries.reduce((sum, entry) => sum + (Number(entry.bytes) || 0), 0)
+    let kind: MediaEntryKind | '' = ''
+    try {
+      kind = this.mediaKindOfBook(book)
+    } catch {
+      // 文本/本地书没有媒体下载，摘要返回空类型即可，详情页据此隐藏入口。
+      kind = ''
+    }
+    const job = kind ? (this.mediaManager().list({ bookId, kind: MEDIA_DOWNLOAD_KIND })[0] ?? null) : null
+    const requested = Number(args?.total)
+    const total = Math.max(
+      entries.length,
+      Number(book.totalChapterNum) || 0,
+      Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 0,
+    )
+    return {
+      summary: {
+        bookId,
+        kind,
+        total,
+        downloaded: entries.length,
+        failed: job?.failed ?? 0,
+        skipped: job?.skipped ?? 0,
+        bytes,
+        job,
+      },
+    }
+  }
+
+  /** 按书删除媒体缓存与索引；文字缓存、阅读进度等一概不动。 */
+  async deleteMediaDownloads(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const db = this.requireDb()
+    const active = this.mediaManager()
+      .list({ bookId, kind: MEDIA_DOWNLOAD_KIND })
+      .find((job) => isActiveJob(job.status))
+    if (active) {
+      await this.mediaManager().cancel(active.id)
+      // 等在途章节收尾，否则刚删掉的文件可能被回写、索引也被补登回来。
+      await this.mediaManager().waitIdle()
+    }
+    const entries = this.mediaEntriesOf(bookId)
+    let removed = 0
+    let bytes = 0
+    for (const entry of entries) {
+      const storeId = mediaStoreId(bookId, Number(entry.chapterIndex ?? 0))
+      await clearMediaDir(storeId)
+      bytes += Number(entry.bytes) || 0
+      removed += 1
+    }
+    const table = this.mediaEntriesTable()
+    if (entries.length && table) await table.deleteMany(entries.map((entry) => String(entry.id)))
+    return { removed, bytes, bookId }
+  }
+
+  /** 按书删除文字缓存与索引；书、章节、书签、笔记、进度一概不动。 */
+  async deleteDownloads(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const db = this.requireDb()
+    const active = this.downloadManager()
+      .list({ bookId, kind: DOWNLOAD_KIND })
+      .find((job) => isActiveJob(job.status))
+    if (active) {
+      await this.downloadManager().cancel(active.id)
+      // 等在途章节收尾，否则刚删掉的文件可能被回写、索引也被补登回来。
+      await this.downloadManager().waitIdle()
+    }
+    const book = db.books.get(bookId) as Record<string, unknown> | undefined
+    const fallbackSource = String(book?.origin ?? '')
+    const entries = this.downloadEntriesOf(bookId)
+    let removed = 0
+    let bytes = 0
+    for (const entry of entries) {
+      await clearChapterCache(String(entry.sourceUrl || fallbackSource), String(entry.chapterUrl))
+      bytes += Number(entry.bytes) || 0
+      removed += 1
+    }
+    if (entries.length) await db.downloadEntries.deleteMany(entries.map((entry) => String(entry.id)))
+    return { removed, bytes }
+  }
+
+  /** 清空全部文字缓存，索引同步清空；不残留指向已删文件的记录。 */
+  async clearDownloads() {
+    const db = this.requireDb()
+    const active = this.downloadManager()
+      .list({ kind: DOWNLOAD_KIND })
+      .filter((job) => isActiveJob(job.status))
+    for (const job of active) await this.downloadManager().cancel(job.id)
+    if (active.length) await this.downloadManager().waitIdle()
+    const table = this.downloadEntriesTable()
+    const keys = table ? (Array.from(table.keys()) as string[]) : []
+    await clearChapterCache('')
+    if (keys.length) await db.downloadEntries.deleteMany(keys)
+    return { removed: keys.length }
+  }
+
+  /** 存储页总览：三类缓存的实际占用 + 配额 + 按书明细（索引口径）。 */
+  async getStorageUsage() {
+    const db = this.requireDb()
+    const [text, media, exportsUsage] = await Promise.all([
+      textCacheUsage(),
+      mediaUsage(),
+      exportUsage(),
+    ])
+    const books = this.storageBookUsage()
+    books.sort(
+      (left, right) =>
+        right.textBytes + right.mediaBytes - (left.textBytes + left.mediaBytes) ||
+        left.name.localeCompare(right.name, 'zh'),
+    )
+    return {
+      text: { bytes: text.bytes, files: text.files },
+      media: {
+        bytes: media.bytes,
+        files: media.files,
+        entries: media.dirs,
+        books: books.filter((book) => book.mediaCount > 0).length,
+      },
+      exports: { bytes: exportsUsage.bytes, files: exportsUsage.files },
+      total: {
+        bytes: text.bytes + media.bytes + exportsUsage.bytes,
+        files: text.files + media.files + exportsUsage.files,
+      },
+      quota: resolveMediaQuota(db.settings?.get?.() as Record<string, unknown> | undefined),
+      books,
+    }
+  }
+
+  /** 设置媒体配额（字节）；传 0 表示回到环境变量或默认 50GB。 */
+  async setMediaQuota(args: Args) {
+    const raw = Number(args?.bytes)
+    if (!Number.isSafeInteger(raw) || raw < 0 || raw > MAX_MEDIA_QUOTA_BYTES) {
+      throw new Error('配额无效：请输入 0 到 10TB 之间的整数（字节）')
+    }
+    const db = this.requireDb()
+    // 与 saveSettings 同样整条合并：只改配额，别的设置原样保留。
+    const next = { ...db.settings.get(), mediaQuotaBytes: raw }
+    await db.settings.set(next)
+    return { settings: next }
+  }
+
+  /** 按书清理文字与媒体缓存：取消该书活动作业并等在途收尾，索引与占用同步更新。 */
+  async clearBookStorage(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    this.requireDb()
+    const text = await this.deleteDownloads({ bookId })
+    const media = await this.deleteMediaDownloads({ bookId })
+    return {
+      text: { removed: text.removed, bytes: text.bytes },
+      media: { removed: media.removed, bytes: media.bytes },
+    }
+  }
+
+  /** 清空全部媒体缓存（含索引）：存储页的「清空媒体」用，文字缓存不动。 */
+  async clearAllMedia() {
+    this.requireDb()
+    const active = this.mediaManager()
+      .list({ kind: MEDIA_DOWNLOAD_KIND })
+      .filter((job) => isActiveJob(job.status))
+    for (const job of active) await this.mediaManager().cancel(job.id)
+    if (active.length) await this.mediaManager().waitIdle()
+    const table = this.mediaEntriesTable()
+    const keys = table ? (Array.from(table.keys()) as string[]) : []
+    let bytes = 0
+    if (table) {
+      for (const [, value] of table.entries()) bytes += Number((value as any)?.bytes) || 0
+    }
+    await clearMediaRoot()
+    if (keys.length && table) await table.deleteMany(keys)
+    return { removed: keys.length, bytes }
   }
 
   async exportBook(args: Args) {
@@ -951,6 +1487,46 @@ export class ReaderService extends TypertRemoteService {
       chapters: parts.length,
       format: 'txt',
       dataBase64: Buffer.from(body, 'utf8').toString('base64'),
+    }
+  }
+
+  /**
+   * 发起全本导出（TXT / EPUB / PDF）：不截断目录，缓存优先、未缓存的在线抓，单章失败只计失败。
+   * 同一本书同一格式同时只保留一个活动作业；PDF 必须在创建作业前确认中文字体可用。
+   */
+  async startExport(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const format = String(args?.format ?? 'txt').trim().toLowerCase()
+    if (format !== 'txt' && format !== 'epub' && format !== 'pdf') {
+      throw new Error('暂只支持 TXT / EPUB / PDF 导出')
+    }
+    if (format === 'pdf') {
+      // 校验放在起作业之前：没有可用中文字体时直接拒绝，不排半成品作业。
+      const fontId = typeof args?.fontId === 'string' ? args.fontId.trim() : ''
+      if (!fontId) throw new Error('请先上传中文字体')
+      try {
+        const { font, data } = await readCustomFont(fontId)
+        if (font.format !== 'truetype' && font.format !== 'opentype') throw new Error('字体格式不可嵌入')
+        assertEmbeddableFont(data)
+      } catch {
+        throw new Error('请先上传中文字体')
+      }
+      return this.exportManager().start(bookId, 'pdf', { fontId })
+    }
+    return this.exportManager().start(bookId, format as ExportFormat)
+  }
+
+  /** 导出完成后的受保护下载地址；产物超过 24 小时按不可用处理。 */
+  async getExportDownload(args: Args) {
+    const jobId = stringArg(args, 'jobId')
+    const record = this.requireDb().jobs.get(jobId) as Record<string, unknown> | undefined
+    if (!record || record.kind !== EXPORT_KIND) throw new Error('作业不存在')
+    if (record.status !== 'done') throw new Error('导出尚未完成')
+    const filePath = String(record.filePath ?? '')
+    if (!filePath || !(await exportArtifactExists(filePath))) throw new Error('导出文件已过期')
+    return {
+      url: this.exportDownloadUrl(jobId),
+      fileName: String(record.fileName || `导出.${String(record.format || 'txt')}`),
     }
   }
 
@@ -1022,9 +1598,37 @@ export class ReaderService extends TypertRemoteService {
     const { book, chapters } = await importLocalBuffer(fileName, buffer)
     const id = String(book.id)
     const existing = this.requireDb().books.get(id) as Record<string, unknown> | undefined
-    const record = { ...book, createdAt: existing?.createdAt ?? book.createdAt }
+    const record: Record<string, unknown> = { ...book }
+    // 同一文件重新导入会命中同一 id：解析字段用新的，用户设置保留旧的。
+    if (existing) {
+      for (const field of LOCAL_BOOK_KEEP_FIELDS) {
+        if (existing[field] !== undefined) record[field] = existing[field]
+      }
+    }
     await this.requireDb().books.put(id, record)
     return { book: record, chapters: chapters.length }
+  }
+
+  /** 详情页用来判断本地书是否为 PDF、是否需要补原文件；非本地书按「不是 PDF」返回。 */
+  async getLocalPdfStatus(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const book = this.requireDb().books.get(bookId) as Record<string, unknown> | undefined
+    if (!book || book.origin !== 'local') {
+      return { bookId, isPdf: false, hasOriginal: false, needsReimport: false }
+    }
+    const record = await readLocalBook(bookId)
+    const isPdf = book.localFormat === 'pdf' || isLocalPdfRecord(record)
+    const hasOriginal = isPdf ? await hasLocalPdfOriginal(bookId) : false
+    const name = typeof book.name === 'string' ? book.name.trim() : ''
+    return {
+      bookId,
+      isPdf,
+      hasOriginal,
+      needsReimport: isPdf && !hasOriginal,
+      // 有原文件时给出可直接交给 pdf.js 的地址；缺文件时不返回地址，前端据此提示重新导入。
+      ...(isPdf && hasOriginal ? { originalUrl: this.localPdfUrl(bookId) } : {}),
+      ...(name ? { fileName: `${name}.pdf` } : {}),
+    }
   }
 
   async addBook(args: Args) {
@@ -1146,9 +1750,21 @@ export class ReaderService extends TypertRemoteService {
 
   async listBooks() {
     const books: Array<Record<string, unknown>> = []
+    // 索引扫一遍按书汇总，书架卡片不必逐本发远程调用；没有索引记录的书按 0 显示。
+    const counts = new Map<string, { downloaded: number; bytes: number }>()
+    for (const [, value] of this.downloadEntriesTable()?.entries() ?? []) {
+      const entry = value as Record<string, unknown>
+      const bookId = String(entry.bookId ?? '')
+      if (!bookId) continue
+      const current = counts.get(bookId) ?? { downloaded: 0, bytes: 0 }
+      current.downloaded += 1
+      current.bytes += Number(entry.bytes) || 0
+      counts.set(bookId, current)
+    }
     for (const [id, value] of this.requireDb().books.entries()) {
       const record = this.requireDb().readRecords.get(id)
-      books.push({ ...(value as Record<string, unknown>), progress: record ?? null })
+      const download = counts.get(id) ?? { downloaded: 0, bytes: 0 }
+      books.push({ ...(value as Record<string, unknown>), progress: record ?? null, download })
     }
     books.sort((a, b) => {
       const left = String(a.lastReadAt ?? a.updatedAt ?? '')
@@ -1172,17 +1788,37 @@ export class ReaderService extends TypertRemoteService {
     return { deleted }
   }
 
+  /**
+   * 保存阅读进度。文本进度与 PDF 原版进度共用一条 read_records 记录，
+   * 这里读-改-写合并、只覆盖显式传入的字段，避免一种模式保存时抹掉另一种模式的进度。
+   */
   async saveProgress(args: Args) {
     const bookId = stringArg(args, 'bookId')
-    const record = {
+    const existing = (this.requireDb().readRecords.get(bookId) ?? {}) as Record<string, unknown>
+    const record: Record<string, unknown> = {
       id: bookId,
       bookId,
-      chapterIndex: Number(args?.chapterIndex ?? 0) || 0,
-      chapterTitle: typeof args?.chapterTitle === 'string' ? args.chapterTitle : '',
-      chapterUrl: typeof args?.chapterUrl === 'string' ? args.chapterUrl : '',
-      position: Number(args?.position ?? 0) || 0,
-      updatedAt: new Date().toISOString(),
+      chapterIndex: 0,
+      chapterTitle: '',
+      chapterUrl: '',
+      position: 0,
+      ...existing,
     }
+    if (args?.chapterIndex !== undefined) record.chapterIndex = Number(args.chapterIndex ?? 0) || 0
+    if (typeof args?.chapterTitle === 'string') record.chapterTitle = args.chapterTitle
+    if (typeof args?.chapterUrl === 'string') record.chapterUrl = args.chapterUrl
+    if (args?.position !== undefined) record.position = Number(args.position ?? 0) || 0
+    // PDF 原版进度：页码 0 起、缩放百分比限制在 50–300、是否适应宽度。
+    if (args?.pdfPage !== undefined) {
+      const page = Math.floor(Number(args.pdfPage))
+      if (Number.isFinite(page) && page >= 0) record.pdfPage = page
+    }
+    if (args?.pdfZoom !== undefined) {
+      const zoom = Number(args.pdfZoom)
+      if (Number.isFinite(zoom)) record.pdfZoom = Math.min(300, Math.max(50, Math.round(zoom)))
+    }
+    if (typeof args?.pdfFitWidth === 'boolean') record.pdfFitWidth = args.pdfFitWidth
+    record.updatedAt = new Date().toISOString()
     await this.requireDb().readRecords.put(bookId, record)
     const book = this.requireDb().books.get(bookId) as Record<string, unknown> | undefined
     if (book) {
@@ -1407,6 +2043,942 @@ export class ReaderService extends TypertRemoteService {
       await this.requireDb().settings.set({ ...current, fontId: '' })
     }
     return result
+  }
+
+  private exportManager(): ExportCoordinator {
+    if (!this.exportsCoordinator) {
+      this.exportsCoordinator = new ExportCoordinator(this.exportHost())
+    }
+    return this.exportsCoordinator
+  }
+
+  private exportHost(): ExportHost {
+    return {
+      db: () => this.requireDb(),
+      loadToc: async (book) => {
+        const toc = await (this as any).getToc({
+          tocUrl: String(book.tocUrl || book.bookUrl || ''),
+          sourceUrl: String(book.origin || ''),
+        })
+        return (toc?.chapters ?? []) as Array<{ title?: string; url?: string; isVolume?: boolean }>
+      },
+      readChapter: async (book, chapterIndex, chapter) => {
+        const sourceUrl = String(book.origin || '')
+        const chapterUrl = String(chapter.url || '')
+        // 缓存优先：已下载过的章节直接拼进导出文件，不再走网络。
+        const cached = await readCachedChapter(sourceUrl, chapterUrl)
+        if (cached) return cached
+        const content = await (this as any).getContent({
+          sourceUrl,
+          chapterUrl,
+          bookId: String(book.id || ''),
+          chapterIndex,
+          chapterTitle: chapter.title ?? '',
+        })
+        if (content?.kind && content.kind !== 'text') throw new Error('章节不是文本')
+        const text = String(content?.content ?? '')
+        if (!text.trim()) throw new Error('章节正文为空')
+        return text
+      },
+      loadCover: (book) => this.fetchExportCover(book),
+      loadFont: async (fontId) => {
+        const { font, data } = await readCustomFont(fontId)
+        return { data, format: font.format }
+      },
+    }
+  }
+
+  /** 导出封面：任何失败都只当没有封面，绝不阻断整本导出。 */
+  private async fetchExportCover(book: Record<string, unknown>) {
+    return loadCoverImage(String(book.coverUrl ?? ''))
+  }
+
+  /** 作业分派：活动作业先问协调器，再读 jobs 表里的 kind。 */
+  private jobKindOf(id: string): 'export' | 'media' | 'download' {
+    if (this.exportsCoordinator?.peek(id)) return 'export'
+    if (this.mediaDownloadsCoordinator?.peek(id)) return 'media'
+    const record = this.db?.jobs?.get?.(id) as Record<string, unknown> | undefined
+    if (record?.kind === EXPORT_KIND) return 'export'
+    if (record?.kind === MEDIA_DOWNLOAD_KIND) return 'media'
+    return 'download'
+  }
+
+  /** 受保护路由的产物定位：只认 jobs 表里 kind=export 且 status=done 的那条记录。 */
+  private async locateExportArtifact(jobId: string): Promise<ArtifactDescriptor | null> {
+    const jobs = this.db?.jobs
+    if (!jobs || typeof jobs.get !== 'function') return null
+    const record = jobs.get(jobId) as Record<string, unknown> | undefined
+    if (!record || record.kind !== EXPORT_KIND) return null
+    if (record.status !== 'done') return null
+    const filePath = String(record.filePath ?? '')
+    if (!filePath) return null
+    const format = String(record.format ?? 'txt')
+    return {
+      filePath,
+      fileName: String(record.fileName || `导出.${format}`),
+      contentType: contentTypeOf(format),
+    }
+  }
+
+  /** PDF 原文件地址：宿主还没监听时返回相对路径，浏览器里同样能取到。 */
+  private localPdfUrl(bookId: string): string {
+    let origin = ''
+    try {
+      const value = (this.ctx as any)?.webServer?.getOrigin?.()
+      if (typeof value === 'string') origin = value.replace(/\/+$/, '')
+    } catch {
+      // 拿不到 origin 不影响取文件：相对地址在页面里同样可用。
+    }
+    return `${origin}${LOCAL_PDF_ROUTE_PATH}/${bookId}`
+  }
+
+  private exportDownloadUrl(jobId: string): string {
+    let origin = ''
+    try {
+      const value = (this.ctx as any)?.webServer?.getOrigin?.()
+      if (typeof value === 'string') origin = value.replace(/\/+$/, '')
+    } catch {
+      // 宿主还没监听时退回相对地址，页面内照样能下载。
+    }
+    return `${origin}${EXPORT_ROUTE_PATH}/${encodeURIComponent(jobId)}`
+  }
+
+  /** 宿主存在 webServer 时才注册下载路由，并随服务销毁释放。 */
+  private registerExportRoute(): void {
+    const ctx = this.ctx as any
+    if (typeof ctx?.inject !== 'function') return
+    ctx.inject(['webServer'], (webCtx: any) => {
+      const webServer = webCtx?.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+      if (typeof webCtx.effect !== 'function') return
+      webCtx.effect(
+        () => {
+          try {
+            return registerArtifactRoute(webServer, {
+              path: EXPORT_ROUTE_PATH,
+              auth: 'required',
+              root: () => exportRoot(),
+              locate: (jobId: string) => this.locateExportArtifact(jobId),
+            })
+          } catch {
+            // 同一宿主里已经注册过同路径路由时不重复注册，也不让启动失败。
+            return () => {}
+          }
+        },
+        'reader: export download route',
+      )
+    })
+  }
+
+  /** PDF 原文件路由：书 id 只做白名单校验，磁盘路径由服务端自己拼。 */
+  private registerLocalPdfRoute(): void {
+    const ctx = this.ctx as any
+    if (typeof ctx?.inject !== 'function') return
+    ctx.inject(['webServer'], (webCtx: any) => {
+      const webServer = webCtx?.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+      if (typeof webCtx.effect !== 'function') return
+      webCtx.effect(
+        () => {
+          try {
+            return registerProtectedFileRoute(webServer, {
+              path: LOCAL_PDF_ROUTE_PATH,
+              auth: 'required',
+              idPattern: /^[0-9a-f]{24}$/,
+              root: () => localRoot(),
+              locate: async (bookId: string): Promise<FileArtifactDescriptor | null> => {
+                const book = this.db?.books?.get?.(bookId) as Record<string, unknown> | undefined
+                if (!book || book.origin !== 'local') return null
+                const record = await readLocalBook(bookId)
+                if (!record) return null
+                const name = typeof book.name === 'string' ? book.name.trim() : ''
+                return {
+                  filePath: `${bookId}/${LOCAL_PDF_ORIGINAL}`,
+                  fileName: `${name || '本地 PDF'}.pdf`,
+                  contentType: 'application/pdf',
+                }
+              },
+            })
+          } catch {
+            // 同一宿主里已经注册过同路径路由时不重复注册，也不让启动失败。
+            return () => {}
+          }
+        },
+        'reader: local pdf route',
+      )
+    })
+  }
+
+  /** 媒体代理登记表按需创建：测试里可以直接换成自定义 TTL 的实例。 */
+  private mediaRegistryInstance(): MediaRegistry {
+    if (!this.mediaRegistry) this.mediaRegistry = new MediaRegistry()
+    return this.mediaRegistry
+  }
+
+  /** 宿主对外地址；还没监听时返回空串，代理地址退化成相对路径。 */
+  private mediaOrigin(): string {
+    try {
+      const value = (this.ctx as any)?.webServer?.getOrigin?.()
+      if (typeof value === 'string') return value.replace(/\/+$/, '')
+    } catch {
+      // 拿不到 origin 不影响播放：相对地址在页面里同样可用。
+    }
+    return ''
+  }
+
+  /**
+   * 登记一条媒体地址并返回代理 URL；私网 / 非法地址登记失败时返回空串，
+   * 由调用方回退原始地址——代理挂了也不该让整章阅读失败。
+   */
+  private async proxyMediaUrl(
+    rawUrl: string,
+    options: {
+      headers?: Record<string, string>
+      kind?: MediaKind
+      referer?: string
+      ext?: string
+      dedupeKey?: string
+    } = {},
+  ): Promise<string> {
+    if (!/^https?:\/\//i.test(rawUrl)) return ''
+    const kind = options.kind ?? 'other'
+    const headers: Record<string, string> = { ...(options.headers ?? {}) }
+    const referer = options.referer || headers.Referer || headers.referer || ''
+    if (referer) headers.Referer = referer
+    try {
+      // 登记前先过 SSRF 守卫：代理抓取时还会逐跳再查一次。
+      await assertPublicHttpUrl(rawUrl)
+    } catch {
+      return ''
+    }
+    const ext = options.ext ?? extFromUrl(rawUrl, defaultExtForKind(kind))
+    const token = this.mediaRegistryInstance().register(rawUrl, {
+      headers,
+      kind,
+      ext,
+      dedupeKey: options.dedupeKey,
+    })
+    return mediaUrlOf(this.mediaOrigin(), token, safeMediaName(rawUrl), ext)
+  }
+
+  /** 代理抓取已登记的媒体地址；测试替换 mediaStreamOpener 即可不联网。 */
+  async openMediaEntry(
+    entry: MediaEntry,
+    options: { method: 'GET' | 'HEAD'; range?: string },
+  ): Promise<MediaStreamResult> {
+    const opener = this.mediaStreamOpener ?? openMediaStream
+    return opener(entry.url, { method: options.method, headers: entry.headers, range: options.range })
+  }
+
+  /** 媒体代理路由：默认要求登录态，只认登记过的 token。 */
+  private registerMediaRoute(): void {
+    const ctx = this.ctx as any
+    if (typeof ctx?.inject !== 'function') return
+    ctx.inject(['webServer'], (webCtx: any) => {
+      const webServer = webCtx?.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+      if (typeof webCtx.effect !== 'function') return
+      webCtx.effect(
+        () => {
+          try {
+            return registerMediaRoute(webServer, {
+              path: MEDIA_ROUTE_PATH,
+              auth: 'required',
+              registry: () => this.mediaRegistryInstance(),
+              origin: () => this.mediaOrigin(),
+              openStream: (entry, request) => this.openMediaEntry(entry, request),
+            })
+          } catch {
+            // 同一宿主里已经注册过同路径路由时不重复注册，也不让启动失败。
+            return () => {}
+          }
+        },
+        'reader: media proxy route',
+      )
+    })
+  }
+
+  /**
+   * 本地媒体文件地址：id 是索引里的不可猜测摘要，路径由服务端反查。
+   * HLS 的本地 playlist 追加 /index.m3u8，播放器只看扩展名就能走 HLS 分支；
+   * 分片由 playlist 里的相对名解析成 <id>/<分片名>，不写死 origin。
+   */
+  private localMediaUrl(fileId: string, name = ''): string {
+    const base = `${this.mediaOrigin()}${LOCAL_MEDIA_ROUTE_PATH}/${fileId}`
+    return name && /\.m3u8$/i.test(name) ? `${base}/${name}` : base
+  }
+
+  /**
+   * 受保护路由的产物定位：只认索引里登记过的文件，磁盘路径不从 URL 取。
+   * HLS 的播放地址是 <playlistFileId>/<name>：id 定位条目，name 必须是该条目
+   * 索引里登记过的文件名（分片或 playlist 本身），否则 404。
+   */
+  private locateLocalMediaFile(fileId: string, name?: string): FileArtifactDescriptor | null {
+    const table = this.mediaEntriesTable()
+    if (!table) return null
+    for (const [, value] of table.entries()) {
+      const entry = value as Record<string, unknown>
+      const files = Array.isArray(entry.files) ? (entry.files as Array<Record<string, unknown>>) : []
+      const anchor = files.find((item) => String(item.id ?? '') === fileId)
+      if (!anchor) continue
+      const target = name === undefined ? anchor : files.find((item) => String(item.name ?? '') === name)
+      if (!target) return null
+      const targetName = String(target.name ?? name ?? 'media')
+      const dot = targetName.lastIndexOf('.')
+      const ext = dot >= 0 ? targetName.slice(dot + 1) : ''
+      const title = String(entry.chapterTitle ?? '').replace(/[\\/:*?"<>|]/g, '_').trim() || '媒体'
+      const fileName = ext ? `${title.slice(0, 80)}.${ext}` : title.slice(0, 80)
+      return {
+        filePath: String(target.path ?? ''),
+        fileName,
+        contentType: String(target.mime ?? '') || contentTypeForExt(ext),
+        disposition: 'inline',
+      }
+    }
+    return null
+  }
+
+  /** 本地媒体文件路由：URL 只带文件摘要，Range / HEAD 与 PDF 原文件路由一致。 */
+  private registerLocalMediaRoute(): void {
+    const ctx = this.ctx as any
+    if (typeof ctx?.inject !== 'function') return
+    ctx.inject(['webServer'], (webCtx: any) => {
+      const webServer = webCtx?.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+      if (typeof webCtx.effect !== 'function') return
+      webCtx.effect(
+        () => {
+          try {
+            return registerProtectedFileRoute(webServer, {
+              path: LOCAL_MEDIA_ROUTE_PATH,
+              auth: 'required',
+              allowName: true,
+              idPattern: /^[0-9a-f]{24}$/,
+              root: () => mediaRoot(),
+              locate: (fileId: string, name?: string) => this.locateLocalMediaFile(fileId, name),
+            })
+          } catch {
+            // 同一宿主里已经注册过同路径路由时不重复注册，也不让启动失败。
+            return () => {}
+          }
+        },
+        'reader: local media route',
+      )
+    })
+  }
+
+  private downloadManager(): DownloadCoordinator {
+    if (!this.downloadsCoordinator) {
+      this.downloadsCoordinator = new DownloadCoordinator(this.downloadHost())
+    }
+    return this.downloadsCoordinator
+  }
+
+  private downloadHost(): DownloadHost {
+    return {
+      db: () => this.requireDb(),
+      getContent: (args) => (this as any).getContent(args),
+      loadToc: async (book) => {
+        const toc = await (this as any).getToc({
+          tocUrl: String(book.tocUrl || book.bookUrl || ''),
+          sourceUrl: String(book.origin || ''),
+        })
+        return (toc?.chapters ?? []) as Array<{ title: string; url: string; isVolume: boolean }>
+      },
+      currentChapterIndex: (bookId, book) => {
+        const record = this.requireDb().readRecords?.get(bookId)
+        const index = Number(record?.chapterIndex ?? book.durChapterIndex ?? 0)
+        return Number.isFinite(index) ? index : 0
+      },
+      retryBaseMs: () => this.downloadRetryBaseMs,
+      recordChapterDownload: (entry) => this.putDownloadEntry(entry),
+    }
+  }
+
+  private mediaManager(): MediaDownloadCoordinator {
+    if (!this.mediaDownloadsCoordinator) {
+      this.mediaDownloadsCoordinator = new MediaDownloadCoordinator(this.mediaDownloadHost())
+    }
+    return this.mediaDownloadsCoordinator
+  }
+
+  private mediaDownloadHost(): MediaDownloadHost {
+    return {
+      db: () => this.requireDb(),
+      loadToc: async (book) => {
+        const toc = await (this as any).getToc({
+          tocUrl: String(book.tocUrl || book.bookUrl || ''),
+          sourceUrl: String(book.origin || ''),
+        })
+        return (toc?.chapters ?? []) as Array<{ title: string; url: string; isVolume: boolean }>
+      },
+      currentChapterIndex: (bookId, book) => {
+        const record = this.requireDb().readRecords?.get(bookId)
+        const index = Number(record?.chapterIndex ?? book.durChapterIndex ?? 0)
+        return Number.isFinite(index) ? index : 0
+      },
+      retryBaseMs: () => this.downloadRetryBaseMs,
+      mediaKind: (_bookId, book) => this.mediaKindOfBook(book),
+      downloadChapterMedia: (args) => this.downloadChapterMediaForJob(args),
+      recordMediaDownload: async (entry) => {
+        await this.putMediaEntry(entry)
+        // 每章落盘后复查配额：仍超（剩下的全是置顶或正在下载的书）就以明确文案失败，已下内容保留。
+        const quota = await this.ensureMediaQuota()
+        if (quota.usage > quota.quota) {
+          throw new PermanentMediaError(
+            `媒体缓存已满且没有可清理的作品，请先清理媒体缓存或调大配额（当前配额 ${formatQuotaBytes(quota.quota)}）`,
+          )
+        }
+      },
+      chapterMediaBytes: (bookId, chapterIndex, kind) =>
+        this.mediaChapterBytes(bookId, chapterIndex, kind),
+      discardChapterMedia: async (bookId, chapterIndex) => {
+        await clearMediaDir(mediaStoreId(bookId, chapterIndex))
+      },
+    }
+  }
+
+  /** 书目记录 + 书源决定媒体类型；文本/本地书没有可下载媒体。 */
+  private mediaKindOfBook(book: Record<string, unknown>): MediaEntryKind {
+    const kind = this.bookContentKind(book)
+    if (kind === 'images') return 'image'
+    if (kind === 'audio' || kind === 'video') return kind
+    throw new Error('这本书是文本类型，请用文字下载')
+  }
+
+  /** 媒体索引表；旧测试的假 db 可能没有这张表，按「无索引」处理。 */
+  private mediaEntriesTable(): any | undefined {
+    const table = this.requireDb().mediaEntries
+    return table && typeof table.entries === 'function' ? table : undefined
+  }
+
+  private mediaEntriesOf(bookId: string): Array<Record<string, unknown>> {
+    const table = this.mediaEntriesTable()
+    if (!table) return []
+    const entries: Array<Record<string, unknown>> = []
+    for (const [, value] of table.entries()) {
+      const entry = value as Record<string, unknown>
+      if (String(entry.bookId ?? '') === bookId) entries.push(entry)
+    }
+    entries.sort((left, right) => Number(left.chapterIndex ?? 0) - Number(right.chapterIndex ?? 0))
+    return entries
+  }
+
+  /** 发布可播索引：只在整章文件全部落盘后调用，重复登记保留最初时间。 */
+  private async putMediaEntry(entry: MediaChapterDownload): Promise<void> {
+    const table = this.mediaEntriesTable()
+    if (!table) return
+    const key = mediaEntryKey(entry.bookId, entry.chapterIndex)
+    const existing = table.get(key) as Record<string, unknown> | undefined
+    const now = Date.now()
+    await table.put(key, {
+      ...existing,
+      id: key,
+      bookId: entry.bookId,
+      chapterIndex: entry.chapterIndex,
+      chapterUrl: entry.chapterUrl,
+      chapterTitle: entry.chapterTitle || String(existing?.chapterTitle ?? ''),
+      sourceUrl: entry.sourceUrl,
+      kind: entry.kind,
+      mime: entry.mime,
+      bytes: entry.bytes,
+      files: entry.files,
+      createdAt: Number(existing?.createdAt ?? 0) || now,
+      updatedAt: now,
+    })
+  }
+
+  /** 按书聚合缓存索引：文字来自下载索引，媒体来自媒体索引；书名取不到就用 bookId。 */
+  private storageBookUsage(): Array<{
+    bookId: string
+    name: string
+    pinned: boolean
+    lastReadAt: number
+    textBytes: number
+    textCount: number
+    mediaBytes: number
+    mediaCount: number
+  }> {
+    const db = this.requireDb()
+    const map = new Map<
+      string,
+      {
+        bookId: string
+        name: string
+        pinned: boolean
+        lastReadAt: number
+        textBytes: number
+        textCount: number
+        mediaBytes: number
+        mediaCount: number
+      }
+    >()
+    const ensure = (bookId: string) => {
+      let record = map.get(bookId)
+      if (!record) {
+        const book = db.books?.get?.(bookId) as Record<string, unknown> | undefined
+        record = {
+          bookId,
+          name: String(book?.name ?? '') || bookId,
+          pinned: book?.pinned === true,
+          lastReadAt: Number(book?.lastReadAt) || 0,
+          textBytes: 0,
+          textCount: 0,
+          mediaBytes: 0,
+          mediaCount: 0,
+        }
+        map.set(bookId, record)
+      }
+      return record
+    }
+    const textRows = (this.downloadEntriesTable()?.entries() ?? []) as Iterable<[string, unknown]>
+    for (const [, value] of textRows) {
+      const entry = value as Record<string, unknown>
+      const bookId = String(entry.bookId ?? '')
+      if (!bookId) continue
+      const record = ensure(bookId)
+      record.textBytes += Number(entry.bytes) || 0
+      record.textCount += 1
+    }
+    const mediaRows = (this.mediaEntriesTable()?.entries() ?? []) as Iterable<[string, unknown]>
+    for (const [, value] of mediaRows) {
+      const entry = value as Record<string, unknown>
+      const bookId = String(entry.bookId ?? '')
+      if (!bookId) continue
+      const record = ensure(bookId)
+      record.mediaBytes += Number(entry.bytes) || 0
+      record.mediaCount += 1
+    }
+    return [...map.values()]
+  }
+
+  /** 正在下载媒体的书：作业表里有活动作业即可；协调器内存里刚建、还没落盘的也算。 */
+  private mediaBusyBookIds(): Set<string> {
+    const busy = new Set<string>()
+    const jobs = (this.requireDb().jobs as any)?.entries?.()
+    if (jobs) {
+      for (const [, value] of jobs as Iterable<[string, unknown]>) {
+        const job = value as Record<string, unknown>
+        if (String(job.kind ?? '') !== MEDIA_DOWNLOAD_KIND) continue
+        if (!isActiveJob(String(job.status ?? ''))) continue
+        const bookId = String(job.bookId ?? '')
+        if (bookId) busy.add(bookId)
+      }
+    }
+    try {
+      for (const job of this.mediaManager().list({ kind: MEDIA_DOWNLOAD_KIND })) {
+        if (isActiveJob(job.status) && job.bookId) busy.add(String(job.bookId))
+      }
+    } catch {
+      // 协调器尚未初始化或旧假 db 没有作业表：只按落盘作业判断。
+    }
+    return busy
+  }
+
+  /**
+   * 配额执行：串行排队，算用量、超限就按「整本作品最久未读」淘汰，返回淘汰后的用量。
+   * 淘汰只删媒体目录与索引；pinned 的书、正在下载的书一律不动。
+   */
+  private ensureMediaQuota(): Promise<{
+    evicted: string[]
+    bytes: number
+    usage: number
+    quota: number
+    source: QuotaSource
+  }> {
+    const previous = this.storageLock ?? Promise.resolve()
+    const next = previous.catch(() => undefined).then(() => this.evictMediaToQuota())
+    this.storageLock = next.catch(() => undefined)
+    return next
+  }
+
+  private async evictMediaToQuota(): Promise<{
+    evicted: string[]
+    bytes: number
+    usage: number
+    quota: number
+    source: QuotaSource
+  }> {
+    const db = this.requireDb()
+    const quota = resolveMediaQuota(db.settings?.get?.() as Record<string, unknown> | undefined)
+    let usage = (await mediaUsage()).bytes
+    const evicted: string[] = []
+    let freed = 0
+    if (usage > quota.bytes) {
+      const busy = this.mediaBusyBookIds()
+      const candidates = this.storageBookUsage()
+        .filter((book) => book.mediaCount > 0 && !book.pinned && !busy.has(book.bookId))
+        .sort(
+          (left, right) =>
+            left.lastReadAt - right.lastReadAt || left.bookId.localeCompare(right.bookId),
+        )
+      for (const book of candidates) {
+        if (usage <= quota.bytes) break
+        const result = await this.deleteMediaDownloads({ bookId: book.bookId })
+        if (result.removed > 0) {
+          evicted.push(book.bookId)
+          freed += result.bytes
+        }
+        usage = (await mediaUsage()).bytes
+      }
+    }
+    return { evicted, bytes: freed, usage, quota: quota.bytes, source: quota.source }
+  }
+
+  /**
+   * 本地优先：索引存在且每个文件都还在才返回本地地址；
+   * 文件缺失/损坏时删掉索引并回退在线，阅读本身不报错（args.preferOnline 可强制在线）。
+   * 无索引返回 null；索引存在但文件不完整返回 { localMissing: true }，供前端提示已改用在线。
+   */
+  private async localMediaContent(
+    args: Args,
+    kind: 'images' | 'audio' | 'video',
+    chapterUrl: string,
+  ): Promise<Record<string, unknown> | null> {
+    if (args?.preferOnline === true) return null
+    const bookId = typeof args?.bookId === 'string' ? args.bookId : ''
+    const chapterIndex = Number(args?.chapterIndex)
+    if (!bookId || !Number.isInteger(chapterIndex) || chapterIndex < 0) return null
+    const table = this.mediaEntriesTable()
+    if (!table) return null
+    const key = mediaEntryKey(bookId, chapterIndex)
+    const entry = table.get(key) as Record<string, unknown> | undefined
+    if (!entry) return null
+    const expected = kind === 'images' ? 'image' : kind
+    if (String(entry.kind ?? '') !== expected) return null
+    const files = Array.isArray(entry.files) ? (entry.files as Array<Record<string, unknown>>) : []
+    if (!files.length) {
+      await table.delete(key)
+      return { localMissing: true }
+    }
+    const storeId = mediaStoreId(bookId, chapterIndex)
+    const urls: string[] = []
+    for (const file of files) {
+      const id = String(file.id ?? '')
+      const name = String(file.name ?? '')
+      if (!id || !name || !(await mediaFilePresent(storeId, name))) {
+        // 磁盘文件被删或损坏：索引立即作废，回退在线播放并提示。
+        await table.delete(key)
+        return { localMissing: true }
+      }
+      urls.push(this.localMediaUrl(id, name))
+    }
+    if (kind === 'images') {
+      return { kind: 'images', images: urls, content: '', mediaUrl: '', url: chapterUrl, local: true }
+    }
+    return { kind, content: '', images: [], mediaUrl: urls[0], url: chapterUrl, local: true }
+  }
+
+  /** 续跑优化：本章已完整落盘则返回字节数，供协调器跳过重复下载。 */
+  private async mediaChapterBytes(
+    bookId: string,
+    chapterIndex: number,
+    kind: MediaEntryKind,
+  ): Promise<number | null> {
+    const table = this.mediaEntriesTable()
+    if (!table) return null
+    const entry = table.get(mediaEntryKey(bookId, chapterIndex)) as Record<string, unknown> | undefined
+    if (!entry) return null
+    const expected = kind === 'image' ? 'image' : kind
+    if (String(entry.kind ?? '') !== expected) return null
+    const files = Array.isArray(entry.files) ? (entry.files as Array<Record<string, unknown>>) : []
+    if (!files.length) return null
+    const storeId = mediaStoreId(bookId, chapterIndex)
+    for (const file of files) {
+      if (!(await mediaFilePresent(storeId, String(file.name ?? '')))) return null
+    }
+    const bytes = files.reduce((sum, file) => sum + (Number(file.bytes) || 0), 0)
+    return bytes || Number(entry.bytes) || 0
+  }
+
+  /**
+   * 解析本章的真实媒体地址（不登记代理）：下载器要抓原始 URL + 书源 header，
+   * 不能去抓对外的 /reader/media/<token> 相对地址。
+   * 音视频地址是 playlist（.m3u8 或响应声明 HLS）时走 HLS 分支；直链在下载时再按响应头兜底识别。
+   */
+  private async resolveChapterMediaItems(options: {
+    sourceUrl: string
+    chapterUrl: string
+    bookUrl: string
+    kind: MediaEntryKind
+  }): Promise<{
+    items: Array<{ url: string; headers: Record<string, string>; ext: string }>
+    skip?: string
+    playlist?: { url: string; headers: Record<string, string> }
+  }> {
+    const source = this.getSource(options.sourceUrl)
+    const sourceHeaders = parseHeaders(source.header)
+    if (options.kind === 'audio' || options.kind === 'video') {
+      const mediaRule = source.ruleContent?.content ?? ''
+      let mediaUrl = options.chapterUrl
+      let headers = this.mediaHeadersWithReferer(sourceHeaders, options.bookUrl || options.chapterUrl)
+      if (mediaRule) {
+        const raw = await this.fetch({ url: options.chapterUrl, method: 'GET', headers: {} }, source)
+        const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
+        mediaUrl = String(parsed.mediaUrl ?? '')
+        if (!mediaUrl) throw new Error('没有解析到媒体地址')
+        headers = this.mediaHeadersWithReferer(sourceHeaders, raw.url)
+      }
+      if (this.isHlsMediaUrl(mediaUrl)) return { items: [], playlist: { url: mediaUrl, headers } }
+      return {
+        items: [{ url: mediaUrl, headers, ext: extFromUrl(mediaUrl, defaultExtForKind(options.kind)) }],
+      }
+    }
+    const raw = await this.fetch({ url: options.chapterUrl, method: 'GET', headers: {} }, source)
+    const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
+    const images = (Array.isArray(parsed.images) ? parsed.images : []).filter((image) => /^https?:\/\//i.test(image))
+    if (!images.length) throw new Error('本章没有图片')
+    return {
+      items: images.map((image) => ({
+        url: image,
+        headers: this.mediaHeadersWithReferer(sourceHeaders, raw.url),
+        ext: extFromUrl(image, defaultExtForKind('image')),
+      })),
+    }
+  }
+
+  private mediaHeadersWithReferer(
+    headers: Record<string, string>,
+    referer: string,
+  ): Record<string, string> {
+    const next: Record<string, string> = { ...headers }
+    if (referer) next.Referer = referer
+    return next
+  }
+
+  private isHlsMediaUrl(url: string): boolean {
+    return /\.m3u8(?:[?#]|$)/i.test(url)
+  }
+
+  /** 单章媒体下载：全部文件写成功才返回条目；HLS 保留断点清单，直链失败清空目录。 */
+  private async downloadChapterMediaForJob(args: {
+    bookId: string
+    book: Record<string, unknown>
+    chapterIndex: number
+    chapterTitle: string
+    chapterUrl: string
+    sourceUrl: string
+    kind: MediaEntryKind
+    signal?: AbortSignal
+  }): Promise<{ skipped: boolean; reason?: string; entry?: MediaChapterDownload }> {
+    const storeId = mediaStoreId(args.bookId, args.chapterIndex)
+    // HLS 的普通失败/暂停要保留 partial 清单供续传；直链失败仍按 #112 清目录。
+    let hls = false
+    try {
+      const resolved = await this.resolveChapterMediaItems({
+        sourceUrl: args.sourceUrl,
+        chapterUrl: args.chapterUrl,
+        bookUrl: String(args.book.bookUrl || ''),
+        kind: args.kind,
+      })
+      if (resolved.skip) {
+        await clearMediaDir(storeId)
+        return { skipped: true, reason: resolved.skip }
+      }
+      if (resolved.playlist) {
+        hls = true
+        return await this.downloadHlsChapterMedia(storeId, resolved.playlist.url, resolved.playlist.headers, args)
+      }
+      let prepared = false
+      const ensurePrepared = async (): Promise<void> => {
+        if (prepared) return
+        prepared = true
+        await prepareMediaDir(storeId)
+      }
+      const files: MediaFileRecord[] = []
+      let bytes = 0
+      let mime = ''
+      for (let index = 0; index < resolved.items.length; index += 1) {
+        if (args.signal?.aborted) throw new Error('媒体下载已中断')
+        let saved: { id: string; name: string; mime: string; bytes: number }
+        try {
+          saved = await this.downloadMediaFile(storeId, index, resolved.items[index]!, args.signal, ensurePrepared)
+        } catch (error) {
+          // 直链响应头声明是 playlist：改走 HLS，不把 playlist 文本当媒体文件。
+          if (error instanceof HlsMediaDetected) {
+            hls = true
+            return await this.downloadHlsChapterMedia(storeId, error.url, error.headers, args)
+          }
+          throw error
+        }
+        files.push({
+          id: saved.id,
+          name: saved.name,
+          mime: saved.mime,
+          bytes: saved.bytes,
+          path: `${storeId}/${saved.name}`,
+        })
+        bytes += saved.bytes
+        if (!mime) mime = saved.mime
+      }
+      if (!files.length) throw new Error('没有可下载的媒体')
+      return {
+        skipped: false,
+        entry: {
+          bookId: args.bookId,
+          chapterIndex: args.chapterIndex,
+          chapterTitle: args.chapterTitle,
+          chapterUrl: args.chapterUrl,
+          sourceUrl: args.sourceUrl,
+          kind: args.kind,
+          mime,
+          bytes,
+          files,
+        },
+      }
+    } catch (error) {
+      // DRM 等永久失败连半成品一起清掉；HLS 的其它失败留给下次续传。
+      if (error instanceof PermanentMediaError || !hls) await clearMediaDir(storeId)
+      throw error
+    }
+  }
+
+  /** HLS 整章：playlist + 分片全部落盘后组装成与直链相同的索引条目。 */
+  private async downloadHlsChapterMedia(
+    storeId: string,
+    playlistUrl: string,
+    headers: Record<string, string>,
+    args: {
+      bookId: string
+      chapterIndex: number
+      chapterTitle: string
+      chapterUrl: string
+      sourceUrl: string
+      kind: MediaEntryKind
+      signal?: AbortSignal
+    },
+  ): Promise<{ skipped: boolean; entry?: MediaChapterDownload }> {
+    const result = await downloadHlsChapter({
+      playlistUrl,
+      headers,
+      storeId,
+      signal: args.signal,
+      opener: this.mediaStreamOpener ?? openMediaStream,
+    })
+    const files: MediaFileRecord[] = result.files.map((file, index) => ({
+      id: mediaFileIdOf(storeId, index),
+      name: file.name,
+      mime: file.mime,
+      bytes: file.bytes,
+      path: `${storeId}/${file.name}`,
+    }))
+    return {
+      skipped: false,
+      entry: {
+        bookId: args.bookId,
+        chapterIndex: args.chapterIndex,
+        chapterTitle: args.chapterTitle,
+        chapterUrl: args.chapterUrl,
+        sourceUrl: args.sourceUrl,
+        kind: args.kind,
+        mime: files[0]?.mime ?? '',
+        bytes: files.reduce((sum, file) => sum + file.bytes, 0),
+        files,
+      },
+    }
+  }
+
+  /**
+   * 单个媒体文件：流式落盘，避免整部视频进内存。
+   * beforeWrite 在确认响应不是 playlist 后才调用（第一次写之前清好章节目录）。
+   */
+  private async downloadMediaFile(
+    storeId: string,
+    index: number,
+    item: { url: string; headers: Record<string, string>; ext: string },
+    signal?: AbortSignal,
+    beforeWrite?: () => Promise<void>,
+  ): Promise<{ id: string; name: string; mime: string; bytes: number }> {
+    const name = mediaFileName(index, item.ext)
+    const opener = this.mediaStreamOpener ?? openMediaStream
+    const { response } = await opener(item.url, { method: 'GET', headers: item.headers })
+    if (!response.ok && response.status !== 206) throw new Error(`HTTP ${response.status}`)
+    const contentType = (response.headers.get('content-type') ?? '').toLowerCase()
+    if (/mpegurl/.test(contentType)) {
+      try {
+        await response.body?.cancel()
+      } catch {
+        // 响应体可能已关闭，取消失败不影响切换 HLS 分支。
+      }
+      throw new HlsMediaDetected(item.url, item.headers)
+    }
+    const mime = contentType.split(';')[0]!.trim() || contentTypeForExt(item.ext)
+    await beforeWrite?.()
+    const bytes = await saveMediaStream(storeId, name, response.body, signal)
+    if (!bytes) throw new Error('媒体文件为空')
+    return { id: mediaFileIdOf(storeId, index), name, mime, bytes }
+  }
+
+  /** 下载索引表；旧测试的假 db 可能没有这张表，按「无索引」处理。 */
+  private downloadEntriesTable(): any | undefined {
+    const table = this.requireDb().downloadEntries
+    return table && typeof table.entries === 'function' ? table : undefined
+  }
+
+  private downloadEntriesOf(bookId: string): Array<Record<string, unknown>> {
+    const table = this.downloadEntriesTable()
+    if (!table) return []
+    const entries: Array<Record<string, unknown>> = []
+    for (const [, value] of table.entries()) {
+      const entry = value as Record<string, unknown>
+      if (String(entry.bookId ?? '') === bookId) entries.push(entry)
+    }
+    entries.sort((left, right) => Number(left.chapterIndex ?? 0) - Number(right.chapterIndex ?? 0))
+    return entries
+  }
+
+  /** 索引只记归属：一章一条，重复登记保留最初的时间并更新字节数。 */
+  private async putDownloadEntry(entry: ChapterDownload): Promise<void> {
+    const table = this.downloadEntriesTable()
+    if (!table) return
+    const key = downloadEntryKey(entry.bookId, entry.chapterIndex)
+    const existing = table.get(key) as Record<string, unknown> | undefined
+    // 重复登记（典型是每次阅读命中缓存）内容没变就不写，避免无意义的落盘。
+    if (
+      existing &&
+      Number(existing.bytes) === entry.bytes &&
+      String(existing.chapterUrl ?? '') === entry.chapterUrl &&
+      String(existing.sourceUrl ?? '') === entry.sourceUrl
+    ) {
+      return
+    }
+    const now = Date.now()
+    await table.put(key, {
+      ...existing,
+      id: key,
+      bookId: entry.bookId,
+      chapterIndex: entry.chapterIndex,
+      chapterUrl: entry.chapterUrl,
+      chapterTitle: entry.chapterTitle || String(existing?.chapterTitle ?? ''),
+      sourceUrl: entry.sourceUrl,
+      bytes: entry.bytes,
+      createdAt: Number(existing?.createdAt ?? 0) || now,
+      updatedAt: now,
+    })
+  }
+
+  /** 阅读命中老缓存时补登索引；没有书/章信息（如导出内部调用）则跳过。 */
+  private async registerKnownDownload(args: Args, sourceUrl: string, chapterUrl: string, bytes: number): Promise<void> {
+    const bookId = typeof args?.bookId === 'string' ? args.bookId : ''
+    const chapterIndex = Number(args?.chapterIndex)
+    if (!bookId || !Number.isInteger(chapterIndex) || chapterIndex < 0) return
+    try {
+      await this.putDownloadEntry({
+        bookId,
+        chapterIndex,
+        chapterTitle: typeof args?.chapterTitle === 'string' ? args.chapterTitle : '',
+        chapterUrl,
+        sourceUrl,
+        bytes,
+      })
+    } catch {
+      // 补登只是统计，失败不打断阅读。
+    }
+  }
+
+  private retryBase(): number {
+    const value = Number(this.downloadRetryBaseMs)
+    return Number.isFinite(value) && value >= 0 ? value : DEFAULT_RETRY_BASE_MS
   }
 
   private requireDb(): any {

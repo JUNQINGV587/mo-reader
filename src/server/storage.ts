@@ -4,6 +4,79 @@ import { DEFAULT_MENU_ITEMS, DEFAULT_TAP_ZONES } from '../core/reader/reader-con
 
 const identified = z.object({ id: z.string().min(1).max(4096) }).passthrough()
 
+/** 下载/导出等后台作业：服务重启后据它恢复暂停态，故记录需带完整进度字段。 */
+const jobRecord = z
+  .object({
+    id: z.string().min(1).max(4096),
+    kind: z.string().min(1).max(80).default('download'),
+    bookId: z.string().max(4096).default(''),
+    bookName: z.string().max(4096).default(''),
+    status: z.enum(['queued', 'running', 'paused', 'done', 'failed', 'cancelled']).default('queued'),
+    fromIndex: z.number().int().min(0).default(0),
+    toIndex: z.number().int().min(0).default(0),
+    all: z.boolean().default(false),
+    total: z.number().int().min(0).default(0),
+    completed: z.number().int().min(0).default(0),
+    failed: z.number().int().min(0).default(0),
+    skipped: z.number().int().min(0).default(0),
+    bytes: z.number().int().min(0).default(0),
+    error: z.string().max(4096).default(''),
+    createdAt: z.number().int().min(0).default(0),
+    updatedAt: z.number().int().min(0).default(0),
+  })
+  .passthrough()
+
+/**
+ * 已下载章节的索引：只记「哪一章、多少字节、什么时候下的」，正文仍只在文字缓存文件里。
+ * key 由 bookId + 章序号派生（见 download.ts 的 downloadEntryKey），一书记录数 = 已下载章数。
+ */
+const downloadEntry = z
+  .object({
+    id: z.string().min(1).max(4096),
+    bookId: z.string().min(1).max(4096),
+    chapterIndex: z.number().int().min(0).default(0),
+    chapterUrl: z.string().min(1).max(8192),
+    chapterTitle: z.string().max(4096).default(''),
+    sourceUrl: z.string().max(8192).default(''),
+    bytes: z.number().int().min(0).default(0),
+    createdAt: z.number().int().min(0).default(0),
+    updatedAt: z.number().int().min(0).default(0),
+  })
+  .passthrough()
+
+/** 媒体条目里的单个文件：路径相对媒体缓存根，id 是下发给前端的不可猜测短摘要。 */
+const mediaFile = z
+  .object({
+    id: z.string().min(1).max(80),
+    name: z.string().min(1).max(200),
+    mime: z.string().max(200).default(''),
+    bytes: z.number().int().min(0).default(0),
+    path: z.string().min(1).max(8192),
+  })
+  .passthrough()
+
+/**
+ * 已下载媒体的索引（#112）：漫画一章一条（files 多张图），音视频一章一条（files 一个）。
+ * key 由 bookId + 章序号派生（见 media-cache.ts 的 mediaEntryKey）；
+ * 只有整章文件全部落盘后 service 才写入本表，因此「有索引」即「可离线播放」。
+ */
+const mediaEntry = z
+  .object({
+    id: z.string().min(1).max(4096),
+    bookId: z.string().min(1).max(4096),
+    chapterIndex: z.number().int().min(0).default(0),
+    chapterUrl: z.string().min(1).max(8192),
+    chapterTitle: z.string().max(4096).default(''),
+    sourceUrl: z.string().max(8192).default(''),
+    kind: z.enum(['image', 'audio', 'video']),
+    mime: z.string().max(200).default(''),
+    bytes: z.number().int().min(0).default(0),
+    files: z.array(mediaFile).default([]),
+    createdAt: z.number().int().min(0).default(0),
+    updatedAt: z.number().int().min(0).default(0),
+  })
+  .passthrough()
+
 /**
  * 墨读的新领域：与旧实现的 `reader` 域分开，避免旧记录过不了新 schema。
  * 旧数据按设计不迁移，书源/书架/进度在 M1 起重新导入。
@@ -65,6 +138,8 @@ export const ReaderDomain = defineDomain({
               .passthrough(),
           )
           .default([]),
+        /** 媒体缓存配额（字节）；0 表示跟随环境变量或默认 50GB。 */
+        mediaQuotaBytes: z.number().int().min(0).default(0),
       })
       .passthrough(),
     initial: {
@@ -84,6 +159,7 @@ export const ReaderDomain = defineDomain({
       tapZones: DEFAULT_TAP_ZONES,
       menuItems: DEFAULT_MENU_ITEMS,
       replaceRules: [],
+      mediaQuotaBytes: 0,
     },
   },
   tables: {
@@ -97,7 +173,9 @@ export const ReaderDomain = defineDomain({
     notes: domainTable(identified),
     bookmarks: domainTable(identified),
     read_records: domainTable(identified),
-    jobs: domainTable(identified),
+    jobs: domainTable(jobRecord),
+    download_entries: domainTable(downloadEntry),
+    media_entries: domainTable(mediaEntry),
     subscriptions: domainTable(identified),
   },
 })
@@ -115,6 +193,8 @@ export async function openReaderStorage(ctx: any) {
     bookmarks: domain.table('bookmarks'),
     readRecords: domain.table('read_records'),
     jobs: domain.table('jobs'),
+    downloadEntries: domain.table('download_entries'),
+    mediaEntries: domain.table('media_entries'),
     subscriptions: domain.table('subscriptions'),
     settings: domain.global,
   }
