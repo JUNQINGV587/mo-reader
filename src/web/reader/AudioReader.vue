@@ -105,7 +105,7 @@ onUnmounted(destroyHls)
         @ended="emit('ended')"
         @error="failed = true"
       />
-      <p v-if="failed" class="mo-audio-error">音频加载失败：{{ src }}</p>
+      <p v-if="failed" class="mo-audio-error" data-testid="audio-error">音频加载失败（代理播放失败或网络异常）：{{ src }}</p>
       <a v-if="failed" class="mo-audio-link" :href="src" target="_blank" rel="noreferrer">在浏览器打开</a>
     </div>
   </div>

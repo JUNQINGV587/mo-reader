@@ -9,7 +9,13 @@ import { analyzeExplore, parseExploreCategories } from '../core/source/explore.j
 import { isExploreEnabled } from '../core/source/filter.js'
 import { parseRssSources } from '../core/rss/source.js'
 import { parseFeed } from '../core/rss/feed.js'
-import { fetchText } from '../core/net/http.js'
+import {
+  fetchText,
+  openMediaStream,
+  type MediaStreamOptions,
+  type MediaStreamResult,
+} from '../core/net/http.js'
+import { assertPublicHttpUrl } from '../core/net/guard.js'
 import {
   buildExploreRequest,
   buildRequest,
@@ -64,6 +70,17 @@ import {
   type ArtifactDescriptor,
   type FileArtifactDescriptor,
 } from './routes.js'
+import {
+  MEDIA_ROUTE_PATH,
+  MediaRegistry,
+  defaultExtForKind,
+  extFromUrl,
+  mediaUrlOf,
+  registerMediaRoute,
+  safeMediaName,
+  type MediaEntry,
+  type MediaKind,
+} from './media.js'
 import { listCustomFonts, readCustomFont, removeCustomFont, saveCustomFont } from './fonts.js'
 import { isKnownTheme, normalizeCustomThemes } from '../core/reader/theme.js'
 import { parseShelfImport, shelfDedupKeys } from '../core/reader/shelf-transfer.js'
@@ -208,6 +225,12 @@ export class ReaderService extends TypertRemoteService {
   /** 导出作业协调器，按需创建；产物落导出目录并由受保护路由下发。 */
   exportsCoordinator: ExportCoordinator | null = null
 
+  /** 媒体代理登记表：token 只在内存里，服务重启即失效。 */
+  mediaRegistry: MediaRegistry | null = null
+
+  /** 上游流式抓取实现，默认 openMediaStream；测试可替换成不联网的假实现。 */
+  mediaStreamOpener: ((url: string, options: MediaStreamOptions) => Promise<MediaStreamResult>) | null = null
+
   downloadRetryBaseMs = DEFAULT_RETRY_BASE_MS
 
   constructor(ctx: any, _options: any = {}) {
@@ -242,6 +265,7 @@ export class ReaderService extends TypertRemoteService {
     }
     this.registerExportRoute()
     this.registerLocalPdfRoute()
+    this.registerMediaRoute()
     const ctx = this.ctx as any
     ctx.effect(
       () => async () => {
@@ -829,17 +853,45 @@ export class ReaderService extends TypertRemoteService {
         return { kind, content: cached, images: [], mediaUrl: '', url: chapterUrl, cached: true }
       }
     }
+    // 媒体地址对外只暴露代理 token：真实地址、书源 header 都留在服务端这次登记的条目里。
+    const sourceHeaders = parseHeaders(source.header)
     if (kind === 'audio' || kind === 'video') {
       const mediaRule = source.ruleContent?.content ?? ''
       if (!mediaRule) {
-        return { kind, content: '', images: [], mediaUrl: chapterUrl, url: chapterUrl }
+        // 没有解析规则时章节地址本身就是媒体地址：Referer 优先用书籍页，拿不到再用章节页。
+        const bookUrl = typeof args?.bookUrl === 'string' ? args.bookUrl : ''
+        const proxied = await this.proxyMediaUrl(chapterUrl, {
+          headers: sourceHeaders,
+          kind,
+          referer: bookUrl || chapterUrl,
+        })
+        return { kind, content: '', images: [], mediaUrl: proxied || chapterUrl, url: chapterUrl }
       }
       const raw = await this.fetch({ url: chapterUrl, method: 'GET', headers: {} }, source)
       const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
-      return { ...parsed, content: '', url: raw.url }
+      const proxied = parsed.mediaUrl
+        ? await this.proxyMediaUrl(parsed.mediaUrl, { headers: sourceHeaders, kind, referer: raw.url })
+        : ''
+      return { ...parsed, mediaUrl: proxied || parsed.mediaUrl, content: '', url: raw.url }
     }
     const raw = await this.fetch({ url: chapterUrl, method: 'GET', headers: {} }, source)
     const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
+    if (kind === 'images') {
+      // 同一章里重复的图片地址复用 token，避免一页几十张图把登记表撑满。
+      const images = await Promise.all(
+        parsed.images.map(async (image) => {
+          const proxied = await this.proxyMediaUrl(image, {
+            headers: sourceHeaders,
+            kind: 'image',
+            referer: raw.url,
+            dedupeKey: `${raw.url}|${image}`,
+          })
+          // 代理登记失败（私网 / 非法地址 / DNS 不通过）时退回原地址，先保证能看。
+          return proxied || image
+        }),
+      )
+      return { ...parsed, images, content: parsed.text, url: raw.url }
+    }
     return { ...parsed, content: parsed.text, url: raw.url }
   }
 
@@ -1844,6 +1896,95 @@ export class ReaderService extends TypertRemoteService {
           }
         },
         'reader: local pdf route',
+      )
+    })
+  }
+
+  /** 媒体代理登记表按需创建：测试里可以直接换成自定义 TTL 的实例。 */
+  private mediaRegistryInstance(): MediaRegistry {
+    if (!this.mediaRegistry) this.mediaRegistry = new MediaRegistry()
+    return this.mediaRegistry
+  }
+
+  /** 宿主对外地址；还没监听时返回空串，代理地址退化成相对路径。 */
+  private mediaOrigin(): string {
+    try {
+      const value = (this.ctx as any)?.webServer?.getOrigin?.()
+      if (typeof value === 'string') return value.replace(/\/+$/, '')
+    } catch {
+      // 拿不到 origin 不影响播放：相对地址在页面里同样可用。
+    }
+    return ''
+  }
+
+  /**
+   * 登记一条媒体地址并返回代理 URL；私网 / 非法地址登记失败时返回空串，
+   * 由调用方回退原始地址——代理挂了也不该让整章阅读失败。
+   */
+  private async proxyMediaUrl(
+    rawUrl: string,
+    options: {
+      headers?: Record<string, string>
+      kind?: MediaKind
+      referer?: string
+      ext?: string
+      dedupeKey?: string
+    } = {},
+  ): Promise<string> {
+    if (!/^https?:\/\//i.test(rawUrl)) return ''
+    const kind = options.kind ?? 'other'
+    const headers: Record<string, string> = { ...(options.headers ?? {}) }
+    const referer = options.referer || headers.Referer || headers.referer || ''
+    if (referer) headers.Referer = referer
+    try {
+      // 登记前先过 SSRF 守卫：代理抓取时还会逐跳再查一次。
+      await assertPublicHttpUrl(rawUrl)
+    } catch {
+      return ''
+    }
+    const ext = options.ext ?? extFromUrl(rawUrl, defaultExtForKind(kind))
+    const token = this.mediaRegistryInstance().register(rawUrl, {
+      headers,
+      kind,
+      ext,
+      dedupeKey: options.dedupeKey,
+    })
+    return mediaUrlOf(this.mediaOrigin(), token, safeMediaName(rawUrl), ext)
+  }
+
+  /** 代理抓取已登记的媒体地址；测试替换 mediaStreamOpener 即可不联网。 */
+  async openMediaEntry(
+    entry: MediaEntry,
+    options: { method: 'GET' | 'HEAD'; range?: string },
+  ): Promise<MediaStreamResult> {
+    const opener = this.mediaStreamOpener ?? openMediaStream
+    return opener(entry.url, { method: options.method, headers: entry.headers, range: options.range })
+  }
+
+  /** 媒体代理路由：默认要求登录态，只认登记过的 token。 */
+  private registerMediaRoute(): void {
+    const ctx = this.ctx as any
+    if (typeof ctx?.inject !== 'function') return
+    ctx.inject(['webServer'], (webCtx: any) => {
+      const webServer = webCtx?.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+      if (typeof webCtx.effect !== 'function') return
+      webCtx.effect(
+        () => {
+          try {
+            return registerMediaRoute(webServer, {
+              path: MEDIA_ROUTE_PATH,
+              auth: 'required',
+              registry: () => this.mediaRegistryInstance(),
+              origin: () => this.mediaOrigin(),
+              openStream: (entry, request) => this.openMediaEntry(entry, request),
+            })
+          } catch {
+            // 同一宿主里已经注册过同路径路由时不重复注册，也不让启动失败。
+            return () => {}
+          }
+        },
+        'reader: media proxy route',
       )
     })
   }
