@@ -2192,6 +2192,7 @@ async function jumpToSearchResult(item: { chapterIndex: number }) {
   }
   readerSearchOpen.value = false
   readerSearchHint.value = ''
+  highlightText.value = ''
   await openChapter(chapter, 0)
   if (currentChapter.value !== chapter) {
     showReaderHint('章节打开失败')
