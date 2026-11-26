@@ -1600,8 +1600,8 @@ async function refreshSelectedToc() {
   }
 }
 
-async function addToShelf() {
-  if (!currentBook.value) return
+async function addToShelf(): Promise<boolean> {
+  if (!currentBook.value) return false
   try {
     const result = await call('addBook', {
       book: {
@@ -1620,8 +1620,10 @@ async function addToShelf() {
     currentBook.value.id = result.book.id
     await refresh()
     status.value = '已加入书架'
+    return true
   } catch (error) {
     status.value = errorText(error)
+    return false
   }
 }
 
@@ -1855,9 +1857,23 @@ function switchCandidateKey(candidate: any) {
 
 async function openSwitchPanel() {
   const book = currentBook.value as any
-  if (!book?.id || String(book.origin ?? '') === 'local') {
+  if (!book || String(book.origin ?? '') === 'local') {
     status.value = '本地书不支持换源'
     return
+  }
+  if (!currentBook.value.id) {
+    status.value = '正在加入书架…'
+    const added = await addToShelf()
+    if (!added) {
+      switchOpen.value = false
+      return
+    }
+    if (!currentBook.value?.id) {
+      switchOpen.value = false
+      status.value = '加入书架失败，无法换源'
+      return
+    }
+    status.value = '已加入书架，正在搜索候选'
   }
   switchOpen.value = true
   switchLoading.value = true
@@ -2570,7 +2586,7 @@ onMounted(async () => {
               <button v-if="!currentBook.id" class="mo-btn" data-testid="add-shelf" @click="addToShelf">加入书架</button>
               <span v-else class="mo-tag">已在书架</span>
               <button
-                v-if="currentBook.id && currentBook.origin !== 'local'"
+                v-if="currentBook.origin !== 'local'"
                 class="mo-btn"
                 data-testid="switch-source"
                 @click="openSwitchPanel"
