@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { TocChapter } from '../core/source/analyze.js'
 import { cachedChapterSize, writeCachedChapter } from './cache.js'
 
@@ -42,6 +42,29 @@ export interface CachedChapterResult {
   cached: boolean
 }
 
+/** 一章下载完成（含命中已有缓存）时交给宿主的登记信息；正文本身不在这里。 */
+export interface ChapterDownload {
+  bookId: string
+  chapterIndex: number
+  chapterTitle: string
+  chapterUrl: string
+  sourceUrl: string
+  bytes: number
+}
+
+/** 单章在整本书里的位置，用于下载/阅读时补登索引。 */
+export interface ChapterLocation {
+  bookId: string
+  chapterIndex: number
+  chapterTitle?: string
+}
+
+/** 索引 key：bookId 可能含任意字符，先哈希再拼章序号，满足 per-record 的 key 约束。 */
+export function downloadEntryKey(bookId: string, chapterIndex: number): string {
+  const digest = createHash('sha1').update(bookId).digest('hex').slice(0, 16)
+  return `dl-${digest}-${Math.max(0, Math.floor(chapterIndex))}`
+}
+
 /** 下载器依赖的服务能力；服务与测试都通过它注入，避免直接抓网络。 */
 export interface DownloadHost {
   db(): any
@@ -49,6 +72,8 @@ export interface DownloadHost {
   loadToc(book: Record<string, unknown>): Promise<TocChapter[]>
   currentChapterIndex(bookId: string, book: Record<string, unknown>): number
   retryBaseMs(): number | undefined
+  /** 可选：把下载完成/已有缓存的章节登记到下载索引；宿主不提供时跳过。 */
+  recordChapterDownload?(entry: ChapterDownload): Promise<void>
 }
 
 export function isActiveJob(status: string): boolean {
@@ -79,9 +104,13 @@ export async function ensureChapterCached(
   sourceUrl: string,
   chapterUrl: string,
   retryBaseMs = DEFAULT_RETRY_BASE_MS,
+  location?: ChapterLocation,
 ): Promise<CachedChapterResult> {
   const existing = await cachedChapterSize(sourceUrl, chapterUrl)
-  if (existing > 0) return { bytes: existing, cached: true }
+  if (existing > 0) {
+    await recordChapterDownload(host, sourceUrl, chapterUrl, existing, location)
+    return { bytes: existing, cached: true }
+  }
   const base = Number.isFinite(retryBaseMs) && retryBaseMs >= 0 ? retryBaseMs : DEFAULT_RETRY_BASE_MS
   let lastError: unknown = null
   for (let attempt = 0; attempt <= CHAPTER_RETRY_LIMIT; attempt += 1) {
@@ -91,6 +120,7 @@ export async function ensureChapterCached(
       const text = String(content?.content ?? '')
       if (!text.trim()) throw new PermanentChapterError('正文为空')
       const bytes = await writeCachedChapter(sourceUrl, chapterUrl, text)
+      await recordChapterDownload(host, sourceUrl, chapterUrl, bytes, location)
       return { bytes, cached: false }
     } catch (error) {
       lastError = error
@@ -99,6 +129,29 @@ export async function ensureChapterCached(
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError))
+}
+
+/** 索引是簿记：登记失败只丢统计，不能让已下好的章节算失败。 */
+async function recordChapterDownload(
+  host: DownloadHost,
+  sourceUrl: string,
+  chapterUrl: string,
+  bytes: number,
+  location?: ChapterLocation,
+): Promise<void> {
+  if (!location || !host.recordChapterDownload) return
+  try {
+    await host.recordChapterDownload({
+      bookId: location.bookId,
+      chapterIndex: location.chapterIndex,
+      chapterTitle: location.chapterTitle ?? '',
+      chapterUrl,
+      sourceUrl,
+      bytes,
+    })
+  } catch {
+    // 忽略：索引缺失时按未登记处理，缓存文件仍可读。
+  }
 }
 
 /** 全局 + 同来源两级并发闸门；acquire 排队等待，release 后唤醒可运行者。 */
@@ -402,7 +455,11 @@ export class DownloadCoordinator {
         await this.limiter.acquire(sourceUrl)
         try {
           if (job.status !== 'running') return
-          const result = await ensureChapterCached(this.host, sourceUrl, chapter.url, this.retryBase())
+          const result = await ensureChapterCached(this.host, sourceUrl, chapter.url, this.retryBase(), {
+            bookId: job.bookId,
+            chapterIndex: index,
+            chapterTitle: chapter.title,
+          })
           job.completed += 1
           job.bytes += result.bytes
         } catch {

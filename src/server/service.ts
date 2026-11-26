@@ -31,12 +31,16 @@ import {
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
 import { mapSwitchProgress, matchBookName, sameAuthorName } from '../core/source/switch.js'
 import { openReaderStorage } from './storage.js'
-import { readCachedChapter } from './cache.js'
+import { clearChapterCache, readCachedChapter } from './cache.js'
 import {
   DEFAULT_RETRY_BASE_MS,
+  DOWNLOAD_KIND,
   DownloadCoordinator,
+  downloadEntryKey,
   ensureChapterCached,
+  isActiveJob,
   recoverInterruptedJobs,
+  type ChapterDownload,
   type DownloadHost,
 } from './download.js'
 import { buildEpub } from './epub-export.js'
@@ -766,6 +770,8 @@ export class ReaderService extends TypertRemoteService {
     if (kind === 'text') {
       const cached = await readCachedChapter(sourceUrl, chapterUrl)
       if (cached !== null) {
+        // 老缓存可能没有索引记录：阅读命中时顺手补登，统计与「已下载」徽标才看得到。
+        await this.registerKnownDownload(args, sourceUrl, chapterUrl, Buffer.byteLength(cached, 'utf8'))
         return { kind, content: cached, images: [], mediaUrl: '', url: chapterUrl, cached: true }
       }
     }
@@ -905,7 +911,11 @@ export class ReaderService extends TypertRemoteService {
       if (!url) continue
       try {
         // 与整本下载共用同一段单章逻辑：命中缓存直接计完成，否则抓取并写缓存。
-        const result = await ensureChapterCached(host, sourceUrl, url, retryBase)
+        const result = await ensureChapterCached(host, sourceUrl, url, retryBase, {
+          bookId,
+          chapterIndex: i,
+          chapterTitle: chapters[i]?.title ?? '',
+        })
         if (!result.cached) bytes += result.bytes
         cached += 1
       } catch {
@@ -961,6 +971,74 @@ export class ReaderService extends TypertRemoteService {
   /** 测试/关停用：等待所有下载协程收尾。 */
   async waitForDownloads() {
     await this.downloadManager().waitIdle()
+  }
+
+  /** 按书聚合下载结果：书架/详情只调一次就能显示进度、体积与当前作业。 */
+  async getDownloadSummary(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const book = this.requireDb().books.get(bookId) as Record<string, unknown> | undefined
+    if (!book) throw new Error('书不存在')
+    const entries = this.downloadEntriesOf(bookId)
+    const bytes = entries.reduce((sum, entry) => sum + (Number(entry.bytes) || 0), 0)
+    const job = this.downloadManager().list({ bookId, kind: DOWNLOAD_KIND })[0] ?? null
+    const requested = Number(args?.total)
+    const total = Math.max(
+      entries.length,
+      Number(book.totalChapterNum) || 0,
+      Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : 0,
+    )
+    return {
+      summary: {
+        bookId,
+        total,
+        downloaded: entries.length,
+        failed: job?.failed ?? 0,
+        skipped: job?.skipped ?? 0,
+        bytes,
+        job,
+      },
+    }
+  }
+
+  /** 按书删除文字缓存与索引；书、章节、书签、笔记、进度一概不动。 */
+  async deleteDownloads(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const db = this.requireDb()
+    const active = this.downloadManager()
+      .list({ bookId, kind: DOWNLOAD_KIND })
+      .find((job) => isActiveJob(job.status))
+    if (active) {
+      await this.downloadManager().cancel(active.id)
+      // 等在途章节收尾，否则刚删掉的文件可能被回写、索引也被补登回来。
+      await this.downloadManager().waitIdle()
+    }
+    const book = db.books.get(bookId) as Record<string, unknown> | undefined
+    const fallbackSource = String(book?.origin ?? '')
+    const entries = this.downloadEntriesOf(bookId)
+    let removed = 0
+    let bytes = 0
+    for (const entry of entries) {
+      await clearChapterCache(String(entry.sourceUrl || fallbackSource), String(entry.chapterUrl))
+      bytes += Number(entry.bytes) || 0
+      removed += 1
+    }
+    if (entries.length) await db.downloadEntries.deleteMany(entries.map((entry) => String(entry.id)))
+    return { removed, bytes }
+  }
+
+  /** 清空全部文字缓存，索引同步清空；不残留指向已删文件的记录。 */
+  async clearDownloads() {
+    const db = this.requireDb()
+    const active = this.downloadManager()
+      .list({ kind: DOWNLOAD_KIND })
+      .filter((job) => isActiveJob(job.status))
+    for (const job of active) await this.downloadManager().cancel(job.id)
+    if (active.length) await this.downloadManager().waitIdle()
+    const table = this.downloadEntriesTable()
+    const keys = table ? (Array.from(table.keys()) as string[]) : []
+    await clearChapterCache('')
+    if (keys.length) await db.downloadEntries.deleteMany(keys)
+    return { removed: keys.length }
   }
 
   async exportBook(args: Args) {
@@ -1207,9 +1285,21 @@ export class ReaderService extends TypertRemoteService {
 
   async listBooks() {
     const books: Array<Record<string, unknown>> = []
+    // 索引扫一遍按书汇总，书架卡片不必逐本发远程调用；没有索引记录的书按 0 显示。
+    const counts = new Map<string, { downloaded: number; bytes: number }>()
+    for (const [, value] of this.downloadEntriesTable()?.entries() ?? []) {
+      const entry = value as Record<string, unknown>
+      const bookId = String(entry.bookId ?? '')
+      if (!bookId) continue
+      const current = counts.get(bookId) ?? { downloaded: 0, bytes: 0 }
+      current.downloaded += 1
+      current.bytes += Number(entry.bytes) || 0
+      counts.set(bookId, current)
+    }
     for (const [id, value] of this.requireDb().books.entries()) {
       const record = this.requireDb().readRecords.get(id)
-      books.push({ ...(value as Record<string, unknown>), progress: record ?? null })
+      const download = counts.get(id) ?? { downloaded: 0, bytes: 0 }
+      books.push({ ...(value as Record<string, unknown>), progress: record ?? null, download })
     }
     books.sort((a, b) => {
       const left = String(a.lastReadAt ?? a.updatedAt ?? '')
@@ -1494,6 +1584,74 @@ export class ReaderService extends TypertRemoteService {
         return Number.isFinite(index) ? index : 0
       },
       retryBaseMs: () => this.downloadRetryBaseMs,
+      recordChapterDownload: (entry) => this.putDownloadEntry(entry),
+    }
+  }
+
+  /** 下载索引表；旧测试的假 db 可能没有这张表，按「无索引」处理。 */
+  private downloadEntriesTable(): any | undefined {
+    const table = this.requireDb().downloadEntries
+    return table && typeof table.entries === 'function' ? table : undefined
+  }
+
+  private downloadEntriesOf(bookId: string): Array<Record<string, unknown>> {
+    const table = this.downloadEntriesTable()
+    if (!table) return []
+    const entries: Array<Record<string, unknown>> = []
+    for (const [, value] of table.entries()) {
+      const entry = value as Record<string, unknown>
+      if (String(entry.bookId ?? '') === bookId) entries.push(entry)
+    }
+    entries.sort((left, right) => Number(left.chapterIndex ?? 0) - Number(right.chapterIndex ?? 0))
+    return entries
+  }
+
+  /** 索引只记归属：一章一条，重复登记保留最初的时间并更新字节数。 */
+  private async putDownloadEntry(entry: ChapterDownload): Promise<void> {
+    const table = this.downloadEntriesTable()
+    if (!table) return
+    const key = downloadEntryKey(entry.bookId, entry.chapterIndex)
+    const existing = table.get(key) as Record<string, unknown> | undefined
+    // 重复登记（典型是每次阅读命中缓存）内容没变就不写，避免无意义的落盘。
+    if (
+      existing &&
+      Number(existing.bytes) === entry.bytes &&
+      String(existing.chapterUrl ?? '') === entry.chapterUrl &&
+      String(existing.sourceUrl ?? '') === entry.sourceUrl
+    ) {
+      return
+    }
+    const now = Date.now()
+    await table.put(key, {
+      ...existing,
+      id: key,
+      bookId: entry.bookId,
+      chapterIndex: entry.chapterIndex,
+      chapterUrl: entry.chapterUrl,
+      chapterTitle: entry.chapterTitle || String(existing?.chapterTitle ?? ''),
+      sourceUrl: entry.sourceUrl,
+      bytes: entry.bytes,
+      createdAt: Number(existing?.createdAt ?? 0) || now,
+      updatedAt: now,
+    })
+  }
+
+  /** 阅读命中老缓存时补登索引；没有书/章信息（如导出内部调用）则跳过。 */
+  private async registerKnownDownload(args: Args, sourceUrl: string, chapterUrl: string, bytes: number): Promise<void> {
+    const bookId = typeof args?.bookId === 'string' ? args.bookId : ''
+    const chapterIndex = Number(args?.chapterIndex)
+    if (!bookId || !Number.isInteger(chapterIndex) || chapterIndex < 0) return
+    try {
+      await this.putDownloadEntry({
+        bookId,
+        chapterIndex,
+        chapterTitle: typeof args?.chapterTitle === 'string' ? args.chapterTitle : '',
+        chapterUrl,
+        sourceUrl,
+        bytes,
+      })
+    } catch {
+      // 补登只是统计，失败不打断阅读。
     }
   }
 

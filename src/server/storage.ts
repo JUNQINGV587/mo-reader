@@ -27,6 +27,24 @@ const jobRecord = z
   .passthrough()
 
 /**
+ * 已下载章节的索引：只记「哪一章、多少字节、什么时候下的」，正文仍只在文字缓存文件里。
+ * key 由 bookId + 章序号派生（见 download.ts 的 downloadEntryKey），一书记录数 = 已下载章数。
+ */
+const downloadEntry = z
+  .object({
+    id: z.string().min(1).max(4096),
+    bookId: z.string().min(1).max(4096),
+    chapterIndex: z.number().int().min(0).default(0),
+    chapterUrl: z.string().min(1).max(8192),
+    chapterTitle: z.string().max(4096).default(''),
+    sourceUrl: z.string().max(8192).default(''),
+    bytes: z.number().int().min(0).default(0),
+    createdAt: z.number().int().min(0).default(0),
+    updatedAt: z.number().int().min(0).default(0),
+  })
+  .passthrough()
+
+/**
  * 墨读的新领域：与旧实现的 `reader` 域分开，避免旧记录过不了新 schema。
  * 旧数据按设计不迁移，书源/书架/进度在 M1 起重新导入。
  */
@@ -120,6 +138,7 @@ export const ReaderDomain = defineDomain({
     bookmarks: domainTable(identified),
     read_records: domainTable(identified),
     jobs: domainTable(jobRecord),
+    download_entries: domainTable(downloadEntry),
     subscriptions: domainTable(identified),
   },
 })
@@ -137,6 +156,7 @@ export async function openReaderStorage(ctx: any) {
     bookmarks: domain.table('bookmarks'),
     readRecords: domain.table('read_records'),
     jobs: domain.table('jobs'),
+    downloadEntries: domain.table('download_entries'),
     subscriptions: domain.table('subscriptions'),
     settings: domain.global,
   }

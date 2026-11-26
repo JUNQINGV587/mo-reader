@@ -45,17 +45,23 @@ function buildToc(count) {
 async function makeHarness(options = {}) {
   process.env.MO_READER_CACHE_ROOT = await mkdtemp(path.join(tmpdir(), 'mo-dl-cache-'))
   const { ReaderService } = await import('../dist/server/service.js')
-  const { readCachedChapter } = await import('../dist/server/cache.js')
+  const { readCachedChapter, writeCachedChapter } = await import('../dist/server/cache.js')
   const sources = fakeTable()
   const books = fakeTable()
   const readRecords = fakeTable()
   const jobs = fakeTable()
+  const downloadEntries = fakeTable()
+  const bookmarks = fakeTable()
+  const notes = fakeTable()
   const service = Object.create(ReaderService.prototype)
   service.db = {
     sources,
     books,
     readRecords,
     jobs,
+    downloadEntries,
+    bookmarks,
+    notes,
     chapters: fakeTable(),
     settings: { get: () => ({ theme: 'system', fontSize: 24, lineSpacing: 1.9 }), set: async () => {} },
   }
@@ -98,7 +104,7 @@ async function makeHarness(options = {}) {
     return { text, url: request.url, status: 200 }
   }
   const countOf = (url) => calls.filter((item) => item === url).length
-  return { service, books, jobs, calls, countOf, pages, readCachedChapter }
+  return { service, books, jobs, calls, countOf, pages, readCachedChapter, writeCachedChapter, downloadEntries, readRecords }
 }
 
 test('整本下载：完成计数、跳过卷标题与空地址、正文写入缓存', async () => {
@@ -321,3 +327,144 @@ test('缓存 20 章入口与单章下载共用逻辑', async () => {
     assert.equal(harness.countOf(`${ORIGIN}/ch/${index}`), 1, `第${index}章只应抓取一次`)
   }
 })
+
+test('下载完成登记索引：章序号、地址、字节数与时间齐全', async () => {
+  const harness = await makeHarness()
+  await harness.service.startDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForDownloads()
+  const records = [...harness.downloadEntries.map.values()].sort((left, right) => left.chapterIndex - right.chapterIndex)
+  assert.equal(records.length, 2)
+  assert.deepEqual(records.map((record) => record.chapterIndex), [1, 2])
+  assert.deepEqual(records.map((record) => record.chapterUrl), [`${ORIGIN}/ch/1`, `${ORIGIN}/ch/2`])
+  assert.equal(records[0].bookId, 'book-1')
+  assert.equal(records[0].sourceUrl, ORIGIN)
+  assert.equal(records[0].chapterTitle, '第1章')
+  assert.ok(records[0].bytes > 0)
+  assert.ok(records[0].createdAt > 0)
+  assert.ok(records[0].updatedAt > 0)
+  assert.match((await harness.readCachedChapter(ORIGIN, `${ORIGIN}/ch/1`)) ?? '', /第1章正文内容/)
+})
+
+test('按书聚合：已下载/总数、失败与跳过数、占用字节与当前作业', async () => {
+  const harness = await makeHarness()
+  const started = await harness.service.startDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForDownloads()
+  const { summary } = await harness.service.getDownloadSummary({ bookId: 'book-1', total: 4 })
+  assert.equal(summary.downloaded, 2)
+  assert.equal(summary.total, 4)
+  assert.equal(summary.failed, 0)
+  assert.equal(summary.skipped, 2)
+  assert.ok(summary.bytes > 0)
+  assert.equal(summary.job.id, started.job.id)
+  assert.equal(summary.job.status, 'done')
+  const shelf = await harness.service.listBooks()
+  assert.deepEqual(shelf.books[0].download, { downloaded: 2, bytes: summary.bytes })
+})
+
+test('聚合包含失败章节数：非文本章计失败、卷标题与空地址计跳过', async () => {
+  const harness = await makeHarness({
+    pages: { [`${ORIGIN}/ch/1`]: '<div id="content"><img src="/img/1.jpg"></div>' },
+  })
+  await harness.service.startDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForDownloads()
+  const { summary } = await harness.service.getDownloadSummary({ bookId: 'book-1' })
+  assert.equal(summary.downloaded, 1)
+  assert.equal(summary.failed, 1)
+  assert.equal(summary.skipped, 2)
+})
+
+test('命中已有缓存也补登索引：老缓存首次下载后可见', async () => {
+  const harness = await makeHarness()
+  await harness.writeCachedChapter(ORIGIN, `${ORIGIN}/ch/1`, '老缓存正文')
+  assert.equal((await harness.service.getDownloadSummary({ bookId: 'book-1' })).summary.downloaded, 0)
+  const result = await harness.service.cacheBook({ bookId: 'book-1', limit: 1 })
+  assert.equal(result.cached, 1)
+  assert.equal(result.bytes, 0)
+  assert.equal(harness.countOf(`${ORIGIN}/ch/1`), 0)
+  const { summary } = await harness.service.getDownloadSummary({ bookId: 'book-1' })
+  assert.equal(summary.downloaded, 1)
+  assert.ok(summary.bytes > 0)
+  assert.equal(harness.downloadEntries.map.size, 1)
+})
+
+test('索引缺失时按未登记处理：已存在的缓存文件仍可离线阅读', async () => {
+  const harness = await makeHarness()
+  await harness.writeCachedChapter(ORIGIN, `${ORIGIN}/ch/1`, '断网也能读的正文')
+  assert.equal((await harness.service.getDownloadSummary({ bookId: 'book-1' })).summary.downloaded, 0)
+  const empty = await harness.service.listBooks()
+  assert.deepEqual(empty.books[0].download, { downloaded: 0, bytes: 0 })
+})
+
+test('断网时已下载章可读、未下载章给出错误，阅读命中会补登索引', async () => {
+  const harness = await makeHarness()
+  await harness.writeCachedChapter(ORIGIN, `${ORIGIN}/ch/1`, '离线正文')
+  harness.service.fetch = async () => {
+    throw new Error('断网')
+  }
+  const offline = await harness.service.getContent({
+    sourceUrl: ORIGIN,
+    chapterUrl: `${ORIGIN}/ch/1`,
+    bookId: 'book-1',
+    chapterIndex: 1,
+    chapterTitle: '第1章',
+  })
+  assert.equal(offline.cached, true)
+  assert.equal(offline.content, '离线正文')
+  assert.equal((await harness.service.getDownloadSummary({ bookId: 'book-1' })).summary.downloaded, 1)
+  await assert.rejects(
+    () => harness.service.getContent({ sourceUrl: ORIGIN, chapterUrl: `${ORIGIN}/ch/2` }),
+    /断网/,
+  )
+})
+
+test('按书删除只清该书的缓存与索引，书/进度/书签/笔记保留', async () => {
+  const harness = await makeHarness()
+  await harness.service.startDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForDownloads()
+  const db = harness.service.db
+  harness.readRecords.put('book-1', {
+    id: 'book-1',
+    bookId: 'book-1',
+    chapterIndex: 2,
+    chapterTitle: '第2章',
+    chapterUrl: `${ORIGIN}/ch/2`,
+    position: 7,
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  })
+  await db.bookmarks.put('bm-1', { id: 'bm-1', bookId: 'book-1', chapterIndex: 1, chapterTitle: '第1章' })
+  await db.notes.put('note-1', { id: 'note-1', bookId: 'book-1', chapterIndex: 1, content: '笔记' })
+  await harness.downloadEntries.put('dl-other-1', {
+    id: 'dl-other-1',
+    bookId: 'book-2',
+    chapterIndex: 0,
+    chapterUrl: 'https://other.example.com/ch/1',
+    sourceUrl: 'https://other.example.com',
+    bytes: 10,
+    createdAt: 1,
+    updatedAt: 1,
+  })
+  const result = await harness.service.deleteDownloads({ bookId: 'book-1' })
+  assert.equal(result.removed, 2)
+  assert.ok(result.bytes > 0)
+  assert.equal(harness.downloadEntries.map.has('dl-other-1'), true)
+  assert.equal([...harness.downloadEntries.map.values()].filter((entry) => entry.bookId === 'book-1').length, 0)
+  assert.equal(await harness.readCachedChapter(ORIGIN, `${ORIGIN}/ch/1`), null)
+  assert.equal(await harness.readCachedChapter(ORIGIN, `${ORIGIN}/ch/2`), null)
+  assert.ok(await harness.books.get('book-1'))
+  assert.equal((await harness.service.getProgress({ bookId: 'book-1' })).progress.chapterIndex, 2)
+  assert.equal((await harness.service.listBookmarks({ bookId: 'book-1' })).bookmarks.length, 1)
+  assert.equal((await harness.service.listNotes({ bookId: 'book-1' })).notes.length, 1)
+  assert.equal((await harness.service.getDownloadSummary({ bookId: 'book-1' })).summary.downloaded, 0)
+})
+
+test('清空全部文字缓存后索引同步清空，不残留指向已删文件的记录', async () => {
+  const harness = await makeHarness()
+  await harness.service.startDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForDownloads()
+  assert.equal(harness.downloadEntries.map.size, 2)
+  const result = await harness.service.clearDownloads()
+  assert.equal(result.removed, 2)
+  assert.equal(harness.downloadEntries.map.size, 0)
+  assert.equal(await harness.readCachedChapter(ORIGIN, `${ORIGIN}/ch/1`), null)
+})
+

@@ -546,8 +546,13 @@ const downloadScope = ref<DownloadScope>('rest')
 const downloadFrom = ref(1)
 const downloadTo = ref(1)
 const downloadJob = ref<any>(null)
+const downloadSummary = ref<any>(null)
 const downloadBusy = ref(false)
+const downloadDeleting = ref(false)
+const deleteConfirmOpen = ref(false)
+const chapterError = ref('')
 let downloadTimer: ReturnType<typeof setInterval> | null = null
+let downloadSummaryAt = 0
 
 function formatBytes(value: number) {
   const size = Number(value) || 0
@@ -601,11 +606,37 @@ async function refreshDownloadJob() {
   } catch (error) {
     status.value = errorText(error)
   }
+  // 下载中每 5 秒刷新一次聚合（索引随完成章增长）；结束/暂停时立即刷新。
+  if (!isDownloadRunning(downloadJob.value) || Date.now() - downloadSummaryAt > 5000) {
+    void refreshDownloadSummary()
+  }
   syncDownloadTimer()
+}
+
+/** 详情页的下载统计：索引聚合在服务端算好，这里只负责显示。 */
+async function refreshDownloadSummary() {
+  const book = currentBook.value as any
+  if (!book?.id) {
+    downloadSummary.value = null
+    return
+  }
+  try {
+    const result: any = await call('getDownloadSummary', {
+      bookId: book.id,
+      total: chapters.value.length,
+    })
+    downloadSummary.value = result?.summary ?? null
+    downloadSummaryAt = Date.now()
+  } catch {
+    // 统计失败不影响下载/阅读，按无索引显示。
+    downloadSummary.value = null
+  }
 }
 
 async function loadActiveDownload() {
   downloadJob.value = null
+  downloadSummary.value = null
+  deleteConfirmOpen.value = false
   const book = currentBook.value as any
   downloadFrom.value = 1
   downloadTo.value = Math.max(1, chapters.value.length)
@@ -613,6 +644,7 @@ async function loadActiveDownload() {
     syncDownloadTimer()
     return
   }
+  void refreshDownloadSummary()
   try {
     const result: any = await call('listJobs', { bookId: book.id, kind: 'download' })
     const jobs: any[] = Array.isArray(result?.jobs) ? result.jobs : []
@@ -622,6 +654,23 @@ async function loadActiveDownload() {
     downloadJob.value = null
   }
   syncDownloadTimer()
+}
+
+/** 按书删除已下载：只清文字缓存与索引，书、进度、书签、笔记都在。 */
+async function deleteDownloaded() {
+  const book = currentBook.value as any
+  if (!book?.id) return
+  deleteConfirmOpen.value = false
+  downloadDeleting.value = true
+  try {
+    const result: any = await call('deleteDownloads', { bookId: book.id })
+    status.value = `已删除 ${result?.removed ?? 0} 章的下载`
+    await loadActiveDownload()
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    downloadDeleting.value = false
+  }
 }
 
 async function startDownload() {
@@ -644,6 +693,7 @@ async function startDownload() {
     const result: any = await call('startDownload', args)
     downloadJob.value = result?.job ?? null
     status.value = result?.existing ? '已有进行中的下载' : '已开始下载'
+    void refreshDownloadSummary()
     syncDownloadTimer()
   } catch (error) {
     status.value = errorText(error)
@@ -664,6 +714,7 @@ async function controlDownload(method: string, message: string) {
     status.value = errorText(error)
   } finally {
     downloadBusy.value = false
+    void refreshDownloadSummary()
     syncDownloadTimer()
   }
 }
@@ -1387,10 +1438,13 @@ async function loadToc(book: any, tocUrlFallback: string) {
     tocUrl: book.tocUrl || tocUrlFallback,
   })
   chapters.value = toc.chapters ?? []
+  if (currentBook.value?.id && view.value === 'detail') void refreshDownloadSummary()
 }
 
 async function openBook(book: any) {
   busy.value = true
+  chapterError.value = ''
+  downloadSummary.value = null
   try {
     const info = await call('getBookInfo', { sourceUrl: book.origin, bookUrl: book.bookUrl })
     currentBook.value = { ...book, ...info.info, tocUrl: info.info.tocUrl || book.bookUrl }
@@ -1411,6 +1465,8 @@ async function openBook(book: any) {
 
 async function openShelfBook(book: any) {
   busy.value = true
+  chapterError.value = ''
+  downloadSummary.value = null
   currentBook.value = { ...book }
   chapters.value = []
   try {
@@ -1897,18 +1953,22 @@ async function openChapter(chapter: any, page?: number) {
   stopSpeech()
   busy.value = true
   chrome.value = false
+  chapterError.value = ''
   initialPage.value =
     typeof page === 'number'
       ? page
       : progress.value?.chapterUrl === chapter.url
         ? Number(progress.value.position ?? 0)
         : 0
+  const index = chapters.value.indexOf(chapter)
   try {
     const result = await call('getContent', {
       sourceUrl: currentBook.value.origin,
       chapterUrl: chapter.url,
+      bookId: currentBook.value?.id,
+      chapterIndex: index,
+      chapterTitle: chapter.title,
     })
-    const index = chapters.value.indexOf(chapter)
     const kind = (result.kind ?? 'text') as 'text' | 'images' | 'audio' | 'video'
     currentChapter.value = chapter
     readerKind.value = kind
@@ -1928,7 +1988,9 @@ async function openChapter(chapter: any, page?: number) {
       }).catch(() => undefined)
     }
   } catch (error) {
-    status.value = errorText(error)
+    const message = errorText(error)
+    chapterError.value = `本章暂不可读：${message}。未下载的章节需要联网后阅读。`
+    status.value = message
   } finally {
     busy.value = false
   }
@@ -2788,6 +2850,7 @@ onMounted(async () => {
               <img v-if="book.coverUrl" :src="book.coverUrl" alt="" loading="lazy" />
               <span v-else class="mo-cover-glyph">{{ String(book.name || '书').slice(0, 1) }}</span>
               <span v-if="book.originName" class="mo-cover-origin">{{ book.originName }}</span>
+              <span v-if="book.download?.downloaded" class="mo-cover-badge" data-testid="shelf-download-badge">已下 {{ book.download.downloaded }} 章</span>
               <span v-if="shelfSelecting" class="mo-cover-check" :class="{ on: selectedBookIds.has(book.id) }">
                 {{ selectedBookIds.has(book.id) ? '✓' : '' }}
               </span>
@@ -3010,6 +3073,35 @@ onMounted(async () => {
             <h3>离线下载</h3>
             <span v-if="downloadJob" class="mo-tag" data-testid="download-status">{{ downloadStatusText(downloadJob) }}</span>
           </div>
+          <p class="mo-download-summary" data-testid="download-summary">
+            已下载 {{ downloadSummary?.downloaded ?? 0 }}/{{ downloadSummary?.total || chapters.length }} 章 · 占用
+            {{ formatBytes(downloadSummary?.bytes ?? 0) }}
+            <template v-if="downloadSummary?.job"> · {{ downloadStatusText(downloadSummary.job) }}</template>
+            <template v-if="downloadSummary?.failed"> · 失败 {{ downloadSummary.failed }}</template>
+            <template v-if="downloadSummary?.skipped"> · 跳过 {{ downloadSummary.skipped }}</template>
+          </p>
+          <div v-if="!deleteConfirmOpen" class="mo-download-actions">
+            <button
+              class="mo-btn"
+              data-testid="delete-downloads"
+              :disabled="downloadDeleting || (!downloadSummary?.downloaded && !downloadSummary?.job)"
+              @click="deleteConfirmOpen = true"
+            >
+              删除已下载
+            </button>
+          </div>
+          <div v-else class="mo-download-actions">
+            <span class="muted">只清文字缓存，书与进度保留</span>
+            <button
+              class="mo-btn danger"
+              data-testid="delete-downloads-confirm"
+              :disabled="downloadDeleting"
+              @click="deleteDownloaded"
+            >
+              {{ downloadDeleting ? '删除中…' : '确认删除' }}
+            </button>
+            <button class="mo-btn" :disabled="downloadDeleting" @click="deleteConfirmOpen = false">取消</button>
+          </div>
           <div class="mo-download-scope">
             <label><input v-model="downloadScope" type="radio" value="rest" />从当前章到末尾</label>
             <label><input v-model="downloadScope" type="radio" value="all" />整本</label>
@@ -3084,6 +3176,7 @@ onMounted(async () => {
             <input v-model="tocFilter" class="mo-toc-filter" placeholder="搜索章节" />
           </div>
           <p v-if="tocHasMore" class="muted">已显示 {{ filteredChapters.length }} / {{ tocTotal }} 章</p>
+          <p v-if="chapterError" class="muted mo-chapter-error" data-testid="chapter-error">{{ chapterError }}</p>
           <ol class="mo-toc" data-testid="toc">
             <li v-for="chapter in filteredChapters" :key="chapter.url || chapter.title" :class="{ volume: chapter.isVolume }">
               <button v-if="!chapter.isVolume" data-testid="chapter" @click="openChapter(chapter)">{{ chapter.title }}</button>
@@ -3496,7 +3589,7 @@ onMounted(async () => {
             @progress="onMediaProgress"
             @ended="openAdjacent(1)"
           />
-          <p v-else class="muted mo-reader-loading">{{ busy ? '加载中…' : '（空章节）' }}</p>
+          <p v-else class="muted mo-reader-loading">{{ chapterError || (busy ? '加载中…' : '（空章节）') }}</p>
         </div>
 
         <transition name="mo-fade">
@@ -4271,6 +4364,16 @@ onMounted(async () => {
   border-radius: 3px;
   background: rgba(0, 0, 0, 0.35);
   color: rgba(255, 255, 255, 0.88);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+}
+.mo-cover-badge {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  padding: 1px 5px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
   font-size: 9px;
   letter-spacing: 0.04em;
 }
@@ -5500,6 +5603,17 @@ textarea {
 .mo-download-head h3 {
   margin: 0;
   font: 600 15px/1.3 'Songti SC', 'Noto Serif SC', serif;
+}
+.mo-download-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+.mo-chapter-error {
+  margin: 8px 0;
+  font-size: 13px;
 }
 .mo-download-scope {
   display: flex;
