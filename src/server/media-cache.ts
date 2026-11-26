@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
-import { mkdir, rm, stat, writeFile } from 'node:fs/promises'
+import type { Dirent } from 'node:fs'
+import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Readable, Transform } from 'node:stream'
@@ -24,10 +25,15 @@ export function mediaRoot(): string {
   return join(cacheRoot, MEDIA_DIR_NAME)
 }
 
+/** 这本书所有章节目录的公共前缀；删书时用它扫出没有索引归属的半成品。 */
+export function mediaStorePrefix(bookId: string): string {
+  const digest = createHash('sha1').update(bookId).digest('hex').slice(0, 16)
+  return `me-${digest}-`
+}
+
 /** 索引 key 与目录名同源：bookId 可能含任意字符，先哈希再拼章序号。 */
 export function mediaEntryKey(bookId: string, chapterIndex: number): string {
-  const digest = createHash('sha1').update(bookId).digest('hex').slice(0, 16)
-  return `me-${digest}-${Math.max(0, Math.floor(chapterIndex))}`
+  return `${mediaStorePrefix(bookId)}${Math.max(0, Math.floor(chapterIndex))}`
 }
 
 /** 单章目录：一章一个目录，下载失败时整体删掉，不留下半成品。 */
@@ -56,6 +62,22 @@ export async function prepareMediaDir(storeId: string): Promise<string> {
 
 export async function clearMediaDir(storeId: string): Promise<void> {
   await rm(join(mediaRoot(), storeId), { recursive: true, force: true })
+}
+
+/** 删掉这本书名下所有媒体目录，包括暂停/失败后半成品这类没有索引归属的残留。 */
+export async function clearBookMediaDirs(bookId: string): Promise<void> {
+  const root = mediaRoot()
+  const prefix = mediaStorePrefix(bookId)
+  let entries: Dirent[]
+  try {
+    entries = await readdir(root, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue
+    await rm(join(root, entry.name), { recursive: true, force: true })
+  }
 }
 
 /** 清空全部媒体缓存（测试与「清空下载」使用）。 */

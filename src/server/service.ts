@@ -37,7 +37,7 @@ import {
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
 import { mapSwitchProgress, matchBookName, sameAuthorName } from '../core/source/switch.js'
 import { openReaderStorage } from './storage.js'
-import { clearChapterCache, readCachedChapter, writeCachedChapter } from './cache.js'
+import { clearAllChapterCache, clearChapterCache, readCachedChapter, writeCachedChapter } from './cache.js'
 import {
   DEFAULT_RETRY_BASE_MS,
   DOWNLOAD_KIND,
@@ -59,6 +59,7 @@ import {
   type MediaFileRecord,
 } from './media-download.js'
 import {
+  clearBookMediaDirs,
   clearMediaDir,
   clearMediaRoot,
   mediaEntryKey,
@@ -1309,7 +1310,7 @@ export class ReaderService extends TypertRemoteService {
     if (active) {
       await this.mediaManager().cancel(active.id)
       // 等在途章节收尾，否则刚删掉的文件可能被回写、索引也被补登回来。
-      await this.mediaManager().waitIdle()
+      await this.mediaManager().waitBookIdle(bookId)
     }
     const entries = this.mediaEntriesOf(bookId)
     let removed = 0
@@ -1320,6 +1321,8 @@ export class ReaderService extends TypertRemoteService {
       bytes += Number(entry.bytes) || 0
       removed += 1
     }
+    // 暂停/失败留下的半成品目录没有索引，按这本书的目录前缀一起清掉。
+    await clearBookMediaDirs(bookId)
     const table = this.mediaEntriesTable()
     if (entries.length && table) await table.deleteMany(entries.map((entry) => String(entry.id)))
     return { removed, bytes, bookId }
@@ -1335,7 +1338,7 @@ export class ReaderService extends TypertRemoteService {
     if (active) {
       await this.downloadManager().cancel(active.id)
       // 等在途章节收尾，否则刚删掉的文件可能被回写、索引也被补登回来。
-      await this.downloadManager().waitIdle()
+      await this.downloadManager().waitBookIdle(bookId)
     }
     const book = db.books.get(bookId) as Record<string, unknown> | undefined
     const fallbackSource = String(book?.origin ?? '')
@@ -1361,7 +1364,8 @@ export class ReaderService extends TypertRemoteService {
     if (active.length) await this.downloadManager().waitIdle()
     const table = this.downloadEntriesTable()
     const keys = table ? (Array.from(table.keys()) as string[]) : []
-    await clearChapterCache('')
+    // 媒体目录默认就在缓存根下：清文字缓存必须保住它，否则媒体索引会指向已删文件。
+    await clearAllChapterCache(mediaRoot())
     if (keys.length) await db.downloadEntries.deleteMany(keys)
     return { removed: keys.length }
   }
@@ -1415,12 +1419,18 @@ export class ReaderService extends TypertRemoteService {
   async clearBookStorage(args: Args) {
     const bookId = stringArg(args, 'bookId')
     this.requireDb()
-    const text = await this.deleteDownloads({ bookId })
-    const media = await this.deleteMediaDownloads({ bookId })
+    const { text, media } = await this.purgeBookCaches(bookId)
     return {
       text: { removed: text.removed, bytes: text.bytes },
       media: { removed: media.removed, bytes: media.bytes },
     }
+  }
+
+  /** 取消这本书的文字与媒体在途作业并清掉两套缓存与索引；按书清理与删书共用。 */
+  private async purgeBookCaches(bookId: string) {
+    const text = await this.deleteDownloads({ bookId })
+    const media = await this.deleteMediaDownloads({ bookId })
+    return { text, media }
   }
 
   /** 清空全部媒体缓存（含索引）：存储页的「清空媒体」用，文字缓存不动。 */
@@ -1433,13 +1443,52 @@ export class ReaderService extends TypertRemoteService {
     if (active.length) await this.mediaManager().waitIdle()
     const table = this.mediaEntriesTable()
     const keys = table ? (Array.from(table.keys()) as string[]) : []
-    let bytes = 0
-    if (table) {
-      for (const [, value] of table.entries()) bytes += Number((value as any)?.bytes) || 0
-    }
+    const bytes = this.entriesBytes(table)
     await clearMediaRoot()
     if (keys.length && table) await table.deleteMany(keys)
     return { removed: keys.length, bytes }
+  }
+
+  /** 索引条目里记录的字节数合计；表缺失（旧测试假 db）按 0。 */
+  private entriesBytes(table: { entries(): Iterable<[string, unknown]> } | undefined): number {
+    let bytes = 0
+    if (!table) return 0
+    for (const [, value] of table.entries()) bytes += Number((value as { bytes?: unknown })?.bytes) || 0
+    return bytes
+  }
+
+  /**
+   * 清空全部缓存：文字与媒体一起清，索引同步清空，也带走没有索引归属的历史残留。
+   * 书、进度、书签、笔记与导出文件都不动。
+   */
+  async clearAllCaches() {
+    this.requireDb()
+    const textActive = this.downloadManager()
+      .list({ kind: DOWNLOAD_KIND })
+      .filter((job) => isActiveJob(job.status))
+    for (const job of textActive) await this.downloadManager().cancel(job.id)
+    if (textActive.length) await this.downloadManager().waitIdle()
+    const mediaActive = this.mediaManager()
+      .list({ kind: MEDIA_DOWNLOAD_KIND })
+      .filter((job) => isActiveJob(job.status))
+    for (const job of mediaActive) await this.mediaManager().cancel(job.id)
+    if (mediaActive.length) await this.mediaManager().waitIdle()
+
+    const [textBefore, mediaBefore] = await Promise.all([textCacheUsage(), mediaUsage()])
+    const downloadTable = this.downloadEntriesTable()
+    const mediaTable = this.mediaEntriesTable()
+    const downloadKeys = downloadTable ? (Array.from(downloadTable.keys()) as string[]) : []
+    const mediaKeys = mediaTable ? (Array.from(mediaTable.keys()) as string[]) : []
+    // 文字缓存整根删（无索引归属的旧文件一起带走），再单独删媒体根。
+    await clearAllChapterCache()
+    await clearMediaRoot()
+    if (downloadKeys.length && downloadTable) await downloadTable.deleteMany(downloadKeys)
+    if (mediaKeys.length && mediaTable) await mediaTable.deleteMany(mediaKeys)
+    // 报实际腾出的空间：无索引的历史文件也计入，界面上不会显示成 0 B。
+    return {
+      text: { removed: downloadKeys.length, bytes: textBefore.bytes },
+      media: { removed: mediaKeys.length, bytes: mediaBefore.bytes },
+    }
   }
 
   async exportBook(args: Args) {
@@ -1791,17 +1840,42 @@ export class ReaderService extends TypertRemoteService {
     return { books }
   }
 
+  /** 取消这本书在跑的导出并等收尾：导出会把章节缓存与下载索引再写回来。 */
+  private async stopBookExports(bookId: string) {
+    const db = this.requireDb()
+    if (!db.jobs || typeof db.jobs.entries !== 'function') return
+    const manager = this.exportManager()
+    const active = manager.list({ bookId }).filter((job) => isActiveJob(job.status))
+    for (const job of active) await manager.cancel(job.id)
+    if (active.length) await manager.waitIdle()
+  }
+
+  /**
+   * 删除书：先停这本书的在途下载、清掉缓存文件与下载索引，再删书目与进度。
+   * 清理失败时这本还没删掉的书留在书架，报错带书名与原因，可以直接再删一次。
+   */
   async removeBooks(args: Args) {
     const ids = args?.ids
     if (!Array.isArray(ids) || ids.length === 0) throw new Error('缺少参数 ids')
     const keys = ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
-    const localIds = keys.filter((id) => {
-      const book = this.requireDb().books.get(id) as Record<string, unknown> | undefined
-      return book?.origin === 'local'
-    })
-    const deleted = await this.requireDb().books.deleteMany(keys)
-    for (const id of keys) await this.requireDb().readRecords.delete(id)
-    for (const id of localIds) await removeLocalBook(id).catch(() => undefined)
+    const db = this.requireDb()
+    let deleted = 0
+    for (const id of keys) {
+      const book = db.books.get(id) as Record<string, unknown> | undefined
+      const name = String(book?.name ?? id)
+      try {
+        // 先停这本书的导出与下载（含在途章节），否则删掉的文件会被回写、索引被补登。
+        await this.stopBookExports(id)
+        await this.purgeBookCaches(id)
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        throw new Error(`删除《${name}》失败：${reason}；缓存未清完的书仍留在书架，可再次删除`)
+      }
+      await db.books.delete(id)
+      await db.readRecords.delete(id)
+      if (book?.origin === 'local') await removeLocalBook(id).catch(() => undefined)
+      if (book) deleted += 1
+    }
     return { deleted }
   }
 

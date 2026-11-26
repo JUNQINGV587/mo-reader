@@ -759,6 +759,8 @@ const storageClearBook = ref('')
 const storageClearing = ref('')
 const storageClearAllOpen = ref(false)
 const storageClearAllBusy = ref(false)
+const storageClearAllCachesOpen = ref(false)
+const storageClearAllCachesBusy = ref(false)
 
 const storageBooks = computed<any[]>(() =>
   Array.isArray(storageUsage.value?.books) ? storageUsage.value.books : [],
@@ -833,6 +835,22 @@ async function clearAllMediaStorage() {
   } finally {
     storageClearAllBusy.value = false
     storageClearAllOpen.value = false
+  }
+}
+
+async function clearAllCachesStorage() {
+  storageClearAllCachesBusy.value = true
+  try {
+    const result = await call('clearAllCaches')
+    const text = formatBytes(Number(result?.text?.bytes ?? 0))
+    const media = formatBytes(Number(result?.media?.bytes ?? 0))
+    storageMessage.value = `已清空全部缓存（文字 ${text}、媒体 ${media}）`
+    await loadStorageUsage()
+  } catch (error) {
+    storageMessage.value = `清理失败：${errorText(error)}`
+  } finally {
+    storageClearAllCachesBusy.value = false
+    storageClearAllCachesOpen.value = false
   }
 }
 
@@ -4442,6 +4460,26 @@ onMounted(async () => {
               清理
             </button>
           </div>
+        </div>
+
+        <div class="mo-card" data-testid="storage-clear-all">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">全部缓存</h3>
+            <span class="muted">文字与媒体一起清空，书架不受影响</span>
+          </div>
+          <div v-if="storageClearAllCachesOpen" class="mo-row">
+            <span class="muted">会删掉全部文字与媒体缓存，包括没有索引的旧文件，确认吗？</span>
+            <button
+              class="mo-btn danger"
+              :disabled="storageClearAllCachesBusy"
+              data-testid="clear-all-caches-confirm"
+              @click="clearAllCachesStorage"
+            >
+              {{ storageClearAllCachesBusy ? '清理中…' : '确认清空' }}
+            </button>
+            <button class="mo-btn" :disabled="storageClearAllCachesBusy" @click="storageClearAllCachesOpen = false">取消</button>
+          </div>
+          <button v-else class="mo-btn danger" data-testid="clear-all-caches" @click="storageClearAllCachesOpen = true">清空全部</button>
         </div>
 
         <div class="mo-card" data-testid="storage-clear-media">

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdir, mkdtemp, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -82,4 +82,19 @@ test('本地书导出 EPUB（含 mimetype/opf/章节正文）', async () => {
   assert.match(opf, /demo/)
   const chapter = await zip.file('OEBPS/chapter1.xhtml').async('string')
   assert.match(chapter, /起点正文内容/)
+})
+
+test('清空文字缓存保留嵌套的媒体目录', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'mo-cache-nested-'))
+  process.env.MO_READER_CACHE_ROOT = root
+  process.env.MO_READER_MEDIA_ROOT = path.join(root, 'media')
+  const { clearAllChapterCache } = await import('../dist/server/cache.js')
+  await writeFile(path.join(root, 'chapter.txt'), 'text')
+  await mkdir(path.join(root, 'media', 'me-x-0'), { recursive: true })
+  await writeFile(path.join(root, 'media', 'me-x-0', '0.jpg'), 'img')
+
+  await clearAllChapterCache(path.join(root, 'media'))
+
+  await assert.rejects(stat(path.join(root, 'chapter.txt')), /ENOENT/)
+  assert.equal((await stat(path.join(root, 'media', 'me-x-0', '0.jpg'))).size, 3)
 })

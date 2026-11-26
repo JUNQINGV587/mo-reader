@@ -295,7 +295,10 @@ export class DownloadCoordinator {
 
   list(filter: ListFilter = {}) {
     const jobs: DownloadJob[] = []
-    for (const [id, record] of this.host.db().jobs.entries()) {
+    const table = this.host.db().jobs
+    // 旧测试的假 db 可能没有作业表，按「没有作业」处理。
+    if (!table || typeof table.entries !== 'function') return jobs
+    for (const [id, record] of table.entries()) {
       const job = (this.live.get(id) ?? record) as DownloadJob
       if (filter.bookId && job.bookId !== filter.bookId) continue
       if (filter.kind && job.kind !== filter.kind) continue
@@ -309,6 +312,19 @@ export class DownloadCoordinator {
   async waitIdle(): Promise<void> {
     while (this.runners.size) {
       await Promise.allSettled([...this.runners.values()])
+    }
+  }
+
+  /** 只等这本书的在途作业收尾，别的书还在下也不耽误删这本。 */
+  async waitBookIdle(bookId: string): Promise<void> {
+    for (;;) {
+      const pending: Promise<void>[] = []
+      for (const [id, runner] of this.runners) {
+        const job = this.live.get(id) ?? (this.host.db().jobs?.get(id) as DownloadJob | undefined)
+        if (job?.bookId === bookId) pending.push(runner)
+      }
+      if (!pending.length) return
+      await Promise.allSettled(pending)
     }
   }
 
@@ -360,7 +376,9 @@ export class DownloadCoordinator {
 
   private findActive(bookId: string): DownloadJob | undefined {
     const candidates: DownloadJob[] = []
-    for (const [id, record] of this.host.db().jobs.entries()) {
+    const table = this.host.db().jobs
+    if (!table || typeof table.entries !== 'function') return undefined
+    for (const [id, record] of table.entries()) {
       const job = (this.live.get(id) ?? record) as DownloadJob
       if (job.bookId !== bookId || job.kind !== DOWNLOAD_KIND) continue
       if (isActiveJob(job.status)) candidates.push(job)

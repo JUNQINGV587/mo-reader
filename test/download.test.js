@@ -468,3 +468,91 @@ test('清空全部文字缓存后索引同步清空，不残留指向已删文�
   assert.equal(await harness.readCachedChapter(ORIGIN, `${ORIGIN}/ch/1`), null)
 })
 
+test('删书：带走该书下载索引与章节缓存，其他书与书签笔记保留', async () => {
+  const harness = await makeHarness()
+  await harness.service.startDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForDownloads()
+  harness.readRecords.put('book-1', {
+    id: 'book-1',
+    bookId: 'book-1',
+    chapterIndex: 1,
+    chapterTitle: '第2章',
+    chapterUrl: `${ORIGIN}/ch/2`,
+    position: 5,
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  })
+  await harness.service.db.bookmarks.put('bm-1', { id: 'bm-1', bookId: 'book-1', chapterIndex: 0 })
+  await harness.service.db.notes.put('note-1', { id: 'note-1', bookId: 'book-1', content: '笔记' })
+  harness.downloadEntries.put('dl-other-1', {
+    id: 'dl-other-1',
+    bookId: 'book-2',
+    chapterIndex: 0,
+    chapterUrl: 'https://other.example.com/ch/1',
+    sourceUrl: 'https://other.example.com',
+    bytes: 10,
+    createdAt: 1,
+    updatedAt: 1,
+  })
+  await harness.writeCachedChapter('https://other.example.com', 'https://other.example.com/ch/1', '别的书')
+
+  const result = await harness.service.removeBooks({ ids: ['book-1'] })
+
+  assert.equal(result.deleted, 1)
+  assert.equal(harness.books.map.has('book-1'), false)
+  assert.equal(harness.readRecords.map.has('book-1'), false)
+  assert.equal([...harness.downloadEntries.map.values()].filter((entry) => entry.bookId === 'book-1').length, 0)
+  assert.equal(await harness.readCachedChapter(ORIGIN, `${ORIGIN}/ch/1`), null)
+  assert.equal(await harness.readCachedChapter(ORIGIN, `${ORIGIN}/ch/2`), null)
+  assert.equal(harness.downloadEntries.map.has('dl-other-1'), true)
+  assert.equal(await harness.readCachedChapter('https://other.example.com', 'https://other.example.com/ch/1'), '别的书')
+  // 删书语义保持原样：书签与笔记不级联删除。
+  assert.equal((await harness.service.listBookmarks({ bookId: 'book-1' })).bookmarks.length, 1)
+  assert.equal((await harness.service.listNotes({ bookId: 'book-1' })).notes.length, 1)
+})
+
+test('删书时有在途下载：先停作业收尾再删文件，缓存不被回写', async () => {
+  const harness = await makeHarness({
+    chapters: 3,
+    delays: {
+      [`${ORIGIN}/ch/1`]: 80,
+      [`${ORIGIN}/ch/2`]: 80,
+      [`${ORIGIN}/ch/3`]: 80,
+    },
+  })
+  const started = await harness.service.startDownload({ bookId: 'book-1', all: true })
+  await waitFor(() => harness.calls.includes(`${ORIGIN}/ch/1`))
+
+  const result = await harness.service.removeBooks({ ids: ['book-1'] })
+
+  assert.equal(result.deleted, 1)
+  const { job } = await harness.service.getJob({ id: started.job.id })
+  assert.equal(job.status, 'cancelled')
+  assert.equal(harness.downloadEntries.map.size, 0)
+  assert.equal(await harness.readCachedChapter(ORIGIN, `${ORIGIN}/ch/1`), null)
+  assert.equal(await harness.readCachedChapter(ORIGIN, `${ORIGIN}/ch/2`), null)
+  assert.equal(harness.books.map.has('book-1'), false)
+})
+
+test('删书清理失败：书留在书架并报出书名，再次删除可继续', async () => {
+  const harness = await makeHarness()
+  const original = harness.service.deleteMediaDownloads.bind(harness.service)
+  let fail = true
+  harness.service.deleteMediaDownloads = async (args) => {
+    if (fail) {
+      fail = false
+      throw new Error('磁盘忙')
+    }
+    return original(args)
+  }
+
+  await assert.rejects(
+    () => harness.service.removeBooks({ ids: ['book-1'] }),
+    /删除《测试书》失败：磁盘忙/,
+  )
+  assert.equal(harness.books.map.has('book-1'), true, '清理失败时书不删，方便重试')
+
+  const again = await harness.service.removeBooks({ ids: ['book-1'] })
+  assert.equal(again.deleted, 1)
+  assert.equal(harness.books.map.has('book-1'), false)
+})
+

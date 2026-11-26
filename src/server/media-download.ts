@@ -253,6 +253,8 @@ export class MediaDownloadCoordinator {
   list(filter: MediaJobFilter = {}): MediaJob[] {
     const db = this.host.db()
     const found: MediaJob[] = []
+    // 旧测试的假 db 可能没有作业表，按「没有作业」处理。
+    if (!db.jobs || typeof db.jobs.entries !== 'function') return found
     for (const [id, record] of db.jobs.entries()) {
       if (record?.kind !== MEDIA_DOWNLOAD_KIND) continue
       const job = (this.live.get(id) ?? record) as MediaJob
@@ -269,6 +271,19 @@ export class MediaDownloadCoordinator {
     for (;;) {
       if (!this.runners.size) return
       await Promise.allSettled([...this.runners.values()])
+    }
+  }
+
+  /** 只等这本书的在途作业收尾，别的书还在下也不耽误删这本。 */
+  async waitBookIdle(bookId: string): Promise<void> {
+    for (;;) {
+      const pending: Promise<void>[] = []
+      for (const [id, runner] of this.runners) {
+        const job = this.live.get(id) ?? (this.host.db().jobs?.get(id) as MediaJob | undefined)
+        if (job?.bookId === bookId) pending.push(runner)
+      }
+      if (!pending.length) return
+      await Promise.allSettled(pending)
     }
   }
 
@@ -292,6 +307,7 @@ export class MediaDownloadCoordinator {
   private findActive(bookId: string, kind: MediaEntryKind): MediaJob | null {
     const db = this.host.db()
     const candidates: MediaJob[] = []
+    if (!db.jobs || typeof db.jobs.entries !== 'function') return null
     for (const [id, record] of db.jobs.entries()) {
       if (record?.kind !== MEDIA_DOWNLOAD_KIND) continue
       if (record.bookId !== bookId) continue

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -565,4 +565,73 @@ test('媒体下载摘要按书聚合类型、条数与字节', async () => {
   assert.equal(summary.total, 2)
   assert.ok(summary.bytes > 0)
   assert.equal(summary.job.status, 'done')
+})
+
+test('删书：带走该书媒体索引、文件与半成品，阅读进度一起删', async () => {
+  const harness = await makeHarness({ pages: imagePages(HOST, 2, 1) })
+  await harness.service.startMediaDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForMediaDownloads()
+  const entries = [...harness.mediaEntries.map.values()]
+  assert.equal(entries.length, 2)
+  harness.service.db.readRecords.put('book-1', { id: 'book-1', bookId: 'book-1', chapterIndex: 1 })
+  const mediaDir = process.env.MO_READER_MEDIA_ROOT
+  const { mediaStoreId } = await import('../dist/server/media-cache.js')
+  // 暂停/失败留下的半成品没有索引，删书也要带走；别的书目录不能碰。
+  const partialDir = path.join(mediaDir, mediaStoreId('book-1', 9))
+  await mkdir(partialDir, { recursive: true })
+  await writeFile(path.join(partialDir, '0.jpg'), 'half')
+  const otherDir = path.join(mediaDir, mediaStoreId('book-2', 0))
+  await mkdir(otherDir, { recursive: true })
+  await writeFile(path.join(otherDir, '0.jpg'), 'other')
+
+  const result = await harness.service.removeBooks({ ids: ['book-1'] })
+
+  assert.equal(result.deleted, 1)
+  assert.equal(harness.mediaEntries.map.size, 0)
+  assert.equal(harness.books.map.has('book-1'), false)
+  assert.equal(harness.service.db.readRecords.map.has('book-1'), false)
+  for (const entry of entries) {
+    const file = path.join(mediaDir, entry.files[0].path)
+    await assert.rejects(readFile(file), /ENOENT/)
+  }
+  await assert.rejects(readFile(path.join(partialDir, '0.jpg')), /ENOENT/, '无索引半成品也要删')
+  assert.ok((await stat(path.join(otherDir, '0.jpg'))).size > 0, '别的书媒体目录不动')
+})
+
+test('清空文字缓存不动媒体文件与媒体索引', async () => {
+  const harness = await makeHarness({ pages: imagePages(HOST, 1, 1) })
+  await harness.service.startMediaDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForMediaDownloads()
+  const [entry] = harness.mediaEntries.map.values()
+  const file = path.join(process.env.MO_READER_MEDIA_ROOT, entry.files[0].path)
+  assert.ok((await stat(file)).size > 0)
+
+  await harness.service.clearDownloads()
+
+  assert.equal(harness.mediaEntries.map.size, 1, '文字缓存清理不碰媒体索引')
+  assert.ok((await stat(file)).size > 0, '文字缓存清理不碰媒体文件')
+})
+
+test('清空全部缓存：带走无索引归属的文字与媒体残留，索引同步清空', async () => {
+  const harness = await makeHarness({ pages: imagePages(HOST, 1, 1) })
+  await harness.service.startMediaDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForMediaDownloads()
+  assert.equal(harness.mediaEntries.map.size, 1)
+  const { writeCachedChapter, readCachedChapter } = await import('../dist/server/cache.js')
+  const root = process.env.MO_READER_MEDIA_ROOT
+  const legacyText = `${HOST}/legacy`
+  await writeCachedChapter(HOST, legacyText, '旧文字缓存')
+  const legacyMedia = path.join(root, 'me-legacy-0')
+  await mkdir(legacyMedia, { recursive: true })
+  await writeFile(path.join(legacyMedia, '0.jpg'), 'old')
+
+  const result = await harness.service.clearAllCaches()
+
+  assert.equal(result.media.removed, 1)
+  assert.equal(result.text.removed, 0, '无索引文字不计入索引条数')
+  assert.equal(await readCachedChapter(HOST, legacyText), null)
+  assert.deepEqual(await readdir(root).catch(() => []), [], '文字与媒体残留都不再留在缓存根')
+  assert.equal(harness.mediaEntries.map.size, 0)
+  assert.equal(harness.service.db.downloadEntries.map.size, 0)
+  assert.equal(harness.books.map.has('book-1'), true, '清缓存不删书')
 })

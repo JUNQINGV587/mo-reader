@@ -69,6 +69,7 @@ export const REMOTE_METHODS = Object.freeze([
   'setMediaQuota',
   'clearBookStorage',
   'clearAllMedia',
+  'clearAllCaches',
   'listFonts',
   'uploadFont',
   'getFont',
