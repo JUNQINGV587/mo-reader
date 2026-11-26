@@ -10,6 +10,9 @@ export const DEFAULT_MEDIA_QUOTA_BYTES = 50 * 1024 ** 3
 /** 配额上限 10TB：拦住误输入的超大数字，避免把限制设成实际上没有上限。 */
 export const MAX_MEDIA_QUOTA_BYTES = 10 * 1024 ** 4
 
+/** 用量达到配额的这个比例就算「将满」：界面提前提示，不等淘汰或失败。 */
+export const MEDIA_QUOTA_WARN_RATIO = 0.8
+
 export interface UsageCount {
   bytes: number
   files: number

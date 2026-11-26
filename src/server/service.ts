@@ -72,6 +72,7 @@ import {
 } from './media-cache.js'
 import {
   MAX_MEDIA_QUOTA_BYTES,
+  MEDIA_QUOTA_WARN_RATIO,
   exportUsage,
   formatQuotaBytes,
   mediaUsage,
@@ -1129,7 +1130,14 @@ export class ReaderService extends TypertRemoteService {
         `媒体缓存已满且没有可清理的作品，请先清理媒体缓存或调大配额（当前配额 ${formatQuotaBytes(quota.quota)}）`,
       )
     }
-    return this.mediaManager().start(bookId, options)
+    const started = await this.mediaManager().start(bookId, options)
+    // 配额将满（≥80%）时提前提示，用户可以在这次下载把空间吃完前先清理。
+    const ratio = quota.quota > 0 ? quota.usage / quota.quota : 0
+    const warning =
+      ratio >= MEDIA_QUOTA_WARN_RATIO
+        ? `媒体缓存已用 ${Math.round(ratio * 100)}%，接近配额 ${formatQuotaBytes(quota.quota)}，可在「存储」页按书清理`
+        : ''
+    return { ...started, warning }
   }
 
   async pauseJob(args: Args) {

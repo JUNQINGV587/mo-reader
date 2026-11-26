@@ -554,6 +554,20 @@ function exportStatusText(job: any) {
   return job.status === 'failed' ? '失败' : String(job.status)
 }
 
+function exportFailedChapters(job: any) {
+  const list = Array.isArray(job?.failedChapters) ? job.failedChapters : []
+  if (!list.length) return ''
+  const shown = list.slice(0, 8).join('、')
+  return list.length > 8 ? `${shown} 等 ${list.length} 章` : shown
+}
+
+const storageQuotaWarning = computed(() => {
+  const used = Number(storageUsage.value?.media?.bytes ?? 0)
+  const quota = Number(storageUsage.value?.quota?.bytes ?? 0)
+  if (!quota || used / quota < 0.8) return ''
+  return `媒体缓存已用 ${Math.round((used / quota) * 100)}%，接近配额，建议按书清理`
+})
+
 function exportPercent(job: any) {
   const total = Number(job?.total) || 0
   if (!total) return 0
@@ -971,6 +985,7 @@ const mediaScope = ref<MediaScope>('current')
 const mediaFrom = ref(1)
 const mediaTo = ref(1)
 const mediaJob = ref<any>(null)
+const mediaQuotaWarning = ref('')
 const mediaSummary = ref<any>(null)
 const mediaBusy = ref(false)
 const mediaDeleting = ref(false)
@@ -1075,9 +1090,11 @@ async function startMediaDownload() {
     args.toIndex = index
   }
   mediaBusy.value = true
+  mediaQuotaWarning.value = ''
   try {
     const result: any = await call('startMediaDownload', args)
     mediaJob.value = result?.job ?? null
+    mediaQuotaWarning.value = String(result?.warning ?? '')
     status.value = result?.existing ? '已有进行中的离线下载' : '已开始离线下载'
     void refreshMediaSummary()
     syncMediaTimer()
@@ -3763,6 +3780,7 @@ onMounted(async () => {
             <template v-if="mediaSummary?.failed"> · 失败 {{ mediaSummary.failed }}</template>
             <template v-if="mediaSummary?.skipped"> · 跳过 {{ mediaSummary.skipped }}</template>
           </p>
+          <p v-if="mediaQuotaWarning" class="muted" data-testid="media-quota-warning">{{ mediaQuotaWarning }}</p>
           <div v-if="!mediaDeleteConfirmOpen" class="mo-download-actions">
             <button
               class="mo-btn"
@@ -3883,6 +3901,9 @@ onMounted(async () => {
             <span>失败 {{ exportJob.failed }}</span>
             <span>{{ formatBytes(exportJob.bytes) }}</span>
           </div>
+          <p v-if="exportFailedChapters(exportJob)" class="muted" data-testid="export-failed-chapters">
+            未导出章节：{{ exportFailedChapters(exportJob) }}
+          </p>
           <p v-if="exportJob?.error && exportJob.status !== 'paused'" class="muted">{{ exportJob.error }}</p>
           <div v-if="exportJob" class="mo-download-actions">
             <a
@@ -4295,6 +4316,7 @@ onMounted(async () => {
         </div>
         <p v-if="storageBusy && !storageUsage" class="muted">统计中…</p>
         <p v-if="storageMessage" class="muted" data-testid="storage-message">{{ storageMessage }}</p>
+        <p v-if="storageQuotaWarning" class="muted" data-testid="quota-warning">{{ storageQuotaWarning }}</p>
 
         <div class="mo-card" data-testid="storage-overview">
           <h3 class="mo-card-title">占用</h3>

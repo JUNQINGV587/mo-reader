@@ -187,6 +187,7 @@ test('单章失败只计失败，整本继续导出', async () => {
   assert.equal(job.status, 'done')
   assert.equal(job.completed, 2)
   assert.equal(job.failed, 1)
+  assert.deepEqual(job.failedChapters, ['第2章'], '记下没导出的章节名')
   const body = await readFile(path.join(harness.exportRoot, job.filePath), 'utf8')
   assert.ok(body.includes('第1章正文内容。'))
   assert.ok(!body.includes('第2章正文内容。'))

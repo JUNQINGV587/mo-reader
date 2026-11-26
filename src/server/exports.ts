@@ -31,6 +31,8 @@ export interface ExportJob {
   filePath: string
   /** 产物字节数；导出过程中是已拼正文的累计字节。 */
   size: number
+  /** 导出失败的章节名（最多 100 条），完成后供界面列出「哪些章没导出」。 */
+  failedChapters: string[]
   /** 字体预留字段：#107 起排版类导出按它取字体。 */
   fontId: string
   fromIndex: number
@@ -204,6 +206,7 @@ export class ExportCoordinator {
       fileName: exportFileName(String(book.name ?? ''), format),
       filePath: '',
       size: 0,
+      failedChapters: [],
       fontId: format === 'pdf' ? String(options.fontId ?? '') : '',
       fromIndex: 0,
       toIndex: 0,
@@ -359,6 +362,7 @@ export class ExportCoordinator {
     job.toIndex = Math.max(0, chapters.length - 1)
     job.completed = 0
     job.failed = 0
+    job.failedChapters = []
     job.skipped = 0
     job.bytes = 0
     job.updatedAt = Date.now()
@@ -389,8 +393,11 @@ export class ExportCoordinator {
           job.completed += 1
           job.bytes += Buffer.byteLength(text, 'utf8')
         } catch {
-          // 单章失败只计数，不中止整本导出。
+          // 单章失败只计数，不中止整本导出；记下章节名，完成后界面能说清哪些章没导出。
           job.failed += 1
+          if (job.failedChapters.length < 100) {
+            job.failedChapters.push(String(chapter.title || `第 ${index + 1} 章`))
+          }
         } finally {
           limiter.release(sourceUrl)
         }

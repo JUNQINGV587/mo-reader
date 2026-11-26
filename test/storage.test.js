@@ -344,6 +344,28 @@ test('媒体作业运行时超配额：作业 failed 且 error 含「媒体缓�
   }
 })
 
+test('配额将满时开始下载给出提示，未接近配额时不提示', async () => {
+  const { ReaderService } = await import('../dist/server/service.js')
+  const near = await makeMediaHarness(ReaderService)
+  near.setSettings({ mediaQuotaBytes: 100 })
+  // 先占 85 字节：没超配额，但已到 80% 提示线。
+  await putMediaBook(
+    { media: process.env.MO_READER_MEDIA_ROOT },
+    { bookId: near.bookId, chapterIndex: 5, size: 85, fileName: 'q.bin' },
+  )
+  const started = await near.service.startMediaDownload({ bookId: near.bookId, all: true })
+  assert.match(String(started.warning), /接近配额/)
+  await near.service.cancelJob({ id: started.job.id })
+  await near.service.waitForMediaDownloads()
+
+  const fresh = await makeMediaHarness(ReaderService)
+  fresh.setSettings({ mediaQuotaBytes: 100 })
+  const quiet = await fresh.service.startMediaDownload({ bookId: fresh.bookId, all: true })
+  assert.equal(String(quiet.warning ?? ''), '')
+  await fresh.service.cancelJob({ id: quiet.job.id })
+  await fresh.service.waitForMediaDownloads()
+})
+
 /** 最小媒体下载外壳：假 TOC / 假章节页 / 假文件流，用来跑真实作业。 */
 async function makeMediaHarness(ReaderService) {
   process.env.MO_READER_MEDIA_ROOT = await mkdtemp(path.join(tmpdir(), 'mo-storage-media-'))
