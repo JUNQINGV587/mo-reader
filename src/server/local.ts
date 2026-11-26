@@ -6,6 +6,7 @@ import { parseEpub } from '../core/import/epub.js'
 import { parseMobi } from '../core/import/mobi.js'
 import { parsePdf } from '../core/import/pdf.js'
 import { parseTxt, type ImportedBook, type ImportedChapter } from '../core/import/txt.js'
+import { isPdfPageChapters } from '../core/pdf-pages.js'
 
 export interface LocalBookRecord {
   book: Record<string, unknown>
@@ -20,9 +21,6 @@ export const LOCAL_PDF_ORIGINAL = 'original.pdf'
 /** 本地书 id 是文件字节 sha1 的前 24 位小写十六进制，路由与路径拼接只认这个形状。 */
 const LOCAL_BOOK_ID_PATTERN = /^[0-9a-f]{24}$/
 
-/** 旧版 pdfjs 逐页抽文本时，章节标题固定是「第 N 页」（数字与「页」之间有空格）。 */
-const PDF_PAGE_TITLE_PATTERN = /^第 \d+ 页$/
-
 export function localRoot(): string {
   return process.env.MO_READER_LOCAL_ROOT || join(homedir(), '.dsh', 'reader', 'local')
 }
@@ -35,12 +33,6 @@ export function localBookId(url: string): string {
 /** 书目录只接受合法 id，调用方拿到的路径不会被外部输入带出本地书根目录。 */
 export function localBookDir(id: string): string | null {
   return LOCAL_BOOK_ID_PATTERN.test(id) ? join(localRoot(), id) : null
-}
-
-/** 章节标题是否全部是「第 N 页」：这是旧版 PDF 导入留下的特征。 */
-export function isPdfPageChapters(chapters: ImportedChapter[]): boolean {
-  if (chapters.length === 0) return false
-  return chapters.every((chapter) => !chapter.isVolume && PDF_PAGE_TITLE_PATTERN.test(chapter.title))
 }
 
 /** 兼容新老两种本地书记录：新记录看 localFormat，旧记录看章节标题。 */

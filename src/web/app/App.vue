@@ -6,6 +6,7 @@ import PdfReader from '../reader/PdfReader.vue'
 import AudioReader from '../reader/AudioReader.vue'
 import VideoReader from '../reader/VideoReader.vue'
 import { simulatedChapterCount, simulatedProgress } from '../../core/reader/simulate'
+import { chapterForPdfPage, pdfPageOfChapterTitle } from '../../core/pdf-pages'
 import {
   DEFAULT_MENU_ITEMS,
   DEFAULT_TAP_ZONES,
@@ -2706,8 +2707,18 @@ function continueReadingText() {
   if (target) openChapter(target)
 }
 
-/** 打开 PDF 原版视图：页码与缩放从阅读进度里恢复。 */
-async function openPdfReader() {
+/** 详情目录点章节：PDF 有原文件、标题又能取回页码时进原版对应页，其余仍进文本模式。 */
+async function openTocChapter(chapter: any) {
+  const page = pdfPageOfChapterTitle(chapter?.title)
+  if (isPdfReadable.value && page !== null) {
+    await openPdfReader(page)
+    return
+  }
+  await openChapter(chapter)
+}
+
+/** 打开 PDF 原版视图：指定页优先，否则从阅读进度里恢复页码与缩放。 */
+async function openPdfReader(page?: number) {
   const book = currentBook.value as any
   if (!book?.id) {
     status.value = '请先把这本书加入书架'
@@ -2723,10 +2734,16 @@ async function openPdfReader() {
   const info = localPdfStatus.value
   if (!info?.isPdf) pdfError.value = '这本书没有 PDF 原文件，只能阅读文本模式'
   else if (!info.hasOriginal || !info.originalUrl) pdfError.value = '原文件缺失，重新导入同一个 PDF 即可恢复原版阅读'
+  const requested = typeof page === 'number' && Number.isFinite(page) ? Math.floor(page) : 0
+  if (requested > 0) {
+    // 立即并入本地进度：原版首帧渲染前就切回文本时，也能落到同一页对应的章节。
+    progress.value = { ...(progress.value ?? {}), bookId: book.id, pdfPage: requested - 1 }
+  }
   readerKind.value = 'pdf'
   readerTitle.value = '原版 PDF'
   pdfOriginalUrl.value = info?.isPdf && info?.hasOriginal ? String(info.originalUrl ?? '') : ''
-  pdfInitialPage.value = Math.max(0, Math.floor(Number(progress.value?.pdfPage ?? 0) || 0))
+  pdfInitialPage.value =
+    requested > 0 ? requested - 1 : Math.max(0, Math.floor(Number(progress.value?.pdfPage ?? 0) || 0))
   pdfInitialZoom.value = Math.min(300, Math.max(50, Number(progress.value?.pdfZoom ?? 100) || 100))
   pdfInitialFitWidth.value = Boolean(progress.value?.pdfFitWidth)
   view.value = 'reader'
@@ -2761,14 +2778,20 @@ function closePdfReader() {
   chrome.value = true
 }
 
-/** 从原版切到文本：PDF 一章对应一页，按原页尽量落到同一章。 */
+/** 从原版切到文本：先落到当前页所在章节（空文字页落回上一页），再退回上次的文本进度。 */
 async function switchToTextFromPdf() {
   const readable = chapters.value.filter((chapter: any) => !chapter.isVolume && chapter.url)
   if (!readable.length) {
     showReaderHint('没有可读文本，请先缓存或重新导入')
     return
   }
-  // 文本模式有自己的章节进度，优先回到上次读的那一章；没有才按原版页码映射。
+  const page = Math.max(1, Math.floor(Number(progress.value?.pdfPage ?? 0) || 0) + 1)
+  const byPage = chapterForPdfPage(readable, page)
+  if (byPage) {
+    await openChapter(byPage)
+    return
+  }
+  // 章节标题不是页码的旧数据：回到上次读的文本章节。
   const recorded = progress.value?.chapterUrl
     ? chapters.value.find((chapter: any) => !chapter.isVolume && chapter.url === progress.value.chapterUrl)
     : null
@@ -2776,7 +2799,7 @@ async function switchToTextFromPdf() {
     await openChapter(recorded)
     return
   }
-  const index = Math.min(Math.max(0, Number(progress.value?.pdfPage ?? 0) || 0), readable.length - 1)
+  const index = Math.min(page - 1, readable.length - 1)
   await openChapter(readable[index])
 }
 
@@ -2790,7 +2813,8 @@ async function togglePdfMode() {
     showReaderHint('没有可用的 PDF 原文件')
     return
   }
-  await openPdfReader()
+  // 从文本进原版：先落到当前章的页，来回切换才不会互相丢位置。
+  await openPdfReader(pdfPageOfChapterTitle(currentChapter.value?.title) ?? undefined)
 }
 
 const switchOpen = ref(false)
@@ -4016,7 +4040,7 @@ onMounted(async () => {
           <p v-if="chapterError" class="muted mo-chapter-error" data-testid="chapter-error">{{ chapterError }}</p>
           <ol class="mo-toc" data-testid="toc">
             <li v-for="chapter in filteredChapters" :key="chapter.url || chapter.title" :class="{ volume: chapter.isVolume }">
-              <button v-if="!chapter.isVolume" data-testid="chapter" @click="openChapter(chapter)">{{ chapter.title }}</button>
+              <button v-if="!chapter.isVolume" data-testid="chapter" @click="openTocChapter(chapter)">{{ chapter.title }}</button>
               <span v-else>{{ chapter.title }}</span>
             </li>
           </ol>
