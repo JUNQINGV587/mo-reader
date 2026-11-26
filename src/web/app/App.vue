@@ -30,6 +30,11 @@ import {
   type ThemeColors,
 } from '../../core/reader/theme'
 import { exportFullShelf, exportLegadoShelf } from '../../core/reader/shelf-transfer'
+import {
+  defaultReaderSettings,
+  type ReaderSettings,
+  type SettingsGroupKey,
+} from '../../core/reader/settings'
 import { enabledDictRules, lookupAll, type DictLookupOutcome } from '../../core/dict/lookup-all'
 import { swapDictOrder } from '../../core/dict/order'
 import { filterSources, hasExplore, needsLogin, sourceHost } from '../../core/source/filter'
@@ -229,30 +234,18 @@ async function loadBattery() {
     batteryPercent.value = null
   }
 }
-const settings = ref({
-  fontSize: 22,
-  fontId: '',
-  lineSpacing: 1.9,
-  paragraphSpacing: 6,
-  indent: 2,
-  padding: { left: 22, top: 5, right: 22, bottom: 4 },
-  theme: 'light' as string,
-  customThemes: [] as CustomTheme[],
-  pageAnimation: 'cover' as Turn,
-  headerMode: 1,
-  footerMode: 6,
-  showHeaderLine: true,
-  showFooterLine: true,
-  tapZones: [...DEFAULT_TAP_ZONES] as number[],
-  menuItems: [...DEFAULT_MENU_ITEMS] as string[],
-  replaceRules: [] as Array<{
-    id: string
-    pattern: string
-    replacement: string
-    regex: boolean
-    enabled: boolean
-  }>,
-})
+/** 全局设置与「本书覆盖」合并后的当前生效值；面板里的控件都绑它。 */
+const settings = ref<ReaderSettings>(defaultReaderSettings())
+type SettingsScope = 'global' | 'book'
+const settingsScope = ref<SettingsScope>('global')
+const bookOverridden = ref(false)
+const settingsError = ref('')
+/** 最近一次读取/保存后的基准值，用于算出「只提交改过的字段」。 */
+const settingsBaseline = ref<ReaderSettings>(defaultReaderSettings())
+const settingsSheetRef = ref<HTMLElement | null>(null)
+const settingsTrigger = ref<HTMLElement | null>(null)
+const canUseBookScope = computed(() => Boolean(currentBook.value?.id))
+let settingsPersistTimer: ReturnType<typeof setTimeout> | null = null
 const readerRef = ref<any>(null)
 const initialPage = ref(0)
 const tocFilter = ref('')
@@ -450,12 +443,8 @@ async function refresh() {
     sources.value = sourceResult?.sources ?? []
     shelfBooks.value = bookResult?.books ?? []
     await loadDictRules()
-    try {
-      const stored = await call('getSettings')
-      if (stored?.settings) settings.value = { ...settings.value, ...stored.settings }
-    } catch {
-      // 设置读取失败不阻塞主流程
-    }
+    // 设置读取失败只在面板里提示，不阻塞书源/书架加载。
+    await loadSettings()
     try {
       const fontResult = await call('listFonts')
       customFonts.value = fontResult?.fonts ?? []
@@ -1302,6 +1291,7 @@ onUnmounted(() => {
   stopDownloadTimer()
   stopMediaTimer()
   stopExportTimer()
+  if (settingsPersistTimer) clearTimeout(settingsPersistTimer)
 })
 
 const reviewOpen = ref(false)
@@ -2022,6 +2012,7 @@ async function openBook(book: any) {
   try {
     const info = await call('getBookInfo', { sourceUrl: book.origin, bookUrl: book.bookUrl })
     currentBook.value = { ...book, ...info.info, tocUrl: info.info.tocUrl || book.bookUrl }
+    if (settingsScope.value === 'book') await loadSettings()
     await loadToc(currentBook.value, book.bookUrl)
     await loadLocalPdfStatus(currentBook.value)
     await loadBookmarks()
@@ -2043,6 +2034,7 @@ async function openShelfBook(book: any) {
   chapterError.value = ''
   downloadSummary.value = null
   currentBook.value = { ...book }
+  if (settingsScope.value === 'book') await loadSettings()
   chapters.value = []
   try {
     await loadToc(currentBook.value, book.bookUrl)
@@ -2190,9 +2182,14 @@ async function deleteFont(font: { id: string; name: string }) {
 
 async function commitThemeState(themeId: string, themes: CustomTheme[], message: string) {
   try {
-    await call('saveSettings', { settings: { theme: themeId, customThemes: themes } })
+    // 主题列表只存全局；选中的主题按当前作用域写入（本书可单独换主题）。
+    if (!deepEqualValue(themes, settings.value.customThemes)) {
+      await call('saveSettings', { settings: { customThemes: themes } })
+      settings.value.customThemes = themes
+      settingsBaseline.value.customThemes = themes
+    }
     settings.value.theme = themeId
-    settings.value.customThemes = themes
+    await persistSettings()
     themeMessage.value = message
     return true
   } catch (error) {
@@ -3371,29 +3368,165 @@ function toggleMenuItem(key: string) {
   persistSettings()
 }
 
-async function persistSettings() {
+/** 滑杆连续拖动时合并保存，避免每移动一格就写一次。 */
+function schedulePersistSettings() {
+  if (settingsPersistTimer) clearTimeout(settingsPersistTimer)
+  settingsPersistTimer = setTimeout(() => {
+    settingsPersistTimer = null
+    void persistSettings()
+  }, 120)
+}
+
+const deepEqualValue = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right)
+
+/** 只提交与基准不同的字段；自定义主题与媒体配额属全局层，不随面板保存。 */
+function settingsDiff(base: ReaderSettings, current: ReaderSettings): Record<string, unknown> {
+  const patch: Record<string, unknown> = {}
+  for (const key of Object.keys(current) as Array<keyof ReaderSettings>) {
+    if (!deepEqualValue(current[key], base[key])) patch[key] = current[key]
+  }
+  delete patch.customThemes
+  delete patch.mediaQuotaBytes
+  return patch
+}
+
+const cloneSettings = (value: ReaderSettings): ReaderSettings => JSON.parse(JSON.stringify(value)) as ReaderSettings
+
+/** 读取当前作用域的设置：无书写全局，有书读合并值并带上「本书是否覆盖」。 */
+async function loadSettings() {
+  await settingsSaveChain
+  const bookId = currentBook.value?.id ?? ''
+  const scope: SettingsScope = bookId ? settingsScope.value : 'global'
+  if (!bookId) settingsScope.value = 'global'
   try {
-    await call('saveSettings', {
-      settings: {
-        fontSize: settings.value.fontSize,
-        fontId: settings.value.fontId,
-        lineSpacing: settings.value.lineSpacing,
-        paragraphSpacing: settings.value.paragraphSpacing,
-        indent: settings.value.indent,
-        padding: settings.value.padding,
-        theme: settings.value.theme,
-        customThemes: settings.value.customThemes,
-        pageAnimation: settings.value.pageAnimation,
-        headerMode: settings.value.headerMode,
-        footerMode: settings.value.footerMode,
-        showHeaderLine: settings.value.showHeaderLine,
-        showFooterLine: settings.value.showFooterLine,
-        tapZones: settings.value.tapZones,
-        menuItems: settings.value.menuItems,
-      },
-    })
+    const stored = scope === 'book' ? await call('getSettings', { bookId }) : await call('getSettings')
+    if (!stored?.settings) return
+    settings.value = { ...defaultReaderSettings(), ...stored.settings } as ReaderSettings
+    settingsBaseline.value = cloneSettings(settings.value)
+    bookOverridden.value = scope === 'book' ? Boolean(stored.bookOverridden) : false
+    settingsError.value = ''
   } catch (error) {
-    status.value = errorText(error)
+    settingsError.value = `设置读取失败：${errorText(error)}`
+  }
+}
+
+/** 串行保存队列：先发后到的响应不能把后来的改动覆盖掉。 */
+let settingsSaveChain: Promise<void> = Promise.resolve()
+
+/**
+ * 保存设置：只提交本次改动字段，按当前作用域写到全局或本书。
+ * 失败时保留用户当前值，在面板内提示原因，可重试。
+ */
+function persistSettings(): Promise<void> {
+  if (settingsPersistTimer) {
+    clearTimeout(settingsPersistTimer)
+    settingsPersistTimer = null
+  }
+  const run = () => runPersistSettings()
+  settingsSaveChain = settingsSaveChain.then(run, run)
+  return settingsSaveChain
+}
+
+async function runPersistSettings() {
+  const bookId = settingsScope.value === 'book' ? currentBook.value?.id ?? '' : ''
+  const patch = settingsDiff(settingsBaseline.value, settings.value)
+  if (Object.keys(patch).length === 0) return
+  const sent = JSON.parse(JSON.stringify(patch)) as Record<string, unknown>
+  try {
+    const args: Record<string, unknown> = { settings: patch }
+    if (bookId) args.bookId = bookId
+    const result = await call('saveSettings', args)
+    if (result?.settings) {
+      const normalized = { ...defaultReaderSettings(), ...result.settings } as ReaderSettings
+      const merged = cloneSettings(normalized)
+      for (const key of Object.keys(sent)) {
+        const local = (settings.value as unknown as Record<string, unknown>)[key]
+        // 保存途中用户又改过这个字段：保留本地新值，等下一轮再提交。
+        if (!deepEqualValue(local, sent[key])) (merged as unknown as Record<string, unknown>)[key] = local
+      }
+      settings.value = merged
+      settingsBaseline.value = cloneSettings(normalized)
+    } else {
+      settingsBaseline.value = cloneSettings(settings.value)
+    }
+    bookOverridden.value = bookId ? Boolean(result?.bookOverridden ?? true) : false
+    settingsError.value = ''
+    status.value = bookId ? '已保存到本书' : '已保存全局设置'
+  } catch (error) {
+    settingsError.value = `保存失败：${errorText(error)}`
+  }
+}
+
+function openSettings(event?: Event) {
+  settingsTrigger.value = (event?.currentTarget as HTMLElement | null) ?? (document.activeElement as HTMLElement | null)
+  settingsOpen.value = true
+  settingsError.value = ''
+  void loadSettings()
+  nextTick(() => {
+    settingsSheetRef.value?.querySelector<HTMLElement>('button, select, input, summary')?.focus()
+  })
+}
+
+function closeSettings() {
+  settingsOpen.value = false
+  const trigger = settingsTrigger.value
+  settingsTrigger.value = null
+  nextTick(() => trigger?.focus())
+}
+
+async function switchSettingsScope(scope: SettingsScope) {
+  if (scope === 'book' && !canUseBookScope.value) return
+  if (scope === settingsScope.value) return
+  settingsScope.value = scope
+  await loadSettings()
+}
+
+/** 恢复全局：清掉本书覆盖层，面板立即显示继承后的值。 */
+async function restoreGlobalSettings() {
+  const bookId = currentBook.value?.id
+  if (!bookId) return
+  await settingsSaveChain
+  try {
+    await call('resetBookSettings', { bookId })
+    bookOverridden.value = false
+    await loadSettings()
+    status.value = '已恢复全局设置'
+  } catch (error) {
+    settingsError.value = `恢复失败：${errorText(error)}`
+  }
+}
+
+/** 恢复本节默认：全局层回默认值，本书层删掉该分区覆盖、改为跟随全局。 */
+async function resetSettingsSection(group: SettingsGroupKey) {
+  const bookId = settingsScope.value === 'book' ? currentBook.value?.id ?? '' : ''
+  await settingsSaveChain
+  try {
+    const args: Record<string, unknown> = { group }
+    if (bookId) args.bookId = bookId
+    await call('resetSettingsGroup', args)
+    await loadSettings()
+    status.value = bookId ? '已恢复本节，改为跟随全局' : '已恢复本节默认'
+  } catch (error) {
+    settingsError.value = `恢复失败：${errorText(error)}`
+  }
+}
+
+/** 面板内 Tab 循环，焦点不跑到后面的阅读页。 */
+function trapSettingsFocus(event: KeyboardEvent) {
+  const root = settingsSheetRef.value
+  if (!root) return
+  const focusable = Array.from(
+    root.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, summary, [tabindex]:not([tabindex="-1"])'),
+  ).filter((node) => !node.hasAttribute('disabled') && node.offsetParent !== null)
+  if (focusable.length === 0) return
+  const first = focusable[0]
+  const last = focusable[focusable.length - 1]
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first.focus()
   }
 }
 
@@ -4752,7 +4885,7 @@ onMounted(async () => {
             </div>
             <div class="mo-chrome-bottom">
               <button v-if="settings.menuItems.includes('prev')" class="mo-chrome-btn" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
-              <button v-if="settings.menuItems.includes('settings') && readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-settings" @click="settingsOpen = true">Aa</button>
+              <button v-if="settings.menuItems.includes('settings') && readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-settings" @click="openSettings($event)">Aa</button>
               <button v-if="readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-speak" @click="toggleSpeech">{{ speaking ? '暂停' : '朗读' }}</button>
               <button v-if="settings.menuItems.includes('toc')" class="mo-chrome-btn" @click="tocOpen = true">目录</button>
               <button
@@ -4893,147 +5026,304 @@ onMounted(async () => {
           </div>
         </transition>
 
-        <transition name="mo-fade">
-          <div v-if="settingsOpen" class="mo-sheet-mask" @click.self="settingsOpen = false">
-            <div class="mo-sheet mo-sheet-scroll">
+                <transition name="mo-fade">
+          <div
+            v-if="settingsOpen"
+            class="mo-sheet-mask mo-settings-mask"
+            data-testid="settings-mask"
+            @click.self="closeSettings"
+          >
+            <div
+              ref="settingsSheetRef"
+              class="mo-sheet mo-sheet-scroll mo-settings-sheet"
+              data-testid="settings-panel"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="mo-settings-title"
+              tabindex="-1"
+              @pointerdown.stop
+              @click.stop
+              @keydown.esc="closeSettings"
+              @keydown.tab="trapSettingsFocus"
+            >
               <div class="mo-sheet-head">
-                <strong>阅读设置</strong>
-                <button class="mo-icon-btn" @click="settingsOpen = false">✕</button>
+                <strong id="mo-settings-title">阅读设置</strong>
+                <button class="mo-icon-btn" data-testid="settings-close" title="关闭" @click="closeSettings">✕</button>
               </div>
+              
+              <div class="mo-scope-row">
+                <div class="mo-scope-tabs" role="tablist" aria-label="设置作用范围">
+                  <button
+                    class="mo-scope-tab"
+                    :class="{ on: settingsScope === 'global' }"
+                    role="tab"
+                    :aria-selected="settingsScope === 'global'"
+                    data-testid="settings-scope-global"
+                    @click="switchSettingsScope('global')"
+                  >全局</button>
+                  <button
+                    class="mo-scope-tab"
+                    :class="{ on: settingsScope === 'book' }"
+                    role="tab"
+                    :aria-selected="settingsScope === 'book'"
+                    :disabled="!canUseBookScope"
+                    data-testid="settings-scope-book"
+                    @click="switchSettingsScope('book')"
+                  >本书</button>
+                </div>
+                <span v-if="settingsScope === 'book' && bookOverridden" class="mo-scope-badge" data-testid="settings-book-overridden">本书已自定义</span>
+                <button
+                  v-if="settingsScope === 'book' && bookOverridden"
+                  class="mo-btn tiny"
+                  data-testid="settings-restore-global"
+                  @click="restoreGlobalSettings"
+                >恢复全局</button>
+              </div>
+              <p v-if="settingsScope === 'book' && !bookOverridden" class="mo-settings-tip">本书跟随全局设置</p>
+              <p v-else-if="!canUseBookScope" class="mo-settings-tip">打开一本书后可单独设置本书</p>
+              
+              <div v-if="settingsError" class="mo-settings-error" role="status" data-testid="settings-error">
+                <span>{{ settingsError }}</span>
+                <button class="mo-btn tiny" data-testid="settings-retry" @click="persistSettings">重试</button>
+                <button class="mo-btn tiny" data-testid="settings-reload" @click="loadSettings">还原</button>
+              </div>
+              
               <div class="mo-theme-row">
                 <span>预设</span>
                 <button v-for="preset in READER_PRESETS" :key="preset.key" @click="applyPreset(preset)">{{ preset.name }}</button>
               </div>
-              <label class="mo-slider">
-                <span>字号</span>
-                <input v-model.number="settings.fontSize" type="range" min="14" max="34" step="1" @change="persistSettings" />
-                <b>{{ settings.fontSize }}</b>
-              </label>
-              <div class="mo-theme-row">
-                <span>字体</span>
-                <select class="mo-select" data-testid="font-select" :value="settings.fontId" @change="selectFont">
-                  <option value="">默认宋体</option>
-                  <option v-for="font in customFonts" :key="font.id" :value="font.id">{{ font.name }}</option>
-                </select>
-                <label class="mo-font-upload" data-testid="font-upload">
-                  上传
-                  <input type="file" accept=".ttf,.otf,.woff,.woff2" @change="uploadFontFile" />
+              
+              <details class="mo-settings-group" open>
+                <summary>排版</summary>
+                <div class="mo-group-bar">
+                  <span class="muted">字号、行距与文字样式</span>
+                  <button class="mo-btn tiny" data-testid="settings-reset-layout" @click="resetSettingsSection('layout')">恢复本节默认</button>
+                </div>
+                <label class="mo-slider">
+                  <span>字号</span>
+                  <input v-model.number="settings.fontSize" type="range" min="12" max="48" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.fontSize }}</b>
                 </label>
-              </div>
-              <div v-if="customFonts.length" class="mo-font-list" data-testid="font-list">
-                <div v-for="font in customFonts" :key="font.id" class="mo-font-item">
-                  <span>{{ font.name }}</span>
-                  <small>{{ (font.size / 1024 / 1024).toFixed(1) }} MB</small>
-                  <button class="mo-icon-btn" data-testid="font-delete" title="删除字体" @click="deleteFont(font)">✕</button>
+                <div class="mo-theme-row">
+                  <span>字体</span>
+                  <select class="mo-select" data-testid="font-select" :value="settings.fontId" @change="selectFont">
+                    <option value="">默认宋体</option>
+                    <option v-for="font in customFonts" :key="font.id" :value="font.id">{{ font.name }}</option>
+                  </select>
+                  <label class="mo-font-upload" data-testid="font-upload">
+                    上传
+                    <input type="file" accept=".ttf,.otf,.woff,.woff2" @change="uploadFontFile" />
+                  </label>
                 </div>
-              </div>
-              <p v-if="fontMessage" class="mo-font-status" data-testid="font-status">{{ fontMessage }}</p>
-              <label class="mo-slider">
-                <span>行距</span>
-                <input v-model.number="settings.lineSpacing" type="range" min="1.2" max="2.6" step="0.1" @change="persistSettings" />
-                <b>{{ settings.lineSpacing.toFixed(1) }}</b>
-              </label>
-              <label class="mo-slider">
-                <span>段距</span>
-                <input v-model.number="settings.paragraphSpacing" type="range" min="0" max="20" step="1" @change="persistSettings" />
-                <b>{{ settings.paragraphSpacing }}</b>
-              </label>
-              <div class="mo-theme-row">
-                <span>缩进</span>
-                <button :class="{ on: settings.indent === 2 }" @click="settings.indent = 2; persistSettings()">两字</button>
-                <button :class="{ on: settings.indent === 0 }" @click="settings.indent = 0; persistSettings()">无</button>
-              </div>
-              <div class="mo-theme-row">
-                <span>主题</span>
-                <button v-for="item in [{ value: 'light', label: '纸白' }, { value: 'sepia', label: '米黄' }, { value: 'dark', label: '夜读' }]" :key="item.value" :class="{ on: settings.theme === item.value }" @click="selectTheme(item.value)">{{ item.label }}</button>
-              </div>
-              <div v-if="settings.customThemes.length" class="mo-theme-row mo-theme-wrap">
-                <span>自定义</span>
-                <button v-for="item in settings.customThemes" :key="item.id" data-testid="theme-custom" :class="{ on: settings.theme === item.id }" @click="selectTheme(item.id)">{{ item.name }}</button>
-              </div>
-              <div class="mo-theme-row">
-                <span>管理</span>
-                <button data-testid="theme-new" @click="startThemeCreate">新建</button>
-                <button v-if="activeCustomTheme" data-testid="theme-edit" @click="startThemeEdit">编辑</button>
-                <button v-if="activeCustomTheme" data-testid="theme-delete" @click="deleteActiveTheme">删除</button>
-              </div>
-              <div class="mo-theme-row">
-                <span>迁移</span>
-                <label class="mo-font-upload" data-testid="theme-import">
-                  导入
-                  <input type="file" accept=".json,application/json" @change="importThemeFile" />
+                <div v-if="customFonts.length" class="mo-font-list" data-testid="font-list">
+                  <div v-for="font in customFonts" :key="font.id" class="mo-font-item">
+                    <span>{{ font.name }}</span>
+                    <small>{{ (font.size / 1024 / 1024).toFixed(1) }} MB</small>
+                    <button class="mo-icon-btn" data-testid="font-delete" title="删除字体" @click="deleteFont(font)">✕</button>
+                  </div>
+                </div>
+                <p v-if="fontMessage" class="mo-font-status" data-testid="font-status">{{ fontMessage }}</p>
+                <label class="mo-slider">
+                  <span>行距</span>
+                  <input v-model.number="settings.lineSpacing" type="range" min="1.2" max="2.6" step="0.1" @input="schedulePersistSettings" />
+                  <b>{{ settings.lineSpacing.toFixed(1) }}</b>
                 </label>
-                <button data-testid="theme-export-legado" @click="exportThemes('legado')">兼容版</button>
-                <button data-testid="theme-export-full" @click="exportThemes('full')">全量版</button>
-              </div>
-              <p v-if="themeMessage" class="mo-font-status" data-testid="theme-status">{{ themeMessage }}</p>
-              <div v-if="themeDraft" class="mo-theme-editor" data-testid="theme-editor">
-                <div class="mo-theme-editor-head">
-                  <strong>{{ themeDraft.id ? '编辑主题' : '新建主题' }}</strong>
-                  <button class="mo-icon-btn" data-testid="theme-cancel" title="取消" @click="themeDraft = null">✕</button>
-                </div>
-                <label class="mo-theme-field">
-                  <span>名称</span>
-                  <input v-model="themeDraft.name" class="mo-input" data-testid="theme-name" maxlength="32" placeholder="主题名称" />
+                <label class="mo-slider">
+                  <span>段距</span>
+                  <input v-model.number="settings.paragraphSpacing" type="range" min="0" max="24" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.paragraphSpacing }}</b>
                 </label>
-                <div class="mo-color-grid">
-                  <label class="mo-color-field"><span>背景</span><input v-model="themeDraft.bg" type="color" data-testid="theme-bg" /></label>
-                  <label class="mo-color-field"><span>正文</span><input v-model="themeDraft.text" type="color" data-testid="theme-text" /></label>
-                  <label class="mo-color-field"><span>辅助</span><input v-model="themeDraft.muted" type="color" data-testid="theme-muted" /></label>
-                  <label class="mo-color-field"><span>分隔</span><input v-model="themeDraft.line" type="color" data-testid="theme-line" /></label>
+                <label class="mo-slider">
+                  <span>字距</span>
+                  <input v-model.number="settings.letterSpacing" type="range" min="0" max="4" step="0.5" @input="schedulePersistSettings" />
+                  <b>{{ settings.letterSpacing.toFixed(1) }}</b>
+                </label>
+                <div class="mo-theme-row">
+                  <span>缩进</span>
+                  <button :class="{ on: settings.indent === 2 }" @click="settings.indent = 2; persistSettings()">两字</button>
+                  <button :class="{ on: settings.indent === 0 }" @click="settings.indent = 0; persistSettings()">无</button>
                 </div>
-                <div class="mo-theme-editor-actions">
-                  <button class="mo-btn primary" data-testid="theme-save" @click="saveThemeDraft">保存</button>
-                  <button class="mo-btn" @click="themeDraft = null">取消</button>
+                <label class="mo-switch"><input v-model="settings.bold" type="checkbox" @change="persistSettings" />加粗正文</label>
+                <div class="mo-theme-row">
+                  <span>标题位置</span>
+                  <button
+                    v-for="mode in [{ value: 0, label: '靠左' }, { value: 1, label: '居中' }, { value: 2, label: '隐藏' }, { value: 3, label: '靠右' }]"
+                    :key="mode.value"
+                    :class="{ on: settings.titleMode === mode.value }"
+                    @click="settings.titleMode = mode.value; persistSettings()"
+                  >{{ mode.label }}</button>
                 </div>
-              </div>
-              <div class="mo-theme-row">
-                <span>翻页</span>
-                <button v-for="item in [{ value: 'cover', label: '覆盖' }, { value: 'slide', label: '平移' }, { value: 'simulate', label: '仿真' }, { value: 'scroll', label: '滚动' }, { value: 'none', label: '无动画' }]" :key="item.value" :class="{ on: settings.pageAnimation === item.value }" @click="settings.pageAnimation = item.value as any; persistSettings()">{{ item.label }}</button>
-              </div>
-              <div class="mo-theme-row">
-                <span>页眉</span>
-                <select v-model.number="settings.headerMode" class="mo-select" @change="persistSettings">
-                  <option v-for="mode in TIP_MODES" :key="mode.code" :value="mode.code">{{ mode.label }}</option>
-                </select>
-              </div>
-              <div class="mo-theme-row">
-                <span>页脚</span>
-                <select v-model.number="settings.footerMode" class="mo-select" @change="persistSettings">
-                  <option v-for="mode in TIP_MODES" :key="mode.code" :value="mode.code">{{ mode.label }}</option>
-                </select>
-              </div>
-              <div class="mo-theme-row">
-                <span>分隔线</span>
-                <label class="mo-switch"><input v-model="settings.showHeaderLine" type="checkbox" @change="persistSettings" />页眉</label>
-                <label class="mo-switch"><input v-model="settings.showFooterLine" type="checkbox" @change="persistSettings" />页脚</label>
-              </div>
-              <div class="mo-zone-grid">
-                <div v-for="(zone, index) in settings.tapZones" :key="index" class="mo-zone-cell">
-                  <span>{{ TAP_ZONE_NAMES[index] }}</span>
-                  <select :value="zone" class="mo-select" @change="setTapZone(index, $event)">
-                    <option v-for="action in TAP_ACTIONS" :key="action.code" :value="action.code">{{ action.label }}{{ action.available ? '' : '（未开放）' }}</option>
+                <label class="mo-slider">
+                  <span>标题字号</span>
+                  <input v-model.number="settings.titleSize" type="range" min="0" max="8" step="1" @input="schedulePersistSettings" />
+                  <b>+{{ settings.titleSize * 2 }}px</b>
+                </label>
+                <div class="mo-theme-row">
+                  <span>对齐</span>
+                  <button :class="{ on: settings.align === 'left' }" @click="settings.align = 'left'; persistSettings()">左齐</button>
+                  <button :class="{ on: settings.align === 'justify' }" @click="settings.align = 'justify'; persistSettings()">两端</button>
+                </div>
+                <label class="mo-switch"><input v-model="settings.compressPunctuation" type="checkbox" @change="persistSettings" />标点压缩</label>
+                <label class="mo-switch"><input v-model="settings.kinsoku" type="checkbox" @change="persistSettings" />避头尾</label>
+              </details>
+              
+              <details class="mo-settings-group">
+                <summary>页面</summary>
+                <div class="mo-group-bar">
+                  <span class="muted">主题、边距与页眉页脚</span>
+                  <button class="mo-btn tiny" data-testid="settings-reset-page" @click="resetSettingsSection('page')">恢复本节默认</button>
+                </div>
+                <div class="mo-theme-row">
+                  <span>主题</span>
+                  <button v-for="item in [{ value: 'light', label: '纸白' }, { value: 'sepia', label: '米黄' }, { value: 'dark', label: '夜读' }]" :key="item.value" :class="{ on: settings.theme === item.value }" @click="selectTheme(item.value)">{{ item.label }}</button>
+                </div>
+                <div v-if="settings.customThemes.length" class="mo-theme-row mo-theme-wrap">
+                  <span>自定义</span>
+                  <button v-for="item in settings.customThemes" :key="item.id" data-testid="theme-custom" :class="{ on: settings.theme === item.id }" @click="selectTheme(item.id)">{{ item.name }}</button>
+                </div>
+                <div class="mo-theme-row">
+                  <span>管理</span>
+                  <button data-testid="theme-new" @click="startThemeCreate">新建</button>
+                  <button v-if="activeCustomTheme" data-testid="theme-edit" @click="startThemeEdit">编辑</button>
+                  <button v-if="activeCustomTheme" data-testid="theme-delete" @click="deleteActiveTheme">删除</button>
+                </div>
+                <div class="mo-theme-row">
+                  <span>迁移</span>
+                  <label class="mo-font-upload" data-testid="theme-import">
+                    导入
+                    <input type="file" accept=".json,application/json" @change="importThemeFile" />
+                  </label>
+                  <button data-testid="theme-export-legado" @click="exportThemes('legado')">兼容版</button>
+                  <button data-testid="theme-export-full" @click="exportThemes('full')">全量版</button>
+                </div>
+                <p v-if="themeMessage" class="mo-font-status" data-testid="theme-status">{{ themeMessage }}</p>
+                <div v-if="themeDraft" class="mo-theme-editor" data-testid="theme-editor">
+                  <div class="mo-theme-editor-head">
+                    <strong>{{ themeDraft.id ? '编辑主题' : '新建主题' }}</strong>
+                    <button class="mo-icon-btn" data-testid="theme-cancel" title="取消" @click="themeDraft = null">✕</button>
+                  </div>
+                  <label class="mo-theme-field">
+                    <span>名称</span>
+                    <input v-model="themeDraft.name" class="mo-input" data-testid="theme-name" maxlength="32" placeholder="主题名称" />
+                  </label>
+                  <div class="mo-color-grid">
+                    <label class="mo-color-field"><span>背景</span><input v-model="themeDraft.bg" type="color" data-testid="theme-bg" /></label>
+                    <label class="mo-color-field"><span>正文</span><input v-model="themeDraft.text" type="color" data-testid="theme-text" /></label>
+                    <label class="mo-color-field"><span>辅助</span><input v-model="themeDraft.muted" type="color" data-testid="theme-muted" /></label>
+                    <label class="mo-color-field"><span>分隔</span><input v-model="themeDraft.line" type="color" data-testid="theme-line" /></label>
+                  </div>
+                  <div class="mo-theme-editor-actions">
+                    <button class="mo-btn primary" data-testid="theme-save" @click="saveThemeDraft">保存</button>
+                    <button class="mo-btn" @click="themeDraft = null">取消</button>
+                  </div>
+                </div>
+                <label class="mo-slider">
+                  <span>左距</span>
+                  <input v-model.number="settings.padding.left" type="range" min="8" max="48" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.padding.left }}</b>
+                </label>
+                <label class="mo-slider">
+                  <span>右距</span>
+                  <input v-model.number="settings.padding.right" type="range" min="8" max="48" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.padding.right }}</b>
+                </label>
+                <label class="mo-slider">
+                  <span>上距</span>
+                  <input v-model.number="settings.padding.top" type="range" min="0" max="32" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.padding.top }}</b>
+                </label>
+                <label class="mo-slider">
+                  <span>下距</span>
+                  <input v-model.number="settings.padding.bottom" type="range" min="0" max="32" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.padding.bottom }}</b>
+                </label>
+                <div class="mo-theme-row">
+                  <span>翻页</span>
+                  <button v-for="item in [{ value: 'cover', label: '覆盖' }, { value: 'slide', label: '平移' }, { value: 'simulate', label: '仿真' }, { value: 'scroll', label: '滚动' }, { value: 'none', label: '无动画' }]" :key="item.value" :class="{ on: settings.pageAnimation === item.value }" @click="settings.pageAnimation = item.value as any; persistSettings()">{{ item.label }}</button>
+                </div>
+                <div class="mo-theme-row">
+                  <span>页眉</span>
+                  <select v-model.number="settings.headerMode" class="mo-select" @change="persistSettings">
+                    <option v-for="mode in TIP_MODES" :key="mode.code" :value="mode.code">{{ mode.label }}</option>
                   </select>
                 </div>
-              </div>
-              <div class="mo-theme-row">
-                <span>底栏</span>
-                <label v-for="item in MENU_ITEMS" :key="item.key" class="mo-switch">
-                  <input type="checkbox" :checked="settings.menuItems.includes(item.key)" @change="toggleMenuItem(item.key)" />{{ item.label }}
+                <div class="mo-theme-row">
+                  <span>页脚</span>
+                  <select v-model.number="settings.footerMode" class="mo-select" @change="persistSettings">
+                    <option v-for="mode in TIP_MODES" :key="mode.code" :value="mode.code">{{ mode.label }}</option>
+                  </select>
+                </div>
+                <div class="mo-theme-row">
+                  <span>分隔线</span>
+                  <label class="mo-switch"><input v-model="settings.showHeaderLine" type="checkbox" @change="persistSettings" />页眉</label>
+                  <label class="mo-switch"><input v-model="settings.showFooterLine" type="checkbox" @change="persistSettings" />页脚</label>
+                </div>
+                <label class="mo-switch"><input v-model="settings.dualColumn" type="checkbox" @change="persistSettings" />双栏</label>
+                <label class="mo-switch"><input v-model="settings.inkMode" type="checkbox" @change="persistSettings" />墨水屏</label>
+              </details>
+              
+              <details class="mo-settings-group">
+                <summary>操作</summary>
+                <div class="mo-group-bar">
+                  <span class="muted">点击区域与底栏</span>
+                  <button class="mo-btn tiny" data-testid="settings-reset-operate" @click="resetSettingsSection('operate')">恢复本节默认</button>
+                </div>
+                <div class="mo-zone-grid">
+                  <div v-for="(zone, index) in settings.tapZones" :key="index" class="mo-zone-cell">
+                    <span>{{ TAP_ZONE_NAMES[index] }}</span>
+                    <select :value="zone" class="mo-select" @change="setTapZone(index, $event)">
+                      <option v-for="action in TAP_ACTIONS" :key="action.code" :value="action.code">{{ action.label }}{{ action.available ? '' : '（未开放）' }}</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="mo-theme-row">
+                  <span>底栏</span>
+                  <label v-for="item in MENU_ITEMS" :key="item.key" class="mo-switch">
+                    <input type="checkbox" :checked="settings.menuItems.includes(item.key)" @change="toggleMenuItem(item.key)" />{{ item.label }}
+                  </label>
+                </div>
+                <label class="mo-slider">
+                  <span>自动翻页</span>
+                  <input v-model.number="settings.autoPageSeconds" type="range" min="1" max="60" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.autoPageSeconds }} 秒</b>
                 </label>
-              </div>
-              <div class="mo-theme-row">
-                <span>替换</span>
-                <button class="mo-btn" data-testid="replace-add" @click="addReplaceRule">加规则</button>
-                <span class="muted">按顺序作用于正文</span>
-              </div>
-              <div v-for="rule in settings.replaceRules" :key="rule.id" class="mo-replace-rule">
-                <input v-model="rule.pattern" class="mo-input" placeholder="查找内容" @change="persistSettings" />
-                <input v-model="rule.replacement" class="mo-input" placeholder="替换为" @change="persistSettings" />
-                <label class="mo-switch"><input v-model="rule.regex" type="checkbox" @change="persistSettings" />正则</label>
-                <label class="mo-switch"><input v-model="rule.enabled" type="checkbox" @change="persistSettings" />启用</label>
-                <button class="mo-icon-btn" @click="removeReplaceRule(rule)">✕</button>
-              </div>
+              </details>
+              
+              <details class="mo-settings-group">
+                <summary>朗读</summary>
+                <div class="mo-group-bar">
+                  <span class="muted">音色与语速</span>
+                  <button class="mo-btn tiny" data-testid="settings-reset-speak" @click="resetSettingsSection('speak')">恢复本节默认</button>
+                </div>
+                <label class="mo-theme-row">
+                  <span>音色</span>
+                  <input v-model="settings.ttsVoice" class="mo-input" maxlength="120" placeholder="留空用系统默认" @change="persistSettings" />
+                </label>
+                <label class="mo-slider">
+                  <span>语速</span>
+                  <input v-model.number="settings.ttsRate" type="range" min="0.5" max="2" step="0.1" @input="schedulePersistSettings" />
+                  <b>{{ settings.ttsRate.toFixed(1) }}×</b>
+                </label>
+                <label class="mo-switch"><input v-model="settings.ttsContinuous" type="checkbox" @change="persistSettings" />连续朗读</label>
+              </details>
+              
+              <details class="mo-settings-group">
+                <summary>替换</summary>
+                <div class="mo-group-bar">
+                  <span class="muted">按顺序作用于正文</span>
+                  <button class="mo-btn tiny" data-testid="settings-reset-replace" @click="resetSettingsSection('replace')">恢复本节默认</button>
+                </div>
+                <div class="mo-theme-row">
+                  <button class="mo-btn" data-testid="replace-add" @click="addReplaceRule">加规则</button>
+                </div>
+                <div v-for="rule in settings.replaceRules" :key="rule.id" class="mo-replace-rule">
+                  <input v-model="rule.pattern" class="mo-input" placeholder="查找内容" @change="persistSettings" />
+                  <input v-model="rule.replacement" class="mo-input" placeholder="替换为" @change="persistSettings" />
+                  <label class="mo-switch"><input v-model="rule.regex" type="checkbox" @change="persistSettings" />正则</label>
+                  <label class="mo-switch"><input v-model="rule.enabled" type="checkbox" @change="persistSettings" />启用</label>
+                  <button class="mo-icon-btn" @click="removeReplaceRule(rule)">✕</button>
+                </div>
+              </details>
             </div>
           </div>
         </transition>
@@ -6401,6 +6691,142 @@ textarea {
 .mo-sheet-scroll {
   max-height: 78vh;
   overflow-y: auto;
+}
+/* 设置面板：移动端底部、桌面右侧；分区可折叠 */
+.mo-settings-mask {
+  z-index: 5;
+}
+.mo-settings-sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-bottom: calc(26px + env(safe-area-inset-bottom));
+}
+.mo-settings-sheet:focus-visible {
+  outline: 2px solid var(--mo-accent);
+  outline-offset: -2px;
+}
+.mo-settings-group {
+  border-top: 1px solid var(--mo-line);
+  padding: 4px 0;
+}
+.mo-settings-group > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 6px 0;
+  font-size: 14px;
+  font-weight: 600;
+  list-style: none;
+  cursor: pointer;
+}
+.mo-settings-group > summary::-webkit-details-marker {
+  display: none;
+}
+.mo-settings-group > summary::before {
+  content: '▸';
+  color: var(--mo-muted);
+  font-size: 12px;
+}
+.mo-settings-group[open] > summary::before {
+  content: '▾';
+}
+.mo-group-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.mo-group-bar .muted,
+.mo-settings-tip {
+  font-size: 12px;
+}
+.mo-settings-tip {
+  margin: 0 0 6px;
+}
+.mo-scope-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 10px;
+}
+.mo-scope-tabs {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid var(--mo-line);
+  border-radius: 999px;
+}
+.mo-scope-tab {
+  min-height: 36px;
+  padding: 8px 16px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.mo-scope-tab.on {
+  background: var(--mo-accent);
+  color: #fff;
+}
+.mo-scope-tab:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.mo-scope-badge {
+  padding: 2px 8px;
+  border: 1px solid var(--mo-accent);
+  border-radius: 999px;
+  color: var(--mo-accent);
+  font-size: 12px;
+}
+.mo-settings-error {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid #d9534f;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.mo-settings-sheet .mo-slider,
+.mo-settings-sheet .mo-theme-row,
+.mo-settings-sheet .mo-switch {
+  min-height: 44px;
+}
+@media (min-width: 721px) {
+  .mo-settings-mask {
+    justify-content: flex-end;
+    align-items: stretch;
+  }
+  .mo-settings-sheet {
+    width: 420px;
+    max-width: 92vw;
+    height: 100%;
+    max-height: none;
+    border-radius: 14px 0 0 14px;
+    padding-bottom: 26px;
+  }
+}
+@media (max-width: 720px) {
+  .mo-settings-sheet {
+    max-height: 82vh;
+  }
+  .mo-settings-sheet .mo-slider input,
+  .mo-settings-sheet .mo-theme-row button,
+  .mo-settings-sheet .mo-theme-row select,
+  .mo-settings-sheet .mo-input {
+    min-height: 44px;
+  }
+  .mo-settings-sheet .mo-input {
+    font-size: 16px;
+  }
 }
 .mo-switch-body {
   display: grid;
