@@ -52,6 +52,7 @@ import {
 import {
   MEDIA_DOWNLOAD_KIND,
   MediaDownloadCoordinator,
+  PermanentMediaError,
   type MediaChapterDownload,
   type MediaDownloadHost,
   type MediaEntryKind,
@@ -68,6 +69,7 @@ import {
   prepareMediaDir,
   saveMediaStream,
 } from './media-cache.js'
+import { downloadHlsChapter } from './hls.js'
 import { buildEpub } from './epub-export.js'
 import { assertEmbeddableFont } from './pdf-export.js'
 import { loadCoverImage } from './export-cover.js'
@@ -172,6 +174,19 @@ const SAFE_KEY = /^[a-z][a-z0-9_-]+$/
 
 function sameRequest(a: RequestSpec, b: RequestSpec): boolean {
   return a.url === b.url && a.method === b.method && (a.body ?? '') === (b.body ?? '')
+}
+
+/** 直链响应头声明为 HLS：改走 playlist 下载，避免把 playlist 文本当成媒体文件落盘。 */
+class HlsMediaDetected extends Error {
+  readonly url: string
+  readonly headers: Record<string, string>
+
+  constructor(url: string, headers: Record<string, string>) {
+    super('检测到 HLS 播放列表')
+    this.name = 'HlsMediaDetected'
+    this.url = url
+    this.headers = { ...headers }
+  }
 }
 
 /**
@@ -2179,29 +2194,40 @@ export class ReaderService extends TypertRemoteService {
     })
   }
 
-  /** 本地媒体文件地址：id 是索引里的不可猜测摘要，路径由服务端反查。 */
-  private localMediaUrl(fileId: string): string {
-    return `${this.mediaOrigin()}${LOCAL_MEDIA_ROUTE_PATH}/${fileId}`
+  /**
+   * 本地媒体文件地址：id 是索引里的不可猜测摘要，路径由服务端反查。
+   * HLS 的本地 playlist 追加 /index.m3u8，播放器只看扩展名就能走 HLS 分支；
+   * 分片由 playlist 里的相对名解析成 <id>/<分片名>，不写死 origin。
+   */
+  private localMediaUrl(fileId: string, name = ''): string {
+    const base = `${this.mediaOrigin()}${LOCAL_MEDIA_ROUTE_PATH}/${fileId}`
+    return name && /\.m3u8$/i.test(name) ? `${base}/${name}` : base
   }
 
-  /** 受保护路由的产物定位：只认索引里登记过的文件，磁盘路径不从 URL 取。 */
-  private locateLocalMediaFile(fileId: string): FileArtifactDescriptor | null {
+  /**
+   * 受保护路由的产物定位：只认索引里登记过的文件，磁盘路径不从 URL 取。
+   * HLS 的播放地址是 <playlistFileId>/<name>：id 定位条目，name 必须是该条目
+   * 索引里登记过的文件名（分片或 playlist 本身），否则 404。
+   */
+  private locateLocalMediaFile(fileId: string, name?: string): FileArtifactDescriptor | null {
     const table = this.mediaEntriesTable()
     if (!table) return null
     for (const [, value] of table.entries()) {
       const entry = value as Record<string, unknown>
       const files = Array.isArray(entry.files) ? (entry.files as Array<Record<string, unknown>>) : []
-      const file = files.find((item) => String(item.id ?? '') === fileId)
-      if (!file) continue
-      const name = String(file.name ?? 'media')
-      const dot = name.lastIndexOf('.')
-      const ext = dot >= 0 ? name.slice(dot + 1) : ''
+      const anchor = files.find((item) => String(item.id ?? '') === fileId)
+      if (!anchor) continue
+      const target = name === undefined ? anchor : files.find((item) => String(item.name ?? '') === name)
+      if (!target) return null
+      const targetName = String(target.name ?? name ?? 'media')
+      const dot = targetName.lastIndexOf('.')
+      const ext = dot >= 0 ? targetName.slice(dot + 1) : ''
       const title = String(entry.chapterTitle ?? '').replace(/[\\/:*?"<>|]/g, '_').trim() || '媒体'
       const fileName = ext ? `${title.slice(0, 80)}.${ext}` : title.slice(0, 80)
       return {
-        filePath: String(file.path ?? ''),
+        filePath: String(target.path ?? ''),
         fileName,
-        contentType: String(file.mime ?? '') || contentTypeForExt(ext),
+        contentType: String(target.mime ?? '') || contentTypeForExt(ext),
         disposition: 'inline',
       }
     }
@@ -2222,9 +2248,10 @@ export class ReaderService extends TypertRemoteService {
             return registerProtectedFileRoute(webServer, {
               path: LOCAL_MEDIA_ROUTE_PATH,
               auth: 'required',
+              allowName: true,
               idPattern: /^[0-9a-f]{24}$/,
               root: () => mediaRoot(),
-              locate: (fileId: string) => this.locateLocalMediaFile(fileId),
+              locate: (fileId: string, name?: string) => this.locateLocalMediaFile(fileId, name),
             })
           } catch {
             // 同一宿主里已经注册过同路径路由时不重复注册，也不让启动失败。
@@ -2384,7 +2411,7 @@ export class ReaderService extends TypertRemoteService {
         await table.delete(key)
         return { localMissing: true }
       }
-      urls.push(this.localMediaUrl(id))
+      urls.push(this.localMediaUrl(id, name))
     }
     if (kind === 'images') {
       return { kind: 'images', images: urls, content: '', mediaUrl: '', url: chapterUrl, local: true }
@@ -2417,43 +2444,34 @@ export class ReaderService extends TypertRemoteService {
   /**
    * 解析本章的真实媒体地址（不登记代理）：下载器要抓原始 URL + 书源 header，
    * 不能去抓对外的 /reader/media/<token> 相对地址。
-   * HLS（.m3u8）暂不在本票范围，返回 skip 让作业计为跳过而不是失败。
+   * 音视频地址是 playlist（.m3u8 或响应声明 HLS）时走 HLS 分支；直链在下载时再按响应头兜底识别。
    */
   private async resolveChapterMediaItems(options: {
     sourceUrl: string
     chapterUrl: string
     bookUrl: string
     kind: MediaEntryKind
-  }): Promise<{ items: Array<{ url: string; headers: Record<string, string>; ext: string }>; skip?: string }> {
+  }): Promise<{
+    items: Array<{ url: string; headers: Record<string, string>; ext: string }>
+    skip?: string
+    playlist?: { url: string; headers: Record<string, string> }
+  }> {
     const source = this.getSource(options.sourceUrl)
     const sourceHeaders = parseHeaders(source.header)
     if (options.kind === 'audio' || options.kind === 'video') {
       const mediaRule = source.ruleContent?.content ?? ''
-      if (!mediaRule) {
-        if (this.isHlsMediaUrl(options.chapterUrl)) return { items: [], skip: 'HLS 暂不支持离线下载' }
-        return {
-          items: [
-            {
-              url: options.chapterUrl,
-              headers: this.mediaHeadersWithReferer(sourceHeaders, options.bookUrl || options.chapterUrl),
-              ext: extFromUrl(options.chapterUrl, defaultExtForKind(options.kind)),
-            },
-          ],
-        }
+      let mediaUrl = options.chapterUrl
+      let headers = this.mediaHeadersWithReferer(sourceHeaders, options.bookUrl || options.chapterUrl)
+      if (mediaRule) {
+        const raw = await this.fetch({ url: options.chapterUrl, method: 'GET', headers: {} }, source)
+        const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
+        mediaUrl = String(parsed.mediaUrl ?? '')
+        if (!mediaUrl) throw new Error('没有解析到媒体地址')
+        headers = this.mediaHeadersWithReferer(sourceHeaders, raw.url)
       }
-      const raw = await this.fetch({ url: options.chapterUrl, method: 'GET', headers: {} }, source)
-      const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
-      const mediaUrl = String(parsed.mediaUrl ?? '')
-      if (!mediaUrl) throw new Error('没有解析到媒体地址')
-      if (this.isHlsMediaUrl(mediaUrl)) return { items: [], skip: 'HLS 暂不支持离线下载' }
+      if (this.isHlsMediaUrl(mediaUrl)) return { items: [], playlist: { url: mediaUrl, headers } }
       return {
-        items: [
-          {
-            url: mediaUrl,
-            headers: this.mediaHeadersWithReferer(sourceHeaders, raw.url),
-            ext: extFromUrl(mediaUrl, defaultExtForKind(options.kind)),
-          },
-        ],
+        items: [{ url: mediaUrl, headers, ext: extFromUrl(mediaUrl, defaultExtForKind(options.kind)) }],
       }
     }
     const raw = await this.fetch({ url: options.chapterUrl, method: 'GET', headers: {} }, source)
@@ -2482,7 +2500,7 @@ export class ReaderService extends TypertRemoteService {
     return /\.m3u8(?:[?#]|$)/i.test(url)
   }
 
-  /** 单章媒体下载：全部文件写成功才返回条目；任何失败清空整章目录。 */
+  /** 单章媒体下载：全部文件写成功才返回条目；HLS 保留断点清单，直链失败清空目录。 */
   private async downloadChapterMediaForJob(args: {
     bookId: string
     book: Record<string, unknown>
@@ -2494,7 +2512,8 @@ export class ReaderService extends TypertRemoteService {
     signal?: AbortSignal
   }): Promise<{ skipped: boolean; reason?: string; entry?: MediaChapterDownload }> {
     const storeId = mediaStoreId(args.bookId, args.chapterIndex)
-    await prepareMediaDir(storeId)
+    // HLS 的普通失败/暂停要保留 partial 清单供续传；直链失败仍按 #112 清目录。
+    let hls = false
     try {
       const resolved = await this.resolveChapterMediaItems({
         sourceUrl: args.sourceUrl,
@@ -2506,12 +2525,32 @@ export class ReaderService extends TypertRemoteService {
         await clearMediaDir(storeId)
         return { skipped: true, reason: resolved.skip }
       }
+      if (resolved.playlist) {
+        hls = true
+        return await this.downloadHlsChapterMedia(storeId, resolved.playlist.url, resolved.playlist.headers, args)
+      }
+      let prepared = false
+      const ensurePrepared = async (): Promise<void> => {
+        if (prepared) return
+        prepared = true
+        await prepareMediaDir(storeId)
+      }
       const files: MediaFileRecord[] = []
       let bytes = 0
       let mime = ''
       for (let index = 0; index < resolved.items.length; index += 1) {
         if (args.signal?.aborted) throw new Error('媒体下载已中断')
-        const saved = await this.downloadMediaFile(storeId, index, resolved.items[index]!, args.signal)
+        let saved: { id: string; name: string; mime: string; bytes: number }
+        try {
+          saved = await this.downloadMediaFile(storeId, index, resolved.items[index]!, args.signal, ensurePrepared)
+        } catch (error) {
+          // 直链响应头声明是 playlist：改走 HLS，不把 playlist 文本当媒体文件。
+          if (error instanceof HlsMediaDetected) {
+            hls = true
+            return await this.downloadHlsChapterMedia(storeId, error.url, error.headers, args)
+          }
+          throw error
+        }
         files.push({
           id: saved.id,
           name: saved.name,
@@ -2538,24 +2577,83 @@ export class ReaderService extends TypertRemoteService {
         },
       }
     } catch (error) {
-      await clearMediaDir(storeId)
+      // DRM 等永久失败连半成品一起清掉；HLS 的其它失败留给下次续传。
+      if (error instanceof PermanentMediaError || !hls) await clearMediaDir(storeId)
       throw error
     }
   }
 
-  /** 单个媒体文件：流式落盘，避免整部视频进内存。 */
+  /** HLS 整章：playlist + 分片全部落盘后组装成与直链相同的索引条目。 */
+  private async downloadHlsChapterMedia(
+    storeId: string,
+    playlistUrl: string,
+    headers: Record<string, string>,
+    args: {
+      bookId: string
+      chapterIndex: number
+      chapterTitle: string
+      chapterUrl: string
+      sourceUrl: string
+      kind: MediaEntryKind
+      signal?: AbortSignal
+    },
+  ): Promise<{ skipped: boolean; entry?: MediaChapterDownload }> {
+    const result = await downloadHlsChapter({
+      playlistUrl,
+      headers,
+      storeId,
+      signal: args.signal,
+      opener: this.mediaStreamOpener ?? openMediaStream,
+    })
+    const files: MediaFileRecord[] = result.files.map((file, index) => ({
+      id: mediaFileIdOf(storeId, index),
+      name: file.name,
+      mime: file.mime,
+      bytes: file.bytes,
+      path: `${storeId}/${file.name}`,
+    }))
+    return {
+      skipped: false,
+      entry: {
+        bookId: args.bookId,
+        chapterIndex: args.chapterIndex,
+        chapterTitle: args.chapterTitle,
+        chapterUrl: args.chapterUrl,
+        sourceUrl: args.sourceUrl,
+        kind: args.kind,
+        mime: files[0]?.mime ?? '',
+        bytes: files.reduce((sum, file) => sum + file.bytes, 0),
+        files,
+      },
+    }
+  }
+
+  /**
+   * 单个媒体文件：流式落盘，避免整部视频进内存。
+   * beforeWrite 在确认响应不是 playlist 后才调用（第一次写之前清好章节目录）。
+   */
   private async downloadMediaFile(
     storeId: string,
     index: number,
     item: { url: string; headers: Record<string, string>; ext: string },
     signal?: AbortSignal,
+    beforeWrite?: () => Promise<void>,
   ): Promise<{ id: string; name: string; mime: string; bytes: number }> {
     const name = mediaFileName(index, item.ext)
     const opener = this.mediaStreamOpener ?? openMediaStream
     const { response } = await opener(item.url, { method: 'GET', headers: item.headers })
     if (!response.ok && response.status !== 206) throw new Error(`HTTP ${response.status}`)
-    const mime =
-      (response.headers.get('content-type') ?? '').split(';')[0]!.trim() || contentTypeForExt(item.ext)
+    const contentType = (response.headers.get('content-type') ?? '').toLowerCase()
+    if (/mpegurl/.test(contentType)) {
+      try {
+        await response.body?.cancel()
+      } catch {
+        // 响应体可能已关闭，取消失败不影响切换 HLS 分支。
+      }
+      throw new HlsMediaDetected(item.url, item.headers)
+    }
+    const mime = contentType.split(';')[0]!.trim() || contentTypeForExt(item.ext)
+    await beforeWrite?.()
     const bytes = await saveMediaStream(storeId, name, response.body, signal)
     if (!bytes) throw new Error('媒体文件为空')
     return { id: mediaFileIdOf(storeId, index), name, mime, bytes }

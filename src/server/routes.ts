@@ -124,6 +124,50 @@ export function artifactIdOf(request: Request, routePath: string): string {
   return singleSegmentIdOf(request, routePath, DEFAULT_ARTIFACT_ID_PATTERN)
 }
 
+/** 受保护文件路由的请求：id 必填，HLS 分片/playlist 额外带一个文件名。 */
+export interface ProtectedFileRequest {
+  id: string
+  name?: string
+}
+
+/** 第二段文件名白名单：只允许单段、非点开头，长度够 HLS 的 index.m3u8 / seg-000.ts。 */
+const PROTECTED_FILE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+/**
+ * 从 URL 取 <id> 或 <id>/<name>：两段分别解码并各自过白名单，
+ * 多段、'.'/'..'、编码过的路径分隔符都会落到白名单外，直接 404。
+ */
+export function protectedFileRequestOf(
+  request: Request,
+  routePath: string,
+  pattern: RegExp,
+  allowName = false,
+): ProtectedFileRequest | null {
+  let pathname = ''
+  try {
+    pathname = new URL(request.url).pathname
+  } catch {
+    return null
+  }
+  if (pathname !== routePath && !pathname.startsWith(`${routePath}/`)) return null
+  const rest = pathname.slice(routePath.length + 1)
+  if (!rest) return null
+  const parts = rest.split('/')
+  if (!allowName && parts.length > 1) return null
+  if (parts.length > 2) return null
+  let id = ''
+  let name: string | undefined
+  try {
+    id = decodeURIComponent(parts[0] ?? '')
+    if (parts.length === 2) name = decodeURIComponent(parts[1] ?? '')
+  } catch {
+    return null
+  }
+  if (!pattern.test(id)) return null
+  if (name !== undefined && !PROTECTED_FILE_NAME_PATTERN.test(name)) return null
+  return name === undefined ? { id } : { id, name }
+}
+
 /** 只从 URL 里取「单段且匹配白名单」的 id：多段、'.'/'..'、编码绕过都会落到白名单外。 */
 export function singleSegmentIdOf(request: Request, routePath: string, pattern: RegExp): string {
   let pathname = ''
@@ -182,8 +226,13 @@ export interface ProtectedFileRouteOptions {
   path?: string
   auth?: 'required' | 'anonymous' | 'deny'
   root(): string
-  /** 由 URL 里的单段 id 定位产物；id 已通过白名单校验。返回 null 表示 404。 */
-  locate(id: string): Promise<FileArtifactDescriptor | null> | FileArtifactDescriptor | null
+  /**
+   * 由 URL 里的 id（以及可选的第二段文件名）定位产物；两者都已通过白名单校验。
+   * 返回 null 表示 404；name 只用于 HLS 的 <id>/<分片名> 形式。
+   */
+  locate(id: string, name?: string): Promise<FileArtifactDescriptor | null> | FileArtifactDescriptor | null
+  /** 是否允许 <id>/<name> 两段（HLS 的 playlist 与分片）；默认只认单段 id。 */
+  allowName?: boolean
   /** id 白名单，默认沿用导出路由的标识规则。 */
   idPattern?: RegExp
   allow?(peer: ArtifactPeer | undefined): boolean
@@ -219,11 +268,11 @@ export function createProtectedFileRoute(options: ProtectedFileRouteOptions): Ar
       }
       if (requirePeer && !peer) return refuse(401)
       if (!allow(peer)) return refuse(403)
-      const id = singleSegmentIdOf(request, routePath, idPattern)
-      if (!id) return refuse(404)
+      const target = protectedFileRequestOf(request, routePath, idPattern, options.allowName === true)
+      if (!target) return refuse(404)
       let descriptor: FileArtifactDescriptor | null = null
       try {
-        descriptor = await options.locate(id)
+        descriptor = await options.locate(target.id, target.name)
       } catch {
         return refuse(404)
       }

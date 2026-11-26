@@ -402,20 +402,29 @@ test('重启恢复：running/queued 的媒体作业变 paused 并注明宿主重
   }
 })
 
-test('HLS 章节跳过而不是失败', async () => {
+test('HLS 章节：playlist 与分片一起落盘，本地 playlist 不留密钥', async () => {
+  const playlist = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:4', '#EXTINF:4,', 'seg-0.ts', '#EXT-X-ENDLIST', ''].join('\n')
   const harness = await makeHarness({
     type: 4,
     contentRule: 'video@src',
     toc: '<ul class="toc"><li><a href="/ch/1">第1章</a></li></ul>',
     pages: { [`${HOST}/ch/1`]: '<div id="content"><video src="/media/a.m3u8"></video></div>' },
+    opener: async (url) => {
+      if (/\.m3u8(?:[?#]|$)/i.test(url)) return responseOf(playlist, 'application/vnd.apple.mpegurl')()
+      return responseOf(Buffer.from('ts-0'), 'video/mp2t')()
+    },
   })
   const started = await harness.service.startMediaDownload({ bookId: 'book-1', all: true })
   await harness.service.waitForMediaDownloads()
   const { job } = await harness.service.getJob({ id: started.job.id })
-  assert.equal(job.skipped, 1)
-  assert.equal(job.completed, 0)
   assert.equal(job.status, 'done')
-  assert.equal(harness.mediaEntries.map.size, 0)
+  assert.equal(job.completed, 1)
+  assert.equal(job.skipped, 0)
+  const entry = [...harness.mediaEntries.entries()][0][1]
+  assert.deepEqual(entry.files.map((file) => file.name), ['index.m3u8', 'seg-000.ts'])
+  const text = await readFile(path.join(process.env.MO_READER_MEDIA_ROOT, entry.files[0].path), 'utf8')
+  assert.match(text, /(?:^|\n)seg-000\.ts\n/)
+  assert.doesNotMatch(text, /EXT-X-KEY/)
 })
 
 test('本地文件缺失：删除索引并回退在线，不直接失败', async () => {
@@ -518,6 +527,8 @@ test('暂停会立即中断在途媒体流，不等整章下完', async () => {
     },
   })
   const harness = await makeHarness({
+    // 只放一章：本章只验证「在途流被立即中断」，多一章会让另一个 worker 的失败重试干扰计数。
+    toc: '<ul class="toc"><li><a href="/ch/1">第1章</a></li></ul>',
     pages: imagePages(HOST, 1, 1),
     opener: async () => ({
       response: new Response(stalled, {

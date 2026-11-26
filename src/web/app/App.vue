@@ -3708,7 +3708,7 @@ onMounted(async () => {
               开始离线下载
             </button>
           </div>
-          <p class="muted">漫画按章保存整章图片；音频与视频保存当个媒体文件。HLS 章节暂不支持离线，会自动跳过。</p>
+          <p class="muted">漫画按章保存整章图片；音频与视频保存当个媒体文件。HLS 会按最高码率整章下载；受版权保护（DRM）的会提示无法离线。</p>
           <div v-if="mediaJob" class="mo-download-progress">
             <span class="mo-download-bar"><span :style="{ width: `${downloadPercent(mediaJob)}%` }" /></span>
             <span data-testid="media-download-done">已完成 {{ mediaJob.completed }} / {{ mediaJob.total }} {{ mediaUnit() }}</span>
@@ -3716,7 +3716,7 @@ onMounted(async () => {
             <span>跳过 {{ mediaJob.skipped }}</span>
             <span>{{ formatBytes(mediaJob.bytes) }}</span>
           </div>
-          <p v-if="mediaJob?.error && mediaJob.status !== 'paused'" class="muted">{{ mediaJob.error }}</p>
+          <p v-if="mediaJob?.error && mediaJob.status !== 'paused'" class="muted" data-testid="media-download-error">{{ mediaJob.error }}</p>
           <div v-if="mediaJob" class="mo-download-actions">
             <button
               v-if="isDownloadRunning(mediaJob)"

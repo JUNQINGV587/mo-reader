@@ -76,6 +76,17 @@ export interface MediaDownloadHost {
   discardChapterMedia?(bookId: string, chapterIndex: number): Promise<void>
 }
 
+/**
+ * 永久失败：重试没有意义（典型是 DRM 加密）。
+ * 协调器遇到它直接让作业失败并保留原始文案，不再重试、不发布索引。
+ */
+export class PermanentMediaError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PermanentMediaError'
+  }
+}
+
 /** 暂停/取消后抛给舞者，让整章下载立即停止且不落索引。 */
 export class MediaDownloadInterrupted extends Error {
   constructor() {
@@ -410,10 +421,13 @@ export class MediaDownloadCoordinator {
     toIndex: number,
   ): Promise<void> {
     let nextIndex = fromIndex
+    // 永久失败（DRM 等）要中断整批章节：等已开工的章节收尾后把原因抛给 run()，
+    // 由它把作业置 failed 并写原始文案，而不是落成「全部章节下载失败」。
+    let permanentError: PermanentMediaError | null = null
     const workerCount = Math.max(1, Math.min(MEDIA_DOWNLOAD_CONCURRENCY, toIndex - fromIndex + 1))
     const worker = async (): Promise<void> => {
       for (;;) {
-        if (job.status !== 'running') return
+        if (job.status !== 'running' || permanentError) return
         const index = nextIndex
         nextIndex += 1
         if (index > toIndex) return
@@ -444,6 +458,10 @@ export class MediaDownloadCoordinator {
           }
         } catch (error) {
           if (error instanceof MediaDownloadInterrupted) return
+          if (error instanceof PermanentMediaError) {
+            permanentError = permanentError ?? error
+            return
+          }
           job.failed += 1
         } finally {
           this.limiter.release(sourceUrl)
@@ -452,6 +470,7 @@ export class MediaDownloadCoordinator {
       }
     }
     await Promise.all(Array.from({ length: workerCount }, () => worker()))
+    if (permanentError) throw permanentError
   }
 
   private async chapterReadyBytes(job: MediaJob, index: number): Promise<number | null> {
@@ -489,17 +508,22 @@ export class MediaDownloadCoordinator {
         })
         if (result.skipped) return result
         if (!result.entry) throw new Error('媒体下载未产生条目')
-        // 下载期间可能被暂停/取消：此时绝不发布索引，并清掉半成品文件。
+        // 下载期间可能被暂停/取消：绝不发布索引；取消清半成品，暂停保留断点清单。
         if (job.status !== 'running') {
-          await this.host.discardChapterMedia?.(job.bookId, index).catch(() => {})
+          await this.discardIfCancelled(job, index)
           throw new MediaDownloadInterrupted()
         }
         await this.host.recordMediaDownload(result.entry)
         return result
       } catch (error) {
         if (error instanceof MediaDownloadInterrupted) throw error
+        // DRM 等永久失败不重试：直接把原始原因抛给作业。
+        if (error instanceof PermanentMediaError) throw error
         // 暂停/取消/卸载断流导致的失败不算重试次数：状态已不是 running 就直接收尾。
-        if (job.status !== 'running') throw new MediaDownloadInterrupted()
+        if (job.status !== 'running') {
+          await this.discardIfCancelled(job, index)
+          throw new MediaDownloadInterrupted()
+        }
         lastError = error
         if (attempt < CHAPTER_RETRY_LIMIT) {
           await sleep(this.retryBase() * 2 ** attempt)
@@ -507,6 +531,12 @@ export class MediaDownloadCoordinator {
       }
     }
     throw lastError ?? new Error('媒体下载失败')
+  }
+
+  /** 暂停保留已下分片供续传；取消意味着不再继续，清掉本章目录。 */
+  private async discardIfCancelled(job: MediaJob, index: number): Promise<void> {
+    if (job.status !== 'cancelled') return
+    await this.host.discardChapterMedia?.(job.bookId, index).catch(() => {})
   }
 
   private retryBase(): number {
