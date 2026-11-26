@@ -5,14 +5,19 @@
  * - 所有 playlist / 分片 / 密钥请求都走调用方注入的流式抓取器（默认 openMediaStream），
  *   由它负责 SSRF 守卫与逐跳重定向复检；这里不直接 fetch。
  * - AES-128 密钥只在内存里用于解密，不落盘、不进索引；本地 playlist 不残留 EXT-X-KEY。
- * - SAMPLE-AES / 非 identity KEYFORMAT 等 DRM 抛 PermanentMediaError，调用方不得重试。
- * - 断点续传只补缺分片：同指纹复用已下完的分片，指纹变化（源 playlist 变了）才整章重下。
+ * - SAMPLE-AES / 非 identity KEYFORMAT 等 DRM 抛 PermanentMediaError，调用方不得重试；
+ *   EXT-X-BYTERANGE 同样属于「源格式暂不支持」的永久失败，一次失败并给出明确文案。
+ * - AES-128 加密的初始化段（EXT-X-MAP）用生效 EXT-X-KEY 的 IV 解密（RFC 8216 §4.3.2.5）。
+ * - 加密分片边下边解密落盘，峰值内存与分片大小无关。
+ * - 断点续传按分片 / 密钥 / 初始化段的地址序列判定，注释与无关标签变化不触发整章重下；
+ *   章节成功发布后删除续传清单，暂停 / 失败保留。
  */
 import { createDecipheriv, createHash } from 'node:crypto'
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { pipeline, Readable } from 'node:stream'
 import { readBodyLimited, type MediaStreamOptions, type MediaStreamResult } from '../core/net/http.js'
-import { MEDIA_ABORTED_MESSAGE, MEDIA_MAX_FILE_BYTES, mediaRoot, prepareMediaDir, saveMediaStream, writeMediaFile } from './media-cache.js'
+import { MEDIA_ABORTED_MESSAGE, mediaRoot, prepareMediaDir, saveMediaStream, writeMediaFile } from './media-cache.js'
 import { contentTypeForExt, extFromUrl, PLAYLIST_MAX_BYTES } from './media.js'
 import { PermanentMediaError } from './media-download.js'
 
@@ -22,6 +27,8 @@ export const HLS_PLAYLIST_NAME = 'index.m3u8'
 export const HLS_PARTIAL_FILE = '.hls-partial.json'
 /** DRM 明确失败的统一文案：作业 error 直接展示给用户。 */
 export const HLS_DRM_MESSAGE = '该 HLS 使用 DRM 加密（SAMPLE-AES/Widevine），无法离线下载'
+/** 按字节范围切分属于永久不支持：一次失败即收尾，不进入章节重试循环。 */
+export const HLS_BYTERANGE_MESSAGE = '暂不支持按字节范围切分的 HLS（EXT-X-BYTERANGE），无法离线下载'
 /** 播放列表最多嵌套几层（master -> media），防御异常站点构造的递归。 */
 const MAX_PLAYLIST_DEPTH = 4
 /** 密钥响应上限：标准 AES-128 密钥固定 16 字节。 */
@@ -46,6 +53,8 @@ export interface HlsKey {
 export interface HlsMap {
   uri: string
   name: string
+  /** EXT-X-MAP 生效的密钥；明文初始化段为 null。 */
+  key: HlsKey | null
 }
 
 export interface HlsSegment {
@@ -238,21 +247,27 @@ export function parseMediaPlaylist(text: string, playlistUrl: string): HlsMediaP
           currentKey = { method: 'AES-128', uri: resolveUri(uri, playlistUrl), iv: parseIv(attributes.IV) }
         }
       } else if (tag === '#EXT-X-MAP') {
-        if (attributes.BYTERANGE) throw new Error('暂不支持按字节范围切分的 HLS 初始化段')
+        if (attributes.BYTERANGE) throw new PermanentMediaError(HLS_BYTERANGE_MESSAGE)
         const uri = String(attributes.URI ?? '').trim()
         if (uri) {
           const absolute = resolveUri(uri, playlistUrl)
-          let map = mapByUri.get(absolute)
+          // 同一初始化段地址在不同 EXT-X-KEY 下不是同一份内容，去重键要带上密钥与 IV。
+          const mapKey = `${absolute}\u0000${keySignature(currentKey)}`
+          let map = mapByUri.get(mapKey)
           if (!map) {
             const ext = extFromUrl(absolute, 'mp4')
-            map = { uri: absolute, name: `init-${String(maps.length).padStart(3, '0')}.${ext}` }
-            mapByUri.set(absolute, map)
+            map = {
+              uri: absolute,
+              name: `init-${String(maps.length).padStart(3, '0')}.${ext}`,
+              key: currentKey,
+            }
+            mapByUri.set(mapKey, map)
             maps.push(map)
           }
           currentMap = map
         }
       } else if (tag === '#EXT-X-BYTERANGE') {
-        throw new Error('暂不支持按字节范围切分的 HLS 分片')
+        throw new PermanentMediaError(HLS_BYTERANGE_MESSAGE)
       }
       continue
     }
@@ -268,6 +283,26 @@ export function parseMediaPlaylist(text: string, playlistUrl: string): HlsMediaP
   }
   if (!segments.length) throw new Error('HLS 播放列表没有分片')
   return { text, playlistUrl, segments, maps }
+}
+
+function keySignature(key: HlsKey | null): string {
+  if (!key) return '-'
+  return `${key.uri}|${key.iv ? key.iv.toString('hex') : '-'}`
+}
+
+/**
+ * 续传指纹：只取下载语义（分片 / 密钥 / 初始化段的地址序列与解密参数）。
+ * 注释、TARGETDURATION 等与下载无关的标签变化不再触发整章重下。
+ */
+export function hlsPlanFingerprint(plan: HlsMediaPlan): string {
+  const mapUriByName = new Map(plan.maps.map((map) => [map.name, map.uri]))
+  const lines = ['hls-v2']
+  for (const map of plan.maps) lines.push(JSON.stringify(['map', map.uri, keySignature(map.key)]))
+  for (const segment of plan.segments) {
+    const mapUri = segment.mapName ? (mapUriByName.get(segment.mapName) ?? segment.mapName) : '-'
+    lines.push(JSON.stringify(['seg', segment.uri, keySignature(segment.key), segment.sequence, mapUri]))
+  }
+  return createHash('sha1').update(lines.join('\n')).digest('hex')
 }
 
 /** 生成本地 playlist：去掉密钥/低延迟分片标签，分片与初始化段改成相对文件名。 */
@@ -428,44 +463,50 @@ async function loadKey(
   return data
 }
 
-function decryptSegment(data: Buffer, key: Buffer, iv: Buffer): Buffer {
-  if (!data.length || data.length % 16 !== 0) throw new Error('HLS 加密分片长度异常')
-  const decipher = createDecipheriv('aes-128-cbc', key, iv)
-  return Buffer.concat([decipher.update(data), decipher.final()])
-}
-
-/** 明文分片：流式落盘，受 MEDIA_MAX_FILE_BYTES 保护；已完整下载的分片直接复用。 */
-async function downloadPlainSegment(
+/**
+ * 下载单个媒体文件（分片或初始化段）并落盘：明文直写；AES-128 加密时边下边解密，
+ * 峰值内存与文件大小无关，容量上限与中断语义复用 saveMediaStream（按明文计）。
+ * ivSequence 供缺省 IV 推导；EXT-X-MAP 没有 media sequence，调用方传 0。
+ */
+async function downloadMediaFile(
   opener: HlsStreamOpener,
-  segment: HlsSegment,
+  target: { uri: string; name: string; key: HlsKey | null },
+  ivSequence: number,
   headers: Record<string, string>,
   storeId: string,
   signal: AbortSignal | undefined,
+  keyCache: Map<string, Buffer>,
 ): Promise<number> {
-  const opened = await openStream(opener, segment.uri, headers, signal)
-  const bytes = await saveMediaStream(storeId, segment.name, opened.response.body, signal)
-  if (!bytes) throw new Error('媒体文件为空')
-  return bytes
-}
-
-/** 加密分片：读入内存→AES-128-CBC 解密→落盘；密钥用完即丢，不写文件。 */
-async function downloadEncryptedSegment(
-  opener: HlsStreamOpener,
-  segment: HlsSegment,
-  key: Buffer,
-  headers: Record<string, string>,
-  storeId: string,
-  signal: AbortSignal | undefined,
-): Promise<number> {
-  const opened = await openStream(opener, segment.uri, headers, signal)
-  const encrypted = await readBodyLimited(opened.response, MEDIA_MAX_FILE_BYTES)
+  const key = target.key ? await loadKey(opener, target.key.uri, keyCache, headers, signal) : null
+  const opened = await openStream(opener, target.uri, headers, signal)
+  const body = opened.response.body
+  if (!body) throw new Error('媒体文件为空')
   throwIfAborted(signal)
-  const plain = decryptSegment(encrypted, key, segment.key?.iv ?? ivForSequence(segment.sequence))
-  const bytes = await writeMediaFile(storeId, segment.name, plain)
+  let stream = body as ReadableStream
+  if (key) {
+    // RFC 8216 §4.3.2.5 要求加密初始化段带显式 IV；个别源站省略时按 0（与 AES 默认 IV 一致）处理。
+    const decipher = createDecipheriv('aes-128-cbc', key, target.key?.iv ?? ivForSequence(ivSequence))
+    // pipeline（而不是 pipe）才能在中断 / 解密失败时把销毁沿链路传回源响应体。
+    pipeline(Readable.fromWeb(body as any), decipher, () => {})
+    stream = Readable.toWeb(decipher) as any
+  }
+  const bytes = await saveMediaStream(storeId, target.name, stream, signal)
   if (!bytes) throw new Error('媒体文件为空')
   return bytes
 }
 
+
+/**
+ * 章节发布后清理该章的续传清单：发布失败 / 暂停时清单必须留着才能续传，
+ * 所以删除动作放在索引写入之后，由调用方触发；清理失败不影响已发布的章节。
+ */
+export async function clearHlsPartial(storeId: string): Promise<void> {
+  try {
+    await rm(join(mediaRoot(), storeId, HLS_PARTIAL_FILE), { force: true })
+  } catch {
+    // 残留清单下次续传时会按指纹判断，不影响正确性。
+  }
+}
 /**
  * 下载一整章 HLS：选最高码率 → 初始化段 → 分片（按需解密）→ 本地 playlist。
  * 全部文件落盘后才返回；调用方据此发布索引。断点续传只补缺分片。
@@ -477,7 +518,7 @@ export async function downloadHlsChapter(options: HlsDownloadOptions): Promise<H
   throwIfAborted(signal)
   const top = await fetchPlaylist(opener, options.playlistUrl, baseHeaders, signal)
   const plan = await resolveMediaPlan(top, opener, signal)
-  const fingerprint = createHash('sha1').update(plan.text).digest('hex')
+  const fingerprint = hlsPlanFingerprint(plan)
   const previous = await readPartial(options.storeId)
   const reusable = previous !== null && previous.fingerprint === fingerprint
   if (reusable) await mkdir(join(mediaRoot(), options.storeId), { recursive: true })
@@ -492,13 +533,7 @@ export async function downloadHlsChapter(options: HlsDownloadOptions): Promise<H
     const cached = state.done[map.name]
     const bytes = cached !== undefined && (await fileBytes(options.storeId, map.name)) === cached
       ? cached
-      : await downloadPlainSegment(
-          opener,
-          { uri: map.uri, key: null, sequence: 0, name: map.name, mapName: null },
-          headers,
-          options.storeId,
-          signal,
-        )
+      : await downloadMediaFile(opener, map, 0, headers, options.storeId, signal, keyCache)
     state.done[map.name] = bytes
     files.push({ name: map.name, mime: contentTypeForExt(extOfName(map.name)), bytes })
   }
@@ -510,12 +545,7 @@ export async function downloadHlsChapter(options: HlsDownloadOptions): Promise<H
     if (cached !== undefined && (await fileBytes(options.storeId, segment.name)) === cached) {
       bytes = cached
     } else {
-      if (segment.key) {
-        const key = await loadKey(opener, segment.key.uri, keyCache, headers, signal)
-        bytes = await downloadEncryptedSegment(opener, segment, key, headers, options.storeId, signal)
-      } else {
-        bytes = await downloadPlainSegment(opener, segment, headers, options.storeId, signal)
-      }
+      bytes = await downloadMediaFile(opener, segment, segment.sequence, headers, options.storeId, signal, keyCache)
       state.done[segment.name] = bytes
       await savePartial(options.storeId, state)
     }
@@ -529,8 +559,6 @@ export async function downloadHlsChapter(options: HlsDownloadOptions): Promise<H
     HLS_PLAYLIST_NAME,
     Buffer.from(playlist, 'utf8'),
   )
-  state.done[HLS_PLAYLIST_NAME] = playlistBytes
-  await savePartial(options.storeId, state)
   files.unshift({ name: HLS_PLAYLIST_NAME, mime: contentTypeForExt('m3u8'), bytes: playlistBytes })
   return { files, fingerprint }
 }

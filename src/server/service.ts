@@ -80,7 +80,7 @@ import {
   textCacheUsage,
   type QuotaSource,
 } from './storage-usage.js'
-import { downloadHlsChapter } from './hls.js'
+import { clearHlsPartial, downloadHlsChapter } from './hls.js'
 import { buildEpub } from './epub-export.js'
 import { assertEmbeddableFont } from './pdf-export.js'
 import { loadCoverImage } from './export-cover.js'
@@ -2422,6 +2422,8 @@ export class ReaderService extends TypertRemoteService {
       downloadChapterMedia: (args) => this.downloadChapterMediaForJob(args),
       recordMediaDownload: async (entry) => {
         await this.putMediaEntry(entry)
+        // 索引写入即「章节已发布」：HLS 续传清单到此完成使命，删掉避免残留在缓存目录。
+        await clearHlsPartial(mediaStoreId(entry.bookId, entry.chapterIndex))
         // 每章落盘后复查配额：仍超（剩下的全是置顶或正在下载的书）就以明确文案失败，已下内容保留。
         const quota = await this.ensureMediaQuota()
         if (quota.usage > quota.quota) {
