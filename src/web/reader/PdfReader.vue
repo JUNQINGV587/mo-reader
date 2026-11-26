@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch 
 import * as pdfjsLib from 'pdfjs-dist'
 // 宿主只加载打包后的 dist/client/client.js，独立 worker 文件不会作为静态资源提供，因此内联 worker。
 import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker&inline'
+import { pdfjsDocumentOptions } from '../../core/pdfjs-assets'
 
 /**
  * PDF 原版阅读器：单页渲染，支持翻页、跳页、缩放与适应宽度。
@@ -157,7 +158,8 @@ async function openDocument(): Promise<void> {
   }
   try {
     ensurePdfWorker()
-    const task = pdfjsLib.getDocument({ url: props.src })
+    // cmaps / standard_fonts 由服务端从已安装的 pdfjs-dist 提供，缺了它们未嵌入中文字形的 PDF 会缺字。
+    const task = pdfjsLib.getDocument(pdfjsDocumentOptions(props.src))
     loadingTask = task
     const doc = await task.promise
     if (seq !== loadSeq) {

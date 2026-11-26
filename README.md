@@ -8,7 +8,7 @@
 
 本地导入的 PDF 默认按原页面渲染（翻页、跳页、50%–300% 缩放、适应宽度），阅读页与详情页都能一键切到文本模式；两种进度分别保存，互不覆盖。原版模式不生成文字层，选词、搜索与笔记请切到文本模式。
 
-PDF 原版渲染使用 pdfjs-dist。宿主只加载打包后的 `dist/client/client.js`，因此 PDF worker 以内联方式打进同一个 bundle。cmaps 与标准字体不随包提供：使用嵌入式字体的 PDF 正常显示；未嵌入字体的中文等 CJK 文本可能缺字形，此类书建议切到文本模式阅读。
+PDF 原版渲染使用 pdfjs-dist。宿主只加载打包后的 `dist/client/client.js`，因此 PDF worker 以内联方式打进同一个 bundle。cmaps 与标准字体取自安装的 pdfjs-dist，由本地服务按 `/reader/pdfjs/` 提供（与导入路径同一套资源，不走 CDN），未嵌入字形的中文 PDF 也能正常显示；内联 worker 是 data: URL，资源必须由主线程加载（`useWorkerFetch: false`），交给 worker 的只是解析结果。
 
 ## 结构
 

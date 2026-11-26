@@ -103,6 +103,7 @@ import {
   type ArtifactDescriptor,
   type FileArtifactDescriptor,
 } from './routes.js'
+import { registerPdfjsAssetRoute } from './pdfjs-assets.js'
 import {
   MEDIA_ROUTE_PATH,
   MediaRegistry,
@@ -318,6 +319,7 @@ export class ReaderService extends TypertRemoteService {
     }
     this.registerExportRoute()
     this.registerLocalPdfRoute()
+    this.registerPdfjsAssetRoute()
     this.registerMediaRoute()
     this.registerLocalMediaRoute()
     const ctx = this.ctx as any
@@ -2205,6 +2207,28 @@ export class ReaderService extends TypertRemoteService {
           }
         },
         'reader: local pdf route',
+      )
+    })
+  }
+
+  /** pdfjs 资源路由：原版阅读缺字形时由它提供 cmaps / standard_fonts，资源随依赖安装。 */
+  private registerPdfjsAssetRoute(): void {
+    const ctx = this.ctx as any
+    if (typeof ctx?.inject !== 'function') return
+    ctx.inject(['webServer'], (webCtx: any) => {
+      const webServer = webCtx?.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+      if (typeof webCtx.effect !== 'function') return
+      webCtx.effect(
+        () => {
+          try {
+            return registerPdfjsAssetRoute(webServer)
+          } catch {
+            // 重复注册或宿主缺 pdfjs-dist 依赖时跳过资源路由，原版阅读退回缺字形而不让启动失败。
+            return () => {}
+          }
+        },
+        'reader: pdfjs asset route',
       )
     })
   }

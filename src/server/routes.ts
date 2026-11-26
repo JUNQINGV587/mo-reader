@@ -235,6 +235,8 @@ export interface ProtectedFileRouteOptions {
   allowName?: boolean
   /** id 白名单，默认沿用导出路由的标识规则。 */
   idPattern?: RegExp
+  /** 响应缓存策略；默认 private, max-age=0，随版本不变的静态资源可以放宽。 */
+  cacheControl?: string
   allow?(peer: ArtifactPeer | undefined): boolean
   requirePeer?: boolean
 }
@@ -284,6 +286,7 @@ export function createProtectedFileRoute(options: ProtectedFileRouteOptions): Ar
         fileName: descriptor.fileName,
         contentType: descriptor.contentType,
         disposition: descriptor.disposition,
+        cacheControl: options.cacheControl,
       })
     },
   }
@@ -300,6 +303,8 @@ export async function serveFileResponse(
     fileName: string
     contentType: string
     disposition?: 'attachment' | 'inline'
+    /** 响应缓存策略，默认 ARTIFACT_CACHE_CONTROL。 */
+    cacheControl?: string
   },
 ): Promise<Response> {
   let info: Awaited<ReturnType<typeof stat>>
@@ -314,7 +319,7 @@ export async function serveFileResponse(
     'Content-Type': options.contentType || 'application/octet-stream',
     'Content-Length': String(size),
     'Content-Disposition': attachmentHeader(options.fileName, options.disposition),
-    'Cache-Control': ARTIFACT_CACHE_CONTROL,
+    'Cache-Control': options.cacheControl ?? ARTIFACT_CACHE_CONTROL,
     'Accept-Ranges': 'bytes',
   }
   // HEAD 不解析 Range，按整文件报告长度，客户端不会误读半份内容。
