@@ -32,7 +32,7 @@ import { enabledDictRules, lookupAll, type DictLookupOutcome } from '../../core/
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
-type View = 'shelf' | 'sources' | 'search' | 'detail' | 'reader'
+type View = 'shelf' | 'sources' | 'search' | 'explore' | 'detail' | 'reader'
 type Theme = 'light' | 'sepia' | 'dark'
 type Turn = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
 type DictResult = DictLookupOutcome
@@ -133,6 +133,16 @@ const searchScope = ref('')
 const searchExact = ref(false)
 const searchHistory = ref<string[]>([])
 const SEARCH_HISTORY_KEY = 'mo-reader-search-history'
+
+const exploreSources = ref<any[]>([])
+const exploreGroups = ref<Array<{ source: any; categories: any[]; error: string }>>([])
+const exploreLoading = ref(false)
+const exploreActive = ref<any>(null)
+const exploreBooks = ref<any[]>([])
+const explorePage = ref(0)
+const exploreHasMore = ref(false)
+const exploreBusy = ref(false)
+const exploreError = ref('')
 
 const currentBook = ref<any>(null)
 const introText = computed(() => plainText(currentBook.value?.intro))
@@ -1004,6 +1014,97 @@ function rememberSearch(key: string) {
 function useHistory(key: string) {
   searchKey.value = key
   void search()
+}
+
+function openExplore() {
+  view.value = 'explore'
+  void loadExploreGroups()
+}
+
+async function loadExploreGroups(force = false) {
+  if (exploreLoading.value) return
+  if (!force && exploreGroups.value.length) return
+  exploreLoading.value = true
+  if (force) exploreGroups.value = []
+  exploreActive.value = null
+  exploreBooks.value = []
+  explorePage.value = 0
+  exploreHasMore.value = false
+  exploreError.value = ''
+  try {
+    const result = await call('listExploreSources')
+    const list: any[] = result?.sources ?? []
+    exploreSources.value = list
+    const settled = await Promise.allSettled(
+      list.map(async (source) => {
+        const res = await call('getExploreCategories', { sourceUrl: source.bookSourceUrl })
+        return { source, categories: res?.categories ?? [], error: '' }
+      }),
+    )
+    exploreGroups.value = settled.map((item, index) => {
+      if (item.status === 'fulfilled') return item.value
+      const source = list[index]
+      return {
+        source,
+        categories: [],
+        error: `${source?.bookSourceName || source?.bookSourceUrl || '未知书源'}：${errorText(item.reason)}`,
+      }
+    })
+    status.value = `发现 ${list.length} 个书源`
+  } catch (error) {
+    exploreGroups.value = []
+    exploreError.value = errorText(error)
+    status.value = exploreError.value
+  } finally {
+    exploreLoading.value = false
+  }
+}
+
+function isActiveCategory(group: any, category: any) {
+  return (
+    exploreActive.value?.sourceUrl === group.source.bookSourceUrl &&
+    exploreActive.value?.url === category.url
+  )
+}
+
+async function selectExploreCategory(group: any, category: any) {
+  exploreActive.value = {
+    sourceUrl: group.source.bookSourceUrl,
+    sourceName: group.source.bookSourceName,
+    name: category.name,
+    url: category.url,
+  }
+  exploreError.value = ''
+  await loadExplorePage(1, true)
+}
+
+async function loadExplorePage(page: number, replace: boolean) {
+  if (!exploreActive.value) return
+  exploreBusy.value = true
+  exploreError.value = ''
+  if (replace) {
+    exploreBooks.value = []
+    explorePage.value = 0
+    exploreHasMore.value = false
+  }
+  try {
+    const result = await call('exploreBooks', {
+      sourceUrl: exploreActive.value.sourceUrl,
+      categoryUrl: exploreActive.value.url,
+      page,
+    })
+    const list = result?.books ?? []
+    exploreBooks.value = replace ? list : [...exploreBooks.value, ...list]
+    explorePage.value = Number(result?.page ?? page)
+    exploreHasMore.value = Boolean(result?.hasMore)
+    status.value = `${exploreActive.value.name} · ${exploreBooks.value.length} 本`
+  } catch (error) {
+    exploreError.value = errorText(error)
+    exploreHasMore.value = false
+    status.value = exploreError.value
+  } finally {
+    exploreBusy.value = false
+  }
 }
 
 async function loadToc(book: any, tocUrlFallback: string) {
@@ -2051,6 +2152,7 @@ onMounted(async () => {
       <nav class="mo-nav">
         <button :class="{ on: view === 'shelf' }" data-testid="nav-shelf" @click="view = 'shelf'">书架</button>
         <button :class="{ on: view === 'search' || view === 'detail' }" data-testid="nav-search" @click="view = 'search'">搜索</button>
+        <button :class="{ on: view === 'explore' }" data-testid="nav-explore" @click="openExplore">发现</button>
         <button :class="{ on: view === 'sources' }" data-testid="nav-sources" @click="view = 'sources'">书源</button>
         <button :class="{ on: view === 'rss' }" data-testid="nav-rss" @click="view = 'rss'">订阅</button>
         <span class="mo-version">v{{ version }}</span>
@@ -2222,6 +2324,102 @@ onMounted(async () => {
             {{ error.sourceUrl }}：{{ error.message }}
           </p>
         </div>
+      </section>
+
+      <section v-if="view === 'explore'" class="mo-pane">
+        <div class="mo-section-head">
+          <h2>发现</h2>
+          <span class="muted">{{ exploreSources.length }} 个书源可发现</span>
+          <button class="mo-btn" :disabled="exploreLoading" data-testid="explore-refresh" @click="loadExploreGroups(true)">
+            {{ exploreLoading ? '加载中…' : '刷新分类' }}
+          </button>
+        </div>
+
+        <p v-if="exploreError && exploreSources.length > 0 && !exploreActive" class="muted mo-explore-error">
+          发现加载失败：{{ exploreError }}
+        </p>
+
+        <div v-if="exploreLoading && exploreGroups.length === 0" class="mo-empty small">
+          <p class="muted">正在加载分类…</p>
+        </div>
+
+        <div v-else-if="exploreSources.length === 0" class="mo-empty">
+          <div class="mo-empty-glyph">源</div>
+          <p class="mo-empty-title">还没有可发现的源</p>
+          <p class="muted">书源开启「发现」并填写发现地址后，这里就能按分类找书。</p>
+          <p v-if="exploreError" class="muted mo-explore-error">{{ exploreError }}</p>
+          <button class="mo-btn" data-testid="explore-goto-sources" @click="view = 'sources'">去书源</button>
+        </div>
+
+        <template v-else>
+          <div v-for="group in exploreGroups" :key="group.source.bookSourceUrl" class="mo-explore-group">
+            <div class="mo-explore-head">
+              <h3>{{ group.source.bookSourceName || group.source.bookSourceUrl }}</h3>
+              <span class="muted">{{ group.categories.length }} 个分类</span>
+            </div>
+            <p v-if="group.error" class="muted mo-explore-error">{{ group.error }}</p>
+            <p v-else-if="group.categories.length === 0" class="muted">这个源没有分类</p>
+            <div v-else class="mo-explore-chips">
+              <button
+                v-for="category in group.categories"
+                :key="category.url"
+                class="mo-chip"
+                :class="{ on: isActiveCategory(group, category) }"
+                @click="selectExploreCategory(group, category)"
+              >
+                {{ category.name }}
+              </button>
+            </div>
+          </div>
+
+          <div v-if="exploreActive" class="mo-explore-result">
+            <div class="mo-section-head">
+              <h3>{{ exploreActive.sourceName }} · {{ exploreActive.name }}</h3>
+              <span class="muted">
+                {{ exploreBooks.length }} 本<span v-if="explorePage"> · 第 {{ explorePage }} 页</span>
+              </span>
+            </div>
+
+            <div v-if="exploreBusy && exploreBooks.length === 0" class="mo-empty small">
+              <p class="muted">正在加载书目…</p>
+            </div>
+            <div v-else-if="exploreBooks.length" class="mo-results">
+              <button
+                v-for="book in exploreBooks"
+                :key="book.origin + book.bookUrl"
+                class="mo-result"
+                data-testid="explore-book"
+                @click="openBook(book)"
+              >
+                <span class="mo-result-cover" :style="coverStyle(book)">
+                  <img v-if="book.coverUrl" :src="book.coverUrl" alt="" loading="lazy" />
+                  <span v-else>{{ String(book.name || '书').slice(0, 1) }}</span>
+                </span>
+                <span class="mo-result-main">
+                  <span class="mo-result-name">{{ book.name }}</span>
+                  <span class="muted">{{ book.author || '未知作者' }} · {{ book.kind || '小说' }}</span>
+                  <span v-if="book.lastChapter" class="muted">最新：{{ book.lastChapter }}</span>
+                  <span class="muted">{{ book.originName || book.origin }}</span>
+                </span>
+                <span class="mo-result-arrow">›</span>
+              </button>
+            </div>
+            <div v-else-if="!exploreBusy && !exploreError" class="mo-empty small">
+              <p class="muted">这个分类暂时没有书</p>
+            </div>
+
+            <div v-if="exploreError" class="mo-errors">
+              <p class="muted">加载失败：{{ exploreError }}</p>
+            </div>
+
+            <div v-if="exploreHasMore && !exploreError" class="mo-explore-more">
+              <button class="mo-btn" :disabled="exploreBusy" data-testid="explore-more" @click="loadExplorePage(explorePage + 1, false)">
+                {{ exploreBusy ? '加载中…' : '加载更多' }}
+              </button>
+            </div>
+            <p v-else-if="!exploreError && exploreBooks.length" class="muted mo-explore-note">没有更多了</p>
+          </div>
+        </template>
       </section>
 
       <section v-if="view === 'detail' && currentBook" class="mo-pane">
@@ -3408,6 +3606,49 @@ onMounted(async () => {
   margin-top: 14px;
   padding-top: 10px;
   border-top: 1px dashed var(--mo-line);
+}
+.mo-explore-group {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--mo-line);
+}
+.mo-explore-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.mo-explore-head h3 {
+  margin: 0;
+  font: 600 16px/1.3 'Songti SC', 'Noto Serif SC', serif;
+}
+.mo-explore-head .muted {
+  margin-left: auto;
+}
+.mo-explore-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.mo-chip.on {
+  border-color: var(--mo-accent);
+  background: var(--mo-accent-soft);
+  color: var(--mo-accent);
+}
+.mo-explore-error {
+  margin: 4px 0;
+  color: #a33;
+}
+.mo-explore-result {
+  margin-top: 22px;
+}
+.mo-explore-more {
+  display: flex;
+  justify-content: center;
+  margin: 16px 0;
+}
+.mo-explore-note {
+  margin: 10px 0;
+  text-align: center;
 }
 .mo-back {
   border: 0;

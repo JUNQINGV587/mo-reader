@@ -5,10 +5,18 @@ import { VERSION } from '../core/version.js'
 import { parseSource, type BookSource } from '../core/model/source.js'
 import { dictRuleKey, parseDictRule, type DictRule } from '../core/model/dict.js'
 import { AnalyzeRule } from '../core/rules/analyze-rule.js'
+import { analyzeExplore, parseExploreCategories } from '../core/source/explore.js'
 import { parseRssSources } from '../core/rss/source.js'
 import { parseFeed } from '../core/rss/feed.js'
 import { fetchText } from '../core/net/http.js'
-import { buildRequest, buildSearchRequest, parseHeaders, splitUrlOptions, type RequestSpec } from '../core/source/url.js'
+import {
+  buildExploreRequest,
+  buildRequest,
+  buildSearchRequest,
+  parseHeaders,
+  splitUrlOptions,
+  type RequestSpec,
+} from '../core/source/url.js'
 import {
   analyzeBookInfo,
   analyzeChapterContent,
@@ -338,6 +346,61 @@ export class ReaderService extends TypertRemoteService {
       }
     })
     return { books, errors }
+  }
+
+  async listExploreSources() {
+    const sources: Array<{
+      bookSourceUrl: string
+      bookSourceName: string
+      bookSourceGroup: string
+      bookSourceType: number
+    }> = []
+    for (const [, value] of this.requireDb().sources.entries()) {
+      const source = value as BookSource
+      if (source.enabled === false) continue
+      if (source.enabledExplore === false) continue
+      if (!source.exploreUrl || !source.exploreUrl.trim()) continue
+      sources.push({
+        bookSourceUrl: source.bookSourceUrl,
+        bookSourceName: source.bookSourceName,
+        bookSourceGroup: source.bookSourceGroup ?? '',
+        bookSourceType: source.bookSourceType ?? 0,
+      })
+    }
+    sources.sort((a, b) => a.bookSourceName.localeCompare(b.bookSourceName, 'zh'))
+    return { sources }
+  }
+
+  async getExploreCategories(args: Args) {
+    const source = this.exploreSource(stringArg(args, 'sourceUrl'))
+    let categories: ReturnType<typeof parseExploreCategories>
+    try {
+      categories = parseExploreCategories(source.exploreUrl, source.bookSourceUrl, { source })
+    } catch (error) {
+      throw new Error(`发现分类解析失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+    if (categories.length === 0) throw new Error('未解析到发现分类')
+    return { categories }
+  }
+
+  async exploreBooks(args: Args) {
+    const source = this.exploreSource(stringArg(args, 'sourceUrl'))
+    const categoryUrl = stringArg(args, 'categoryUrl')
+    const page = typeof args?.page === 'number' && args.page > 0 ? Math.floor(args.page) : 1
+    const request = buildExploreRequest(source, categoryUrl, page)
+    if (!request) throw new Error('书源没有发现地址')
+    const raw = await this.fetch(request, source)
+    if (raw.status >= 400) throw new Error(`HTTP ${raw.status}`)
+    const books = analyzeExplore(raw.text, source, raw.url)
+    return { books, page, hasMore: books.length > 0, url: raw.url }
+  }
+
+  private exploreSource(url: string): BookSource {
+    const source = this.getSource(url)
+    if (source.enabled === false) throw new Error('书源已停用')
+    if (source.enabledExplore === false) throw new Error('书源未开启发现')
+    if (!source.exploreUrl || !source.exploreUrl.trim()) throw new Error('书源没有发现分类')
+    return source
   }
 
   async getBookInfo(args: Args) {
