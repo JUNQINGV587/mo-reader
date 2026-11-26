@@ -29,6 +29,7 @@ import {
 } from '../../core/reader/theme'
 import { exportFullShelf, exportLegadoShelf } from '../../core/reader/shelf-transfer'
 import { enabledDictRules, lookupAll, type DictLookupOutcome } from '../../core/dict/lookup-all'
+import { filterSources, hasExplore, needsLogin, sourceHost } from '../../core/source/filter'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
@@ -82,6 +83,16 @@ const SOURCE_PAGE_SIZE = 50
 const sourcePage = ref(1)
 const selectedSourceIds = ref<Set<string>>(new Set())
 const checkReport = ref<{ total: number; ok: number; problems: Array<{ name: string; message: string }> } | null>(null)
+const sourceLogin = ref<'all' | 'required' | 'none'>('all')
+const sourceExploreOnly = ref(false)
+const sourceMessage = ref('')
+const onlineCheckBusy = ref(false)
+const onlineCheckReport = ref<{
+  scope: 'selected' | 'page'
+  total: number
+  ok: number
+  results: Array<{ url: string; ok: boolean; status: number | null; elapsedMs: number; error: string }>
+} | null>(null)
 const sourceTypeNames: Record<number, string> = { 0: '文本', 1: '音频', 2: '图片', 3: '文件', 4: '视频' }
 
 const dictRules = ref<any[]>([])
@@ -297,28 +308,19 @@ const activeThemeColors = computed<ThemeColors>(() =>
 const activeCustomTheme = computed<CustomTheme | undefined>(() =>
   settings.value.customThemes.find((item) => item.id === settings.value.theme),
 )
-function hostOf(url?: string) {
-  try {
-    return new URL(String(url ?? '')).host
-  } catch {
-    return ''
-  }
-}
 const sourceGroups = computed(() =>
   [...new Set(sources.value.map((source) => source.bookSourceGroup).filter((group): group is string => typeof group === 'string' && group.length > 0))].sort((a, b) => a.localeCompare(b, 'zh')),
 )
-const sourceDomains = computed(() => [...new Set(sources.value.map((source) => hostOf(source.bookSourceUrl)).filter(Boolean))].sort())
+const sourceDomains = computed(() => [...new Set(sources.value.map((source) => sourceHost(source.bookSourceUrl)).filter(Boolean))].sort())
 const filteredSortedSources = computed(() => {
-  const key = sourceFilter.value.trim().toLowerCase()
-  let list = sources.value
-  if (key) {
-    list = list.filter((source) =>
-      `${source.bookSourceName ?? ''} ${source.bookSourceUrl ?? ''} ${source.bookSourceGroup ?? ''}`.toLowerCase().includes(key),
-    )
-  }
-  if (sourceGroup.value) list = list.filter((source) => source.bookSourceGroup === sourceGroup.value)
-  if (sourceDomain.value) list = list.filter((source) => hostOf(source.bookSourceUrl) === sourceDomain.value)
-  const sorted = [...list]
+  const filtered = filterSources(sources.value, {
+    key: sourceFilter.value,
+    group: sourceGroup.value,
+    domain: sourceDomain.value,
+    login: sourceLogin.value,
+    exploreOnly: sourceExploreOnly.value,
+  })
+  const sorted = [...filtered]
   if (sourceSort.value === 'url') {
     sorted.sort((a, b) => String(a.bookSourceUrl ?? '').localeCompare(String(b.bookSourceUrl ?? '')))
   } else if (sourceSort.value === 'updated') {
@@ -338,7 +340,20 @@ const allPageSelected = computed(
   () => pagedSources.value.length > 0 && pagedSources.value.every((source) => selectedSourceIds.value.has(source.id)),
 )
 const selectedCount = computed(() => selectedSourceIds.value.size)
-watch([sourceFilter, sourceGroup, sourceDomain, sourceSort], () => {
+/** 在线检查范围：已选优先，否则本页可见；空地址不检查。 */
+const onlineCheckTargets = computed(() => {
+  const base =
+    selectedCount.value > 0
+      ? sources.value.filter((source) => selectedSourceIds.value.has(source.id))
+      : pagedSources.value
+  return base.filter(
+    (source) => typeof source.bookSourceUrl === 'string' && source.bookSourceUrl.trim().length > 0,
+  )
+})
+const onlineCheckScope = computed(() =>
+  selectedCount.value > 0 ? `已选 ${onlineCheckTargets.value.length} 个` : `本页 ${onlineCheckTargets.value.length} 个`,
+)
+watch([sourceFilter, sourceGroup, sourceDomain, sourceSort, sourceLogin, sourceExploreOnly], () => {
   sourcePage.value = 1
 })
 watch(
@@ -931,6 +946,76 @@ async function batchSetEnabled(enabled: boolean) {
     status.value = errorText(error)
   } finally {
     busy.value = false
+  }
+}
+
+function sourceNameOf(url: string): string {
+  return sources.value.find((source) => source.bookSourceUrl === url)?.bookSourceName || url
+}
+
+function safeFileName(value: string): string {
+  const cleaned = value
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return cleaned.slice(0, 40) || 'source'
+}
+
+function exportStamp(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+async function exportSource(source: any) {
+  try {
+    const result = await call('exportSources', { ids: [source.id] })
+    downloadJson(
+      `mo-reader-source-${safeFileName(source.bookSourceName || 'source')}-${exportStamp()}.json`,
+      JSON.parse(result.json),
+    )
+    sourceMessage.value = `已导出「${source.bookSourceName || '书源'}」`
+  } catch (error) {
+    sourceMessage.value = errorText(error)
+  }
+}
+
+async function exportSelectedSources() {
+  const ids = [...selectedSourceIds.value]
+  if (ids.length === 0) return
+  try {
+    const result = await call('exportSources', { ids })
+    downloadJson(`mo-reader-sources-${exportStamp()}.json`, JSON.parse(result.json))
+    sourceMessage.value = `已导出 ${result.count} 个书源`
+  } catch (error) {
+    sourceMessage.value = errorText(error)
+  }
+}
+
+/** 在线可达性：只查地址能不能打开，与静态结构检查（checkReport）分开显示。 */
+async function runOnlineSourceCheck() {
+  const list = onlineCheckTargets.value
+  if (list.length === 0) {
+    sourceMessage.value = '没有可检查的地址'
+    return
+  }
+  const scope = selectedCount.value > 0 ? 'selected' : 'page'
+  const urls = list.map((source) => String(source.bookSourceUrl).trim())
+  onlineCheckBusy.value = true
+  try {
+    const result = await call('checkSources', { urls })
+    const results = result.results as Array<{
+      url: string
+      ok: boolean
+      status: number | null
+      elapsedMs: number
+      error: string
+    }>
+    const ok = results.filter((item) => item.ok).length
+    onlineCheckReport.value = { scope, total: results.length, ok, results }
+    sourceMessage.value = `在线可达 ${ok}/${results.length}`
+  } catch (error) {
+    sourceMessage.value = errorText(error)
+  } finally {
+    onlineCheckBusy.value = false
   }
 }
 
@@ -2819,19 +2904,56 @@ onMounted(async () => {
               <option value="updated">按更新时间</option>
               <option value="enabled">按启用状态</option>
             </select>
-            <button class="mo-btn" data-testid="source-check" @click="runSourceCheck">检查</button>
+            <select v-model="sourceLogin" class="mo-select" aria-label="登录要求">
+              <option value="all">全部</option>
+              <option value="required">需登录</option>
+              <option value="none">免登录</option>
+            </select>
+            <label class="mo-switch" title="只看开启发现且有发现地址的书源">
+              <input v-model="sourceExploreOnly" type="checkbox" data-testid="source-explore-only" />
+              有发现
+            </label>
+            <button class="mo-btn" data-testid="source-check" @click="runSourceCheck">结构检查</button>
           </div>
           <div class="mo-source-bulk">
             <label class="mo-switch"><input type="checkbox" :checked="allPageSelected" @change="toggleSelectPage" />本页全选</label>
             <span class="muted">已选 {{ selectedCount }} 个</span>
             <button class="mo-btn" :disabled="selectedCount === 0 || busy" data-testid="batch-enable" @click="batchSetEnabled(true)">批量启用</button>
             <button class="mo-btn" :disabled="selectedCount === 0 || busy" data-testid="batch-disable" @click="batchSetEnabled(false)">批量禁用</button>
+            <button class="mo-btn" :disabled="selectedCount === 0 || busy" data-testid="batch-export" @click="exportSelectedSources">导出选中</button>
+            <span v-if="sourceMessage" class="muted" data-testid="source-message">{{ sourceMessage }}</span>
           </div>
           <div v-if="checkReport" class="mo-check-report" data-testid="source-check-report">
             <p>检查 {{ checkReport.total }} 个：通过 {{ checkReport.ok }}，问题 {{ checkReport.problems.length }}</p>
             <ul v-if="checkReport.problems.length">
               <li v-for="item in checkReport.problems.slice(0, 8)" :key="item.name">{{ item.name }}：{{ item.message }}</li>
               <li v-if="checkReport.problems.length > 8" class="muted">…另有 {{ checkReport.problems.length - 8 }} 个</li>
+            </ul>
+          </div>
+          <div class="mo-source-online">
+            <button
+              class="mo-btn"
+              :disabled="onlineCheckBusy || onlineCheckTargets.length === 0"
+              data-testid="source-online-check"
+              @click="runOnlineSourceCheck"
+            >
+              {{ onlineCheckBusy ? '检查中' : '在线检查' }}
+            </button>
+            <span class="muted">{{ onlineCheckScope }}，检查能否打开</span>
+          </div>
+          <div v-if="onlineCheckReport" class="mo-check-report" data-testid="source-online-report">
+            <p>
+              在线检查（{{ onlineCheckReport.scope === 'selected' ? '已选' : '本页' }}）
+              {{ onlineCheckReport.total }} 个：可达 {{ onlineCheckReport.ok }}
+            </p>
+            <ul>
+              <li v-for="item in onlineCheckReport.results" :key="item.url" data-testid="source-online-row">
+                <span>{{ sourceNameOf(item.url) }}</span>
+                <span class="mo-tag soft">{{ item.ok ? '可达' : '不可达' }}</span>
+                <span v-if="item.status !== null" class="muted">HTTP {{ item.status }}</span>
+                <span class="muted">{{ item.elapsedMs }}ms</span>
+                <span v-if="item.error" class="muted">{{ item.error }}</span>
+              </li>
             </ul>
           </div>
           <div v-if="filteredSortedSources.length === 0" class="mo-empty small">没有匹配的书源。</div>
@@ -2851,9 +2973,10 @@ onMounted(async () => {
               <span class="mo-url">{{ source.bookSourceUrl }}</span>
               <span v-if="source.bookSourceGroup" class="mo-tag soft">{{ source.bookSourceGroup }}</span>
               <span class="mo-tag soft">{{ sourceTypeNames[source.bookSourceType ?? 0] ?? '文本' }}</span>
-              <span v-if="source.enabledExplore" class="mo-tag soft">发现</span>
-              <span v-if="source.loginUrl" class="mo-tag warn">需登录</span>
+              <span v-if="hasExplore(source)" class="mo-tag soft">发现</span>
+              <span v-if="needsLogin(source)" class="mo-tag warn">需登录</span>
               <span v-else-if="source.enabledCookieJar" class="mo-tag soft">Cookie</span>
+              <button class="mo-btn tiny" :disabled="busy" title="导出为 Legado JSON" data-testid="source-export" @click="exportSource(source)">导出</button>
               <button class="mo-icon-btn" title="编辑" data-testid="source-edit" @click="beginEdit(source)">✎</button>
               <button class="mo-icon-btn danger" title="删除" @click="removeSource(source)">✕</button>
             </li>
@@ -4310,6 +4433,15 @@ onMounted(async () => {
 .mo-tag.warn {
   color: #8a4b1e;
   border-color: #d8b28d;
+}
+.mo-source-online {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 2px 0 10px;
+  color: var(--mo-ink-2);
+  font-size: 12px;
 }
 .mo-check-report {
   margin: 6px 0 10px;
