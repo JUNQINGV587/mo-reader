@@ -169,6 +169,11 @@ const content = ref('')
 const readerKind = ref<'text' | 'images' | 'audio' | 'video' | 'pdf'>('text')
 const readerImages = ref<string[]>([])
 const readerMedia = ref('')
+/** 当前章节是否来自本地离线缓存；播放器据此显示「本地 / 在线」。 */
+const readerLocal = ref(false)
+/** 本地文件损坏/缺失时回退在线的提示，留在阅读页不解散。 */
+const readerMediaNotice = ref('')
+let mediaFallbackBusy = false
 const replacedContent = computed(() => {
   let text = content.value
   for (const rule of settings.value.replaceRules) {
@@ -867,18 +872,193 @@ function retryDownload() {
   void controlDownload('retryDownload', '重试失败章节')
 }
 
+type MediaScope = 'current' | 'all' | 'range'
+const mediaScope = ref<MediaScope>('current')
+const mediaFrom = ref(1)
+const mediaTo = ref(1)
+const mediaJob = ref<any>(null)
+const mediaSummary = ref<any>(null)
+const mediaBusy = ref(false)
+const mediaDeleting = ref(false)
+const mediaDeleteConfirmOpen = ref(false)
+let mediaTimer: ReturnType<typeof setInterval> | null = null
+let mediaSummaryAt = 0
+
+function mediaUnit() {
+  return mediaSummary.value?.kind === 'image' ? '章' : '个'
+}
+
+function stopMediaTimer() {
+  if (mediaTimer !== null) {
+    clearInterval(mediaTimer)
+    mediaTimer = null
+  }
+}
+
+function syncMediaTimer() {
+  if (isDownloadRunning(mediaJob.value)) {
+    if (mediaTimer === null) mediaTimer = setInterval(refreshMediaJob, 600)
+  } else {
+    stopMediaTimer()
+  }
+}
+
+/** 媒体作业与文字作业共用 jobs 表结构，进度文案复用同一套函数。 */
+async function refreshMediaJob() {
+  const job = mediaJob.value
+  if (!job?.id) return
+  try {
+    const result: any = await call('getJob', { id: job.id })
+    mediaJob.value = result?.job ?? mediaJob.value
+  } catch (error) {
+    status.value = errorText(error)
+  }
+  if (!isDownloadRunning(mediaJob.value) || Date.now() - mediaSummaryAt > 5000) {
+    void refreshMediaSummary()
+  }
+  syncMediaTimer()
+}
+
+/** 媒体离线统计：服务端按书聚合条目，kind 为空表示不是媒体书。 */
+async function refreshMediaSummary() {
+  const book = currentBook.value as any
+  if (!book?.id) {
+    mediaSummary.value = null
+    return
+  }
+  try {
+    const result: any = await call('getMediaDownloadSummary', {
+      bookId: book.id,
+      total: chapters.value.length,
+    })
+    mediaSummary.value = result?.summary ?? null
+    mediaSummaryAt = Date.now()
+  } catch {
+    mediaSummary.value = null
+  }
+}
+
+async function loadActiveMedia() {
+  mediaJob.value = null
+  mediaSummary.value = null
+  mediaDeleteConfirmOpen.value = false
+  mediaScope.value = 'current'
+  mediaFrom.value = 1
+  mediaTo.value = Math.max(1, chapters.value.length)
+  const book = currentBook.value as any
+  if (!book?.id) {
+    syncMediaTimer()
+    return
+  }
+  void refreshMediaSummary()
+  try {
+    const result: any = await call('listJobs', { bookId: book.id, kind: 'media-download' })
+    const jobs: any[] = Array.isArray(result?.jobs) ? result.jobs : []
+    const active = jobs.find((job) => ['queued', 'running', 'paused'].includes(job.status))
+    mediaJob.value = active ?? jobs[0] ?? null
+  } catch {
+    mediaJob.value = null
+  }
+  syncMediaTimer()
+}
+
+async function startMediaDownload() {
+  const book = currentBook.value as any
+  if (!book?.id) return
+  const args: any = { bookId: book.id }
+  if (mediaScope.value === 'all') {
+    args.all = true
+  } else if (mediaScope.value === 'range') {
+    const last = Math.max(1, chapters.value.length)
+    const from = Math.max(1, Math.min(last, Number(mediaFrom.value) || 1))
+    const to = Math.max(from, Math.min(last, Number(mediaTo.value) || last))
+    args.fromIndex = from - 1
+    args.toIndex = to - 1
+  } else {
+    // 当前章：起止都钉在同一章，避免只给起点被当作「从这章到末尾」。
+    const index = Math.max(0, Number(progress.value?.chapterIndex ?? 0) || 0)
+    args.fromIndex = index
+    args.toIndex = index
+  }
+  mediaBusy.value = true
+  try {
+    const result: any = await call('startMediaDownload', args)
+    mediaJob.value = result?.job ?? null
+    status.value = result?.existing ? '已有进行中的离线下载' : '已开始离线下载'
+    void refreshMediaSummary()
+    syncMediaTimer()
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    mediaBusy.value = false
+  }
+}
+
+async function controlMediaDownload(method: string, message: string) {
+  const job = mediaJob.value
+  if (!job?.id) return
+  mediaBusy.value = true
+  try {
+    const result: any = await call(method, { id: job.id })
+    mediaJob.value = result?.job ?? mediaJob.value
+    status.value = message
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    mediaBusy.value = false
+    void refreshMediaSummary()
+    syncMediaTimer()
+  }
+}
+
+function pauseMediaDownload() {
+  void controlMediaDownload('pauseJob', '已暂停离线下载')
+}
+
+function resumeMediaDownload() {
+  void controlMediaDownload('resumeJob', '继续离线下载')
+}
+
+function cancelMediaDownload() {
+  void controlMediaDownload('cancelJob', '已取消离线下载')
+}
+
+function retryMediaDownload() {
+  void controlMediaDownload('retryDownload', '重试失败章节')
+}
+
+/** 按书删除媒体离线文件与索引；文字缓存、书与进度保留。 */
+async function deleteMediaDownloaded() {
+  const book = currentBook.value as any
+  if (!book?.id) return
+  mediaDeleteConfirmOpen.value = false
+  mediaDeleting.value = true
+  try {
+    const result: any = await call('deleteMediaDownloads', { bookId: book.id })
+    status.value = `已删除 ${result?.removed ?? 0} ${mediaUnit()}离线媒体`
+    await loadActiveMedia()
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    mediaDeleting.value = false
+  }
+}
+
 watch(view, (next) => {
   if (next === 'detail') {
     void loadActiveDownload()
+    void loadActiveMedia()
     void loadActiveExport()
   } else {
     stopDownloadTimer()
+    stopMediaTimer()
     stopExportTimer()
   }
 })
 
 onUnmounted(() => {
   stopDownloadTimer()
+  stopMediaTimer()
   stopExportTimer()
 })
 
@@ -2133,6 +2313,8 @@ async function openChapter(chapter: any, page?: number) {
     readerImages.value = kind === 'images' ? (result.images ?? []) : []
     readerMedia.value =
       kind === 'audio' || kind === 'video' ? (result.mediaUrl ?? chapter.url) : ''
+    readerLocal.value = result.local === true
+    readerMediaNotice.value = result.localMissing === true ? '本地文件已失效，已改用在线内容' : ''
     readerTitle.value = chapter.title
     view.value = 'reader'
     if (currentBook.value?.id) {
@@ -2150,6 +2332,35 @@ async function openChapter(chapter: any, page?: number) {
     status.value = message
   } finally {
     busy.value = false
+  }
+}
+
+/** 本地文件被删/损坏：同一章改用在线代理重取，只回退一次，失败只提示。 */
+async function onReaderMediaError() {
+  if (!readerLocal.value || mediaFallbackBusy) return
+  const book = currentBook.value as any
+  const chapter = currentChapter.value
+  if (!book?.id || !chapter?.url) return
+  mediaFallbackBusy = true
+  try {
+    const index = chapters.value.indexOf(chapter)
+    const result: any = await call('getContent', {
+      sourceUrl: book.origin,
+      chapterUrl: chapter.url,
+      bookId: book.id,
+      chapterIndex: index,
+      chapterTitle: chapter.title,
+      preferOnline: true,
+    })
+    const kind = result?.kind ?? 'text'
+    if (kind === 'images') readerImages.value = result?.images ?? []
+    else if (kind === 'audio' || kind === 'video') readerMedia.value = result?.mediaUrl ?? chapter.url
+    readerLocal.value = false
+    readerMediaNotice.value = '本地文件不可用，已切换到在线播放'
+  } catch (error) {
+    readerMediaNotice.value = `本地文件不可用，在线回退也失败了：${errorText(error)}`
+  } finally {
+    mediaFallbackBusy = false
   }
 }
 
@@ -3441,6 +3652,111 @@ onMounted(async () => {
           </div>
         </div>
 
+        <div
+          v-if="currentBook.origin !== 'local' && mediaSummary?.kind"
+          class="mo-download"
+          data-testid="media-download-panel"
+        >
+          <div class="mo-download-head">
+            <h3>离线媒体</h3>
+            <span v-if="mediaJob" class="mo-tag" data-testid="media-download-status">{{ downloadStatusText(mediaJob) }}</span>
+          </div>
+          <p class="mo-download-summary" data-testid="media-download-summary">
+            已离线 {{ mediaSummary?.downloaded ?? 0 }}/{{ mediaSummary?.total || chapters.length }} {{ mediaUnit() }} · 占用
+            {{ formatBytes(mediaSummary?.bytes ?? 0) }}
+            <template v-if="mediaSummary?.job"> · {{ downloadStatusText(mediaSummary.job) }}</template>
+            <template v-if="mediaSummary?.failed"> · 失败 {{ mediaSummary.failed }}</template>
+            <template v-if="mediaSummary?.skipped"> · 跳过 {{ mediaSummary.skipped }}</template>
+          </p>
+          <div v-if="!mediaDeleteConfirmOpen" class="mo-download-actions">
+            <button
+              class="mo-btn"
+              data-testid="media-delete-downloads"
+              :disabled="mediaDeleting || (!mediaSummary?.downloaded && !mediaSummary?.job)"
+              @click="mediaDeleteConfirmOpen = true"
+            >
+              删除离线文件
+            </button>
+          </div>
+          <div v-else class="mo-download-actions">
+            <span class="muted">只清媒体文件与索引，书与进度保留</span>
+            <button
+              class="mo-btn danger"
+              data-testid="media-delete-downloads-confirm"
+              :disabled="mediaDeleting"
+              @click="deleteMediaDownloaded"
+            >
+              {{ mediaDeleting ? '删除中…' : '确认删除' }}
+            </button>
+            <button class="mo-btn" :disabled="mediaDeleting" @click="mediaDeleteConfirmOpen = false">取消</button>
+          </div>
+          <div class="mo-download-scope">
+            <label><input v-model="mediaScope" type="radio" value="current" data-testid="media-scope-current" />当前章</label>
+            <label><input v-model="mediaScope" type="radio" value="all" data-testid="media-scope-all" />整本</label>
+            <label><input v-model="mediaScope" type="radio" value="range" data-testid="media-scope-range" />指定起止</label>
+            <template v-if="mediaScope === 'range'">
+              <input v-model.number="mediaFrom" type="number" min="1" :max="chapters.length" aria-label="起始章" />
+              <span>至</span>
+              <input v-model.number="mediaTo" type="number" min="1" :max="chapters.length" aria-label="结束章" />
+            </template>
+            <button
+              class="mo-btn primary"
+              data-testid="media-download-start"
+              :disabled="mediaBusy || isDownloadRunning(mediaJob)"
+              @click="startMediaDownload"
+            >
+              开始离线下载
+            </button>
+          </div>
+          <p class="muted">漫画按章保存整章图片；音频与视频保存当个媒体文件。HLS 章节暂不支持离线，会自动跳过。</p>
+          <div v-if="mediaJob" class="mo-download-progress">
+            <span class="mo-download-bar"><span :style="{ width: `${downloadPercent(mediaJob)}%` }" /></span>
+            <span data-testid="media-download-done">已完成 {{ mediaJob.completed }} / {{ mediaJob.total }} {{ mediaUnit() }}</span>
+            <span>失败 {{ mediaJob.failed }}</span>
+            <span>跳过 {{ mediaJob.skipped }}</span>
+            <span>{{ formatBytes(mediaJob.bytes) }}</span>
+          </div>
+          <p v-if="mediaJob?.error && mediaJob.status !== 'paused'" class="muted">{{ mediaJob.error }}</p>
+          <div v-if="mediaJob" class="mo-download-actions">
+            <button
+              v-if="isDownloadRunning(mediaJob)"
+              class="mo-btn"
+              data-testid="media-download-pause"
+              :disabled="mediaBusy"
+              @click="pauseMediaDownload"
+            >
+              暂停
+            </button>
+            <button
+              v-if="mediaJob.status === 'paused'"
+              class="mo-btn primary"
+              data-testid="media-download-resume"
+              :disabled="mediaBusy"
+              @click="resumeMediaDownload"
+            >
+              继续
+            </button>
+            <button
+              v-if="['queued', 'running', 'paused'].includes(mediaJob.status)"
+              class="mo-btn danger"
+              data-testid="media-download-cancel"
+              :disabled="mediaBusy"
+              @click="cancelMediaDownload"
+            >
+              取消
+            </button>
+            <button
+              v-if="mediaJob.failed > 0 && !isDownloadRunning(mediaJob)"
+              class="mo-btn"
+              data-testid="media-download-retry"
+              :disabled="mediaBusy"
+              @click="retryMediaDownload"
+            >
+              重试失败章
+            </button>
+          </div>
+        </div>
+
         <div v-if="currentBook.origin !== 'local'" class="mo-download" data-testid="export-panel">
           <div class="mo-download-head">
             <h3>导出全本</h3>
@@ -3877,6 +4193,14 @@ onMounted(async () => {
       </section>
 
       <section v-if="view === 'reader'" class="mo-reader">
+        <p
+          v-if="readerMediaNotice"
+          class="mo-media-notice"
+          data-testid="media-fallback-notice"
+          role="status"
+        >
+          {{ readerMediaNotice }}
+        </p>
         <div class="mo-reader-canvas" data-testid="reader-content">
           <CanvasReader
             v-if="readerKind === 'text' && content"
@@ -3930,7 +4254,9 @@ onMounted(async () => {
             :images="readerImages"
             :title="readerTitle"
             :initial-page="initialPage"
+            :local="readerLocal"
             @page="onPage"
+            @media-error="onReaderMediaError"
           />
           <AudioReader
             v-else-if="readerKind === 'audio'"
@@ -3938,8 +4264,10 @@ onMounted(async () => {
             :title="readerTitle"
             :book-name="currentBook?.name || ''"
             :initial-position="initialPage"
+            :local="readerLocal"
             @progress="onMediaProgress"
             @ended="openAdjacent(1)"
+            @media-error="onReaderMediaError"
           />
           <VideoReader
             v-else-if="readerKind === 'video'"
@@ -3947,8 +4275,10 @@ onMounted(async () => {
             :title="readerTitle"
             :book-name="currentBook?.name || ''"
             :initial-position="initialPage"
+            :local="readerLocal"
             @progress="onMediaProgress"
             @ended="openAdjacent(1)"
+            @media-error="onReaderMediaError"
           />
           <p v-else class="muted mo-reader-loading">{{ chapterError || (busy ? '加载中…' : '（空章节）') }}</p>
         </div>
@@ -5437,6 +5767,22 @@ textarea {
 }
 .mo-search-errors p {
   margin: 4px 0 0;
+}
+.mo-media-notice {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  z-index: 5;
+  transform: translateX(-50%);
+  max-width: 82%;
+  margin: 0;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: rgba(20, 21, 24, 0.86);
+  color: #d8d4c8;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
 }
 .mo-reader-hint {
   position: absolute;

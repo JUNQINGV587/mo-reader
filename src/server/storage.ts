@@ -44,6 +44,39 @@ const downloadEntry = z
   })
   .passthrough()
 
+/** 媒体条目里的单个文件：路径相对媒体缓存根，id 是下发给前端的不可猜测短摘要。 */
+const mediaFile = z
+  .object({
+    id: z.string().min(1).max(80),
+    name: z.string().min(1).max(200),
+    mime: z.string().max(200).default(''),
+    bytes: z.number().int().min(0).default(0),
+    path: z.string().min(1).max(8192),
+  })
+  .passthrough()
+
+/**
+ * 已下载媒体的索引（#112）：漫画一章一条（files 多张图），音视频一章一条（files 一个）。
+ * key 由 bookId + 章序号派生（见 media-cache.ts 的 mediaEntryKey）；
+ * 只有整章文件全部落盘后 service 才写入本表，因此「有索引」即「可离线播放」。
+ */
+const mediaEntry = z
+  .object({
+    id: z.string().min(1).max(4096),
+    bookId: z.string().min(1).max(4096),
+    chapterIndex: z.number().int().min(0).default(0),
+    chapterUrl: z.string().min(1).max(8192),
+    chapterTitle: z.string().max(4096).default(''),
+    sourceUrl: z.string().max(8192).default(''),
+    kind: z.enum(['image', 'audio', 'video']),
+    mime: z.string().max(200).default(''),
+    bytes: z.number().int().min(0).default(0),
+    files: z.array(mediaFile).default([]),
+    createdAt: z.number().int().min(0).default(0),
+    updatedAt: z.number().int().min(0).default(0),
+  })
+  .passthrough()
+
 /**
  * 墨读的新领域：与旧实现的 `reader` 域分开，避免旧记录过不了新 schema。
  * 旧数据按设计不迁移，书源/书架/进度在 M1 起重新导入。
@@ -139,6 +172,7 @@ export const ReaderDomain = defineDomain({
     read_records: domainTable(identified),
     jobs: domainTable(jobRecord),
     download_entries: domainTable(downloadEntry),
+    media_entries: domainTable(mediaEntry),
     subscriptions: domainTable(identified),
   },
 })
@@ -157,6 +191,7 @@ export async function openReaderStorage(ctx: any) {
     readRecords: domain.table('read_records'),
     jobs: domain.table('jobs'),
     downloadEntries: domain.table('download_entries'),
+    mediaEntries: domain.table('media_entries'),
     subscriptions: domain.table('subscriptions'),
     settings: domain.global,
   }

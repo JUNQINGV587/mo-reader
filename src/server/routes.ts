@@ -8,6 +8,8 @@ import { isArtifactFileName } from './exports.js'
 export const EXPORT_ROUTE_PATH = '/reader/exports'
 /** 本地 PDF 原文件路由：URL 里是 24 位小写十六进制书 id，路径由服务端自己拼。 */
 export const LOCAL_PDF_ROUTE_PATH = '/reader/local-pdf'
+/** 本地媒体文件路由（#112）：URL 里是 24 位十六进制文件摘要，路径由索引反查。 */
+export const LOCAL_MEDIA_ROUTE_PATH = '/reader/media-local'
 /** 导出作业 id 的默认白名单：单段、字母数字开头、允许短横线。 */
 const DEFAULT_ARTIFACT_ID_PATTERN = /^[0-9a-zA-Z][0-9a-zA-Z-]{7,63}$/
 /** 私有产物只让浏览器本地缓存，不进共享缓存。 */
@@ -153,14 +155,17 @@ export function resolveArtifactPath(root: string, filePath: string): string | nu
 }
 
 /** RFC 6266 下载头：ASCII 兜底 + UTF-8 扩展文件名，中文书名不丢。 */
-export function attachmentHeader(fileName: string): string {
+export function attachmentHeader(
+  fileName: string,
+  disposition: 'attachment' | 'inline' = 'attachment',
+): string {
   const safe = String(fileName || 'download')
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
     .replace(/["\\]/g, '_')
     .trim() || 'download'
   const ascii = safe.replace(/[^\x20-\x7e]/g, '_')
   const encoded = encodeURIComponent(safe).replace(/['()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`
+  return `${disposition}; filename="${ascii}"; filename*=UTF-8''${encoded}`
 }
 
 /** 受保护文件路由的产物描述：filePath 相对 root，可含子目录，但解析后必须仍在 root 内。 */
@@ -168,6 +173,8 @@ export interface FileArtifactDescriptor {
   filePath: string
   fileName: string
   contentType: string
+  /** 浏览器展示方式：下载附件（默认）或内联播放/查看（图片、音频、视频）。 */
+  disposition?: 'attachment' | 'inline'
 }
 
 export interface ProtectedFileRouteOptions {
@@ -227,6 +234,7 @@ export function createProtectedFileRoute(options: ProtectedFileRouteOptions): Ar
         absolutePath: absolute,
         fileName: descriptor.fileName,
         contentType: descriptor.contentType,
+        disposition: descriptor.disposition,
       })
     },
   }
@@ -238,7 +246,12 @@ export function createProtectedFileRoute(options: ProtectedFileRouteOptions): Ar
  */
 export async function serveFileResponse(
   request: Request,
-  options: { absolutePath: string; fileName: string; contentType: string },
+  options: {
+    absolutePath: string
+    fileName: string
+    contentType: string
+    disposition?: 'attachment' | 'inline'
+  },
 ): Promise<Response> {
   let info: Awaited<ReturnType<typeof stat>>
   try {
@@ -251,7 +264,7 @@ export async function serveFileResponse(
   const headers: Record<string, string> = {
     'Content-Type': options.contentType || 'application/octet-stream',
     'Content-Length': String(size),
-    'Content-Disposition': attachmentHeader(options.fileName),
+    'Content-Disposition': attachmentHeader(options.fileName, options.disposition),
     'Cache-Control': ARTIFACT_CACHE_CONTROL,
     'Accept-Ranges': 'bytes',
   }
