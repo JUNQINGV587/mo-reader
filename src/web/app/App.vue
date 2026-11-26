@@ -1094,7 +1094,19 @@ async function loadExplorePage(page: number, replace: boolean) {
       page,
     })
     const list = result?.books ?? []
-    exploreBooks.value = replace ? list : [...exploreBooks.value, ...list]
+    if (replace) {
+      exploreBooks.value = list
+    } else {
+      // 有的源会忽略页码返回同一页，追加时按书目去重，避免重复行。
+      const seen = new Set(exploreBooks.value.map((book: any) => `${book.origin}|${book.bookUrl}`))
+      const fresh = list.filter((book: any) => {
+        const key = `${book.origin}|${book.bookUrl}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+      exploreBooks.value = [...exploreBooks.value, ...fresh]
+    }
     explorePage.value = Number(result?.page ?? page)
     exploreHasMore.value = Boolean(result?.hasMore)
     status.value = `${exploreActive.value.name} · ${exploreBooks.value.length} 本`

@@ -61,6 +61,10 @@ const SAFE_KEY = /^[a-z][a-z0-9_-]+$/
  * 存储的 per-record key 只能是路径安全的小写串；书源的 bookSourceUrl
  * 常是完整 URL，用 sha1 生成稳定 key，兼容旧数据里本身就是安全串的 key。
  */
+function sameRequest(a: RequestSpec, b: RequestSpec): boolean {
+  return a.url === b.url && a.method === b.method && (a.body ?? '') === (b.body ?? '')
+}
+
 function sourceKey(bookSourceUrl: string): string {
   return SAFE_KEY.test(bookSourceUrl)
     ? bookSourceUrl
@@ -389,10 +393,17 @@ export class ReaderService extends TypertRemoteService {
     const page = typeof args?.page === 'number' && args.page > 0 ? Math.floor(args.page) : 1
     const request = buildExploreRequest(source, categoryUrl, page)
     if (!request) throw new Error('书源没有发现地址')
+    // 分类地址必须随页码变化才可能翻页；否则同一地址会反复返回同一页。
+    const hasPageRule = /\{\{\s*page\s*\}\}/i.test(categoryUrl)
+    const nextRequest = buildExploreRequest(source, categoryUrl, page + 1)
+    const canPaginate = Boolean(hasPageRule && nextRequest && !sameRequest(request, nextRequest))
+    if (page > 1 && !canPaginate) {
+      return { books: [], page, hasMore: false, url: request.url }
+    }
     const raw = await this.fetch(request, source)
     if (raw.status >= 400) throw new Error(`HTTP ${raw.status}`)
     const books = analyzeExplore(raw.text, source, raw.url)
-    return { books, page, hasMore: books.length > 0, url: raw.url }
+    return { books, page, hasMore: books.length > 0 && canPaginate, url: raw.url }
   }
 
   private exploreSource(url: string): BookSource {

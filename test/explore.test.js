@@ -111,6 +111,7 @@ async function startExploreServer() {
     let body = ''
     if (url.pathname === '/cat/xuanhuan') body = page === 1 ? pageHtml([ITEM_1, ITEM_2]) : page === 2 ? pageHtml([ITEM_3]) : ''
     else if (url.pathname === '/cat/dushi') body = page === 1 ? pageHtml([ITEM_2]) : ''
+    else if (url.pathname === '/cat/single') body = pageHtml([ITEM_1])
     else {
       response.writeHead(404)
       response.end('not found')
@@ -190,6 +191,14 @@ async function createService(origin) {
       ruleExplore: exploreRule(),
     },
     {
+      bookSourceUrl: `${origin}/g`,
+      bookSourceName: '单页源',
+      enabled: true,
+      enabledExplore: true,
+      exploreUrl: '单页::/cat/single',
+      ruleExplore: exploreRule(),
+    },
+    {
       bookSourceUrl: `${origin}/f`,
       bookSourceName: '解析失败',
       enabled: true,
@@ -210,10 +219,10 @@ test('发现服务：只列出启用且开启发现且有地址的书源', async
 
   const { sources } = await service.listExploreSources()
   assert.deepEqual(
-    sources.map((source) => source.bookSourceName),
-    ['甲源', '解析失败', '乙源'],
+    sources.map((source) => source.bookSourceName).sort((a, b) => a.localeCompare(b, 'zh')),
+    ['甲源', '解析失败', '乙源', '单页源'].sort((a, b) => a.localeCompare(b, 'zh')),
   )
-  const first = sources[0]
+  const first = sources.find((source) => source.bookSourceName === '甲源')
   assert.equal(first.bookSourceUrl, origin)
   assert.equal(first.bookSourceGroup, '')
   assert.equal(first.bookSourceType, 0)
@@ -285,6 +294,29 @@ test('发现服务：分页加载、绝对地址、origin 与空页 hasMore=fals
   assert.deepEqual(empty.books, [])
 })
 
+test('发现服务：分类地址没有 {{page}} 时不可翻页，第二页返回空且不重发请求', async (t) => {
+  const { server, origin } = await startExploreServer()
+  t.after(() => server.close())
+  const service = await createService(origin)
+
+  const first = await service.exploreBooks({
+    sourceUrl: `${origin}/g`,
+    categoryUrl: `${origin}/cat/single`,
+    page: 1,
+  })
+  assert.equal(first.books.length, 1)
+  assert.equal(first.hasMore, false)
+
+  const second = await service.exploreBooks({
+    sourceUrl: `${origin}/g`,
+    categoryUrl: `${origin}/cat/single`,
+    page: 2,
+  })
+  assert.equal(second.page, 2)
+  assert.deepEqual(second.books, [])
+  assert.equal(second.hasMore, false)
+})
+
 test('发现服务：单源故障只影响该源', async (t) => {
   const { server, origin } = await startExploreServer()
   t.after(() => server.close())
@@ -302,5 +334,8 @@ test('发现服务：单源故障只影响该源', async (t) => {
   )
 
   const { sources } = await service.listExploreSources()
-  assert.deepEqual(sources.map((source) => source.bookSourceName), ['甲源', '解析失败', '乙源'])
+  assert.deepEqual(
+    sources.map((source) => source.bookSourceName).sort((a, b) => a.localeCompare(b, 'zh')),
+    ['甲源', '解析失败', '乙源', '单页源'].sort((a, b) => a.localeCompare(b, 'zh')),
+  )
 })
