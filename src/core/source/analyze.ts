@@ -142,12 +142,15 @@ export interface ChapterContent {
 }
 
 /** 阅读 BookSourceType：0 文本、1 音频、2 图片、3 文件、4 视频。 */
-export function contentKindOf(source: BookSource): ContentKind {
-  const type = Number((source as any).bookSourceType ?? 0)
+export function contentKindOfType(type: number): ContentKind {
   if (type === 1) return 'audio'
   if (type === 2) return 'images'
   if (type === 4) return 'video'
   return 'text'
+}
+
+export function contentKindOf(source: BookSource): ContentKind {
+  return contentKindOfType(Number((source as any).bookSourceType ?? 0))
 }
 
 /**

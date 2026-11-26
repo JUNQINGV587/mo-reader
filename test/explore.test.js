@@ -55,6 +55,31 @@ test('探索解析：@js 抛错或返回空时不产生分类', async () => {
   assert.deepEqual(parseExploreCategories('', BASE), [])
 })
 
+test('发现分组：未分组排最后，组内保持传入顺序', async () => {
+  const { groupExploreBySourceGroup } = await import('../dist/core/source/group.js')
+  const items = [
+    { tag: 'a', source: { bookSourceUrl: 'a', bookSourceGroup: '甲组' } },
+    { tag: 'b', source: { bookSourceUrl: 'b', bookSourceGroup: '' } },
+    { tag: 'c', source: { bookSourceUrl: 'c', bookSourceGroup: '   ' } },
+    { tag: 'd', source: { bookSourceUrl: 'd', bookSourceGroup: ' 甲组 ' } },
+    { tag: 'e', source: { bookSourceUrl: 'e' } },
+    { tag: 'f', source: { bookSourceUrl: 'f', bookSourceGroup: '乙组' } },
+  ]
+  const groups = groupExploreBySourceGroup(items, (item) => item.source.bookSourceGroup)
+  assert.deepEqual(
+    groups.map((group) => group.name),
+    ['甲组', '乙组', '未分组'],
+  )
+  assert.deepEqual(
+    groups[0].items.map((item) => item.tag),
+    ['a', 'd'],
+  )
+  assert.deepEqual(
+    groups[2].items.map((item) => item.tag),
+    ['b', 'c', 'e'],
+  )
+})
+
 /* ---------- 服务层：发现分类 / 分页 / 书目 ---------- */
 
 process.env.MO_READER_INSECURE_ALLOW_PRIVATE = '1'
@@ -211,6 +236,34 @@ async function createService(origin) {
   assert.equal(imported.added, sources.length)
   return service
 }
+
+test('发现服务：按分组/名称排序，未设置发现的书源不列出', async () => {
+  const { ReaderService } = await import('../dist/server/service.js')
+  const service = Object.create(ReaderService.prototype)
+  service.db = { sources: fakeTable() }
+  const records = [
+    { bookSourceUrl: 'http://example.test/1', bookSourceName: '乙源', bookSourceGroup: '甲组', enabled: true, enabledExplore: true, exploreUrl: '分类::/cat' },
+    { bookSourceUrl: 'http://example.test/2', bookSourceName: '甲源', bookSourceGroup: '甲组', enabled: true, enabledExplore: true, exploreUrl: '分类::/cat' },
+    { bookSourceUrl: 'http://example.test/3', bookSourceName: '丙源', bookSourceGroup: '乙组', enabled: true, enabledExplore: true, exploreUrl: '分类::/cat' },
+    { bookSourceUrl: 'http://example.test/4', bookSourceName: '未设置源', bookSourceGroup: '乙组', enabled: true, exploreUrl: '分类::/cat' },
+    { bookSourceUrl: 'http://example.test/5', bookSourceName: '关闭源', bookSourceGroup: '乙组', enabled: true, enabledExplore: false, exploreUrl: '分类::/cat' },
+  ]
+  for (const record of records) await service.db.sources.put(record.bookSourceUrl, record)
+
+  const { sources } = await service.listExploreSources()
+  assert.deepEqual(
+    sources.map((source) => [source.bookSourceGroup, source.bookSourceName]),
+    [
+      ['甲组', '甲源'],
+      ['甲组', '乙源'],
+      ['乙组', '丙源'],
+    ],
+  )
+  await assert.rejects(
+    () => service.getExploreCategories({ sourceUrl: 'http://example.test/4' }),
+    /未开启发现/,
+  )
+})
 
 test('发现服务：只列出启用且开启发现且有地址的书源', async (t) => {
   const { server, origin } = await startExploreServer()

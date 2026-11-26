@@ -246,3 +246,27 @@ test('字典查询：单本失败不影响其他字典（UI 并发契约）', as
   assert.equal(settled[1].status, 'rejected')
   assert.equal(settled[0].value.text, '在线释义')
 })
+
+test('字典排序：交换实际 customOrder，稀疏与缺失时按位置兜底', async () => {
+  const { swapDictOrder } = await import('../dist/core/dict/order.js')
+  assert.deepEqual(swapDictOrder({ customOrder: 6 }, { customOrder: 7 }, 1, 2), {
+    currentOrder: 7,
+    otherOrder: 6,
+  })
+  assert.deepEqual(swapDictOrder({ customOrder: 5 }, { customOrder: 7 }, 0, 2), {
+    currentOrder: 7,
+    otherOrder: 5,
+  })
+  assert.deepEqual(swapDictOrder({}, { customOrder: 7 }, 0, 1), {
+    currentOrder: 2,
+    otherOrder: 1,
+  })
+  assert.deepEqual(swapDictOrder({ customOrder: 5 }, {}, 0, 1), {
+    currentOrder: 2,
+    otherOrder: 1,
+  })
+  assert.deepEqual(swapDictOrder({ customOrder: Number.NaN }, { customOrder: 7 }, 0, 1), {
+    currentOrder: 2,
+    otherOrder: 1,
+  })
+})

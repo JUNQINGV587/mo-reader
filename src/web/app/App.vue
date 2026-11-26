@@ -29,7 +29,9 @@ import {
 } from '../../core/reader/theme'
 import { exportFullShelf, exportLegadoShelf } from '../../core/reader/shelf-transfer'
 import { enabledDictRules, lookupAll, type DictLookupOutcome } from '../../core/dict/lookup-all'
+import { swapDictOrder } from '../../core/dict/order'
 import { filterSources, hasExplore, needsLogin, sourceHost } from '../../core/source/filter'
+import { groupExploreBySourceGroup } from '../../core/source/group'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
@@ -147,6 +149,9 @@ const SEARCH_HISTORY_KEY = 'mo-reader-search-history'
 
 const exploreSources = ref<any[]>([])
 const exploreGroups = ref<Array<{ source: any; categories: any[]; error: string }>>([])
+const exploreSections = computed(() =>
+  groupExploreBySourceGroup(exploreGroups.value, (group) => group.source?.bookSourceGroup),
+)
 const exploreLoading = ref(false)
 const exploreActive = ref<any>(null)
 const exploreBooks = ref<any[]>([])
@@ -712,9 +717,10 @@ async function moveDictRule(rule: any, delta: number) {
   if (index < 0 || target < 0 || target >= list.length) return
   const current = list[index]
   const other = list[target]
+  const swap = swapDictOrder(current, other, index, target)
   try {
-    await call('saveDictRule', { rule: { ...current, customOrder: target + 1 } })
-    await call('saveDictRule', { rule: { ...other, customOrder: index + 1 } })
+    await call('saveDictRule', { rule: { ...current, customOrder: swap.currentOrder } })
+    await call('saveDictRule', { rule: { ...other, customOrder: swap.otherOrder } })
     await loadDictRules()
   } catch (error) {
     dictMessage.value = errorText(error)
@@ -2730,23 +2736,26 @@ onMounted(async () => {
         </div>
 
         <template v-else>
-          <div v-for="group in exploreGroups" :key="group.source.bookSourceUrl" class="mo-explore-group">
-            <div class="mo-explore-head">
-              <h3>{{ group.source.bookSourceName || group.source.bookSourceUrl }}</h3>
-              <span class="muted">{{ group.categories.length }} 个分类</span>
-            </div>
-            <p v-if="group.error" class="muted mo-explore-error">{{ group.error }}</p>
-            <p v-else-if="group.categories.length === 0" class="muted">这个源没有分类</p>
-            <div v-else class="mo-explore-chips">
-              <button
-                v-for="category in group.categories"
-                :key="category.url"
-                class="mo-chip"
-                :class="{ on: isActiveCategory(group, category) }"
-                @click="selectExploreCategory(group, category)"
-              >
-                {{ category.name }}
-              </button>
+          <div v-for="section in exploreSections" :key="section.name" class="mo-explore-section">
+            <h3 class="mo-explore-section-title">{{ section.name }}</h3>
+            <div v-for="group in section.items" :key="group.source.bookSourceUrl" class="mo-explore-group">
+              <div class="mo-explore-head">
+                <h3>{{ group.source.bookSourceName || group.source.bookSourceUrl }}</h3>
+                <span class="muted">{{ group.categories.length }} 个分类</span>
+              </div>
+              <p v-if="group.error" class="muted mo-explore-error">{{ group.error }}</p>
+              <p v-else-if="group.categories.length === 0" class="muted">这个源没有分类</p>
+              <div v-else class="mo-explore-chips">
+                <button
+                  v-for="category in group.categories"
+                  :key="category.url"
+                  class="mo-chip"
+                  :class="{ on: isActiveCategory(group, category) }"
+                  @click="selectExploreCategory(group, category)"
+                >
+                  {{ category.name }}
+                </button>
+              </div>
             </div>
           </div>
 
@@ -3289,7 +3298,7 @@ onMounted(async () => {
               <button v-if="readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-speak" @click="toggleSpeech">{{ speaking ? '暂停' : '朗读' }}</button>
               <button v-if="settings.menuItems.includes('toc')" class="mo-chrome-btn" @click="tocOpen = true">目录</button>
               <button
-                v-if="currentBook?.id && currentBook?.origin !== 'local'"
+                v-if="currentBook && currentBook.origin !== 'local'"
                 class="mo-chrome-btn"
                 data-testid="reader-switch"
                 @click="openSwitchPanel"
@@ -4177,6 +4186,18 @@ onMounted(async () => {
   margin-top: 14px;
   padding-top: 10px;
   border-top: 1px dashed var(--mo-line);
+}
+.mo-explore-section {
+  padding-top: 14px;
+}
+.mo-explore-section:first-child {
+  padding-top: 0;
+}
+.mo-explore-section-title {
+  margin: 0;
+  font: 600 13px/1.4 -apple-system, 'Noto Sans SC', 'PingFang SC', sans-serif;
+  color: var(--mo-ink-3);
+  letter-spacing: 0.04em;
 }
 .mo-explore-group {
   padding: 12px 0;
