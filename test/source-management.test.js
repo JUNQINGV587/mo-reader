@@ -383,3 +383,25 @@ test('在线检查：并发上限 8 且按输入顺序返回', async (t) => {
   assert.ok(elapsed >= 180, `总耗时 ${elapsed}ms 应有第二批`)
   assert.ok(elapsed < 1000, `总耗时 ${elapsed}ms 应远小于串行`)
 })
+
+test('在线检查：重定向到私网时逐跳复检，第二跳不发起请求', async () => {
+  delete process.env.MO_READER_INSECURE_ALLOW_PRIVATE
+  const calls = []
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    calls.push(String(url))
+    return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:9/secret' } })
+  }
+  try {
+    const { fetchText } = await import('../dist/core/net/http.js')
+    const { UnsafeUrlError } = await import('../dist/core/net/guard.js')
+    await assert.rejects(
+      fetchText('http://[2606:4700:4700::1111]/'),
+      (error) => error instanceof UnsafeUrlError && /禁止访问本机\/内网地址/.test(error.message),
+    )
+    // 首跳公网地址发出一次请求；第二跳在发请求前被守卫拦下。
+    assert.equal(calls.length, 1)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
