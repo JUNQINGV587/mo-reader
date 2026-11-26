@@ -57,14 +57,14 @@ function stringArg(args: Args, name: string): string {
 
 const SAFE_KEY = /^[a-z][a-z0-9_-]+$/
 
-/**
- * 存储的 per-record key 只能是路径安全的小写串；书源的 bookSourceUrl
- * 常是完整 URL，用 sha1 生成稳定 key，兼容旧数据里本身就是安全串的 key。
- */
 function sameRequest(a: RequestSpec, b: RequestSpec): boolean {
   return a.url === b.url && a.method === b.method && (a.body ?? '') === (b.body ?? '')
 }
 
+/**
+ * 存储的 per-record key 只能是路径安全的小写串；书源的 bookSourceUrl
+ * 常是完整 URL，用 sha1 生成稳定 key，兼容旧数据里本身就是安全串的 key。
+ */
 function sourceKey(bookSourceUrl: string): string {
   return SAFE_KEY.test(bookSourceUrl)
     ? bookSourceUrl
