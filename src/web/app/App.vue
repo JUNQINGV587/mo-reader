@@ -540,6 +540,129 @@ async function exportBook(format: 'txt' | 'epub') {
   }
 }
 
+const exportJob = ref<any>(null)
+const exportDownload = ref<{ url: string; fileName: string } | null>(null)
+let exportTimer: ReturnType<typeof setInterval> | null = null
+
+function isExportRunning(job: any) {
+  return job?.status === 'running' || job?.status === 'queued'
+}
+
+function exportStatusText(job: any) {
+  if (!job) return ''
+  if (job.status === 'paused') return job.error === '宿主重启' ? '已暂停（宿主重启）' : '已暂停'
+  if (job.status === 'queued') return '排队中'
+  if (job.status === 'running') return '导出中'
+  if (job.status === 'done') return '已完成'
+  if (job.status === 'cancelled') return '已取消'
+  return job.status === 'failed' ? '失败' : String(job.status)
+}
+
+function exportPercent(job: any) {
+  const total = Number(job?.total) || 0
+  if (!total) return 0
+  const handled = Number(job.completed) + Number(job.failed) + Number(job.skipped)
+  return Math.max(0, Math.min(100, Math.round((handled / total) * 100)))
+}
+
+function stopExportTimer() {
+  if (exportTimer !== null) {
+    clearInterval(exportTimer)
+    exportTimer = null
+  }
+}
+
+function syncExportTimer() {
+  if (isExportRunning(exportJob.value)) {
+    if (exportTimer === null) exportTimer = setInterval(refreshExportJob, 600)
+  } else {
+    stopExportTimer()
+  }
+}
+
+async function loadExportDownload() {
+  const job = exportJob.value
+  if (!job?.id || job.status !== 'done') {
+    exportDownload.value = null
+    return
+  }
+  try {
+    const result: any = await call('getExportDownload', { jobId: job.id })
+    exportDownload.value = { url: String(result?.url ?? ''), fileName: String(result?.fileName ?? '') }
+  } catch (error) {
+    exportDownload.value = null
+    status.value = errorText(error)
+  }
+}
+
+async function refreshExportJob() {
+  const job = exportJob.value
+  if (!job?.id) return
+  try {
+    const result: any = await call('getJob', { id: job.id })
+    exportJob.value = result?.job ?? exportJob.value
+  } catch (error) {
+    status.value = errorText(error)
+  }
+  if (exportJob.value?.status === 'done') await loadExportDownload()
+  syncExportTimer()
+}
+
+async function loadActiveExport() {
+  exportJob.value = null
+  exportDownload.value = null
+  exportBusy.value = false
+  const book = currentBook.value as any
+  if (!book?.id) {
+    stopExportTimer()
+    return
+  }
+  try {
+    const result: any = await call('listJobs', { bookId: book.id, kind: 'export' })
+    const jobs: any[] = Array.isArray(result?.jobs) ? result.jobs : []
+    const active = jobs.find((job) => ['queued', 'running', 'paused'].includes(job.status))
+    exportJob.value = active ?? jobs[0] ?? null
+  } catch {
+    exportJob.value = null
+  }
+  if (exportJob.value?.status === 'done') await loadExportDownload()
+  syncExportTimer()
+}
+
+async function startExport() {
+  const book = currentBook.value as any
+  if (!book?.id) return
+  exportBusy.value = true
+  exportDownload.value = null
+  try {
+    const result: any = await call('startExport', { bookId: book.id, format: 'txt' })
+    exportJob.value = result?.job ?? null
+    status.value = result?.existing ? '已有进行中的导出' : '已开始导出'
+    syncExportTimer()
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    exportBusy.value = false
+  }
+}
+
+async function cancelExport() {
+  const job = exportJob.value
+  if (!job?.id) return
+  exportBusy.value = true
+  try {
+    const result: any = await call('cancelJob', { id: job.id })
+    exportJob.value = result?.job ?? exportJob.value
+    exportDownload.value = null
+    status.value = '已取消导出'
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    exportBusy.value = false
+    syncExportTimer()
+  }
+}
+
 
 type DownloadScope = 'rest' | 'all' | 'range'
 const downloadScope = ref<DownloadScope>('rest')
@@ -736,11 +859,19 @@ function retryDownload() {
 }
 
 watch(view, (next) => {
-  if (next === 'detail') void loadActiveDownload()
-  else stopDownloadTimer()
+  if (next === 'detail') {
+    void loadActiveDownload()
+    void loadActiveExport()
+  } else {
+    stopDownloadTimer()
+    stopExportTimer()
+  }
 })
 
-onUnmounted(stopDownloadTimer)
+onUnmounted(() => {
+  stopDownloadTimer()
+  stopExportTimer()
+})
 
 const reviewOpen = ref(false)
 const reviewBusy = ref(false)
@@ -3058,7 +3189,14 @@ onMounted(async () => {
               </button>
               <button class="mo-btn" data-testid="simulate" @click="openSimulate">模拟阅读</button>
               <button class="mo-btn" :disabled="cacheBusy" data-testid="cache-book" @click="cacheBookChapters">{{ cacheBusy ? '缓存中…' : '缓存 20 章' }}</button>
-              <button class="mo-btn" :disabled="exportBusy" data-testid="export-book" @click="exportBook('txt')">{{ exportBusy ? '导出中…' : '导出 TXT' }}</button>
+              <button
+                class="mo-btn"
+                :disabled="exportBusy || isExportRunning(exportJob)"
+                data-testid="export-start"
+                @click="startExport"
+              >
+                {{ isExportRunning(exportJob) ? '导出中…' : '导出 TXT' }}
+              </button>
               <button class="mo-btn" :disabled="exportBusy" data-testid="export-epub" @click="exportBook('epub')">{{ exportBusy ? '导出中…' : '导出 EPUB' }}</button>
               <span v-if="currentBook.simulateEnabled" class="mo-tag soft">模拟至 {{ simulatedChapterCount(currentBook) }} 章</span>
               <span v-if="progress" class="muted">
@@ -3164,6 +3302,49 @@ onMounted(async () => {
               @click="retryDownload"
             >
               重试失败章
+            </button>
+          </div>
+        </div>
+
+        <div v-if="currentBook.origin !== 'local'" class="mo-download" data-testid="export-panel">
+          <div class="mo-download-head">
+            <h3>导出全本</h3>
+            <span v-if="exportJob" class="mo-tag" data-testid="export-status">{{ exportStatusText(exportJob) }}</span>
+          </div>
+          <p class="mo-download-summary">导出 TXT 全本，目录多少章都导完；生成的文件保留 24 小时。</p>
+          <div v-if="exportJob" class="mo-download-progress">
+            <span class="mo-download-bar"><span :style="{ width: `${exportPercent(exportJob)}%` }" /></span>
+            <span>已完成 {{ exportJob.completed }} / {{ exportJob.total }} 章</span>
+            <span>失败 {{ exportJob.failed }}</span>
+            <span>{{ formatBytes(exportJob.bytes) }}</span>
+          </div>
+          <p v-if="exportJob?.error && exportJob.status !== 'paused'" class="muted">{{ exportJob.error }}</p>
+          <div v-if="exportJob" class="mo-download-actions">
+            <a
+              v-if="exportDownload?.url"
+              class="mo-btn primary"
+              data-testid="export-download"
+              :href="exportDownload.url"
+              :download="exportDownload.fileName"
+            >
+              下载文件
+            </a>
+            <button
+              v-if="['queued', 'running', 'paused'].includes(exportJob.status)"
+              class="mo-btn danger"
+              data-testid="export-cancel"
+              :disabled="exportBusy"
+              @click="cancelExport"
+            >
+              取消
+            </button>
+            <button
+              v-if="!isExportRunning(exportJob) && exportJob.status !== 'done'"
+              class="mo-btn"
+              :disabled="exportBusy"
+              @click="startExport"
+            >
+              重新导出
             </button>
           </div>
         </div>

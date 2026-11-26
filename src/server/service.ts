@@ -44,6 +44,17 @@ import {
   type DownloadHost,
 } from './download.js'
 import { buildEpub } from './epub-export.js'
+import {
+  EXPORT_KIND,
+  ExportCoordinator,
+  cleanupExpiredExports,
+  contentTypeOf,
+  exportArtifactExists,
+  exportRoot,
+  type ExportFormat,
+  type ExportHost,
+} from './exports.js'
+import { EXPORT_ROUTE_PATH, registerArtifactRoute, type ArtifactDescriptor } from './routes.js'
 import { listCustomFonts, readCustomFont, removeCustomFont, saveCustomFont } from './fonts.js'
 import { isKnownTheme, normalizeCustomThemes } from '../core/reader/theme.js'
 import { parseShelfImport, shelfDedupKeys } from '../core/reader/shelf-transfer.js'
@@ -167,6 +178,9 @@ export class ReaderService extends TypertRemoteService {
   /** 下载作业协调器，按需创建；测试可直接改 downloadRetryBaseMs 缩短重试间隔。 */
   downloadsCoordinator: DownloadCoordinator | null = null
 
+  /** 导出作业协调器，按需创建；产物落导出目录并由受保护路由下发。 */
+  exportsCoordinator: ExportCoordinator | null = null
+
   downloadRetryBaseMs = DEFAULT_RETRY_BASE_MS
 
   constructor(ctx: any, _options: any = {}) {
@@ -193,9 +207,21 @@ export class ReaderService extends TypertRemoteService {
     } catch {
       // 作业恢复失败不应阻止服务启动。
     }
+    // 导出产物只保留 24 小时：启动时扫一次，导出前再顺带清（不启定时器）。
+    try {
+      await cleanupExpiredExports(this.db.jobs)
+    } catch {
+      // 清理失败不影响启动。
+    }
+    this.registerExportRoute()
     const ctx = this.ctx as any
     ctx.effect(
       () => async () => {
+        try {
+          await this.exportsCoordinator?.shutdown()
+        } finally {
+          this.exportsCoordinator = null
+        }
         try {
           await this.downloadsCoordinator?.shutdown()
         } finally {
@@ -939,38 +965,58 @@ export class ReaderService extends TypertRemoteService {
   }
 
   async pauseJob(args: Args) {
-    return this.downloadManager().pause(stringArg(args, 'id'))
+    const id = stringArg(args, 'id')
+    return this.jobKindIsExport(id) ? this.exportManager().pause(id) : this.downloadManager().pause(id)
   }
 
   async resumeJob(args: Args) {
-    return this.downloadManager().resume(stringArg(args, 'id'))
+    const id = stringArg(args, 'id')
+    return this.jobKindIsExport(id) ? this.exportManager().resume(id) : this.downloadManager().resume(id)
   }
 
+  /** 取消对下载、导出两种作业通用：按 jobs 表里的 kind 分派给对应协调器。 */
   async cancelJob(args: Args) {
-    return this.downloadManager().cancel(stringArg(args, 'id'))
+    const id = stringArg(args, 'id')
+    return this.jobKindIsExport(id) ? this.exportManager().cancel(id) : this.downloadManager().cancel(id)
   }
 
   async retryDownload(args: Args) {
-    return this.downloadManager().retry(stringArg(args, 'id'))
+    const id = stringArg(args, 'id')
+    return this.jobKindIsExport(id) ? this.exportManager().retry(id) : this.downloadManager().retry(id)
   }
 
   async getJob(args: Args) {
-    return this.downloadManager().get(stringArg(args, 'id'))
+    const id = stringArg(args, 'id')
+    const live = this.exportsCoordinator?.peek(id)
+    if (live) return { job: { ...live } }
+    return this.downloadManager().get(id)
   }
 
   async listJobs(args: Args) {
+    const filter = {
+      bookId: typeof args?.bookId === 'string' ? args.bookId : undefined,
+      kind: typeof args?.kind === 'string' ? args.kind : undefined,
+      status: typeof args?.status === 'string' ? args.status : undefined,
+    }
+    // 两个协调器各自的实时进度合并展示；同一作业以导出协调器（更新更实时）为准。
+    const merged = new Map<string, { id: string; updatedAt?: number }>()
+    for (const job of this.downloadManager().list(filter)) merged.set(job.id, job)
+    for (const job of this.exportsCoordinator?.list(filter) ?? []) merged.set(job.id, job)
     return {
-      jobs: this.downloadManager().list({
-        bookId: typeof args?.bookId === 'string' ? args.bookId : undefined,
-        kind: typeof args?.kind === 'string' ? args.kind : undefined,
-        status: typeof args?.status === 'string' ? args.status : undefined,
-      }),
+      jobs: [...merged.values()].sort(
+        (left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0),
+      ),
     }
   }
 
   /** 测试/关停用：等待所有下载协程收尾。 */
   async waitForDownloads() {
     await this.downloadManager().waitIdle()
+  }
+
+  /** 测试/关停用：等待所有导出协程收尾。 */
+  async waitForExports() {
+    await this.exportsCoordinator?.waitIdle()
   }
 
   /** 按书聚合下载结果：书架/详情只调一次就能显示进度、体积与当前作业。 */
@@ -1090,6 +1136,31 @@ export class ReaderService extends TypertRemoteService {
       chapters: parts.length,
       format: 'txt',
       dataBase64: Buffer.from(body, 'utf8').toString('base64'),
+    }
+  }
+
+  /**
+   * 发起全本 TXT 导出：不截断目录，缓存优先、未缓存的在线抓，单章失败只计失败。
+   * 同一本书同一格式同时只保留一个活动作业。
+   */
+  async startExport(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const format = String(args?.format ?? 'txt').trim().toLowerCase()
+    if (format !== 'txt') throw new Error('暂只支持 TXT 导出')
+    return this.exportManager().start(bookId, format as ExportFormat)
+  }
+
+  /** 导出完成后的受保护下载地址；产物超过 24 小时按不可用处理。 */
+  async getExportDownload(args: Args) {
+    const jobId = stringArg(args, 'jobId')
+    const record = this.requireDb().jobs.get(jobId) as Record<string, unknown> | undefined
+    if (!record || record.kind !== EXPORT_KIND) throw new Error('作业不存在')
+    if (record.status !== 'done') throw new Error('导出尚未完成')
+    const filePath = String(record.filePath ?? '')
+    if (!filePath || !(await exportArtifactExists(filePath))) throw new Error('导出文件已过期')
+    return {
+      url: this.exportDownloadUrl(jobId),
+      fileName: String(record.fileName || `导出.${String(record.format || 'txt')}`),
     }
   }
 
@@ -1558,6 +1629,105 @@ export class ReaderService extends TypertRemoteService {
       await this.requireDb().settings.set({ ...current, fontId: '' })
     }
     return result
+  }
+
+  private exportManager(): ExportCoordinator {
+    if (!this.exportsCoordinator) {
+      this.exportsCoordinator = new ExportCoordinator(this.exportHost())
+    }
+    return this.exportsCoordinator
+  }
+
+  private exportHost(): ExportHost {
+    return {
+      db: () => this.requireDb(),
+      loadToc: async (book) => {
+        const toc = await (this as any).getToc({
+          tocUrl: String(book.tocUrl || book.bookUrl || ''),
+          sourceUrl: String(book.origin || ''),
+        })
+        return (toc?.chapters ?? []) as Array<{ title?: string; url?: string; isVolume?: boolean }>
+      },
+      readChapter: async (book, chapterIndex, chapter) => {
+        const sourceUrl = String(book.origin || '')
+        const chapterUrl = String(chapter.url || '')
+        // 缓存优先：已下载过的章节直接拼进导出文件，不再走网络。
+        const cached = await readCachedChapter(sourceUrl, chapterUrl)
+        if (cached) return cached
+        const content = await (this as any).getContent({
+          sourceUrl,
+          chapterUrl,
+          bookId: String(book.id || ''),
+          chapterIndex,
+          chapterTitle: chapter.title ?? '',
+        })
+        if (content?.kind && content.kind !== 'text') throw new Error('章节不是文本')
+        const text = String(content?.content ?? '')
+        if (!text.trim()) throw new Error('章节正文为空')
+        return text
+      },
+    }
+  }
+
+  private jobKindIsExport(id: string): boolean {
+    if (this.exportsCoordinator?.peek(id)) return true
+    const record = this.db?.jobs?.get?.(id) as Record<string, unknown> | undefined
+    return record?.kind === EXPORT_KIND
+  }
+
+  /** 受保护路由的产物定位：只认 jobs 表里 kind=export 且 status=done 的那条记录。 */
+  private async locateExportArtifact(jobId: string): Promise<ArtifactDescriptor | null> {
+    const jobs = this.db?.jobs
+    if (!jobs || typeof jobs.get !== 'function') return null
+    const record = jobs.get(jobId) as Record<string, unknown> | undefined
+    if (!record || record.kind !== EXPORT_KIND) return null
+    if (record.status !== 'done') return null
+    const filePath = String(record.filePath ?? '')
+    if (!filePath) return null
+    const format = String(record.format ?? 'txt')
+    return {
+      filePath,
+      fileName: String(record.fileName || `导出.${format}`),
+      contentType: contentTypeOf(format),
+    }
+  }
+
+  private exportDownloadUrl(jobId: string): string {
+    let origin = ''
+    try {
+      const value = (this.ctx as any)?.webServer?.getOrigin?.()
+      if (typeof value === 'string') origin = value.replace(/\/+$/, '')
+    } catch {
+      // 宿主还没监听时退回相对地址，页面内照样能下载。
+    }
+    return `${origin}${EXPORT_ROUTE_PATH}/${encodeURIComponent(jobId)}`
+  }
+
+  /** 宿主存在 webServer 时才注册下载路由，并随服务销毁释放。 */
+  private registerExportRoute(): void {
+    const ctx = this.ctx as any
+    if (typeof ctx?.inject !== 'function') return
+    ctx.inject(['webServer'], (webCtx: any) => {
+      const webServer = webCtx?.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+      if (typeof webCtx.effect !== 'function') return
+      webCtx.effect(
+        () => {
+          try {
+            return registerArtifactRoute(webServer, {
+              path: EXPORT_ROUTE_PATH,
+              auth: 'required',
+              root: () => exportRoot(),
+              locate: (jobId: string) => this.locateExportArtifact(jobId),
+            })
+          } catch {
+            // 同一宿主里已经注册过同路径路由时不重复注册，也不让启动失败。
+            return () => {}
+          }
+        },
+        'reader: export download route',
+      )
+    })
   }
 
   private downloadManager(): DownloadCoordinator {

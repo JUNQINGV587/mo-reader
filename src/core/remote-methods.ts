@@ -38,6 +38,8 @@ export const REMOTE_METHODS = Object.freeze([
   'deleteDownloads',
   'clearDownloads',
   'exportBook',
+  'startExport',
+  'getExportDownload',
   'debugSource',
   'addBook',
   'importLocalBook',

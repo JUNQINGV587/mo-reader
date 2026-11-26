@@ -1,0 +1,480 @@
+import { randomUUID } from 'node:crypto'
+import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { ChapterLimiter, isActiveJob, type JobStatus } from './download.js'
+
+/** 导出作业的 kind：与下载作业共用 jobs 表，靠它区分。 */
+export const EXPORT_KIND = 'export'
+/** 产物保留 24 小时，过期在服务启动时与每次导出前清理。 */
+export const EXPORT_TTL_MS = 24 * 60 * 60 * 1000
+/** 导出并发：与下载共用上限思路，单源更保守。 */
+export const EXPORT_CONCURRENCY = 4
+export const EXPORT_SOURCE_CONCURRENCY = 2
+/** 进度落盘的节流窗口；没有定时器，只在章节收尾时按需写一次。 */
+export const EXPORT_FLUSH_MS = 500
+
+export type ExportFormat = 'txt'
+
+export interface ExportJob {
+  id: string
+  kind: string
+  bookId: string
+  bookName: string
+  status: JobStatus
+  format: ExportFormat
+  /** 浏览器下载时展示的文件名，不含路径。 */
+  fileName: string
+  /** 相对导出目录的文件名，受保护路由只认它；未完成时为空。 */
+  filePath: string
+  /** 产物字节数；导出过程中是已拼正文的累计字节。 */
+  size: number
+  /** 字体预留字段：#107 起排版类导出按它取字体。 */
+  fontId: string
+  fromIndex: number
+  toIndex: number
+  all: boolean
+  total: number
+  completed: number
+  failed: number
+  skipped: number
+  bytes: number
+  error: string
+  createdAt: number
+  updatedAt: number
+}
+
+export interface ExportChapter {
+  title?: string
+  url?: string
+  isVolume?: boolean
+}
+
+export interface ExportHost {
+  db(): any
+  loadToc(book: Record<string, unknown>): Promise<ExportChapter[]>
+  /** 取一章正文：缓存优先，未缓存时在线抓取；非文本或空正文应抛错，由协调器计失败。 */
+  readChapter(book: Record<string, unknown>, chapterIndex: number, chapter: ExportChapter): Promise<string>
+}
+
+export interface ExportListFilter {
+  bookId?: string
+  kind?: string
+  status?: string
+}
+
+/** 导出目录：环境变量优先，默认与文字缓存并列放在读者数据目录下。 */
+export function exportRoot(): string {
+  const configured = process.env.MO_READER_EXPORT_ROOT
+  if (configured && configured.trim()) return configured.trim()
+  return join(homedir(), '.dsh', 'reader', 'exports')
+}
+
+export async function ensureExportRoot(): Promise<string> {
+  const root = exportRoot()
+  await mkdir(root, { recursive: true })
+  return root
+}
+
+/** 产物落在导出目录里的唯一文件名（只含巴斯名，路由据此做穿越检查）。 */
+export function exportArtifactName(jobId: string, format: ExportFormat): string {
+  return `${jobId}.${format}`
+}
+
+/** 浏览器下载名：去掉路径分隔符与非法字符，保留中文书名。 */
+export function exportFileName(bookName: string, format: ExportFormat): string {
+  const cleaned = String(bookName || '')
+    .replace(/[\\/:*?"<>|]/g, ' ')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\.+/, '')
+  const base = (cleaned || '未命名').slice(0, 80)
+  return `${base}.${format}`
+}
+
+export function contentTypeOf(format: string): string {
+  return format === 'txt' ? 'text/plain; charset=utf-8' : 'application/octet-stream'
+}
+
+/** 产物文件名必须是导出目录下的单段文件名，任何分隔符都视为非法。 */
+export function isArtifactFileName(filePath: string): boolean {
+  if (!filePath || filePath === '.' || filePath === '..') return false
+  if (filePath.includes('/') || filePath.includes('\\') || filePath.includes('\0')) return false
+  if (filePath.length > 200) return false
+  return /^[0-9a-zA-Z._-]+$/.test(filePath)
+}
+
+export async function exportArtifactExists(filePath: string): Promise<boolean> {
+  if (!isArtifactFileName(filePath)) return false
+  try {
+    const info = await stat(join(exportRoot(), filePath))
+    return info.isFile()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 清掉过期产物与过期作业记录（已完成/失败/取消且超过 24 小时）。
+ * 由服务 init 调一次、每次导出前再调一次；不启后台定时器，不拖住宿主退出。
+ */
+export async function cleanupExpiredExports(jobs?: any, now = Date.now()): Promise<{ files: number; jobs: number }> {
+  const cutoff = now - EXPORT_TTL_MS
+  let files = 0
+  let removedJobs = 0
+  try {
+    const root = exportRoot()
+    const entries = await readdir(root)
+    for (const name of entries) {
+      const target = join(root, name)
+      try {
+        const info = await stat(target)
+        if (info.mtimeMs >= cutoff) continue
+        await rm(target, { recursive: true, force: true })
+        files += 1
+      } catch {
+        // 单个产物删不掉不影响其余清理。
+      }
+    }
+  } catch {
+    // 还没导出过：目录不存在，无需清理。
+  }
+  if (jobs && typeof jobs.entries === 'function') {
+    const expired: string[] = []
+    for (const [id, record] of jobs.entries()) {
+      const job = record as ExportJob
+      if (job?.kind !== EXPORT_KIND) continue
+      if (isActiveJob(job.status)) continue
+      if (Number(job.updatedAt ?? 0) >= cutoff) continue
+      expired.push(id)
+    }
+    for (const id of expired) {
+      try {
+        await jobs.delete(id)
+        removedJobs += 1
+      } catch {
+        // 作业记录删不掉就留给下一轮清理。
+      }
+    }
+  }
+  return { files, jobs: removedJobs }
+}
+
+export class ExportCoordinator {
+  private readonly live = new Map<string, ExportJob>()
+  private readonly runners = new Map<string, Promise<void>>()
+  private readonly lastPut = new Map<string, number>()
+
+  constructor(private readonly host: ExportHost) {}
+
+  async start(bookId: string, format: ExportFormat): Promise<{ job: ExportJob; existing: boolean }> {
+    const db = this.host.db()
+    const book = db.books.get(bookId) as Record<string, unknown> | undefined
+    if (!book) throw new Error('书不存在')
+    const existing = this.findActive(bookId, format)
+    if (existing) return { job: { ...existing }, existing: true }
+    // 顺手清理过期产物：不需要额外定时器，导出频率就是清理频率。
+    try {
+      await cleanupExpiredExports(db.jobs)
+    } catch {
+      // 清理失败不影响本次导出。
+    }
+    const now = Date.now()
+    const job: ExportJob = {
+      id: randomUUID(),
+      kind: EXPORT_KIND,
+      bookId,
+      bookName: String(book.name ?? ''),
+      status: 'queued',
+      format,
+      fileName: exportFileName(String(book.name ?? ''), format),
+      filePath: '',
+      size: 0,
+      fontId: '',
+      fromIndex: 0,
+      toIndex: 0,
+      all: true,
+      total: 0,
+      completed: 0,
+      failed: 0,
+      skipped: 0,
+      bytes: 0,
+      error: '',
+      createdAt: now,
+      updatedAt: now,
+    }
+    this.live.set(job.id, job)
+    await this.put(job)
+    this.launch(job.id)
+    return { job: { ...job }, existing: false }
+  }
+
+  async pause(id: string) {
+    return this.stop(id, 'paused')
+  }
+
+  async cancel(id: string) {
+    return this.stop(id, 'cancelled')
+  }
+
+  async resume(id: string) {
+    return this.restart(id)
+  }
+
+  async retry(id: string) {
+    return this.restart(id)
+  }
+
+  /** 运行中的内存快照；finished 后会从内存移除，故返回 undefined。 */
+  peek(id: string): ExportJob | undefined {
+    return this.live.get(id)
+  }
+
+  get(id: string) {
+    return { job: { ...this.requireJob(id) } }
+  }
+
+  list(filter: ExportListFilter = {}): ExportJob[] {
+    const jobs: ExportJob[] = []
+    for (const [id, record] of this.host.db().jobs.entries()) {
+      const job = (this.live.get(id) ?? record) as ExportJob
+      if (job?.kind !== EXPORT_KIND) continue
+      if (filter.bookId && job.bookId !== filter.bookId) continue
+      if (filter.kind && filter.kind !== EXPORT_KIND) continue
+      if (filter.status && job.status !== filter.status) continue
+      jobs.push({ ...job })
+    }
+    jobs.sort((left, right) => (Number(right.updatedAt) || 0) - (Number(left.updatedAt) || 0))
+    return jobs
+  }
+
+  async waitIdle(): Promise<void> {
+    while (this.runners.size) {
+      await Promise.allSettled([...this.runners.values()])
+    }
+  }
+
+  /** 服务关闭：把还在跑或排队的作业标为暂停，落盘并等待协程收尾。 */
+  async shutdown(): Promise<void> {
+    const now = Date.now()
+    for (const job of this.live.values()) {
+      if (job.status !== 'running' && job.status !== 'queued') continue
+      job.status = 'paused'
+      job.error = '宿主重启'
+      job.updatedAt = now
+      await this.put(job)
+    }
+    await this.waitIdle()
+  }
+
+  private async stop(id: string, status: 'paused' | 'cancelled') {
+    const job = this.requireJob(id)
+    if (!isActiveJob(job.status) || job.status === status) return { job: { ...job } }
+    job.status = status
+    job.updatedAt = Date.now()
+    if (status === 'cancelled') await this.removeArtifactFile(job)
+    await this.put(job)
+    return { job: { ...job } }
+  }
+
+  private async restart(id: string) {
+    const job = this.requireJob(id)
+    if (job.status === 'running' || job.status === 'queued') return { job: { ...job } }
+    const runner = this.runners.get(id)
+    if (runner) await runner.catch(() => {})
+    const current = this.requireJob(id)
+    current.status = 'queued'
+    current.error = ''
+    current.updatedAt = Date.now()
+    await this.put(current)
+    this.launch(id)
+    return { job: { ...current } }
+  }
+
+  private requireJob(id: string): ExportJob {
+    const existing = this.live.get(id) ?? (this.host.db().jobs.get(id) as ExportJob | undefined)
+    if (!existing) throw new Error('作业不存在')
+    if (existing.kind !== EXPORT_KIND) throw new Error('作业不是导出作业')
+    this.live.set(id, existing)
+    return existing
+  }
+
+  private findActive(bookId: string, format: ExportFormat): ExportJob | undefined {
+    const candidates: ExportJob[] = []
+    for (const [id, record] of this.host.db().jobs.entries()) {
+      const job = (this.live.get(id) ?? record) as ExportJob
+      if (job?.kind !== EXPORT_KIND || job.bookId !== bookId) continue
+      if (String(job.format ?? 'txt') !== format) continue
+      if (isActiveJob(job.status)) candidates.push(job)
+    }
+    return candidates[0]
+  }
+
+  private launch(id: string): void {
+    if (this.runners.has(id)) return
+    const runner = this.run(id)
+      .catch(() => {})
+      .finally(() => {
+        if (this.runners.get(id) === runner) this.runners.delete(id)
+      })
+    this.runners.set(id, runner)
+  }
+
+  private async run(id: string): Promise<void> {
+    const job = this.live.get(id)
+    if (!job || job.status !== 'queued') return
+    const db = this.host.db()
+    const book = db.books.get(job.bookId) as Record<string, unknown> | undefined
+    if (!book) {
+      await this.finish(job, 'failed', '书不存在')
+      return
+    }
+    let chapters: ExportChapter[]
+    try {
+      chapters = await this.host.loadToc(book)
+    } catch (error) {
+      await this.finish(job, 'failed', errorMessage(error))
+      return
+    }
+    // 重新开始（继续/重试）时先删掉上一次的产物，避免新旧内容混淆。
+    await this.removeArtifactFile(job)
+    job.status = 'running'
+    job.error = ''
+    job.total = chapters.length
+    job.fromIndex = 0
+    job.toIndex = Math.max(0, chapters.length - 1)
+    job.completed = 0
+    job.failed = 0
+    job.skipped = 0
+    job.bytes = 0
+    job.updatedAt = Date.now()
+    await this.put(job)
+
+    const sourceUrl = String(book.origin ?? '')
+    const limiter = new ChapterLimiter(EXPORT_CONCURRENCY, EXPORT_SOURCE_CONCURRENCY)
+    const texts: Array<{ title: string; text: string } | null> = new Array(chapters.length).fill(null)
+    let nextIndex = 0
+    const worker = async (): Promise<void> => {
+      while (true) {
+        if (job.status !== 'running') return
+        const index = nextIndex
+        nextIndex += 1
+        if (index >= chapters.length) return
+        const chapter = chapters[index]!
+        if (!chapter || chapter.isVolume || !chapter.url) {
+          job.skipped += 1
+          await this.progress(job)
+          continue
+        }
+        await limiter.acquire(sourceUrl)
+        try {
+          if (job.status !== 'running') return
+          const text = await this.host.readChapter(book, index, chapter)
+          if (job.status !== 'running') return
+          texts[index] = { title: String(chapter.title ?? ''), text }
+          job.completed += 1
+          job.bytes += Buffer.byteLength(text, 'utf8')
+        } catch {
+          // 单章失败只计数，不中止整本导出。
+          job.failed += 1
+        } finally {
+          limiter.release(sourceUrl)
+        }
+        await this.progress(job)
+      }
+    }
+    const workers: Array<Promise<void>> = []
+    const workerCount = Math.max(1, Math.min(EXPORT_CONCURRENCY, Math.max(1, chapters.length)))
+    for (let index = 0; index < workerCount; index += 1) workers.push(worker())
+    try {
+      await Promise.all(workers)
+      if (job.status === 'running') await this.assemble(job, book, texts)
+    } catch (error) {
+      if (job.status === 'running') {
+        job.status = 'failed'
+        job.error = errorMessage(error)
+      }
+    }
+    await this.finish(job)
+  }
+
+  /** 按目录顺序拼接正文并落盘；格式与旧 exportBook 的 TXT 产物保持一致。 */
+  private async assemble(
+    job: ExportJob,
+    book: Record<string, unknown>,
+    texts: Array<{ title: string; text: string } | null>,
+  ): Promise<void> {
+    const parts: string[] = []
+    for (const entry of texts) {
+      if (!entry) continue
+      const title = entry.title || `第${parts.length + 1}章`
+      parts.push(`${title}\n\n${entry.text}`)
+    }
+    if (!parts.length) {
+      job.status = 'failed'
+      job.error = job.failed > 0 ? '全部章节导出失败' : '没有可导出的章节'
+      return
+    }
+    const body = `${String(book.name || '未命名')}\n作者：${String(book.author || '')}\n\n${parts.join('\n\n')}`
+    const root = await ensureExportRoot()
+    const relative = exportArtifactName(job.id, job.format)
+    const absolute = join(root, relative)
+    await writeFile(absolute, body, 'utf8')
+    const info = await stat(absolute)
+    job.filePath = relative
+    job.fileName = exportFileName(String(book.name || ''), job.format)
+    job.size = info.size
+    job.bytes = info.size
+    job.status = 'done'
+    job.error = ''
+  }
+
+  private async finish(job: ExportJob, status?: JobStatus, error?: string): Promise<void> {
+    if (status) {
+      job.status = status
+      if (error !== undefined) job.error = error
+    }
+    if (job.status === 'running') {
+      job.status = 'failed'
+      job.error = job.error || '导出未完成'
+    }
+    job.updatedAt = Date.now()
+    await this.put(job)
+    this.live.delete(job.id)
+    this.lastPut.delete(job.id)
+  }
+
+  private async progress(job: ExportJob): Promise<void> {
+    const last = this.lastPut.get(job.id) ?? 0
+    if (Date.now() - last < EXPORT_FLUSH_MS) return
+    job.updatedAt = Date.now()
+    await this.put(job)
+  }
+
+  private async put(job: ExportJob): Promise<void> {
+    this.lastPut.set(job.id, Date.now())
+    try {
+      await this.host.db().jobs.put(job.id, { ...job })
+    } catch {
+      // 进度落盘失败不打断导出，下一次落盘会带上最新进度。
+    }
+  }
+
+  private async removeArtifactFile(job: ExportJob): Promise<void> {
+    const relative = job.filePath
+    job.filePath = ''
+    job.size = 0
+    if (!relative || !isArtifactFileName(relative)) return
+    try {
+      await rm(join(exportRoot(), relative), { force: true })
+    } catch {
+      // 删不掉就交给 24 小时过期清理。
+    }
+  }
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message
+  return String(error ?? '未知错误')
+}
