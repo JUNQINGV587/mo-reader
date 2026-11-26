@@ -44,6 +44,7 @@ import {
   type DownloadHost,
 } from './download.js'
 import { buildEpub } from './epub-export.js'
+import { loadCoverImage } from './export-cover.js'
 import {
   EXPORT_KIND,
   ExportCoordinator,
@@ -1140,13 +1141,13 @@ export class ReaderService extends TypertRemoteService {
   }
 
   /**
-   * 发起全本 TXT 导出：不截断目录，缓存优先、未缓存的在线抓，单章失败只计失败。
+   * 发起全本导出（TXT / EPUB）：不截断目录，缓存优先、未缓存的在线抓，单章失败只计失败。
    * 同一本书同一格式同时只保留一个活动作业。
    */
   async startExport(args: Args) {
     const bookId = stringArg(args, 'bookId')
     const format = String(args?.format ?? 'txt').trim().toLowerCase()
-    if (format !== 'txt') throw new Error('暂只支持 TXT 导出')
+    if (format !== 'txt' && format !== 'epub') throw new Error('暂只支持 TXT / EPUB 导出')
     return this.exportManager().start(bookId, format as ExportFormat)
   }
 
@@ -1666,7 +1667,13 @@ export class ReaderService extends TypertRemoteService {
         if (!text.trim()) throw new Error('章节正文为空')
         return text
       },
+      loadCover: (book) => this.fetchExportCover(book),
     }
+  }
+
+  /** 导出封面：任何失败都只当没有封面，绝不阻断整本导出。 */
+  private async fetchExportCover(book: Record<string, unknown>) {
+    return loadCoverImage(String(book.coverUrl ?? ''))
   }
 
   private jobKindIsExport(id: string): boolean {

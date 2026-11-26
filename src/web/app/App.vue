@@ -515,31 +515,6 @@ async function cacheBookChapters() {
   }
 }
 
-async function exportBook(format: 'txt' | 'epub') {
-  const book = currentBook.value as any
-  if (!book?.id) return
-  exportBusy.value = true
-  try {
-    const result: any = await call('exportBook', { bookId: book.id, limit: 50, format })
-    const binary = atob(result.dataBase64)
-    const bytes = new Uint8Array(binary.length)
-    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
-    const mime = format === 'epub' ? 'application/epub+zip' : 'text/plain;charset=utf-8'
-    const blob = new Blob([bytes], { type: mime })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = result.fileName || `book.${format}`
-    link.click()
-    URL.revokeObjectURL(url)
-    status.value = `已导出 ${result.chapters} 章（${format.toUpperCase()}）`
-  } catch (error) {
-    status.value = errorText(error)
-  } finally {
-    exportBusy.value = false
-  }
-}
-
 const exportJob = ref<any>(null)
 const exportDownload = ref<{ url: string; fileName: string } | null>(null)
 let exportTimer: ReturnType<typeof setInterval> | null = null
@@ -629,13 +604,13 @@ async function loadActiveExport() {
   syncExportTimer()
 }
 
-async function startExport() {
+async function startExport(format: 'txt' | 'epub' = 'txt') {
   const book = currentBook.value as any
   if (!book?.id) return
   exportBusy.value = true
   exportDownload.value = null
   try {
-    const result: any = await call('startExport', { bookId: book.id, format: 'txt' })
+    const result: any = await call('startExport', { bookId: book.id, format })
     exportJob.value = result?.job ?? null
     status.value = result?.existing ? '已有进行中的导出' : '已开始导出'
     syncExportTimer()
@@ -3193,11 +3168,18 @@ onMounted(async () => {
                 class="mo-btn"
                 :disabled="exportBusy || isExportRunning(exportJob)"
                 data-testid="export-start"
-                @click="startExport"
+                @click="startExport('txt')"
               >
-                {{ isExportRunning(exportJob) ? '导出中…' : '导出 TXT' }}
+                {{ isExportRunning(exportJob) && exportJob?.format !== 'epub' ? '导出中…' : '导出 TXT' }}
               </button>
-              <button class="mo-btn" :disabled="exportBusy" data-testid="export-epub" @click="exportBook('epub')">{{ exportBusy ? '导出中…' : '导出 EPUB' }}</button>
+              <button
+                class="mo-btn"
+                :disabled="exportBusy || isExportRunning(exportJob)"
+                data-testid="export-epub"
+                @click="startExport('epub')"
+              >
+                {{ isExportRunning(exportJob) && exportJob?.format === 'epub' ? '导出中…' : '导出 EPUB' }}
+              </button>
               <span v-if="currentBook.simulateEnabled" class="mo-tag soft">模拟至 {{ simulatedChapterCount(currentBook) }} 章</span>
               <span v-if="progress" class="muted">
                 {{ progress.chapterTitle || `第 ${progress.chapterIndex + 1} 章` }}
@@ -3311,7 +3293,7 @@ onMounted(async () => {
             <h3>导出全本</h3>
             <span v-if="exportJob" class="mo-tag" data-testid="export-status">{{ exportStatusText(exportJob) }}</span>
           </div>
-          <p class="mo-download-summary">导出 TXT 全本，目录多少章都导完；生成的文件保留 24 小时。</p>
+          <p class="mo-download-summary">导出 TXT 或 EPUB 全本，目录多少章都导完；生成的文件保留 24 小时。</p>
           <div v-if="exportJob" class="mo-download-progress">
             <span class="mo-download-bar"><span :style="{ width: `${exportPercent(exportJob)}%` }" /></span>
             <span>已完成 {{ exportJob.completed }} / {{ exportJob.total }} 章</span>
@@ -3342,7 +3324,7 @@ onMounted(async () => {
               v-if="!isExportRunning(exportJob) && exportJob.status !== 'done'"
               class="mo-btn"
               :disabled="exportBusy"
-              @click="startExport"
+              @click="startExport(exportJob.format)"
             >
               重新导出
             </button>

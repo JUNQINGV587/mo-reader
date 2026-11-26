@@ -3,6 +3,7 @@ import test from 'node:test'
 import { mkdtemp, readdir, readFile, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import JSZip from 'jszip'
 
 function fakeTable() {
   const map = new Map()
@@ -429,5 +430,119 @@ test('导出地址只在完成后给出，产物过期报错', async () => {
 
 test('暂不支持的导出格式直接拒绝', async () => {
   const harness = await makeHarness({ chapters: 1 })
-  await assert.rejects(harness.service.startExport({ bookId: 'book-1', format: 'epub' }), /暂只支持 TXT 导出/)
+  await assert.rejects(harness.service.startExport({ bookId: 'book-1', format: 'pdf' }), /暂只支持 TXT \/ EPUB 导出/)
+})
+
+// 1x1 透明 PNG：封面测试只关心字节原样嵌入，不需要真实图片内容。
+const PNG_1X1 = Buffer.from(
+  '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000154a24f6a0000000049454e44ae426082',
+  'hex',
+)
+
+async function readEntry(zip, name) {
+  const entry = zip.file(name)
+  assert.ok(entry, '缺少 ' + name)
+  return entry.async('string')
+}
+
+test('EPUB 全本：目录 60 章全部导出，nav 与 ncx 可跳转', async () => {
+  const harness = await makeHarness({ chapters: 60 })
+  const started = await harness.service.startExport({ bookId: 'book-1', format: 'epub' })
+  assert.equal(started.job.format, 'epub')
+  await harness.service.waitForExports()
+  const { job } = await harness.service.getJob({ id: started.job.id })
+  assert.equal(job.status, 'done')
+  assert.equal(job.total, 60)
+  assert.equal(job.completed, 60)
+  assert.equal(job.failed, 0)
+  assert.equal(job.fileName, '测试书.epub')
+  assert.equal(job.filePath, started.job.id + '.epub')
+
+  const data = await readFile(path.join(harness.exportRoot, job.filePath))
+  const zip = await JSZip.loadAsync(data)
+  assert.equal(await readEntry(zip, 'mimetype'), 'application/epub+zip')
+  assert.match(await readEntry(zip, 'META-INF/container.xml'), /full-path="OEBPS\/content\.opf"/)
+  const opf = await readEntry(zip, 'OEBPS/content.opf')
+  assert.match(opf, /<dc:title>测试书<\/dc:title>/)
+  assert.match(opf, /<dc:creator>某人<\/dc:creator>/)
+  assert.ok(!opf.includes('name="cover"'))
+  const nav = await readEntry(zip, 'OEBPS/nav.xhtml')
+  assert.equal((nav.match(/<li><a href="chapter\d+\.xhtml">/g) ?? []).length, 60)
+  assert.ok(nav.includes('第60章'))
+  const ncx = await readEntry(zip, 'OEBPS/toc.ncx')
+  assert.equal((ncx.match(/<navPoint /g) ?? []).length, 60)
+  assert.match(await readEntry(zip, 'OEBPS/chapter60.xhtml'), /第60章正文内容/)
+
+  const download = await harness.service.getExportDownload({ jobId: job.id })
+  assert.equal(download.url, BASE + ROUTE + '/' + job.id)
+  assert.equal(download.fileName, '测试书.epub')
+  const response = await harness.routes[0].resource(new Request(BASE + ROUTE + '/' + job.id), owner)
+  assert.equal(response.status, 200)
+  assert.equal(response.headers.get('content-type'), 'application/epub+zip')
+})
+
+test('EPUB 缺作者：opf 不输出 dc:creator', async () => {
+  const harness = await makeHarness({ chapters: 1 })
+  harness.books.put('book-1', { ...harness.books.get('book-1'), author: '' })
+  const started = await harness.service.startExport({ bookId: 'book-1', format: 'epub' })
+  await harness.service.waitForExports()
+  const { job } = await harness.service.getJob({ id: started.job.id })
+  assert.equal(job.status, 'done')
+  const zip = await JSZip.loadAsync(await readFile(path.join(harness.exportRoot, job.filePath)))
+  const opf = await readEntry(zip, 'OEBPS/content.opf')
+  assert.ok(!opf.includes('dc:creator'))
+  assert.ok(!opf.includes('未知作者'))
+  assert.match(opf, /<dc:title>测试书<\/dc:title>/)
+})
+
+test('EPUB 封面：data URL 直接内嵌，封面页在 spine 首位', async () => {
+  const harness = await makeHarness({ chapters: 2 })
+  harness.books.put('book-1', {
+    ...harness.books.get('book-1'),
+    coverUrl: 'data:image/png;base64,' + PNG_1X1.toString('base64'),
+  })
+  const started = await harness.service.startExport({ bookId: 'book-1', format: 'epub' })
+  await harness.service.waitForExports()
+  const { job } = await harness.service.getJob({ id: started.job.id })
+  assert.equal(job.status, 'done')
+  const zip = await JSZip.loadAsync(await readFile(path.join(harness.exportRoot, job.filePath)))
+  const opf = await readEntry(zip, 'OEBPS/content.opf')
+  assert.match(opf, /<meta name="cover" content="cover-image"\/>/)
+  assert.match(opf, /<item id="cover-image" href="cover\.png" media-type="image\/png" properties="cover-image"\/>/)
+  assert.match(await readEntry(zip, 'OEBPS/cover.xhtml'), /<img src="cover\.png"/)
+  assert.deepEqual(await zip.file('OEBPS/cover.png').async('nodebuffer'), PNG_1X1)
+  const spine = opf.slice(opf.indexOf('<spine'))
+  assert.ok(spine.indexOf('idref="cover-page"') < spine.indexOf('idref="chapter1"'))
+})
+
+test('EPUB 封面抓取失败：跳过封面，导出照常完成', async () => {
+  const harness = await makeHarness({ chapters: 2 })
+  harness.books.put('book-1', { ...harness.books.get('book-1'), coverUrl: 'https://cdn.example.com/cover.jpg' })
+  harness.service.fetchExportCover = async () => {
+    throw new Error('封面抓取失败')
+  }
+  const started = await harness.service.startExport({ bookId: 'book-1', format: 'epub' })
+  await harness.service.waitForExports()
+  const { job } = await harness.service.getJob({ id: started.job.id })
+  assert.equal(job.status, 'done')
+  const zip = await JSZip.loadAsync(await readFile(path.join(harness.exportRoot, job.filePath)))
+  const opf = await readEntry(zip, 'OEBPS/content.opf')
+  assert.ok(!opf.includes('name="cover"'))
+  assert.equal(zip.file('OEBPS/cover.jpg'), null)
+  assert.match(await readEntry(zip, 'OEBPS/chapter2.xhtml'), /第2章正文内容/)
+})
+
+test('EPUB 单章失败：不中止，失败计数可见，导航只列成功章节', async () => {
+  const harness = await makeHarness({ chapters: 3, failUrls: [ORIGIN + '/ch/2'] })
+  const started = await harness.service.startExport({ bookId: 'book-1', format: 'epub' })
+  await harness.service.waitForExports()
+  const { job } = await harness.service.getJob({ id: started.job.id })
+  assert.equal(job.status, 'done')
+  assert.equal(job.completed, 2)
+  assert.equal(job.failed, 1)
+  const zip = await JSZip.loadAsync(await readFile(path.join(harness.exportRoot, job.filePath)))
+  const nav = await readEntry(zip, 'OEBPS/nav.xhtml')
+  assert.equal((nav.match(/<li><a href="chapter\d+\.xhtml">/g) ?? []).length, 2)
+  assert.ok(!nav.includes('第2章'))
+  assert.match(await readEntry(zip, 'OEBPS/chapter2.xhtml'), /第3章正文内容/)
 })

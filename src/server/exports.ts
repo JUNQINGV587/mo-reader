@@ -3,6 +3,7 @@ import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { ChapterLimiter, isActiveJob, type JobStatus } from './download.js'
+import { buildEpub, type EpubCover } from './epub-export.js'
 
 /** 导出作业的 kind：与下载作业共用 jobs 表，靠它区分。 */
 export const EXPORT_KIND = 'export'
@@ -14,7 +15,7 @@ export const EXPORT_SOURCE_CONCURRENCY = 2
 /** 进度落盘的节流窗口；没有定时器，只在章节收尾时按需写一次。 */
 export const EXPORT_FLUSH_MS = 500
 
-export type ExportFormat = 'txt'
+export type ExportFormat = 'txt' | 'epub'
 
 export interface ExportJob {
   id: string
@@ -55,6 +56,8 @@ export interface ExportHost {
   loadToc(book: Record<string, unknown>): Promise<ExportChapter[]>
   /** 取一章正文：缓存优先，未缓存时在线抓取；非文本或空正文应抛错，由协调器计失败。 */
   readChapter(book: Record<string, unknown>, chapterIndex: number, chapter: ExportChapter): Promise<string>
+  /** 可选：取封面用于嵌入 EPUB；返回 null 或抛错都按无封面继续导出。 */
+  loadCover?(book: Record<string, unknown>): Promise<EpubCover | null>
 }
 
 export interface ExportListFilter {
@@ -94,7 +97,9 @@ export function exportFileName(bookName: string, format: ExportFormat): string {
 }
 
 export function contentTypeOf(format: string): string {
-  return format === 'txt' ? 'text/plain; charset=utf-8' : 'application/octet-stream'
+  if (format === 'txt') return 'text/plain; charset=utf-8'
+  if (format === 'epub') return 'application/epub+zip'
+  return 'application/octet-stream'
 }
 
 /** 产物文件名必须是导出目录下的单段文件名，任何分隔符都视为非法。 */
@@ -399,8 +404,18 @@ export class ExportCoordinator {
     await this.finish(job)
   }
 
-  /** 按目录顺序拼接正文并落盘；格式与旧 exportBook 的 TXT 产物保持一致。 */
+  /** 按格式构建产物：TXT 与旧 exportBook 的产物保持一致，EPUB 见 assembleEpub。 */
   private async assemble(
+    job: ExportJob,
+    book: Record<string, unknown>,
+    texts: Array<{ title: string; text: string } | null>,
+  ): Promise<void> {
+    if (job.format === 'epub') return this.assembleEpub(job, book, texts)
+    return this.assembleTxt(job, book, texts)
+  }
+
+  /** 按目录顺序拼接正文并落盘；格式与旧 exportBook 的 TXT 产物保持一致。 */
+  private async assembleTxt(
     job: ExportJob,
     book: Record<string, unknown>,
     texts: Array<{ title: string; text: string } | null>,
@@ -421,6 +436,50 @@ export class ExportCoordinator {
     const relative = exportArtifactName(job.id, job.format)
     const absolute = join(root, relative)
     await writeFile(absolute, body, 'utf8')
+    const info = await stat(absolute)
+    job.filePath = relative
+    job.fileName = exportFileName(String(book.name || ''), job.format)
+    job.size = info.size
+    job.bytes = info.size
+    job.status = 'done'
+    job.error = ''
+  }
+
+  /** EPUB3 全本：导航只列有正文的章节，能取到封面就嵌入，取不到照常成书。 */
+  private async assembleEpub(
+    job: ExportJob,
+    book: Record<string, unknown>,
+    texts: Array<{ title: string; text: string } | null>,
+  ): Promise<void> {
+    const chapters: Array<{ title: string; text: string }> = []
+    for (const entry of texts) {
+      if (!entry) continue
+      chapters.push({ title: entry.title || `第${chapters.length + 1}章`, text: entry.text })
+    }
+    if (!chapters.length) {
+      job.status = 'failed'
+      job.error = job.failed > 0 ? '全部章节导出失败' : '没有可导出的章节'
+      return
+    }
+    let cover: EpubCover | null = null
+    if (this.host.loadCover) {
+      try {
+        cover = await this.host.loadCover(book)
+      } catch {
+        // 封面只是加分项：抓取失败按无封面继续导出。
+        cover = null
+      }
+    }
+    const data = await buildEpub({
+      title: String(book.name || '未命名'),
+      author: String(book.author || ''),
+      chapters,
+      cover,
+    })
+    const root = await ensureExportRoot()
+    const relative = exportArtifactName(job.id, job.format)
+    const absolute = join(root, relative)
+    await writeFile(absolute, data)
     const info = await stat(absolute)
     job.filePath = relative
     job.fileName = exportFileName(String(book.name || ''), job.format)
