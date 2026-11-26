@@ -162,6 +162,8 @@ export function defaultGroupSettings(group: SettingsGroupKey): Partial<ReaderSet
   const fields = READER_SETTING_GROUPS.find((item) => item.key === group)?.fields ?? []
   const patch: Record<string, unknown> = {}
   for (const field of fields) {
+    // 自定义主题是用户资产，不属于「恢复本节默认」的重置范围
+    if (field === 'customThemes') continue
     ;(patch as Record<string, unknown>)[field] = (defaults as unknown as Record<string, unknown>)[field]
   }
   return patch as Partial<ReaderSettings>

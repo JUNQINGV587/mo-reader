@@ -5297,7 +5297,7 @@ onMounted(async () => {
                 </div>
                 <label class="mo-theme-row">
                   <span>音色</span>
-                  <input v-model="settings.ttsVoice" class="mo-input" maxlength="120" placeholder="留空用系统默认" @change="persistSettings" />
+                  <input v-model="settings.ttsVoice" class="mo-input" maxlength="400" placeholder="留空用系统默认" @change="persistSettings" />
                 </label>
                 <label class="mo-slider">
                   <span>语速</span>

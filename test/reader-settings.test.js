@@ -249,3 +249,11 @@ test('6 套预设只写排版与页面字段，不改操作、朗读、替换', 
   const applied = diffReaderSettings(before, { ...before, ...presetSettingsPatch(READER_PRESETS[4]) })
   assert.ok('fontSize' in applied, '预设字号应写入')
 })
+test('恢复本节默认不含自定义主题（页面分区也不清空主题资产）', async () => {
+  const { defaultGroupSettings } = await import('../dist/core/reader/settings.js')
+  const page = defaultGroupSettings('page')
+  assert.equal('customThemes' in page, false)
+  assert.equal(page.theme, 'light')
+  const speak = defaultGroupSettings('speak')
+  assert.deepEqual(Object.keys(speak).sort(), ['ttsContinuous', 'ttsRate', 'ttsVoice'])
+})

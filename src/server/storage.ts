@@ -189,7 +189,7 @@ export const ReaderDomain = defineDomain({
           )
           .default([]),
         autoPageSeconds: z.preprocess(clampNumber(1, 60, true), z.number().int().min(1).max(60).default(10)),
-        ttsVoice: z.string().max(120).default(''),
+        ttsVoice: z.string().max(400).default(''),
         ttsRate: z.preprocess(clampNumber(0.5, 2), z.number().min(0.5).max(2).default(1)),
         ttsContinuous: z.preprocess(pickBoolean, z.boolean().default(true)),
         /** 媒体缓存配额（字节）；0 表示跟随环境变量或默认 50GB。 */

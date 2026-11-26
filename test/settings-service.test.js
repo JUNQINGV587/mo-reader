@@ -183,3 +183,12 @@ test('恢复未知分组报错，不写任何设置', async () => {
   await assert.rejects(service.resetSettingsGroup({ group: 'nope' }), /未知设置分组/)
   assert.equal(writeCount(), 0)
 })
+
+test('全局恢复页面分区不清空自定义主题', async () => {
+  const theme = { id: 'theme-abc12345', name: '夜', bg: '#000', text: '#fff', muted: '#888', line: '#333', createdAt: '2024-01-01' }
+  const { service, getStored } = await makeService({ theme: 'theme-abc12345', customThemes: [theme], fontSize: 30 })
+  const reset = await service.resetSettingsGroup({ group: 'page' })
+  assert.equal(reset.settings.theme, 'light')
+  assert.equal(reset.settings.customThemes.length, 1)
+  assert.equal(getStored().customThemes.length, 1)
+})
