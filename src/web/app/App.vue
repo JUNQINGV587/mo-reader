@@ -183,6 +183,7 @@ const replacedContent = computed(() => {
 })
 const readerTitle = ref('')
 const progress = ref<any>(null)
+const localPdfStatus = ref<any>(null)
 const batteryPercent = ref<number | null>(null)
 const bookPercent = computed(() => {
   const total = chapters.value.length
@@ -1569,10 +1570,22 @@ async function loadToc(book: any, tocUrlFallback: string) {
   if (currentBook.value?.id && view.value === 'detail') void refreshDownloadSummary()
 }
 
+/** 本地书详情页的 PDF 状态：旧版本导入的 PDF 没有原文件，需要提示重新导入补齐。 */
+async function loadLocalPdfStatus(book: any) {
+  localPdfStatus.value = null
+  if (!book || book.origin !== 'local' || !book.id) return
+  try {
+    localPdfStatus.value = await call('getLocalPdfStatus', { bookId: book.id })
+  } catch {
+    localPdfStatus.value = null
+  }
+}
+
 async function openBook(book: any) {
   busy.value = true
   chapterError.value = ''
   downloadSummary.value = null
+  localPdfStatus.value = null
   try {
     const info = await call('getBookInfo', { sourceUrl: book.origin, bookUrl: book.bookUrl })
     currentBook.value = { ...book, ...info.info, tocUrl: info.info.tocUrl || book.bookUrl }
@@ -1603,6 +1616,7 @@ async function openShelfBook(book: any) {
     await loadNotes()
     const result = await call('getProgress', { bookId: book.id })
     progress.value = result?.progress ?? null
+    await loadLocalPdfStatus(book)
     tocFilter.value = ''
     tocPage.value = 1
     view.value = 'detail'
@@ -3374,6 +3388,14 @@ onMounted(async () => {
           </div>
         </div>
 
+        <p
+          v-if="localPdfStatus?.isPdf && localPdfStatus?.needsReimport"
+          class="muted mo-local-pdf-hint"
+          data-testid="pdf-reimport-hint"
+        >
+          这是旧版本导入的 PDF，缺少原文件；重新导入同一文件即可补齐，文字与阅读进度不受影响
+        </p>
+
         <p v-if="introText" class="mo-intro">{{ introText }}</p>
 
         <div class="mo-toc-block">
@@ -4876,6 +4898,14 @@ onMounted(async () => {
   background: transparent;
   color: var(--mo-ink);
   font-size: 12px;
+}
+.mo-local-pdf-hint {
+  margin: 0 0 20px;
+  padding: 10px 14px;
+  border: 1px solid var(--mo-line);
+  border-radius: 10px;
+  background: var(--mo-accent-soft);
+  line-height: 1.8;
 }
 .mo-intro {
   line-height: 1.9;

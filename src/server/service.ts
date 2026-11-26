@@ -56,14 +56,25 @@ import {
   type ExportFormat,
   type ExportHost,
 } from './exports.js'
-import { EXPORT_ROUTE_PATH, registerArtifactRoute, type ArtifactDescriptor } from './routes.js'
+import {
+  EXPORT_ROUTE_PATH,
+  LOCAL_PDF_ROUTE_PATH,
+  registerArtifactRoute,
+  registerProtectedFileRoute,
+  type ArtifactDescriptor,
+  type FileArtifactDescriptor,
+} from './routes.js'
 import { listCustomFonts, readCustomFont, removeCustomFont, saveCustomFont } from './fonts.js'
 import { isKnownTheme, normalizeCustomThemes } from '../core/reader/theme.js'
 import { parseShelfImport, shelfDedupKeys } from '../core/reader/shelf-transfer.js'
 import {
+  LOCAL_PDF_ORIGINAL,
+  hasLocalPdfOriginal,
   importLocalBuffer,
+  isLocalPdfRecord,
   localBookId,
   localContent,
+  localRoot,
   localToc,
   readLocalBook,
   removeLocalBook,
@@ -78,6 +89,20 @@ type Args = Record<string, unknown> | undefined
 const SEARCH_PAGE_HINT_CHARS = 800
 /** 结果片段在首个命中前后各保留的字数。 */
 const SEARCH_SNIPPET_CONTEXT = 30
+
+/** 重新导入同一文件时，这些用户侧状态要沿用旧记录，否则书架位置与阅读进度会被重置。 */
+const LOCAL_BOOK_KEEP_FIELDS = [
+  'createdAt',
+  'pinned',
+  'group',
+  'lastReadAt',
+  'simulateEnabled',
+  'simulateStartDate',
+  'simulateStartChapter',
+  'simulateDailyChapters',
+  'durChapterIndex',
+  'durChapterTitle',
+] as const
 
 function countOccurrences(value: string, key: string): number {
   if (!key) return 0
@@ -216,6 +241,7 @@ export class ReaderService extends TypertRemoteService {
       // 清理失败不影响启动。
     }
     this.registerExportRoute()
+    this.registerLocalPdfRoute()
     const ctx = this.ctx as any
     ctx.effect(
       () => async () => {
@@ -1249,9 +1275,35 @@ export class ReaderService extends TypertRemoteService {
     const { book, chapters } = await importLocalBuffer(fileName, buffer)
     const id = String(book.id)
     const existing = this.requireDb().books.get(id) as Record<string, unknown> | undefined
-    const record = { ...book, createdAt: existing?.createdAt ?? book.createdAt }
+    const record: Record<string, unknown> = { ...book }
+    // 同一文件重新导入会命中同一 id：解析字段用新的，用户设置保留旧的。
+    if (existing) {
+      for (const field of LOCAL_BOOK_KEEP_FIELDS) {
+        if (existing[field] !== undefined) record[field] = existing[field]
+      }
+    }
     await this.requireDb().books.put(id, record)
     return { book: record, chapters: chapters.length }
+  }
+
+  /** 详情页用来判断本地书是否为 PDF、是否需要补原文件；非本地书按「不是 PDF」返回。 */
+  async getLocalPdfStatus(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const book = this.requireDb().books.get(bookId) as Record<string, unknown> | undefined
+    if (!book || book.origin !== 'local') {
+      return { bookId, isPdf: false, hasOriginal: false, needsReimport: false }
+    }
+    const record = await readLocalBook(bookId)
+    const isPdf = book.localFormat === 'pdf' || isLocalPdfRecord(record)
+    const hasOriginal = isPdf ? await hasLocalPdfOriginal(bookId) : false
+    const name = typeof book.name === 'string' ? book.name.trim() : ''
+    return {
+      bookId,
+      isPdf,
+      hasOriginal,
+      needsReimport: isPdf && !hasOriginal,
+      ...(name ? { fileName: `${name}.pdf` } : {}),
+    }
   }
 
   async addBook(args: Args) {
@@ -1753,6 +1805,45 @@ export class ReaderService extends TypertRemoteService {
           }
         },
         'reader: export download route',
+      )
+    })
+  }
+
+  /** PDF 原文件路由：书 id 只做白名单校验，磁盘路径由服务端自己拼。 */
+  private registerLocalPdfRoute(): void {
+    const ctx = this.ctx as any
+    if (typeof ctx?.inject !== 'function') return
+    ctx.inject(['webServer'], (webCtx: any) => {
+      const webServer = webCtx?.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+      if (typeof webCtx.effect !== 'function') return
+      webCtx.effect(
+        () => {
+          try {
+            return registerProtectedFileRoute(webServer, {
+              path: LOCAL_PDF_ROUTE_PATH,
+              auth: 'required',
+              idPattern: /^[0-9a-f]{24}$/,
+              root: () => localRoot(),
+              locate: async (bookId: string): Promise<FileArtifactDescriptor | null> => {
+                const book = this.db?.books?.get?.(bookId) as Record<string, unknown> | undefined
+                if (!book || book.origin !== 'local') return null
+                const record = await readLocalBook(bookId)
+                if (!record) return null
+                const name = typeof book.name === 'string' ? book.name.trim() : ''
+                return {
+                  filePath: `${bookId}/${LOCAL_PDF_ORIGINAL}`,
+                  fileName: `${name || '本地 PDF'}.pdf`,
+                  contentType: 'application/pdf',
+                }
+              },
+            })
+          } catch {
+            // 同一宿主里已经注册过同路径路由时不重复注册，也不让启动失败。
+            return () => {}
+          }
+        },
+        'reader: local pdf route',
       )
     })
   }

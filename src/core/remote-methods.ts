@@ -43,6 +43,7 @@ export const REMOTE_METHODS = Object.freeze([
   'debugSource',
   'addBook',
   'importLocalBook',
+  'getLocalPdfStatus',
   'importBooks',
   'updateBook',
   'listBooks',

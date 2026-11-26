@@ -1,11 +1,15 @@
 import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
-import { resolve, sep } from 'node:path'
+import { isAbsolute, resolve, sep } from 'node:path'
 import { Readable } from 'node:stream'
 import { isArtifactFileName } from './exports.js'
 
 /** 通用受保护产物路由：目前服务导出文件，#109（PDF 原文件）与 #110（媒体代理）可复用同一套校验。 */
 export const EXPORT_ROUTE_PATH = '/reader/exports'
+/** 本地 PDF 原文件路由：URL 里是 24 位小写十六进制书 id，路径由服务端自己拼。 */
+export const LOCAL_PDF_ROUTE_PATH = '/reader/local-pdf'
+/** 导出作业 id 的默认白名单：单段、字母数字开头、允许短横线。 */
+const DEFAULT_ARTIFACT_ID_PATTERN = /^[0-9a-zA-Z][0-9a-zA-Z-]{7,63}$/
 /** 私有产物只让浏览器本地缓存，不进共享缓存。 */
 export const ARTIFACT_CACHE_CONTROL = 'private, max-age=0'
 
@@ -115,6 +119,11 @@ export function createArtifactResource(
  * 任何编码过的路径分隔符、点段都会在解码后落到白名单之外，直接 404。
  */
 export function artifactIdOf(request: Request, routePath: string): string {
+  return singleSegmentIdOf(request, routePath, DEFAULT_ARTIFACT_ID_PATTERN)
+}
+
+/** 只从 URL 里取「单段且匹配白名单」的 id：多段、'.'/'..'、编码绕过都会落到白名单外。 */
+export function singleSegmentIdOf(request: Request, routePath: string, pattern: RegExp): string {
   let pathname = ''
   try {
     pathname = new URL(request.url).pathname
@@ -124,13 +133,13 @@ export function artifactIdOf(request: Request, routePath: string): string {
   if (pathname !== routePath && !pathname.startsWith(`${routePath}/`)) return ''
   const rest = pathname.slice(routePath.length + 1)
   if (!rest || rest.includes('/')) return ''
-  let jobId = ''
+  let id = ''
   try {
-    jobId = decodeURIComponent(rest)
+    id = decodeURIComponent(rest)
   } catch {
     return ''
   }
-  return /^[0-9a-zA-Z][0-9a-zA-Z-]{7,63}$/.test(jobId) ? jobId : ''
+  return pattern.test(id) ? id : ''
 }
 
 /** 解析产物绝对路径：只接受根目录下的单段文件名，解析后仍在根目录内。 */
@@ -152,6 +161,167 @@ export function attachmentHeader(fileName: string): string {
   const ascii = safe.replace(/[^\x20-\x7e]/g, '_')
   const encoded = encodeURIComponent(safe).replace(/['()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
   return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`
+}
+
+/** 受保护文件路由的产物描述：filePath 相对 root，可含子目录，但解析后必须仍在 root 内。 */
+export interface FileArtifactDescriptor {
+  filePath: string
+  fileName: string
+  contentType: string
+}
+
+export interface ProtectedFileRouteOptions {
+  /** 路由前缀，默认本地 PDF 原文件路由。 */
+  path?: string
+  auth?: 'required' | 'anonymous' | 'deny'
+  root(): string
+  /** 由 URL 里的单段 id 定位产物；id 已通过白名单校验。返回 null 表示 404。 */
+  locate(id: string): Promise<FileArtifactDescriptor | null> | FileArtifactDescriptor | null
+  /** id 白名单，默认沿用导出路由的标识规则。 */
+  idPattern?: RegExp
+  allow?(peer: ArtifactPeer | undefined): boolean
+  requirePeer?: boolean
+}
+
+/** 注册受保护文件路由并返回释放函数；与导出路由同一套注册语义。 */
+export function registerProtectedFileRoute(
+  webServer: ArtifactWebServer,
+  options: ProtectedFileRouteOptions,
+): () => void {
+  const route = createProtectedFileRoute(options)
+  const dispose = webServer.register(route)
+  return typeof dispose === 'function' ? (dispose as () => void) : () => {}
+}
+
+/**
+ * 受保护文件路由：#109 的 PDF 原文件走这里，#110 的媒体代理可以复用同一套
+ * 鉴权 + Range 逻辑。id 只从 URL 取白名单形状，文件路径永远由 locate 在服务端拼。
+ */
+export function createProtectedFileRoute(options: ProtectedFileRouteOptions): ArtifactRoute {
+  const routePath = options.path ?? LOCAL_PDF_ROUTE_PATH
+  const idPattern = options.idPattern ?? DEFAULT_ARTIFACT_ID_PATTERN
+  const requirePeer = options.requirePeer !== false
+  const allow = options.allow ?? ((peer: ArtifactPeer | undefined) => peer?.principal?.kind === 'owner')
+  return {
+    kind: 'prefix',
+    path: routePath,
+    auth: options.auth ?? 'required',
+    async resource(request: Request, peer?: ArtifactPeer): Promise<Response> {
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        return refuse(405, { Allow: 'GET, HEAD' })
+      }
+      if (requirePeer && !peer) return refuse(401)
+      if (!allow(peer)) return refuse(403)
+      const id = singleSegmentIdOf(request, routePath, idPattern)
+      if (!id) return refuse(404)
+      let descriptor: FileArtifactDescriptor | null = null
+      try {
+        descriptor = await options.locate(id)
+      } catch {
+        return refuse(404)
+      }
+      if (!descriptor) return refuse(404)
+      const absolute = resolveResourcePath(options.root(), descriptor.filePath)
+      if (!absolute) return refuse(404)
+      return serveFileResponse(request, {
+        absolutePath: absolute,
+        fileName: descriptor.fileName,
+        contentType: descriptor.contentType,
+      })
+    },
+  }
+}
+
+/**
+ * 按本地文件与 Request 生成 200 / 206 / 416 / HEAD 响应；#110 媒体代理直接复用。
+ * 只支持单段 Range：多段（逗号）与语法错误一律 416，避免返回一份拼不完整的响应。
+ */
+export async function serveFileResponse(
+  request: Request,
+  options: { absolutePath: string; fileName: string; contentType: string },
+): Promise<Response> {
+  let info: Awaited<ReturnType<typeof stat>>
+  try {
+    info = await stat(options.absolutePath)
+  } catch {
+    return refuse(404)
+  }
+  if (!info.isFile()) return refuse(404)
+  const size = info.size
+  const headers: Record<string, string> = {
+    'Content-Type': options.contentType || 'application/octet-stream',
+    'Content-Length': String(size),
+    'Content-Disposition': attachmentHeader(options.fileName),
+    'Cache-Control': ARTIFACT_CACHE_CONTROL,
+    'Accept-Ranges': 'bytes',
+  }
+  // HEAD 不解析 Range，按整文件报告长度，客户端不会误读半份内容。
+  if (request.method === 'HEAD') return new Response(null, { status: 200, headers })
+  const range = parseRangeHeader(request.headers.get('range'), size)
+  if (range === 'invalid') {
+    return new Response(null, {
+      status: 416,
+      headers: {
+        'Content-Range': `bytes */${size}`,
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'no-store',
+        'Content-Type': options.contentType || 'application/octet-stream',
+      },
+    })
+  }
+  if (!range) {
+    const stream = createReadStream(options.absolutePath)
+    stream.on('error', () => {})
+    return new Response(Readable.toWeb(stream) as unknown as ReadableStream<Uint8Array>, { status: 200, headers })
+  }
+  const stream = createReadStream(options.absolutePath, { start: range.start, end: range.end })
+  stream.on('error', () => {})
+  const partialHeaders = {
+    ...headers,
+    'Content-Length': String(range.end - range.start + 1),
+    'Content-Range': `bytes ${range.start}-${range.end}/${size}`,
+  }
+  return new Response(Readable.toWeb(stream) as unknown as ReadableStream<Uint8Array>, {
+    status: 206,
+    headers: partialHeaders,
+  })
+}
+
+interface ByteRange {
+  start: number
+  end: number
+}
+
+/** 解析单段 Range；null 表示没有 Range（整文件），'invalid' 表示应按 416 回复。 */
+function parseRangeHeader(header: string | null, size: number): ByteRange | 'invalid' | null {
+  if (!header) return null
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim())
+  if (!match) return 'invalid'
+  const startText = match[1] ?? ''
+  const endText = match[2] ?? ''
+  if (!startText && !endText) return 'invalid'
+  if (size === 0) return 'invalid'
+  if (!startText) {
+    const suffix = Number(endText)
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) return 'invalid'
+    return { start: Math.max(size - suffix, 0), end: size - 1 }
+  }
+  const start = Number(startText)
+  if (!Number.isSafeInteger(start) || start >= size) return 'invalid'
+  if (!endText) return { start, end: size - 1 }
+  const end = Number(endText)
+  if (!Number.isSafeInteger(end) || end < start) return 'invalid'
+  return { start, end: Math.min(end, size - 1) }
+}
+
+/** 解析受保护路由的绝对路径：允许子目录，但任何越出根目录的写法都返回 null。 */
+function resolveResourcePath(root: string, filePath: string): string | null {
+  if (!filePath || filePath.includes('\0') || isAbsolute(filePath)) return null
+  const rootPath = resolve(root)
+  const absolute = resolve(rootPath, filePath)
+  if (absolute === rootPath) return null
+  if (!absolute.startsWith(rootPath + sep)) return null
+  return absolute
 }
 
 function refuse(status: number, extra: Record<string, string> = {}): Response {
