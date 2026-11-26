@@ -150,6 +150,7 @@ test('导入 PDF 保存原文件并保留章节文本，导入 TXT 不写原文�
     isPdf: true,
     hasOriginal: true,
     needsReimport: false,
+    originalUrl: LOCAL_PDF_ROUTE_PATH + '/' + bookId,
     fileName: 'PDF Fixture.pdf',
   })
 
@@ -239,6 +240,28 @@ test('旧版本 PDF 记录识别为缺原文件，重新导入同一文件后补
   await rm(dir, { recursive: true, force: true })
 })
 
+test('PDF 状态查询：非本地书、未知书、原文件缺失都不给原文件地址', async () => {
+  const { service, books } = await makeService()
+  await books.put('remote-book', { id: 'remote-book', name: '在线书', origin: 'https://source.example.com' })
+
+  const remote = await service.getLocalPdfStatus({ bookId: 'remote-book' })
+  assert.deepEqual(remote, { bookId: 'remote-book', isPdf: false, hasOriginal: false, needsReimport: false })
+  const unknown = await service.getLocalPdfStatus({ bookId: 'no-such-book' })
+  assert.deepEqual(unknown, { bookId: 'no-such-book', isPdf: false, hasOriginal: false, needsReimport: false })
+
+  // PDF 书原文件被删：仍是 PDF，但需要重新导入，且不再返回可交给 pdf.js 的地址。
+  const { imported } = await importPdf(service)
+  const bookId = imported.book.id
+  await rm(join(LOCAL_ROOT, bookId, 'original.pdf'), { force: true })
+  const missing = await service.getLocalPdfStatus({ bookId })
+  assert.equal(missing.isPdf, true)
+  assert.equal(missing.hasOriginal, false)
+  assert.equal(missing.needsReimport, true)
+  assert.equal(missing.originalUrl, undefined)
+
+  await rm(join(LOCAL_ROOT, bookId), { recursive: true, force: true })
+})
+
 test('PDF 原文件路由：200 / HEAD / 206 单段 Range', async () => {
   const { service } = await makeService()
   const route = mountRoute(service)
@@ -249,6 +272,10 @@ test('PDF 原文件路由：200 / HEAD / 206 单段 Range', async () => {
   const { pdf, imported } = await importPdf(service)
   const bookId = imported.book.id
   const total = pdf.length
+
+  // 状态查询用宿主对外地址拼出原文件 URL，前端可直接交给 pdf.js。
+  const status = await service.getLocalPdfStatus({ bookId })
+  assert.equal(status.originalUrl, urlOf(bookId))
 
   const full = await route.resource(new Request(urlOf(bookId)), owner)
   assert.equal(full.status, 200)

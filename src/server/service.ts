@@ -1354,6 +1354,8 @@ export class ReaderService extends TypertRemoteService {
       isPdf,
       hasOriginal,
       needsReimport: isPdf && !hasOriginal,
+      // 有原文件时给出可直接交给 pdf.js 的地址；缺文件时不返回地址，前端据此提示重新导入。
+      ...(isPdf && hasOriginal ? { originalUrl: this.localPdfUrl(bookId) } : {}),
       ...(name ? { fileName: `${name}.pdf` } : {}),
     }
   }
@@ -1515,17 +1517,37 @@ export class ReaderService extends TypertRemoteService {
     return { deleted }
   }
 
+  /**
+   * 保存阅读进度。文本进度与 PDF 原版进度共用一条 read_records 记录，
+   * 这里读-改-写合并、只覆盖显式传入的字段，避免一种模式保存时抹掉另一种模式的进度。
+   */
   async saveProgress(args: Args) {
     const bookId = stringArg(args, 'bookId')
-    const record = {
+    const existing = (this.requireDb().readRecords.get(bookId) ?? {}) as Record<string, unknown>
+    const record: Record<string, unknown> = {
       id: bookId,
       bookId,
-      chapterIndex: Number(args?.chapterIndex ?? 0) || 0,
-      chapterTitle: typeof args?.chapterTitle === 'string' ? args.chapterTitle : '',
-      chapterUrl: typeof args?.chapterUrl === 'string' ? args.chapterUrl : '',
-      position: Number(args?.position ?? 0) || 0,
-      updatedAt: new Date().toISOString(),
+      chapterIndex: 0,
+      chapterTitle: '',
+      chapterUrl: '',
+      position: 0,
+      ...existing,
     }
+    if (args?.chapterIndex !== undefined) record.chapterIndex = Number(args.chapterIndex ?? 0) || 0
+    if (typeof args?.chapterTitle === 'string') record.chapterTitle = args.chapterTitle
+    if (typeof args?.chapterUrl === 'string') record.chapterUrl = args.chapterUrl
+    if (args?.position !== undefined) record.position = Number(args.position ?? 0) || 0
+    // PDF 原版进度：页码 0 起、缩放百分比限制在 50–300、是否适应宽度。
+    if (args?.pdfPage !== undefined) {
+      const page = Math.floor(Number(args.pdfPage))
+      if (Number.isFinite(page) && page >= 0) record.pdfPage = page
+    }
+    if (args?.pdfZoom !== undefined) {
+      const zoom = Number(args.pdfZoom)
+      if (Number.isFinite(zoom)) record.pdfZoom = Math.min(300, Math.max(50, Math.round(zoom)))
+    }
+    if (typeof args?.pdfFitWidth === 'boolean') record.pdfFitWidth = args.pdfFitWidth
+    record.updatedAt = new Date().toISOString()
     await this.requireDb().readRecords.put(bookId, record)
     const book = this.requireDb().books.get(bookId) as Record<string, unknown> | undefined
     if (book) {
@@ -1821,6 +1843,18 @@ export class ReaderService extends TypertRemoteService {
       fileName: String(record.fileName || `导出.${format}`),
       contentType: contentTypeOf(format),
     }
+  }
+
+  /** PDF 原文件地址：宿主还没监听时返回相对路径，浏览器里同样能取到。 */
+  private localPdfUrl(bookId: string): string {
+    let origin = ''
+    try {
+      const value = (this.ctx as any)?.webServer?.getOrigin?.()
+      if (typeof value === 'string') origin = value.replace(/\/+$/, '')
+    } catch {
+      // 拿不到 origin 不影响取文件：相对地址在页面里同样可用。
+    }
+    return `${origin}${LOCAL_PDF_ROUTE_PATH}/${bookId}`
   }
 
   private exportDownloadUrl(jobId: string): string {

@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import CanvasReader from '../reader/CanvasReader.vue'
 import ComicReader from '../reader/ComicReader.vue'
+import PdfReader from '../reader/PdfReader.vue'
 import AudioReader from '../reader/AudioReader.vue'
 import VideoReader from '../reader/VideoReader.vue'
 import { simulatedChapterCount, simulatedProgress } from '../../core/reader/simulate'
@@ -165,7 +166,7 @@ const introText = computed(() => plainText(currentBook.value?.intro))
 const chapters = ref<any[]>([])
 const currentChapter = ref<any>(null)
 const content = ref('')
-const readerKind = ref<'text' | 'images' | 'audio' | 'video'>('text')
+const readerKind = ref<'text' | 'images' | 'audio' | 'video' | 'pdf'>('text')
 const readerImages = ref<string[]>([])
 const readerMedia = ref('')
 const replacedContent = computed(() => {
@@ -184,6 +185,16 @@ const replacedContent = computed(() => {
 const readerTitle = ref('')
 const progress = ref<any>(null)
 const localPdfStatus = ref<any>(null)
+// PDF 原版阅读：地址、初始页/缩放与加载错误都由阅读页接管。
+const pdfOriginalUrl = ref('')
+const pdfInitialPage = ref(0)
+const pdfInitialZoom = ref(100)
+const pdfInitialFitWidth = ref(false)
+const pdfError = ref('')
+let pdfTimer: ReturnType<typeof setTimeout> | undefined
+const isPdfBook = computed(() => Boolean(localPdfStatus.value?.isPdf))
+const isPdfReadable = computed(() => Boolean(localPdfStatus.value?.isPdf && localPdfStatus.value?.hasOriginal && localPdfStatus.value?.originalUrl))
+const hasPdfProgress = computed(() => progress.value?.pdfPage !== undefined || progress.value?.pdfZoom !== undefined)
 const batteryPercent = ref<number | null>(null)
 const bookPercent = computed(() => {
   const total = chapters.value.length
@@ -1590,6 +1601,7 @@ async function openBook(book: any) {
     const info = await call('getBookInfo', { sourceUrl: book.origin, bookUrl: book.bookUrl })
     currentBook.value = { ...book, ...info.info, tocUrl: info.info.tocUrl || book.bookUrl }
     await loadToc(currentBook.value, book.bookUrl)
+    await loadLocalPdfStatus(currentBook.value)
     await loadBookmarks()
     await loadNotes()
     progress.value = null
@@ -2098,6 +2110,7 @@ async function openChapter(chapter: any, page?: number) {
   busy.value = true
   chrome.value = false
   chapterError.value = ''
+  pdfError.value = ''
   initialPage.value =
     typeof page === 'number'
       ? page
@@ -2292,8 +2305,21 @@ async function jumpBookmark(bookmark: any) {
   await openChapter(chapter, Number(bookmark.page ?? 0))
 }
 
+/** 详情页主按钮：PDF 有原文件时默认进原版，其余走文本模式。 */
 function continueReading() {
-  if (!chapters.value.length) return
+  if (isPdfReadable.value) {
+    void openPdfReader()
+    return
+  }
+  continueReadingText()
+}
+
+/** 文本模式：沿用原有「继续阅读」逻辑，PDF 书也复用。 */
+function continueReadingText() {
+  if (!chapters.value.length) {
+    status.value = '这本书还没有可读章节'
+    return
+  }
   const record = progress.value
   let target = chapters.value.find((chapter) => !chapter.isVolume && chapter.url)
   if (record) {
@@ -2303,6 +2329,93 @@ function continueReading() {
       target
   }
   if (target) openChapter(target)
+}
+
+/** 打开 PDF 原版视图：页码与缩放从阅读进度里恢复。 */
+async function openPdfReader() {
+  const book = currentBook.value as any
+  if (!book?.id) {
+    status.value = '请先把这本书加入书架'
+    return
+  }
+  if (!localPdfStatus.value) await loadLocalPdfStatus(book)
+  stopSpeech()
+  closeReaderDict()
+  tocOpen.value = false
+  bookmarksOpen.value = false
+  chapterError.value = ''
+  pdfError.value = ''
+  const info = localPdfStatus.value
+  if (!info?.isPdf) pdfError.value = '这本书没有 PDF 原文件，只能阅读文本模式'
+  else if (!info.hasOriginal || !info.originalUrl) pdfError.value = '原文件缺失，重新导入同一个 PDF 即可恢复原版阅读'
+  readerKind.value = 'pdf'
+  readerTitle.value = '原版 PDF'
+  pdfOriginalUrl.value = info?.isPdf && info?.hasOriginal ? String(info.originalUrl ?? '') : ''
+  pdfInitialPage.value = Math.max(0, Math.floor(Number(progress.value?.pdfPage ?? 0) || 0))
+  pdfInitialZoom.value = Math.min(300, Math.max(50, Number(progress.value?.pdfZoom ?? 100) || 100))
+  pdfInitialFitWidth.value = Boolean(progress.value?.pdfFitWidth)
+  view.value = 'reader'
+  chrome.value = false
+  status.value = `${book.name} · 原版 PDF`
+}
+
+/** 记录原版阅读进度：本地先合并进 progress，服务端按同一字段名保存。 */
+function onPdfPage(payload: { page: number; total: number; zoom: number; fitWidth: boolean }) {
+  progress.value = {
+    ...(progress.value ?? {}),
+    bookId: currentBook.value?.id,
+    pdfPage: payload.page,
+    pdfZoom: payload.zoom,
+    pdfFitWidth: payload.fitWidth,
+  }
+  if (!currentBook.value?.id) return
+  if (pdfTimer) clearTimeout(pdfTimer)
+  pdfTimer = setTimeout(() => {
+    if (!currentBook.value?.id) return
+    call('saveProgress', {
+      bookId: currentBook.value.id,
+      pdfPage: payload.page,
+      pdfZoom: payload.zoom,
+      pdfFitWidth: payload.fitWidth,
+    }).catch(() => undefined)
+  }, 300)
+}
+
+function closePdfReader() {
+  view.value = 'detail'
+  chrome.value = true
+}
+
+/** 从原版切到文本：PDF 一章对应一页，按原页尽量落到同一章。 */
+async function switchToTextFromPdf() {
+  const readable = chapters.value.filter((chapter: any) => !chapter.isVolume && chapter.url)
+  if (!readable.length) {
+    showReaderHint('没有可读文本，请先缓存或重新导入')
+    return
+  }
+  // 文本模式有自己的章节进度，优先回到上次读的那一章；没有才按原版页码映射。
+  const recorded = progress.value?.chapterUrl
+    ? chapters.value.find((chapter: any) => !chapter.isVolume && chapter.url === progress.value.chapterUrl)
+    : null
+  if (recorded) {
+    await openChapter(recorded)
+    return
+  }
+  const index = Math.min(Math.max(0, Number(progress.value?.pdfPage ?? 0) || 0), readable.length - 1)
+  await openChapter(readable[index])
+}
+
+/** 阅读页的原版 / 文本切换入口。 */
+async function togglePdfMode() {
+  if (readerKind.value === 'pdf') {
+    await switchToTextFromPdf()
+    return
+  }
+  if (!isPdfReadable.value) {
+    showReaderHint('没有可用的 PDF 原文件')
+    return
+  }
+  await openPdfReader()
 }
 
 const switchOpen = ref(false)
@@ -3185,11 +3298,13 @@ onMounted(async () => {
               {{ currentBook.originName || currentBook.origin }} · {{ chapters.length }} 章
               <span v-if="currentBook.wordCount"> · {{ currentBook.wordCount }}</span>
               <span v-if="bookStatus(currentBook)" class="mo-tag soft">{{ bookStatus(currentBook) }}</span>
+              <span v-if="isPdfBook" class="mo-tag soft" data-testid="pdf-tag">PDF · 原版</span>
             </p>
             <div class="mo-hero-actions">
               <button class="mo-btn primary" data-testid="read-start" @click="continueReading">
-                {{ progress ? '继续阅读' : '开始阅读' }}
+                {{ isPdfReadable ? (hasPdfProgress ? '继续原版' : '原版阅读') : progress ? '继续阅读' : '开始阅读' }}
               </button>
+              <button v-if="isPdfReadable" class="mo-btn" data-testid="read-text" @click="continueReadingText">文本模式</button>
               <button v-if="!currentBook.id" class="mo-btn" data-testid="add-shelf" @click="addToShelf">加入书架</button>
               <span v-else class="mo-tag">已在书架</span>
               <button
@@ -3792,6 +3907,24 @@ onMounted(async () => {
             @tap-action="onTapAction"
             @select="onReaderSelect"
           />
+          <PdfReader
+            v-else-if="readerKind === 'pdf' && pdfOriginalUrl && !pdfError"
+            :src="pdfOriginalUrl"
+            :title="currentBook?.name || '原版 PDF'"
+            :initial-page="pdfInitialPage"
+            :initial-zoom="pdfInitialZoom"
+            :initial-fit-width="pdfInitialFitWidth"
+            @page="onPdfPage"
+            @switch-text="switchToTextFromPdf"
+            @close="closePdfReader"
+          />
+          <div v-else-if="readerKind === 'pdf'" class="mo-pdf-unavailable" data-testid="pdf-error">
+            <p>{{ pdfError || '原版 PDF 不可用' }}</p>
+            <div class="mo-row">
+              <button class="mo-btn primary" data-testid="pdf-error-text" @click="switchToTextFromPdf">切到文本模式</button>
+              <button class="mo-btn" data-testid="pdf-error-back" @click="closePdfReader">返回详情</button>
+            </div>
+          </div>
           <ComicReader
             v-else-if="readerKind === 'images'"
             :images="readerImages"
@@ -3834,6 +3967,14 @@ onMounted(async () => {
               <button v-if="readerKind === 'text'" class="mo-icon-btn" title="段评" data-testid="reader-review" @click="openReview">💬</button>
               <button v-if="readerKind === 'text'" class="mo-icon-btn" title="书内搜索" aria-label="书内搜索" data-testid="reader-search" @click="openReaderSearch">🔍</button>
               <button class="mo-icon-btn" title="目录" data-testid="reader-toc" @click="tocOpen = true">☰</button>
+              <button
+                v-if="isPdfBook && isPdfReadable"
+                class="mo-chrome-btn"
+                data-testid="reader-pdf-toggle"
+                @click="togglePdfMode"
+              >
+                {{ readerKind === 'pdf' ? '文本' : '原版' }}
+              </button>
             </div>
             <div class="mo-chrome-bottom">
               <button v-if="settings.menuItems.includes('prev')" class="mo-chrome-btn" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
@@ -5330,6 +5471,24 @@ textarea {
 .mo-reader-loading {
   padding: 40px;
   color: #8f897b;
+}
+/* 原版 PDF 缺失或加载失败时的兜底面板：不白屏，并给文本模式入口。 */
+.mo-pdf-unavailable {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  height: 100%;
+  padding: 40px 24px;
+  color: #d8d4c8;
+  text-align: center;
+  background: #1b1d22;
+}
+.mo-pdf-unavailable p {
+  margin: 0;
+  max-width: 420px;
+  line-height: 1.6;
 }
 .mo-chrome {
   position: absolute;
