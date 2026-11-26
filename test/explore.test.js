@@ -39,6 +39,24 @@ test('探索解析：@js 返回数组（字符串与 {name,url}）', async () =>
   ])
 })
 
+test('探索解析：整段 JSON 数组（Legado 常见格式）', async () => {
+  const { parseExploreCategories } = await import('../dist/core/source/explore.js')
+  const raw = JSON.stringify([
+    { title: '首页', url: '/', style: { layout_flexGrow: 1 } },
+    { title: '排行', url: '/rank_{{page}}.html' },
+  ])
+  assert.deepEqual(parseExploreCategories(raw, BASE), [
+    { name: '首页', url: `${BASE}/` },
+    { name: '排行', url: `${BASE}/rank_{{page}}.html` },
+  ])
+})
+
+test('探索解析：@js 返回 JSON 字符串数组', async () => {
+  const { parseExploreCategories } = await import('../dist/core/source/explore.js')
+  const raw = '@js:JSON.stringify([{ title: "玄幻", url: "/x" }])'
+  assert.deepEqual(parseExploreCategories(raw, BASE), [{ name: '玄幻', url: `${BASE}/x` }])
+})
+
 test('探索解析：@js 返回换行分隔字符串', async () => {
   const { parseExploreCategories } = await import('../dist/core/source/explore.js')
   const raw = '@js:"玄幻::/x\\n都市::/d"'

@@ -49,6 +49,8 @@ export function parseExploreCategories(
 
   const categories: ExploreCategory[] = []
   const evalScript = options.evalScript ?? defaultExploreScript
+  // Legado 的 exploreUrl 也常见「整段 JSON 数组」：先整体尝试，失败再按行解析。
+  if (/^\s*\[/.test(text) && collectJson(text, baseUrl, categories)) return categories
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim()
     if (!trimmed) continue
@@ -127,6 +129,19 @@ function addCategory(line: string, baseUrl: string, categories: ExploreCategory[
   categories.push({ name: name || url, url })
 }
 
+/** 整段 JSON 数组（Legado 常见格式）；解析失败返回 false，交给按行解析。 */
+function collectJson(raw: string, baseUrl: string, categories: ExploreCategory[]): boolean {
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    return false
+  }
+  if (!Array.isArray(value)) return false
+  for (const item of value) collectScriptResult(item, baseUrl, categories)
+  return true
+}
+
 /** @js 的返回值可能是数组、换行字符串或单个对象，统一展开成分类。 */
 function collectScriptResult(
   value: unknown,
@@ -135,6 +150,7 @@ function collectScriptResult(
 ): void {
   if (value == null) return
   if (typeof value === 'string') {
+    if (/^\s*\[/.test(value) && collectJson(value, baseUrl, categories)) return
     for (const line of value.split(/\r?\n/)) {
       const trimmed = line.trim()
       if (trimmed) addCategory(trimmed, baseUrl, categories)
@@ -148,7 +164,12 @@ function collectScriptResult(
   if (typeof value !== 'object') return
 
   const record = value as Record<string, unknown>
-  const name = typeof record.name === 'string' ? record.name : ''
+  const name =
+    typeof record.name === 'string'
+      ? record.name
+      : typeof record.title === 'string'
+        ? record.title
+        : ''
   const url =
     typeof record.url === 'string'
       ? record.url
