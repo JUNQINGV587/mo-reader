@@ -65,6 +65,8 @@ export const REMOTE_METHODS = Object.freeze([
   'getRssArticles',
   'getSettings',
   'saveSettings',
+  'resetBookSettings',
+  'resetSettingsGroup',
   'getStorageUsage',
   'setMediaQuota',
   'clearBookStorage',
