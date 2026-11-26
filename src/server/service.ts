@@ -124,6 +124,16 @@ import {
 } from './media.js'
 import { listCustomFonts, readCustomFont, removeCustomFont, saveCustomFont } from './fonts.js'
 import { isKnownTheme, normalizeCustomThemes } from '../core/reader/theme.js'
+import {
+  BOOK_OVERRIDE_FIELDS,
+  defaultGroupSettings,
+  mergeReaderSettings,
+  normalizeBookOverrides,
+  normalizeReaderSettings,
+  normalizeReaderSettingsPatch,
+  settingsGroup,
+  type SettingsGroupKey,
+} from '../core/reader/settings.js'
 import { parseShelfImport, shelfDedupKeys } from '../core/reader/shelf-transfer.js'
 import {
   LOCAL_PDF_ORIGINAL,
@@ -2087,38 +2097,130 @@ export class ReaderService extends TypertRemoteService {
     return { feed, sourceName: String(record.sourceName ?? '') }
   }
 
-  async getSettings() {
-    return { settings: this.requireDb().settings.get() }
+  /** 读取设置：不带 bookId 读全局；带 bookId 返回全局与本书覆盖合并后的结果。 */
+  async getSettings(args?: Args) {
+    const db = this.requireDb()
+    const global = normalizeReaderSettings(db.settings.get())
+    const bookId = typeof args?.bookId === 'string' ? args.bookId.trim() : ''
+    if (!bookId) return { settings: global }
+    const bookOverrides = normalizeBookOverrides(db.readConfigs?.get(bookId), {
+      knownThemeIds: global.customThemes.map((theme) => theme.id),
+    })
+    return {
+      settings: mergeReaderSettings(global, bookOverrides),
+      bookOverridden: Object.keys(bookOverrides).length > 0,
+      bookOverrides,
+    }
   }
 
+  /**
+   * 保存设置：不带 bookId 写全局；带 bookId 只把本次改动写进本书覆盖层。
+   * 未知字段原样保留；坏值不覆盖旧值；本书保存不会清空其他覆盖。
+   */
   async saveSettings(args: Args) {
     const patch = args?.settings
     if (!patch || typeof patch !== 'object') throw new Error('缺少参数 settings')
-    const current = this.requireDb().settings.get()
-    const changedFont = typeof (patch as any).fontId === 'string' && (patch as any).fontId !== current.fontId
-    if (changedFont && (patch as any).fontId) {
-      const fonts = await listCustomFonts()
-      if (!fonts.some((font) => font.id === (patch as any).fontId)) throw new Error('字体不存在')
-    }
+    const db = this.requireDb()
+    const bookId = typeof args?.bookId === 'string' ? args.bookId.trim() : ''
+    const current = normalizeReaderSettings(db.settings.get())
     const patchRecord = patch as Record<string, unknown>
-    const customThemes =
-      patchRecord.customThemes === undefined
-        ? current.customThemes ?? []
-        : normalizeCustomThemes(patchRecord.customThemes)
+    const changedFont = typeof patchRecord.fontId === 'string' && patchRecord.fontId !== current.fontId
+    if (changedFont && patchRecord.fontId) {
+      const fonts = await listCustomFonts()
+      if (!fonts.some((font) => font.id === patchRecord.fontId)) throw new Error('字体不存在')
+    }
+    // 自定义主题只存在全局层；本书保存时忽略请求里的列表，避免把全局主题表写进覆盖。
+    const customThemes = !bookId && patchRecord.customThemes !== undefined
+      ? normalizeCustomThemes(patchRecord.customThemes)
+      : current.customThemes
     const requestedTheme = patchRecord.theme
     if (requestedTheme !== undefined) {
       if (typeof requestedTheme !== 'string' || !requestedTheme) throw new Error('主题无效')
       if (!isKnownTheme(requestedTheme, customThemes)) throw new Error('主题不存在')
     }
-    const nextTheme =
-      typeof requestedTheme === 'string' && isKnownTheme(requestedTheme, customThemes)
-        ? requestedTheme
-        : isKnownTheme(current.theme, customThemes)
-          ? current.theme
-          : 'light'
-    const next = { ...current, ...patchRecord, theme: nextTheme, customThemes }
-    await this.requireDb().settings.set(next)
-    return { settings: next }
+    const knownThemeIds = customThemes.map((theme) => theme.id)
+    const normalizedPatch = normalizeReaderSettingsPatch(patchRecord, { knownThemeIds })
+
+    if (!bookId) {
+      const next = normalizeReaderSettings({
+        ...current,
+        ...normalizedPatch,
+        customThemes,
+        ...(requestedTheme === undefined ? {} : { theme: requestedTheme }),
+      })
+      await db.settings.set(next)
+      return { settings: next }
+    }
+
+    const overrides: Record<string, unknown> = { ...normalizeBookOverrides(db.readConfigs?.get(bookId), { knownThemeIds }) }
+    for (const field of BOOK_OVERRIDE_FIELDS) {
+      if (!(field in normalizedPatch)) continue
+      overrides[field] = (normalizedPatch as Record<string, unknown>)[field]
+    }
+    if (Object.keys(overrides).length === 0) {
+      return { settings: mergeReaderSettings(current, overrides), bookOverridden: false, bookOverrides: {} }
+    }
+    const now = new Date().toISOString()
+    const existing = db.readConfigs?.get(bookId) as Record<string, unknown> | undefined
+    await db.readConfigs.put(bookId, {
+      ...overrides,
+      id: bookId,
+      bookId,
+      createdAt: typeof existing?.createdAt === 'string' ? existing.createdAt : now,
+      updatedAt: now,
+    })
+    return {
+      settings: mergeReaderSettings(current, overrides),
+      bookOverridden: true,
+      bookOverrides: overrides,
+    }
+  }
+
+  /** 恢复全局：清掉本书覆盖层，之后立即继承全局设置。 */
+  async resetBookSettings(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const db = this.requireDb()
+    await db.readConfigs.delete(bookId)
+    return { settings: normalizeReaderSettings(db.settings.get()), bookOverridden: false, bookOverrides: {} }
+  }
+
+  /** 恢复本节默认：全局层回到默认值，本书层删掉该分区的覆盖并继承全局。 */
+  async resetSettingsGroup(args: Args) {
+    const group = stringArg(args, 'group') as SettingsGroupKey
+    const definition = settingsGroup(group)
+    if (!definition) throw new Error('未知设置分组')
+    const db = this.requireDb()
+    const global = normalizeReaderSettings(db.settings.get())
+    const bookId = typeof args?.bookId === 'string' ? args.bookId.trim() : ''
+    if (!bookId) {
+      const next = normalizeReaderSettings({ ...global, ...defaultGroupSettings(definition.key) })
+      await db.settings.set(next)
+      return { settings: next }
+    }
+    const overrides = {
+      ...normalizeBookOverrides(db.readConfigs?.get(bookId), {
+        knownThemeIds: global.customThemes.map((theme) => theme.id),
+      }),
+    } as Record<string, unknown>
+    for (const field of definition.fields) delete overrides[field]
+    const now = new Date().toISOString()
+    const existing = db.readConfigs?.get(bookId) as Record<string, unknown> | undefined
+    if (Object.keys(overrides).length === 0) {
+      await db.readConfigs.delete(bookId)
+    } else {
+      await db.readConfigs.put(bookId, {
+        ...overrides,
+        id: bookId,
+        bookId,
+        createdAt: typeof existing?.createdAt === 'string' ? existing.createdAt : now,
+        updatedAt: now,
+      })
+    }
+    return {
+      settings: mergeReaderSettings(global, overrides),
+      bookOverridden: Object.keys(overrides).length > 0,
+      bookOverrides: overrides,
+    }
   }
 
   async listFonts() {
