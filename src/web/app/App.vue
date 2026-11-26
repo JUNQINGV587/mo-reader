@@ -247,6 +247,26 @@ let speechSegments: Array<{ text: string; start: number }> = []
 let speechIndex = 0
 let pageTimer: ReturnType<typeof setTimeout> | undefined
 
+// 阅读页「书内搜索」：跨批自动推进，令牌用于停止后丢弃在途批次。
+const readerSearchOpen = ref(false)
+const readerSearchKey = ref('')
+const readerSearchUsedKey = ref('')
+const readerSearchBusy = ref(false)
+const readerSearchStarted = ref(false)
+const readerSearchDone = ref(true)
+const readerSearchStopped = ref(false)
+const readerSearchScanned = ref(0)
+const readerSearchTotal = ref(0)
+const readerSearchNextIndex = ref(0)
+const readerSearchResults = ref<
+  Array<{ chapterIndex: number; chapterTitle: string; count: number; snippet: string; pageHint: number }>
+>([])
+const readerSearchErrors = ref<Array<{ chapterIndex: number; chapterTitle: string; message: string }>>([])
+const readerSearchHint = ref('')
+const readerHint = ref('')
+let readerSearchToken = 0
+let readerHintTimer: ReturnType<typeof setTimeout> | undefined
+
 const editing = ref<any>(null)
 const editingJson = ref('')
 const debugType = ref('search')
@@ -2054,6 +2074,140 @@ function toggleSpeech() {
   else startSpeech()
 }
 
+function showReaderHint(text: string) {
+  readerHint.value = text
+  if (readerHintTimer) clearTimeout(readerHintTimer)
+  readerHintTimer = setTimeout(() => {
+    readerHint.value = ''
+  }, 4000)
+}
+
+function openReaderSearch() {
+  if (readerKind.value !== 'text') return
+  if (!currentBook.value?.id) {
+    showReaderHint('加入书架后可搜索')
+    return
+  }
+  readerSearchOpen.value = true
+  readerSearchHint.value = ''
+}
+
+function closeReaderSearch() {
+  readerSearchOpen.value = false
+}
+
+async function runReaderSearch(fromIndex: number, reset: boolean) {
+  const key = readerSearchKey.value.trim()
+  if (!key) {
+    readerSearchHint.value = '请输入关键词'
+    return
+  }
+  const bookId = currentBook.value?.id
+  if (!bookId) {
+    readerSearchHint.value = '加入书架后可搜索'
+    return
+  }
+  const token = ++readerSearchToken
+  readerSearchStarted.value = true
+  readerSearchBusy.value = true
+  readerSearchStopped.value = false
+  readerSearchHint.value = ''
+  if (reset) {
+    readerSearchUsedKey.value = key
+    readerSearchResults.value = []
+    readerSearchErrors.value = []
+    readerSearchScanned.value = 0
+    readerSearchDone.value = false
+    readerSearchTotal.value = chapters.value.length
+  }
+  try {
+    const result = await call('searchInBook', {
+      bookId,
+      key: readerSearchUsedKey.value,
+      fromIndex,
+      maxChapters: 200,
+    })
+    if (token !== readerSearchToken) return
+    readerSearchResults.value.push(...(result?.results ?? []))
+    readerSearchErrors.value.push(...(result?.errors ?? []))
+    const next = Number(result?.nextIndex ?? fromIndex)
+    readerSearchNextIndex.value = next
+    readerSearchScanned.value = next
+    readerSearchTotal.value = Math.max(readerSearchTotal.value, next)
+    readerSearchDone.value = Boolean(result?.done)
+    if (readerSearchDone.value) {
+      if (readerSearchResults.value.length) {
+        readerSearchHint.value = `已搜完，共 ${readerSearchResults.value.length} 章命中`
+      }
+    } else if (!readerSearchResults.value.length && !readerSearchErrors.value.length) {
+      readerSearchHint.value = '本批没有找到，可继续'
+    }
+  } catch (error) {
+    if (token === readerSearchToken) readerSearchHint.value = errorText(error)
+  } finally {
+    if (token === readerSearchToken) readerSearchBusy.value = false
+  }
+}
+
+function startReaderSearch() {
+  if (readerSearchBusy.value) return
+  void runReaderSearch(0, true)
+}
+
+function continueReaderSearch() {
+  void runReaderSearch(readerSearchNextIndex.value, false)
+}
+
+function stopReaderSearch() {
+  if (!readerSearchBusy.value) return
+  readerSearchToken += 1
+  readerSearchBusy.value = false
+  readerSearchStopped.value = true
+  readerSearchHint.value = '已停止，可继续搜索'
+}
+
+const readerSearchCanContinue = computed(
+  () =>
+    readerSearchStarted.value &&
+    !readerSearchBusy.value &&
+    !readerSearchDone.value &&
+    readerSearchKey.value.trim() === readerSearchUsedKey.value,
+)
+
+const readerSearchEmpty = computed(
+  () =>
+    readerSearchStarted.value &&
+    !readerSearchBusy.value &&
+    (readerSearchDone.value || readerSearchStopped.value) &&
+    readerSearchResults.value.length === 0 &&
+    readerSearchErrors.value.length === 0,
+)
+
+async function jumpToSearchResult(item: { chapterIndex: number }) {
+  const chapter = chapters.value[item.chapterIndex]
+  const key = readerSearchUsedKey.value
+  if (!chapter || chapter.isVolume || !chapter.url) {
+    readerSearchHint.value = '章节已变化，请重搜'
+    return
+  }
+  readerSearchOpen.value = false
+  readerSearchHint.value = ''
+  await openChapter(chapter, 0)
+  if (currentChapter.value !== chapter) {
+    showReaderHint('章节打开失败')
+    return
+  }
+  await nextTick()
+  const target = readerRef.value?.findPageFor?.(key)
+  if (typeof target === 'number' && target >= 0) {
+    readerRef.value?.goto?.(target)
+    highlightText.value = key
+  } else {
+    readerRef.value?.goto?.(0)
+    showReaderHint('未定位到关键词')
+  }
+}
+
 function addReplaceRule() {
   settings.value.replaceRules.push({
     id: `r-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
@@ -3002,6 +3156,7 @@ onMounted(async () => {
               <button class="mo-icon-btn" title="书签列表" data-testid="reader-bookmarks" @click="bookmarksOpen = true">🔖</button>
               <button v-if="readerKind === 'text'" class="mo-icon-btn" title="笔记与划线" data-testid="reader-notes" @click="notesOpen = true">✎</button>
               <button v-if="readerKind === 'text'" class="mo-icon-btn" title="段评" data-testid="reader-review" @click="openReview">💬</button>
+              <button v-if="readerKind === 'text'" class="mo-icon-btn" title="书内搜索" aria-label="书内搜索" data-testid="reader-search" @click="openReaderSearch">🔍</button>
               <button class="mo-icon-btn" title="目录" data-testid="reader-toc" @click="tocOpen = true">☰</button>
             </div>
             <div class="mo-chrome-bottom">
@@ -3021,6 +3176,8 @@ onMounted(async () => {
             </div>
           </div>
         </transition>
+
+        <div v-if="readerHint" class="mo-reader-hint" data-testid="reader-hint">{{ readerHint }}</div>
 
         <transition name="mo-fade">
           <div v-if="dictPanelOpen" class="mo-sheet-mask" data-testid="reader-dict-mask" @click.self="closeReaderDict">
@@ -3080,6 +3237,67 @@ onMounted(async () => {
               </template>
               <p v-else-if="!dictPanelBusy && !dictPanelError" class="muted">输入词后查询。</p>
               <p v-if="dictPanelCopied" class="muted" data-testid="reader-dict-copied">{{ dictPanelCopied }}</p>
+            </div>
+          </div>
+        </transition>
+
+        <transition name="mo-fade">
+          <div v-if="readerSearchOpen" class="mo-sheet-mask" data-testid="reader-search-mask" @click.self="closeReaderSearch">
+            <div class="mo-sheet mo-sheet-scroll mo-reader-search" data-testid="reader-search-panel" @pointerdown.stop @click.stop>
+              <div class="mo-sheet-head">
+                <strong>书内搜索</strong>
+                <span class="muted">逐章查找正文</span>
+                <button class="mo-icon-btn" data-testid="reader-search-close" title="关闭" @click="closeReaderSearch">✕</button>
+              </div>
+              <div class="mo-row">
+                <input
+                  v-model="readerSearchKey"
+                  placeholder="输入关键词"
+                  data-testid="reader-search-input"
+                  @keyup.enter="startReaderSearch"
+                />
+                <button
+                  class="mo-btn primary"
+                  :disabled="readerSearchBusy || !readerSearchKey.trim()"
+                  data-testid="reader-search-run"
+                  @click="startReaderSearch"
+                >
+                  搜索
+                </button>
+                <button v-if="readerSearchBusy" class="mo-btn tiny" data-testid="reader-search-stop" @click="stopReaderSearch">停止</button>
+                <button
+                  v-else-if="readerSearchCanContinue"
+                  class="mo-btn tiny"
+                  data-testid="reader-search-continue"
+                  @click="continueReaderSearch"
+                >
+                  继续搜索
+                </button>
+              </div>
+              <p v-if="readerSearchStarted" class="muted mo-search-hint" data-testid="reader-search-progress">
+                已搜 {{ readerSearchScanned }}/{{ readerSearchTotal }} · 命中 {{ readerSearchResults.length }}
+              </p>
+              <p v-if="readerSearchHint" class="muted mo-search-hint" data-testid="reader-search-hint">{{ readerSearchHint }}</p>
+              <ul v-if="readerSearchResults.length" class="mo-search-list" data-testid="reader-search-results">
+                <li v-for="item in readerSearchResults" :key="item.chapterIndex">
+                  <button class="mo-search-item" data-testid="reader-search-result" @click="jumpToSearchResult(item)">
+                    <span class="mo-search-title">{{ item.chapterTitle }}</span>
+                    <span class="mo-search-count">{{ item.count }} 处</span>
+                    <span class="mo-search-snippet">{{ item.snippet }}</span>
+                  </button>
+                </li>
+              </ul>
+              <details v-if="readerSearchErrors.length" class="mo-search-errors" data-testid="reader-search-errors">
+                <summary>失败 {{ readerSearchErrors.length }} 章</summary>
+                <p v-for="error in readerSearchErrors" :key="error.chapterIndex" class="muted">
+                  {{ error.chapterTitle || `第 ${error.chapterIndex + 1} 章` }}：{{ error.message }}
+                </p>
+              </details>
+              <div v-if="readerSearchEmpty" class="mo-empty small" data-testid="reader-search-empty">
+                <p>{{ readerSearchDone ? '没有找到相关章节' : '暂未找到相关章节' }}</p>
+                <p class="muted">{{ readerSearchDone ? '换个关键词试试。' : '可继续搜索后面的章节。' }}</p>
+              </div>
+              <p v-else-if="!readerSearchStarted" class="muted">输入关键词，逐章查找正文。</p>
             </div>
           </div>
         </transition>
@@ -4311,6 +4529,74 @@ textarea {
 }
 .mo-reader-dict .mo-dict-text {
   max-height: 180px;
+}
+
+/* 书内搜索 */
+.mo-search-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+.mo-search-list li + li {
+  border-top: 1px solid var(--mo-line);
+}
+.mo-search-item {
+  display: block;
+  width: 100%;
+  padding: 10px 2px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.mo-search-title {
+  font-size: 14px;
+}
+.mo-search-count {
+  margin-left: 8px;
+  color: var(--mo-accent);
+  font-size: 12px;
+}
+.mo-search-snippet {
+  display: block;
+  margin-top: 4px;
+  color: var(--mo-ink-2);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.mo-search-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+}
+.mo-search-errors {
+  margin-top: 10px;
+  color: var(--mo-ink-2);
+  font-size: 12px;
+}
+.mo-search-errors summary {
+  cursor: pointer;
+}
+.mo-search-errors p {
+  margin: 4px 0 0;
+}
+.mo-reader-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 84px;
+  transform: translateX(-50%);
+  max-width: 82%;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: rgba(20, 21, 24, 0.86);
+  color: #d8d4c8;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+  z-index: 5;
+  pointer-events: none;
 }
 
 /* 阅读页 */
