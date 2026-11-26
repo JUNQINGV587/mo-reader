@@ -9,7 +9,7 @@ import { createRoot } from 'react-dom/client'
 const require = createRequire(import.meta.url)
 
 test('SSRF 守卫：私网、协议与凭据', async () => {
-  const { isPrivateAddress, parseHttpUrl, UnsafeUrlError } = await import('../dist/core/net/guard.js')
+  const { assertPublicHttpUrl, isPrivateAddress, parseHttpUrl, UnsafeUrlError } = await import('../dist/core/net/guard.js')
 
   const privateAddresses = [
     '127.0.0.1',
@@ -45,6 +45,10 @@ test('SSRF 守卫：私网、协议与凭据', async () => {
   const url = parseHttpUrl('https://example.com/search?q=墨读')
   assert.equal(url.hostname, 'example.com')
   assert.equal(url.searchParams.get('q'), '墨读')
+
+  // 公网 IPv6 字面量不应被误当成域名去做 DNS 解析。
+  const ipv6 = await assertPublicHttpUrl('http://[2606:4700:4700::1111]/')
+  assert.equal(ipv6.hostname, '[2606:4700:4700::1111]')
 })
 
 test('server：storage 域与 Remote 契约', async () => {

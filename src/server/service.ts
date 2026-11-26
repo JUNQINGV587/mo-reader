@@ -3,10 +3,21 @@ import { Service } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { VERSION } from '../core/version.js'
 import { parseSource, type BookSource } from '../core/model/source.js'
+import { dictRuleKey, parseDictRule, type DictRule } from '../core/model/dict.js'
+import { AnalyzeRule } from '../core/rules/analyze-rule.js'
+import { analyzeExplore, parseExploreCategories } from '../core/source/explore.js'
+import { isExploreEnabled } from '../core/source/filter.js'
 import { parseRssSources } from '../core/rss/source.js'
 import { parseFeed } from '../core/rss/feed.js'
 import { fetchText } from '../core/net/http.js'
-import { buildRequest, buildSearchRequest, parseHeaders, splitUrlOptions, type RequestSpec } from '../core/source/url.js'
+import {
+  buildExploreRequest,
+  buildRequest,
+  buildSearchRequest,
+  parseHeaders,
+  splitUrlOptions,
+  type RequestSpec,
+} from '../core/source/url.js'
 import {
   analyzeBookInfo,
   analyzeChapterContent,
@@ -14,8 +25,11 @@ import {
   analyzeSearch,
   analyzeToc,
   contentKindOf,
+  contentKindOfType,
+  htmlToText,
 } from '../core/source/analyze.js'
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
+import { mapSwitchProgress, matchBookName, sameAuthorName } from '../core/source/switch.js'
 import { openReaderStorage } from './storage.js'
 import { hasCachedChapter, readCachedChapter, writeCachedChapter } from './cache.js'
 import { buildEpub } from './epub-export.js'
@@ -36,6 +50,29 @@ import { REMOTE_METHODS } from '../core/remote-methods.js'
 
 type Args = Record<string, unknown> | undefined
 
+/** pageHint 只是服务端按约 800 字/页给出的粗估，真实定位由阅读器 findPageFor 完成。 */
+const SEARCH_PAGE_HINT_CHARS = 800
+/** 结果片段在首个命中前后各保留的字数。 */
+const SEARCH_SNIPPET_CONTEXT = 30
+
+function countOccurrences(value: string, key: string): number {
+  if (!key) return 0
+  let count = 0
+  let index = value.indexOf(key)
+  while (index >= 0) {
+    count += 1
+    index = value.indexOf(key, index + key.length)
+  }
+  return count
+}
+
+function searchSnippet(value: string, start: number, length: number): string {
+  const from = Math.max(0, start - SEARCH_SNIPPET_CONTEXT)
+  const to = Math.min(value.length, start + length + SEARCH_SNIPPET_CONTEXT)
+  const body = value.slice(from, to).replace(/\s+/g, ' ').trim()
+  return `${from > 0 ? '…' : ''}${body}${to < value.length ? '…' : ''}`
+}
+
 function stringArg(args: Args, name: string): string {
   const value = args?.[name]
   if (typeof value !== 'string' || !value.trim()) {
@@ -46,6 +83,10 @@ function stringArg(args: Args, name: string): string {
 
 const SAFE_KEY = /^[a-z][a-z0-9_-]+$/
 
+function sameRequest(a: RequestSpec, b: RequestSpec): boolean {
+  return a.url === b.url && a.method === b.method && (a.body ?? '') === (b.body ?? '')
+}
+
 /**
  * 存储的 per-record key 只能是路径安全的小写串；书源的 bookSourceUrl
  * 常是完整 URL，用 sha1 生成稳定 key，兼容旧数据里本身就是安全串的 key。
@@ -54,6 +95,57 @@ function sourceKey(bookSourceUrl: string): string {
   return SAFE_KEY.test(bookSourceUrl)
     ? bookSourceUrl
     : `src-${createHash('sha1').update(bookSourceUrl).digest('hex').slice(0, 24)}`
+}
+
+/** 在线检查并发上限与超时范围：一次只打 8 个源，单请求 0.5–30 秒。 */
+const SOURCE_CHECK_CONCURRENCY = 8
+const SOURCE_CHECK_TIMEOUT_MS = 5000
+const SOURCE_CHECK_TIMEOUT_MIN_MS = 500
+const SOURCE_CHECK_TIMEOUT_MAX_MS = 30_000
+
+interface SourceCheckResult {
+  url: string
+  ok: boolean
+  status: number | null
+  elapsedMs: number
+  error: string
+}
+
+function clampCheckTimeout(value: unknown): number {
+  const raw =
+    typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : SOURCE_CHECK_TIMEOUT_MS
+  return Math.min(SOURCE_CHECK_TIMEOUT_MAX_MS, Math.max(SOURCE_CHECK_TIMEOUT_MIN_MS, raw))
+}
+
+function checkErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    if (error.name === 'TimeoutError' || error.name === 'AbortError') return '请求超时'
+    return error.message || '请求失败'
+  }
+  return String(error)
+}
+
+async function checkOneSource(url: string, timeoutMs: number): Promise<SourceCheckResult> {
+  const started = Date.now()
+  try {
+    const response = await fetchText(url, { timeoutMs })
+    const ok = response.status >= 200 && response.status < 400
+    return {
+      url,
+      ok,
+      status: response.status,
+      elapsedMs: Date.now() - started,
+      error: ok ? '' : `HTTP ${response.status}`,
+    }
+  } catch (error) {
+    return {
+      url,
+      ok: false,
+      status: null,
+      elapsedMs: Date.now() - started,
+      error: checkErrorMessage(error),
+    }
+  }
 }
 
 export class ReaderService extends TypertRemoteService {
@@ -183,6 +275,166 @@ export class ReaderService extends TypertRemoteService {
     return { updated }
   }
 
+  /** 导出书源为 Legado 兼容 JSON：去掉内部存储 id，其余字段原样保留。 */
+  async exportSources(args: Args) {
+    const raw = args?.ids
+    const ids = Array.isArray(raw)
+      ? raw
+          .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+          .map((id) => id.trim())
+      : []
+    if (ids.length === 0) throw new Error('缺少参数 ids')
+    const db = this.requireDb()
+    const sources: Array<Record<string, unknown>> = []
+    const seen = new Set<string>()
+    for (const id of ids) {
+      // 兼容两种入参：存储 key（listSources 返回的 id）或书源 URL。
+      const key = db.sources.get(id) !== undefined ? id : sourceKey(id)
+      if (seen.has(key)) continue
+      const source = db.sources.get(key) as (BookSource & { id?: string }) | undefined
+      if (!source) continue
+      seen.add(key)
+      const out: Record<string, unknown> = { ...source }
+      delete out.id
+      sources.push(out)
+    }
+    if (sources.length === 0) throw new Error('书源不存在')
+    return { json: JSON.stringify(sources, null, 2), count: sources.length }
+  }
+
+  /**
+   * 在线可达性检查：逐条请求书源地址，按输入顺序返回结果。
+   * 与静态结构检查（checkReport）无关，只回答「现在能不能连上」。
+   */
+  async checkSources(args: Args) {
+    const raw = args?.urls
+    const urls = Array.isArray(raw)
+      ? raw
+          .filter((url): url is string => typeof url === 'string' && url.trim().length > 0)
+          .map((url) => url.trim())
+      : []
+    if (urls.length === 0) throw new Error('缺少参数 urls')
+    const timeoutMs = clampCheckTimeout(args?.timeoutMs)
+    const results: SourceCheckResult[] = new Array(urls.length)
+    let cursor = 0
+    const worker = async () => {
+      for (;;) {
+        const index = cursor
+        cursor += 1
+        if (index >= urls.length) return
+        results[index] = await checkOneSource(urls[index], timeoutMs)
+      }
+    }
+    await Promise.all(
+      Array.from({ length: Math.min(SOURCE_CHECK_CONCURRENCY, urls.length) }, () => worker()),
+    )
+    return { results }
+  }
+
+  async listDictRules() {
+    const rules: DictRule[] = []
+    for (const [, value] of this.requireDb().dictRules.entries()) {
+      rules.push(value as DictRule)
+    }
+    rules.sort((a, b) => {
+      const left = typeof a.customOrder === 'number' ? a.customOrder : Number.MAX_SAFE_INTEGER
+      const right = typeof b.customOrder === 'number' ? b.customOrder : Number.MAX_SAFE_INTEGER
+      if (left !== right) return left - right
+      return (a.name ?? '').localeCompare(b.name ?? '', 'zh')
+    })
+    return { rules }
+  }
+
+  /** 新增或更新一条字典规则：id 由名称+地址稳定生成，编辑时沿用旧 id。 */
+  async saveDictRule(args: Args) {
+    const raw = args?.rule
+    if (!raw || typeof raw !== 'object') throw new Error('缺少参数 rule')
+    const rule = parseDictRule(raw)
+    const db = this.requireDb()
+    const incoming = raw as Record<string, unknown>
+    const requestedId = typeof incoming.id === 'string' && incoming.id.trim() ? incoming.id.trim() : ''
+    const key = requestedId && db.dictRules.get(requestedId) !== undefined ? requestedId : dictRuleKey(rule.name, rule.url)
+    const existing = db.dictRules.get(key) as DictRule | undefined
+    const customOrder = this.resolveDictOrder(incoming, existing)
+    const saved = { ...rule, id: key, customOrder } as DictRule
+    await db.dictRules.put(key, saved)
+    return { rule: saved }
+  }
+
+  async deleteDictRules(args: Args) {
+    const ids = Array.isArray(args?.ids)
+      ? (args!.ids as unknown[]).filter((id): id is string => typeof id === 'string' && id.length > 0)
+      : []
+    if (ids.length === 0) throw new Error('缺少参数 ids')
+    const deleted = await this.requireDb().dictRules.deleteMany(ids)
+    return { deleted }
+  }
+
+  /** 导入 Legado 字典数组或 { dictRules: [...] }；单条失败只记错误，不中断整批。 */
+  async importDictRules(args: Args) {
+    const payload = stringArg(args, 'payload')
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(payload)
+    } catch {
+      throw new Error('不是合法的 JSON')
+    }
+    const list = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === 'object' && Array.isArray((parsed as any).dictRules)
+        ? ((parsed as any).dictRules as unknown[])
+        : null
+    if (!list) throw new Error('字典数据格式不正确')
+
+    const db = this.requireDb()
+    let added = 0
+    let updated = 0
+    const errors: Array<{ name: string; message: string }> = []
+    for (const item of list) {
+      try {
+        if (!item || typeof item !== 'object') throw new Error('字典规则格式不正确')
+        const rule = parseDictRule(item)
+        const key = dictRuleKey(rule.name, rule.url)
+        const existing = db.dictRules.get(key) as DictRule | undefined
+        const incoming = item as Record<string, unknown>
+        const customOrder = this.resolveDictOrder(incoming, existing)
+        await db.dictRules.put(key, { ...rule, id: key, customOrder })
+        if (existing) updated += 1
+        else added += 1
+      } catch (error) {
+        errors.push({
+          name: typeof (item as any)?.name === 'string' ? (item as any).name : '',
+          message: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return { added, updated, total: list.length, errors }
+  }
+
+  /** 导出 Legado 兼容数组（去掉内部 id，保留自定义字段）。 */
+  async exportDictRules() {
+    const { rules } = await this.listDictRules()
+    return rules.map((rule) => {
+      const out: Record<string, unknown> = { ...rule }
+      delete out.id
+      return out
+    })
+  }
+
+  /** 服务端代查字典：替换 {{key}}，透传 header，按规则提取纯文本。 */
+  async lookupDict(args: Args) {
+    const ruleId = stringArg(args, 'ruleId')
+    const key = stringArg(args, 'key')
+    const record = this.requireDb().dictRules.get(ruleId) as DictRule | undefined
+    if (!record) throw new Error(`字典不存在：${ruleId}`)
+    if (record.enabled === false) throw new Error('字典未启用')
+    const headers = parseHeaders(typeof record.header === 'string' ? record.header : '')
+    const target = record.url.split('{{key}}').join(encodeURIComponent(key))
+    const raw = await fetchText(target, { headers })
+    const extracted = new AnalyzeRule(raw.text, { baseUrl: raw.url }).getString(record.rule)
+    return { name: record.name, text: htmlToText(extracted), url: raw.url }
+  }
+
   async searchBooks(args: Args) {
     const key = stringArg(args, 'key')
     const page = typeof args?.page === 'number' && args.page > 0 ? Math.floor(args.page) : 1
@@ -221,6 +473,234 @@ export class ReaderService extends TypertRemoteService {
       }
     })
     return { books, errors }
+  }
+
+  async listExploreSources() {
+    const sources: Array<{
+      bookSourceUrl: string
+      bookSourceName: string
+      bookSourceGroup: string
+      bookSourceType: number
+    }> = []
+    for (const [, value] of this.requireDb().sources.entries()) {
+      const source = value as BookSource
+      if (source.enabled === false) continue
+      if (!isExploreEnabled(source)) continue
+      if (!source.exploreUrl || !source.exploreUrl.trim()) continue
+      sources.push({
+        bookSourceUrl: source.bookSourceUrl,
+        bookSourceName: source.bookSourceName,
+        bookSourceGroup: source.bookSourceGroup ?? '',
+        bookSourceType: source.bookSourceType ?? 0,
+      })
+    }
+    // 发现页按「书源分组 → 书源 → 分类」组织，服务端先定好分组/名称顺序。
+    sources.sort(
+      (a, b) =>
+        a.bookSourceGroup.localeCompare(b.bookSourceGroup, 'zh') ||
+        a.bookSourceName.localeCompare(b.bookSourceName, 'zh'),
+    )
+    return { sources }
+  }
+
+  async getExploreCategories(args: Args) {
+    const source = this.exploreSource(stringArg(args, 'sourceUrl'))
+    let categories: ReturnType<typeof parseExploreCategories>
+    try {
+      categories = parseExploreCategories(source.exploreUrl, source.bookSourceUrl, { source })
+    } catch (error) {
+      throw new Error(`发现分类解析失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+    if (categories.length === 0) throw new Error('未解析到发现分类')
+    return { categories }
+  }
+
+  async exploreBooks(args: Args) {
+    const source = this.exploreSource(stringArg(args, 'sourceUrl'))
+    const categoryUrl = stringArg(args, 'categoryUrl')
+    const page = typeof args?.page === 'number' && args.page > 0 ? Math.floor(args.page) : 1
+    const request = buildExploreRequest(source, categoryUrl, page)
+    if (!request) throw new Error('书源没有发现地址')
+    // 分类地址必须随页码变化才可能翻页；否则同一地址会反复返回同一页。
+    const hasPageRule = /\{\{\s*page\s*\}\}/i.test(categoryUrl)
+    const nextRequest = buildExploreRequest(source, categoryUrl, page + 1)
+    const canPaginate = Boolean(hasPageRule && nextRequest && !sameRequest(request, nextRequest))
+    if (page > 1 && !canPaginate) {
+      return { books: [], page, hasMore: false, url: request.url }
+    }
+    const raw = await this.fetch(request, source)
+    if (raw.status >= 400) throw new Error(`HTTP ${raw.status}`)
+    const books = analyzeExplore(raw.text, source, raw.url)
+    return { books, page, hasMore: books.length > 0 && canPaginate, url: raw.url }
+  }
+
+  /** 换源候选：按书名搜所有启用书源，排除当前来源；同作者、书名匹配度高的在前。 */
+  async findSourceCandidates(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const db = this.requireDb()
+    const book = db.books.get(bookId) as Record<string, unknown> | undefined
+    if (!book) throw new Error('书不存在')
+    const currentOrigin = String(book.origin ?? '')
+    if (currentOrigin === 'local') throw new Error('本地书不支持换源')
+    const bookName = String(book.name ?? '').trim()
+    if (!bookName) throw new Error('书名不能为空')
+
+    const sourceUrls: string[] = []
+    for (const [, value] of db.sources.entries()) {
+      const source = value as BookSource
+      if (source.enabled === false) continue
+      if (source.bookSourceUrl === currentOrigin) continue
+      sourceUrls.push(source.bookSourceUrl)
+    }
+    if (sourceUrls.length === 0) return { candidates: [], errors: [] }
+
+    const found = (await this.searchBooks({ key: bookName, sourceUrls })) as {
+      books: ReturnType<typeof analyzeSearch>
+      errors: Array<{ sourceUrl: string; message: string }>
+    }
+    const bookAuthor = String(book.author ?? '')
+    const candidates = found.books.map((item) => {
+      const name = String(item.name ?? '')
+      const nameMatch = matchBookName(bookName, name)
+      return {
+        sourceUrl: String(item.origin ?? ''),
+        sourceName: String(item.originName ?? ''),
+        bookUrl: String(item.bookUrl ?? ''),
+        name,
+        author: String(item.author ?? ''),
+        kind: String(item.kind ?? ''),
+        latestChapter: String(item.lastChapter ?? ''),
+        coverUrl: String(item.coverUrl ?? ''),
+        sameAuthor: sameAuthorName(bookAuthor, item.author),
+        nameMatch,
+        possiblyNotSameBook: nameMatch === 'none',
+      }
+    })
+    const rank = (item: (typeof candidates)[number]) => {
+      const nameRank = item.nameMatch === 'exact' ? 0 : item.nameMatch === 'contains' ? 1 : 2
+      // 作者权重高于书名，保证同作者候选始终排在前面。
+      return (item.sameAuthor ? 0 : 10) + nameRank
+    }
+    candidates.sort(
+      (left, right) =>
+        rank(left) - rank(right) ||
+        left.sourceName.localeCompare(right.sourceName, 'zh') ||
+        left.name.localeCompare(right.name, 'zh'),
+    )
+    return { candidates, errors: found.errors }
+  }
+
+  /** 预览目标详情与目录；只读，不写书、不写目录。 */
+  async previewSourceCandidate(args: Args) {
+    const source = this.getSource(stringArg(args, 'sourceUrl'))
+    if (source.enabled === false) throw new Error('书源已停用')
+    const target = await this.loadSwitchTarget(source, stringArg(args, 'bookUrl'))
+    return {
+      book: {
+        sourceUrl: source.bookSourceUrl,
+        sourceName: source.bookSourceName,
+        bookUrl: target.bookUrl,
+        tocUrl: target.tocUrl,
+        name: target.info.name,
+        author: target.info.author,
+        kind: target.info.kind,
+        coverUrl: target.info.coverUrl,
+        intro: target.info.intro,
+        totalChapterNum: target.chapters.length,
+        latestChapterTitle: target.latestChapter,
+      },
+      chapterCount: target.chapters.length,
+      latestChapter: target.latestChapter,
+      chapters: target.chapters.slice(0, 20),
+    }
+  }
+
+  /** 换源：先完整抓取并校验目标详情与目录，全部成功后才写入书目和进度。 */
+  async switchBookSource(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const sourceUrl = stringArg(args, 'sourceUrl')
+    const bookUrl = stringArg(args, 'bookUrl')
+    const db = this.requireDb()
+    const book = db.books.get(bookId) as Record<string, unknown> | undefined
+    if (!book) throw new Error('书不存在')
+    if (String(book.origin ?? '') === 'local') throw new Error('本地书不支持换源')
+    const source = this.getSource(sourceUrl)
+    if (source.enabled === false) throw new Error('书源已停用')
+
+    // 目标详情、目录与进度映射任何一步失败，都在写入前抛出。
+    const target = await this.loadSwitchTarget(source, bookUrl)
+    const previousProgress = db.readRecords.get(bookId) as Record<string, unknown> | undefined
+    const mapped = mapSwitchProgress(target.chapters, previousProgress ?? null)
+    const now = new Date().toISOString()
+
+    const updatedBook: Record<string, unknown> = {
+      ...book,
+      id: bookId,
+      origin: source.bookSourceUrl,
+      originName: source.bookSourceName,
+      bookUrl: target.bookUrl,
+      tocUrl: target.tocUrl,
+      coverUrl: target.info.coverUrl || String(book.coverUrl ?? ''),
+      intro: target.info.intro || String(book.intro ?? ''),
+      totalChapterNum: target.chapters.length,
+      latestChapterTitle: target.latestChapter,
+      updatedAt: now,
+    }
+    const nextProgress = mapped
+      ? {
+          ...(previousProgress ?? {}),
+          id: bookId,
+          bookId,
+          chapterIndex: mapped.chapterIndex,
+          chapterTitle: mapped.chapterTitle,
+          chapterUrl: mapped.chapterUrl,
+          position: mapped.position,
+          updatedAt: now,
+        }
+      : null
+
+    await db.books.put(bookId, updatedBook)
+    if (nextProgress) {
+      try {
+        await db.readRecords.put(bookId, nextProgress)
+      } catch (error) {
+        // 进度写失败时把书目恢复原样，避免只改了一半。
+        await db.books.put(bookId, book)
+        throw error
+      }
+    }
+    return { book: updatedBook, chapters: target.chapters, progress: nextProgress }
+  }
+
+  private async loadSwitchTarget(source: BookSource, bookUrl: string) {
+    const detail = await this.fetch({ url: bookUrl, method: 'GET', headers: {} }, source)
+    if (detail.status >= 400) throw new Error(`目标详情请求失败：HTTP ${detail.status}`)
+    const info = analyzeBookInfo(detail.text, source, detail.url, detail.url)
+    if (!info.name || !info.name.trim()) throw new Error('目标详情没有书名')
+    const tocUrl = String(info.tocUrl || detail.url).trim()
+    const toc = await this.fetch({ url: tocUrl, method: 'GET', headers: {} }, source)
+    if (toc.status >= 400) throw new Error(`目标目录请求失败：HTTP ${toc.status}`)
+    const chapters = analyzeToc(toc.text, source, toc.url)
+    const readable = chapters.filter(
+      (chapter) => !chapter.isVolume && String(chapter.url ?? '').trim(),
+    )
+    if (readable.length === 0) throw new Error('目标目录为空')
+    const last = readable[readable.length - 1]!
+    return {
+      info,
+      chapters,
+      bookUrl: detail.url,
+      tocUrl: toc.url || tocUrl,
+      latestChapter: String(info.lastChapter ?? '').trim() || String(last.title ?? '').trim(),
+    }
+  }
+
+  private exploreSource(url: string): BookSource {
+    const source = this.getSource(url)
+    if (source.enabled === false) throw new Error('书源已停用')
+    if (!isExploreEnabled(source)) throw new Error('书源未开启发现')
+    if (!source.exploreUrl || !source.exploreUrl.trim()) throw new Error('书源没有发现分类')
+    return source
   }
 
   async getBookInfo(args: Args) {
@@ -278,6 +758,106 @@ export class ReaderService extends TypertRemoteService {
     const raw = await this.fetch({ url: chapterUrl, method: 'GET', headers: {} }, source)
     const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
     return { ...parsed, content: parsed.text, url: raw.url }
+  }
+
+  private bookContentKind(book: Record<string, unknown>): 'text' | 'images' | 'audio' | 'video' {
+    const origin = String(book.origin ?? '')
+    const type = Number(book.type ?? 0)
+    const fromRecord = contentKindOfType(type)
+    if (!origin || origin === 'local') return fromRecord
+    try {
+      return contentKindOf(this.getSource(origin))
+    } catch {
+      // 书源已删 / 未导入时按书目记录兜底，非文本书仍能给出明确拒绝。
+      if (fromRecord !== 'text') return fromRecord
+      throw new Error(`书源不存在：${origin}`)
+    }
+  }
+
+  /** 书内搜索的一章正文：本地正文 > 已缓存正文 > 在线抓取。 */
+  private async chapterTextForSearch(
+    book: Record<string, unknown>,
+    chapter: Record<string, unknown>,
+  ): Promise<string> {
+    const origin = String(book.origin ?? '')
+    const url = String(chapter.url ?? '')
+    const localMatch = /^local:\/\/([^/]+)\/(\d+)/.exec(url)
+    if (localMatch) {
+      const local = await localContent(localMatch[1]!, Number(localMatch[2]))
+      if (!local) throw new Error('本地章节不存在')
+      return local.content
+    }
+    const cached = await readCachedChapter(origin, url)
+    if (cached !== null && cached.trim()) return cached
+    const source = this.getSource(origin)
+    const raw = await this.fetch({ url, method: 'GET', headers: {} }, source)
+    if (raw.status >= 400) throw new Error(`HTTP ${raw.status}`)
+    const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
+    if (parsed.kind !== 'text') throw new Error('该章节不是文本类型')
+    return parsed.text
+  }
+
+  async searchInBook(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const key = stringArg(args, 'key')
+    const db = this.requireDb()
+    const book = db.books.get(bookId) as Record<string, unknown> | undefined
+    if (!book) throw new Error('书不存在')
+    if (this.bookContentKind(book) !== 'text') {
+      throw new Error('该书不是文本类型，无法搜索')
+    }
+
+    const origin = String(book.origin ?? '')
+    const tocUrl = String(book.tocUrl || book.bookUrl || '')
+    if (!tocUrl) throw new Error('书没有目录地址')
+    const toc = await (this as any).getToc({ tocUrl, sourceUrl: origin })
+    const chapters = (toc?.chapters ?? []) as Array<Record<string, unknown>>
+
+    const rawFrom = Number(args?.fromIndex ?? 0)
+    const fromIndex = Number.isFinite(rawFrom)
+      ? Math.max(0, Math.min(chapters.length, Math.floor(rawFrom)))
+      : 0
+    // 单批上限固定 200 章；maxChapters 只能调小，避免长书一次阻塞。
+    const rawMax = Number(args?.maxChapters ?? 200)
+    const maxChapters = Number.isFinite(rawMax) ? Math.max(1, Math.min(200, Math.floor(rawMax))) : 200
+    const window = chapters.slice(fromIndex, fromIndex + maxChapters)
+    const nextIndex = fromIndex + window.length
+
+    const results: Array<{
+      chapterIndex: number
+      chapterTitle: string
+      count: number
+      snippet: string
+      pageHint: number
+    }> = []
+    const errors: Array<{ chapterIndex: number; chapterTitle: string; message: string }> = []
+    for (let offset = 0; offset < window.length; offset += 1) {
+      const chapterIndex = fromIndex + offset
+      const chapter = window[offset]!
+      if (chapter.isVolume || !chapter.url) continue
+      const chapterTitle = String(chapter.title ?? '')
+      try {
+        const text = htmlToText(await this.chapterTextForSearch(book, chapter))
+        const count = countOccurrences(text, key)
+        if (count > 0) {
+          const first = text.indexOf(key)
+          results.push({
+            chapterIndex,
+            chapterTitle,
+            count,
+            snippet: searchSnippet(text, first, key.length),
+            pageHint: Math.floor(first / SEARCH_PAGE_HINT_CHARS) + 1,
+          })
+        }
+      } catch (error) {
+        errors.push({
+          chapterIndex,
+          chapterTitle,
+          message: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return { results, nextIndex, done: nextIndex >= chapters.length, errors }
   }
 
   async cacheBook(args: Args) {
@@ -832,6 +1412,23 @@ export class ReaderService extends TypertRemoteService {
   private requireDb(): any {
     if (!this.db) throw new Error('存储尚未就绪')
     return this.db
+  }
+
+  /** 保存与导入共用的排序值：沿用导入值 > 已有值 > 追加到末尾。 */
+  private resolveDictOrder(incoming: Record<string, unknown>, existing: DictRule | undefined): number {
+    const requested = incoming.customOrder
+    if (typeof requested === 'number' && Number.isFinite(requested)) return requested
+    if (existing && typeof existing.customOrder === 'number') return existing.customOrder
+    return this.nextDictOrder()
+  }
+
+  private nextDictOrder(): number {
+    let max = 0
+    for (const [, value] of this.requireDb().dictRules.entries()) {
+      const order = typeof (value as any).customOrder === 'number' ? (value as any).customOrder : 0
+      if (order > max) max = order
+    }
+    return max + 1
   }
 
   private getSource(url: string): BookSource {

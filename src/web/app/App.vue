@@ -28,12 +28,17 @@ import {
   type ThemeColors,
 } from '../../core/reader/theme'
 import { exportFullShelf, exportLegadoShelf } from '../../core/reader/shelf-transfer'
+import { enabledDictRules, lookupAll, type DictLookupOutcome } from '../../core/dict/lookup-all'
+import { swapDictOrder } from '../../core/dict/order'
+import { filterSources, hasExplore, needsLogin, sourceHost } from '../../core/source/filter'
+import { groupExploreBySourceGroup } from '../../core/source/group'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
-type View = 'shelf' | 'sources' | 'search' | 'detail' | 'reader'
+type View = 'shelf' | 'sources' | 'search' | 'explore' | 'detail' | 'reader'
 type Theme = 'light' | 'sepia' | 'dark'
 type Turn = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
+type DictResult = DictLookupOutcome
 
 /** 旧数据里存的是原始 HTML 简介，展示前转成纯文本。 */
 function plainText(input?: string | null): string {
@@ -80,7 +85,46 @@ const SOURCE_PAGE_SIZE = 50
 const sourcePage = ref(1)
 const selectedSourceIds = ref<Set<string>>(new Set())
 const checkReport = ref<{ total: number; ok: number; problems: Array<{ name: string; message: string }> } | null>(null)
+const sourceLogin = ref<'all' | 'required' | 'none'>('all')
+const sourceExploreOnly = ref(false)
+const sourceMessage = ref('')
+const onlineCheckBusy = ref(false)
+const onlineCheckReport = ref<{
+  scope: 'selected' | 'page'
+  total: number
+  ok: number
+  results: Array<{ url: string; ok: boolean; status: number | null; elapsedMs: number; error: string }>
+} | null>(null)
 const sourceTypeNames: Record<number, string> = { 0: '文本', 1: '音频', 2: '图片', 3: '文件', 4: '视频' }
+
+const dictRules = ref<any[]>([])
+const dictEditing = ref<any>(null)
+const dictImportText = ref('')
+const dictMessage = ref('')
+const dictQuery = ref('')
+const dictTrialBusy = ref(false)
+const dictResults = ref<DictResult[]>([])
+const dictActiveTab = ref('')
+const dictEnabledCount = computed(() => dictRules.value.filter((item) => item.enabled !== false).length)
+const dictActiveResult = computed(
+  () => dictResults.value.find((item) => item.id === dictActiveTab.value) ?? dictResults.value[0] ?? null,
+)
+
+// 阅读页长按选词：独立于「书源 → 字典规则」的试查，互不覆盖。
+const dictCardRef = ref<HTMLElement | null>(null)
+const dictPanelOpen = ref(false)
+const dictPanelText = ref('')
+const dictPanelLine = ref('')
+const dictPanelFallback = ref(false)
+const dictPanelBusy = ref(false)
+const dictPanelError = ref('')
+const dictPanelCopied = ref('')
+const dictPanelResults = ref<DictResult[]>([])
+const dictPanelActive = ref('')
+const dictPanelActiveResult = computed(
+  () => dictPanelResults.value.find((item) => item.id === dictPanelActive.value) ?? dictPanelResults.value[0] ?? null,
+)
+let dictPanelToken = 0
 
 const shelfBooks = ref<any[]>([])
 const shelfSort = ref<'recent' | 'name' | 'progress'>('recent')
@@ -102,6 +146,19 @@ const searchScope = ref('')
 const searchExact = ref(false)
 const searchHistory = ref<string[]>([])
 const SEARCH_HISTORY_KEY = 'mo-reader-search-history'
+
+const exploreSources = ref<any[]>([])
+const exploreGroups = ref<Array<{ source: any; categories: any[]; error: string }>>([])
+const exploreSections = computed(() =>
+  groupExploreBySourceGroup(exploreGroups.value, (group) => group.source?.bookSourceGroup),
+)
+const exploreLoading = ref(false)
+const exploreActive = ref<any>(null)
+const exploreBooks = ref<any[]>([])
+const explorePage = ref(0)
+const exploreHasMore = ref(false)
+const exploreBusy = ref(false)
+const exploreError = ref('')
 
 const currentBook = ref<any>(null)
 const introText = computed(() => plainText(currentBook.value?.intro))
@@ -206,6 +263,26 @@ let speechSegments: Array<{ text: string; start: number }> = []
 let speechIndex = 0
 let pageTimer: ReturnType<typeof setTimeout> | undefined
 
+// 阅读页「书内搜索」：跨批自动推进，令牌用于停止后丢弃在途批次。
+const readerSearchOpen = ref(false)
+const readerSearchKey = ref('')
+const readerSearchUsedKey = ref('')
+const readerSearchBusy = ref(false)
+const readerSearchStarted = ref(false)
+const readerSearchDone = ref(true)
+const readerSearchStopped = ref(false)
+const readerSearchScanned = ref(0)
+const readerSearchTotal = ref(0)
+const readerSearchNextIndex = ref(0)
+const readerSearchResults = ref<
+  Array<{ chapterIndex: number; chapterTitle: string; count: number; snippet: string; pageHint: number }>
+>([])
+const readerSearchErrors = ref<Array<{ chapterIndex: number; chapterTitle: string; message: string }>>([])
+const readerSearchHint = ref('')
+const readerHint = ref('')
+let readerSearchToken = 0
+let readerHintTimer: ReturnType<typeof setTimeout> | undefined
+
 const editing = ref<any>(null)
 const editingJson = ref('')
 const debugType = ref('search')
@@ -236,28 +313,19 @@ const activeThemeColors = computed<ThemeColors>(() =>
 const activeCustomTheme = computed<CustomTheme | undefined>(() =>
   settings.value.customThemes.find((item) => item.id === settings.value.theme),
 )
-function hostOf(url?: string) {
-  try {
-    return new URL(String(url ?? '')).host
-  } catch {
-    return ''
-  }
-}
 const sourceGroups = computed(() =>
   [...new Set(sources.value.map((source) => source.bookSourceGroup).filter((group): group is string => typeof group === 'string' && group.length > 0))].sort((a, b) => a.localeCompare(b, 'zh')),
 )
-const sourceDomains = computed(() => [...new Set(sources.value.map((source) => hostOf(source.bookSourceUrl)).filter(Boolean))].sort())
+const sourceDomains = computed(() => [...new Set(sources.value.map((source) => sourceHost(source.bookSourceUrl)).filter(Boolean))].sort())
 const filteredSortedSources = computed(() => {
-  const key = sourceFilter.value.trim().toLowerCase()
-  let list = sources.value
-  if (key) {
-    list = list.filter((source) =>
-      `${source.bookSourceName ?? ''} ${source.bookSourceUrl ?? ''} ${source.bookSourceGroup ?? ''}`.toLowerCase().includes(key),
-    )
-  }
-  if (sourceGroup.value) list = list.filter((source) => source.bookSourceGroup === sourceGroup.value)
-  if (sourceDomain.value) list = list.filter((source) => hostOf(source.bookSourceUrl) === sourceDomain.value)
-  const sorted = [...list]
+  const filtered = filterSources(sources.value, {
+    key: sourceFilter.value,
+    group: sourceGroup.value,
+    domain: sourceDomain.value,
+    login: sourceLogin.value,
+    exploreOnly: sourceExploreOnly.value,
+  })
+  const sorted = [...filtered]
   if (sourceSort.value === 'url') {
     sorted.sort((a, b) => String(a.bookSourceUrl ?? '').localeCompare(String(b.bookSourceUrl ?? '')))
   } else if (sourceSort.value === 'updated') {
@@ -277,7 +345,20 @@ const allPageSelected = computed(
   () => pagedSources.value.length > 0 && pagedSources.value.every((source) => selectedSourceIds.value.has(source.id)),
 )
 const selectedCount = computed(() => selectedSourceIds.value.size)
-watch([sourceFilter, sourceGroup, sourceDomain, sourceSort], () => {
+/** 在线检查范围：已选优先，否则本页可见；空地址不检查。 */
+const onlineCheckTargets = computed(() => {
+  const base =
+    selectedCount.value > 0
+      ? sources.value.filter((source) => selectedSourceIds.value.has(source.id))
+      : pagedSources.value
+  return base.filter(
+    (source) => typeof source.bookSourceUrl === 'string' && source.bookSourceUrl.trim().length > 0,
+  )
+})
+const onlineCheckScope = computed(() =>
+  selectedCount.value > 0 ? `已选 ${onlineCheckTargets.value.length} 个` : `本页 ${onlineCheckTargets.value.length} 个`,
+)
+watch([sourceFilter, sourceGroup, sourceDomain, sourceSort, sourceLogin, sourceExploreOnly], () => {
   sourcePage.value = 1
 })
 watch(
@@ -286,6 +367,9 @@ watch(
     if (sourcePage.value > sourcePageCount.value) sourcePage.value = sourcePageCount.value
   },
 )
+watch(view, (value) => {
+  if (value !== 'reader') closeReaderDict()
+})
 const enabledSources = computed(() => sources.value.filter((source) => source.enabled !== false))
 const scopedSourceUrls = computed<string[] | null>(() => {
   if (searchScope.value.startsWith('group:')) {
@@ -342,6 +426,7 @@ async function refresh() {
     const [sourceResult, bookResult] = await Promise.all([call('listSources'), call('listBooks')])
     sources.value = sourceResult?.sources ?? []
     shelfBooks.value = bookResult?.books ?? []
+    await loadDictRules()
     try {
       const stored = await call('getSettings')
       if (stored?.settings) settings.value = { ...settings.value, ...stored.settings }
@@ -572,6 +657,251 @@ async function onImportFile(event: Event) {
   }
 }
 
+async function loadDictRules() {
+  try {
+    const result = await call('listDictRules')
+    dictRules.value = result?.rules ?? []
+  } catch (error) {
+    dictMessage.value = `字典加载失败：${errorText(error)}`
+  }
+}
+
+function beginDictEdit(rule?: any) {
+  const draft = rule
+    ? JSON.parse(JSON.stringify(rule))
+    : { name: '', url: '', rule: '', group: '', enabled: true, header: '' }
+  if (draft.header && typeof draft.header !== 'string') draft.header = JSON.stringify(draft.header)
+  dictEditing.value = draft
+  dictMessage.value = ''
+}
+
+async function saveDict() {
+  if (!dictEditing.value) return
+  busy.value = true
+  try {
+    await call('saveDictRule', { rule: { ...dictEditing.value } })
+    dictEditing.value = null
+    await loadDictRules()
+    dictMessage.value = '字典已保存'
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function toggleDictRule(rule: any) {
+  try {
+    await call('saveDictRule', { rule: { ...rule, enabled: rule.enabled === false } })
+    await loadDictRules()
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  }
+}
+
+async function removeDictRule(rule: any) {
+  try {
+    await call('deleteDictRules', { ids: [rule.id] })
+    dictResults.value = dictResults.value.filter((item) => item.id !== rule.id)
+    if (dictActiveTab.value === rule.id) dictActiveTab.value = dictResults.value[0]?.id ?? ''
+    await loadDictRules()
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  }
+}
+
+async function moveDictRule(rule: any, delta: number) {
+  const list = dictRules.value
+  const index = list.findIndex((item) => item.id === rule.id)
+  const target = index + delta
+  if (index < 0 || target < 0 || target >= list.length) return
+  const current = list[index]
+  const other = list[target]
+  const swap = swapDictOrder(current, other, index, target)
+  try {
+    await call('saveDictRule', { rule: { ...current, customOrder: swap.currentOrder } })
+    await call('saveDictRule', { rule: { ...other, customOrder: swap.otherOrder } })
+    await loadDictRules()
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  }
+}
+
+async function importDicts() {
+  if (!dictImportText.value.trim()) return
+  busy.value = true
+  dictMessage.value = ''
+  try {
+    const result = await call('importDictRules', { payload: dictImportText.value })
+    dictMessage.value =
+      `导入 ${result.total} 条：新增 ${result.added}，更新 ${result.updated}` +
+      (result.errors?.length ? `，失败 ${result.errors.length}（${result.errors[0].message}）` : '')
+    dictImportText.value = ''
+    await loadDictRules()
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function onImportDictFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  try {
+    dictImportText.value = await file.text()
+    await importDicts()
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  } finally {
+    input.value = ''
+  }
+}
+
+async function exportDicts() {
+  try {
+    const rules = await call('exportDictRules')
+    if (!Array.isArray(rules) || rules.length === 0) {
+      dictMessage.value = '还没有字典，先新增或导入'
+      return
+    }
+    const suffix = new Date().toISOString().slice(0, 10)
+    downloadJson(`mo-reader-dicts-${suffix}.json`, rules)
+    dictMessage.value = `已导出 ${rules.length} 条字典`
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  }
+}
+
+/** 单本字典查询：把 Remote 的错误统一成 Error，交给 lookupAll 做隔离。 */
+function lookupOne(ruleId: string, key: string) {
+  return call('lookupDict', { ruleId, key }).catch((error: unknown) => {
+    throw new Error(errorText(error))
+  })
+}
+
+async function runDictLookup() {
+  const key = dictQuery.value.trim()
+  if (!key) {
+    dictMessage.value = '请输入要查的词'
+    return
+  }
+  const enabled = enabledDictRules(dictRules.value)
+  if (enabled.length === 0) {
+    dictMessage.value = '还没有可用的字典'
+    return
+  }
+  dictTrialBusy.value = true
+  dictMessage.value = ''
+  try {
+    dictResults.value = await lookupAll(enabled, key, lookupOne)
+    dictActiveTab.value = dictResults.value[0]?.id ?? ''
+  } catch (error) {
+    dictMessage.value = errorText(error)
+  } finally {
+    dictTrialBusy.value = false
+  }
+}
+
+async function writeClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+  const area = document.createElement('textarea')
+  area.value = text
+  area.style.position = 'fixed'
+  area.style.opacity = '0'
+  document.body.appendChild(area)
+  area.select()
+  document.execCommand('copy')
+  area.remove()
+}
+
+async function copyDictResult(result: DictResult) {
+  if (!result?.text) return
+  try {
+    await writeClipboard(result.text)
+    dictMessage.value = `已复制「${result.name}」的释义`
+  } catch (error) {
+    dictMessage.value = `复制失败：${errorText(error)}`
+  }
+}
+
+function openDictResult(result: DictResult) {
+  if (result?.url) window.open(result.url, '_blank', 'noopener')
+}
+
+/** 阅读页长按选词：打开查词面板，有启用字典时立即并发查询。 */
+function onReaderSelect(payload: any) {
+  if (readerKind.value !== 'text') return
+  dictPanelOpen.value = true
+  dictPanelText.value = String(payload?.text || '').trim()
+  dictPanelLine.value = String(payload?.line || '').trim()
+  dictPanelFallback.value = Boolean(payload?.fallback)
+  dictPanelError.value = ''
+  dictPanelCopied.value = ''
+  dictPanelResults.value = []
+  dictPanelActive.value = ''
+  if (!dictPanelText.value) {
+    dictPanelError.value = '没有选中文字，请输入要查的词'
+    return
+  }
+  void runReaderLookup()
+}
+
+async function runReaderLookup() {
+  const key = dictPanelText.value.trim()
+  dictPanelCopied.value = ''
+  dictPanelError.value = ''
+  if (!key) {
+    dictPanelError.value = '请输入要查的词'
+    return
+  }
+  const enabled = enabledDictRules(dictRules.value)
+  if (enabled.length === 0) {
+    dictPanelResults.value = []
+    dictPanelActive.value = ''
+    return
+  }
+  const token = ++dictPanelToken
+  dictPanelBusy.value = true
+  try {
+    const results = await lookupAll(enabled, key, lookupOne)
+    if (token !== dictPanelToken) return
+    dictPanelResults.value = results
+    dictPanelActive.value = results[0]?.id ?? ''
+  } catch (error) {
+    if (token === dictPanelToken) dictPanelError.value = errorText(error)
+  } finally {
+    if (token === dictPanelToken) dictPanelBusy.value = false
+  }
+}
+
+function closeReaderDict() {
+  dictPanelOpen.value = false
+  dictPanelToken += 1
+  dictPanelBusy.value = false
+}
+
+async function copyReaderDict(result: DictResult) {
+  if (!result?.text) return
+  try {
+    await writeClipboard(result.text)
+    dictPanelCopied.value = `已复制「${result.name}」`
+  } catch (error) {
+    dictPanelError.value = `复制失败：${errorText(error)}`
+  }
+}
+
+/** 没有可用字典时，把读者带到「书源 → 字典规则」。 */
+function openDictManage() {
+  closeReaderDict()
+  view.value = 'sources'
+  nextTick(() => dictCardRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+}
+
 async function toggleSource(source: any) {
   try {
     const result = await call('saveSource', {
@@ -622,6 +952,76 @@ async function batchSetEnabled(enabled: boolean) {
     status.value = errorText(error)
   } finally {
     busy.value = false
+  }
+}
+
+function sourceNameOf(url: string): string {
+  return sources.value.find((source) => source.bookSourceUrl === url)?.bookSourceName || url
+}
+
+function safeFileName(value: string): string {
+  const cleaned = value
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return cleaned.slice(0, 40) || 'source'
+}
+
+function exportStamp(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+async function exportSource(source: any) {
+  try {
+    const result = await call('exportSources', { ids: [source.id] })
+    downloadJson(
+      `mo-reader-source-${safeFileName(source.bookSourceName || 'source')}-${exportStamp()}.json`,
+      JSON.parse(result.json),
+    )
+    sourceMessage.value = `已导出「${source.bookSourceName || '书源'}」`
+  } catch (error) {
+    sourceMessage.value = errorText(error)
+  }
+}
+
+async function exportSelectedSources() {
+  const ids = [...selectedSourceIds.value]
+  if (ids.length === 0) return
+  try {
+    const result = await call('exportSources', { ids })
+    downloadJson(`mo-reader-sources-${exportStamp()}.json`, JSON.parse(result.json))
+    sourceMessage.value = `已导出 ${result.count} 个书源`
+  } catch (error) {
+    sourceMessage.value = errorText(error)
+  }
+}
+
+/** 在线可达性：只查地址能不能打开，与静态结构检查（checkReport）分开显示。 */
+async function runOnlineSourceCheck() {
+  const list = onlineCheckTargets.value
+  if (list.length === 0) {
+    sourceMessage.value = '没有可检查的地址'
+    return
+  }
+  const scope = selectedCount.value > 0 ? 'selected' : 'page'
+  const urls = list.map((source) => String(source.bookSourceUrl).trim())
+  onlineCheckBusy.value = true
+  try {
+    const result = await call('checkSources', { urls })
+    const results = result.results as Array<{
+      url: string
+      ok: boolean
+      status: number | null
+      elapsedMs: number
+      error: string
+    }>
+    const ok = results.filter((item) => item.ok).length
+    onlineCheckReport.value = { scope, total: results.length, ok, results }
+    sourceMessage.value = `在线可达 ${ok}/${results.length}`
+  } catch (error) {
+    sourceMessage.value = errorText(error)
+  } finally {
+    onlineCheckBusy.value = false
   }
 }
 
@@ -725,6 +1125,109 @@ function rememberSearch(key: string) {
 function useHistory(key: string) {
   searchKey.value = key
   void search()
+}
+
+function openExplore() {
+  view.value = 'explore'
+  void loadExploreGroups()
+}
+
+async function loadExploreGroups(force = false) {
+  if (exploreLoading.value) return
+  if (!force && exploreGroups.value.length) return
+  exploreLoading.value = true
+  if (force) exploreGroups.value = []
+  exploreActive.value = null
+  exploreBooks.value = []
+  explorePage.value = 0
+  exploreHasMore.value = false
+  exploreError.value = ''
+  try {
+    const result = await call('listExploreSources')
+    const list: any[] = result?.sources ?? []
+    exploreSources.value = list
+    const settled = await Promise.allSettled(
+      list.map(async (source) => {
+        const res = await call('getExploreCategories', { sourceUrl: source.bookSourceUrl })
+        return { source, categories: res?.categories ?? [], error: '' }
+      }),
+    )
+    exploreGroups.value = settled.map((item, index) => {
+      if (item.status === 'fulfilled') return item.value
+      const source = list[index]
+      return {
+        source,
+        categories: [],
+        error: `${source?.bookSourceName || source?.bookSourceUrl || '未知书源'}：${errorText(item.reason)}`,
+      }
+    })
+    status.value = `发现 ${list.length} 个书源`
+  } catch (error) {
+    exploreGroups.value = []
+    exploreError.value = errorText(error)
+    status.value = exploreError.value
+  } finally {
+    exploreLoading.value = false
+  }
+}
+
+function isActiveCategory(group: any, category: any) {
+  return (
+    exploreActive.value?.sourceUrl === group.source.bookSourceUrl &&
+    exploreActive.value?.url === category.url
+  )
+}
+
+async function selectExploreCategory(group: any, category: any) {
+  exploreActive.value = {
+    sourceUrl: group.source.bookSourceUrl,
+    sourceName: group.source.bookSourceName,
+    name: category.name,
+    url: category.url,
+  }
+  exploreError.value = ''
+  await loadExplorePage(1, true)
+}
+
+async function loadExplorePage(page: number, replace: boolean) {
+  if (!exploreActive.value) return
+  exploreBusy.value = true
+  exploreError.value = ''
+  if (replace) {
+    exploreBooks.value = []
+    explorePage.value = 0
+    exploreHasMore.value = false
+  }
+  try {
+    const result = await call('exploreBooks', {
+      sourceUrl: exploreActive.value.sourceUrl,
+      categoryUrl: exploreActive.value.url,
+      page,
+    })
+    const list = result?.books ?? []
+    if (replace) {
+      exploreBooks.value = list
+    } else {
+      // 有的源会忽略页码返回同一页，追加时按书目去重，避免重复行。
+      const seen = new Set(exploreBooks.value.map((book: any) => `${book.origin}|${book.bookUrl}`))
+      const fresh = list.filter((book: any) => {
+        const key = `${book.origin}|${book.bookUrl}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+      exploreBooks.value = [...exploreBooks.value, ...fresh]
+    }
+    explorePage.value = Number(result?.page ?? page)
+    exploreHasMore.value = Boolean(result?.hasMore)
+    status.value = `${exploreActive.value.name} · ${exploreBooks.value.length} 本`
+  } catch (error) {
+    exploreError.value = errorText(error)
+    exploreHasMore.value = false
+    status.value = exploreError.value
+  } finally {
+    exploreBusy.value = false
+  }
 }
 
 async function loadToc(book: any, tocUrlFallback: string) {
@@ -1208,8 +1711,8 @@ async function refreshSelectedToc() {
   }
 }
 
-async function addToShelf() {
-  if (!currentBook.value) return
+async function addToShelf(): Promise<boolean> {
+  if (!currentBook.value) return false
   try {
     const result = await call('addBook', {
       book: {
@@ -1228,8 +1731,10 @@ async function addToShelf() {
     currentBook.value.id = result.book.id
     await refresh()
     status.value = '已加入书架'
+    return true
   } catch (error) {
     status.value = errorText(error)
+    return false
   }
 }
 
@@ -1237,6 +1742,7 @@ async function openChapter(chapter: any, page?: number) {
   if (!chapter || chapter.isVolume || !chapter.url) return
   tocOpen.value = false
   bookmarksOpen.value = false
+  closeReaderDict()
   stopSpeech()
   busy.value = true
   chrome.value = false
@@ -1442,6 +1948,130 @@ function continueReading() {
   if (target) openChapter(target)
 }
 
+const switchOpen = ref(false)
+const switchLoading = ref(false)
+const switchBusy = ref(false)
+const switchPreviewBusy = ref(false)
+const switchCandidates = ref<any[]>([])
+const switchErrors = ref<Array<{ sourceUrl: string; message: string }>>([])
+const switchPreview = ref<any>(null)
+const switchPreviewKey = ref('')
+const switchError = ref('')
+
+const switchErrorText = computed(() =>
+  switchErrors.value.map((item) => `${item.sourceUrl}：${item.message}`).join('；'),
+)
+
+function switchCandidateKey(candidate: any) {
+  return `${candidate?.sourceUrl ?? ''}|${candidate?.bookUrl ?? ''}`
+}
+
+async function openSwitchPanel() {
+  const book = currentBook.value as any
+  if (!book || String(book.origin ?? '') === 'local') {
+    status.value = '本地书不支持换源'
+    return
+  }
+  if (!currentBook.value.id) {
+    status.value = '正在加入书架…'
+    const added = await addToShelf()
+    if (!added) {
+      switchOpen.value = false
+      return
+    }
+    if (!currentBook.value?.id) {
+      switchOpen.value = false
+      status.value = '加入书架失败，无法换源'
+      return
+    }
+    status.value = '已加入书架，正在搜索候选'
+  }
+  switchOpen.value = true
+  switchLoading.value = true
+  switchBusy.value = false
+  switchPreviewBusy.value = false
+  switchCandidates.value = []
+  switchErrors.value = []
+  switchPreview.value = null
+  switchPreviewKey.value = ''
+  switchError.value = ''
+  try {
+    const result: any = await call('findSourceCandidates', { bookId: book.id })
+    switchCandidates.value = result?.candidates ?? []
+    switchErrors.value = result?.errors ?? []
+  } catch (error) {
+    switchError.value = errorText(error)
+  } finally {
+    switchLoading.value = false
+  }
+}
+
+function closeSwitchPanel() {
+  switchOpen.value = false
+}
+
+async function previewCandidate(candidate: any) {
+  if (!candidate) return
+  const key = switchCandidateKey(candidate)
+  switchPreviewKey.value = key
+  switchPreview.value = null
+  switchPreviewBusy.value = true
+  switchError.value = ''
+  try {
+    const result: any = await call('previewSourceCandidate', {
+      sourceUrl: candidate.sourceUrl,
+      bookUrl: candidate.bookUrl,
+    })
+    if (switchPreviewKey.value !== key) return
+    switchPreview.value = result
+    const row = switchCandidates.value.find((item) => switchCandidateKey(item) === key)
+    if (row) row.chapterCount = result?.chapterCount ?? 0
+  } catch (error) {
+    if (switchPreviewKey.value === key) switchError.value = errorText(error)
+  } finally {
+    if (switchPreviewKey.value === key) switchPreviewBusy.value = false
+  }
+}
+
+async function confirmSwitch() {
+  const book = currentBook.value as any
+  const candidate = switchCandidates.value.find(
+    (item) => switchCandidateKey(item) === switchPreviewKey.value,
+  )
+  if (!book?.id || !candidate || !switchPreview.value) return
+  const wasReader = view.value === 'reader'
+  switchBusy.value = true
+  switchError.value = ''
+  try {
+    const result: any = await call('switchBookSource', {
+      bookId: book.id,
+      sourceUrl: candidate.sourceUrl,
+      bookUrl: candidate.bookUrl,
+    })
+    Object.assign(currentBook.value as any, result.book ?? {})
+    chapters.value = result.chapters ?? []
+    progress.value = result.progress ?? null
+    switchOpen.value = false
+    await loadBookmarks()
+    await loadNotes()
+    await refresh()
+    status.value = `已换源 · ${chapters.value.length} 章`
+    if (wasReader) {
+      const record = result.progress
+      const readable = chapters.value.filter((chapter: any) => !chapter.isVolume && chapter.url)
+      const target =
+        (record && readable.find((chapter: any) => chapter.url === record.chapterUrl)) ||
+        (record && readable[Math.min(Number(record.chapterIndex) || 0, readable.length - 1)]) ||
+        readable[0]
+      if (target) await openChapter(target, Number(record?.position ?? 0))
+    }
+  } catch (error) {
+    switchError.value = errorText(error)
+  } finally {
+    switchBusy.value = false
+  }
+}
+
 function onPage(payload: { page: number; total: number }) {
   initialPage.value = payload.page
   if (!currentBook.value?.id) return
@@ -1533,6 +2163,141 @@ function stopSpeech() {
 function toggleSpeech() {
   if (speaking.value) stopSpeech()
   else startSpeech()
+}
+
+function showReaderHint(text: string) {
+  readerHint.value = text
+  if (readerHintTimer) clearTimeout(readerHintTimer)
+  readerHintTimer = setTimeout(() => {
+    readerHint.value = ''
+  }, 4000)
+}
+
+function openReaderSearch() {
+  if (readerKind.value !== 'text') return
+  if (!currentBook.value?.id) {
+    showReaderHint('加入书架后可搜索')
+    return
+  }
+  readerSearchOpen.value = true
+  readerSearchHint.value = ''
+}
+
+function closeReaderSearch() {
+  readerSearchOpen.value = false
+}
+
+async function runReaderSearch(fromIndex: number, reset: boolean) {
+  const key = readerSearchKey.value.trim()
+  if (!key) {
+    readerSearchHint.value = '请输入关键词'
+    return
+  }
+  const bookId = currentBook.value?.id
+  if (!bookId) {
+    readerSearchHint.value = '加入书架后可搜索'
+    return
+  }
+  const token = ++readerSearchToken
+  readerSearchStarted.value = true
+  readerSearchBusy.value = true
+  readerSearchStopped.value = false
+  readerSearchHint.value = ''
+  if (reset) {
+    readerSearchUsedKey.value = key
+    readerSearchResults.value = []
+    readerSearchErrors.value = []
+    readerSearchScanned.value = 0
+    readerSearchDone.value = false
+    readerSearchTotal.value = chapters.value.length
+  }
+  try {
+    const result = await call('searchInBook', {
+      bookId,
+      key: readerSearchUsedKey.value,
+      fromIndex,
+      maxChapters: 200,
+    })
+    if (token !== readerSearchToken) return
+    readerSearchResults.value.push(...(result?.results ?? []))
+    readerSearchErrors.value.push(...(result?.errors ?? []))
+    const next = Number(result?.nextIndex ?? fromIndex)
+    readerSearchNextIndex.value = next
+    readerSearchScanned.value = next
+    readerSearchTotal.value = Math.max(readerSearchTotal.value, next)
+    readerSearchDone.value = Boolean(result?.done)
+    if (readerSearchDone.value) {
+      if (readerSearchResults.value.length) {
+        readerSearchHint.value = `已搜完，共 ${readerSearchResults.value.length} 章命中`
+      }
+    } else if (!readerSearchResults.value.length && !readerSearchErrors.value.length) {
+      readerSearchHint.value = '本批没有找到，可继续'
+    }
+  } catch (error) {
+    if (token === readerSearchToken) readerSearchHint.value = errorText(error)
+  } finally {
+    if (token === readerSearchToken) readerSearchBusy.value = false
+  }
+}
+
+function startReaderSearch() {
+  if (readerSearchBusy.value) return
+  void runReaderSearch(0, true)
+}
+
+function continueReaderSearch() {
+  void runReaderSearch(readerSearchNextIndex.value, false)
+}
+
+function stopReaderSearch() {
+  if (!readerSearchBusy.value) return
+  readerSearchToken += 1
+  readerSearchBusy.value = false
+  readerSearchStopped.value = true
+  readerSearchHint.value = '已停止，可继续搜索'
+}
+
+const readerSearchCanContinue = computed(
+  () =>
+    readerSearchStarted.value &&
+    !readerSearchBusy.value &&
+    !readerSearchDone.value &&
+    readerSearchKey.value.trim() === readerSearchUsedKey.value,
+)
+
+const readerSearchEmpty = computed(
+  () =>
+    readerSearchStarted.value &&
+    !readerSearchBusy.value &&
+    (readerSearchDone.value || readerSearchStopped.value) &&
+    readerSearchResults.value.length === 0 &&
+    readerSearchErrors.value.length === 0,
+)
+
+async function jumpToSearchResult(item: { chapterIndex: number }) {
+  const chapter = chapters.value[item.chapterIndex]
+  const key = readerSearchUsedKey.value
+  if (!chapter || chapter.isVolume || !chapter.url) {
+    readerSearchHint.value = '章节已变化，请重搜'
+    return
+  }
+  readerSearchOpen.value = false
+  readerSearchHint.value = ''
+  highlightText.value = ''
+  await openChapter(chapter, 0)
+  if (currentChapter.value !== chapter) {
+    showReaderHint('章节打开失败')
+    return
+  }
+  await nextTick()
+  const target = readerRef.value?.findPageFor?.(key)
+  if (typeof target === 'number' && target >= 0) {
+    readerRef.value?.goto?.(target)
+    highlightText.value = key
+  } else {
+    readerRef.value?.goto?.(0)
+    showReaderHint('未定位到关键词')
+  }
 }
 
 function addReplaceRule() {
@@ -1771,6 +2536,7 @@ onMounted(async () => {
       <nav class="mo-nav">
         <button :class="{ on: view === 'shelf' }" data-testid="nav-shelf" @click="view = 'shelf'">书架</button>
         <button :class="{ on: view === 'search' || view === 'detail' }" data-testid="nav-search" @click="view = 'search'">搜索</button>
+        <button :class="{ on: view === 'explore' }" data-testid="nav-explore" @click="openExplore">发现</button>
         <button :class="{ on: view === 'sources' }" data-testid="nav-sources" @click="view = 'sources'">书源</button>
         <button :class="{ on: view === 'rss' }" data-testid="nav-rss" @click="view = 'rss'">订阅</button>
         <span class="mo-version">v{{ version }}</span>
@@ -1944,6 +2710,105 @@ onMounted(async () => {
         </div>
       </section>
 
+      <section v-if="view === 'explore'" class="mo-pane">
+        <div class="mo-section-head">
+          <h2>发现</h2>
+          <span class="muted">{{ exploreSources.length }} 个书源可发现</span>
+          <button class="mo-btn" :disabled="exploreLoading" data-testid="explore-refresh" @click="loadExploreGroups(true)">
+            {{ exploreLoading ? '加载中…' : '刷新分类' }}
+          </button>
+        </div>
+
+        <p v-if="exploreError && exploreSources.length > 0 && !exploreActive" class="muted mo-explore-error">
+          发现加载失败：{{ exploreError }}
+        </p>
+
+        <div v-if="exploreLoading && exploreGroups.length === 0" class="mo-empty small">
+          <p class="muted">正在加载分类…</p>
+        </div>
+
+        <div v-else-if="exploreSources.length === 0" class="mo-empty">
+          <div class="mo-empty-glyph">源</div>
+          <p class="mo-empty-title">还没有可发现的源</p>
+          <p class="muted">书源开启「发现」并填写发现地址后，这里就能按分类找书。</p>
+          <p v-if="exploreError" class="muted mo-explore-error">{{ exploreError }}</p>
+          <button class="mo-btn" data-testid="explore-goto-sources" @click="view = 'sources'">去书源</button>
+        </div>
+
+        <template v-else>
+          <div v-for="section in exploreSections" :key="section.name" class="mo-explore-section">
+            <h3 class="mo-explore-section-title">{{ section.name }}</h3>
+            <div v-for="group in section.items" :key="group.source.bookSourceUrl" class="mo-explore-group">
+              <div class="mo-explore-head">
+                <h3>{{ group.source.bookSourceName || group.source.bookSourceUrl }}</h3>
+                <span class="muted">{{ group.categories.length }} 个分类</span>
+              </div>
+              <p v-if="group.error" class="muted mo-explore-error">{{ group.error }}</p>
+              <p v-else-if="group.categories.length === 0" class="muted">这个源没有分类</p>
+              <div v-else class="mo-explore-chips">
+                <button
+                  v-for="category in group.categories"
+                  :key="category.url"
+                  class="mo-chip"
+                  :class="{ on: isActiveCategory(group, category) }"
+                  @click="selectExploreCategory(group, category)"
+                >
+                  {{ category.name }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="exploreActive" class="mo-explore-result">
+            <div class="mo-section-head">
+              <h3>{{ exploreActive.sourceName }} · {{ exploreActive.name }}</h3>
+              <span class="muted">
+                {{ exploreBooks.length }} 本<span v-if="explorePage"> · 第 {{ explorePage }} 页</span>
+              </span>
+            </div>
+
+            <div v-if="exploreBusy && exploreBooks.length === 0" class="mo-empty small">
+              <p class="muted">正在加载书目…</p>
+            </div>
+            <div v-else-if="exploreBooks.length" class="mo-results">
+              <button
+                v-for="book in exploreBooks"
+                :key="book.origin + book.bookUrl"
+                class="mo-result"
+                data-testid="explore-book"
+                @click="openBook(book)"
+              >
+                <span class="mo-result-cover" :style="coverStyle(book)">
+                  <img v-if="book.coverUrl" :src="book.coverUrl" alt="" loading="lazy" />
+                  <span v-else>{{ String(book.name || '书').slice(0, 1) }}</span>
+                </span>
+                <span class="mo-result-main">
+                  <span class="mo-result-name">{{ book.name }}</span>
+                  <span class="muted">{{ book.author || '未知作者' }} · {{ book.kind || '小说' }}</span>
+                  <span v-if="book.lastChapter" class="muted">最新：{{ book.lastChapter }}</span>
+                  <span class="muted">{{ book.originName || book.origin }}</span>
+                </span>
+                <span class="mo-result-arrow">›</span>
+              </button>
+            </div>
+            <div v-else-if="!exploreBusy && !exploreError" class="mo-empty small">
+              <p class="muted">这个分类暂时没有书</p>
+            </div>
+
+            <div v-if="exploreError" class="mo-errors">
+              <p class="muted">加载失败：{{ exploreError }}</p>
+            </div>
+
+            <div v-if="exploreHasMore && !exploreError" class="mo-explore-more">
+              <button class="mo-btn" :disabled="exploreBusy" data-testid="explore-more" @click="loadExplorePage(explorePage + 1, false)">
+                {{ exploreBusy ? '加载中…' : '加载更多' }}
+              </button>
+            </div>
+            <p v-else-if="!exploreError && exploreBooks.length" class="muted mo-explore-note">没有更多了</p>
+          </div>
+        </template>
+      </section>
+
       <section v-if="view === 'detail' && currentBook" class="mo-pane">
         <button class="mo-back" data-testid="detail-back" @click="backFromDetail">‹ 返回</button>
 
@@ -1969,6 +2834,14 @@ onMounted(async () => {
               </button>
               <button v-if="!currentBook.id" class="mo-btn" data-testid="add-shelf" @click="addToShelf">加入书架</button>
               <span v-else class="mo-tag">已在书架</span>
+              <button
+                v-if="currentBook.origin !== 'local'"
+                class="mo-btn"
+                data-testid="switch-source"
+                @click="openSwitchPanel"
+              >
+                换源
+              </button>
               <button class="mo-btn" data-testid="simulate" @click="openSimulate">模拟阅读</button>
               <button class="mo-btn" :disabled="cacheBusy" data-testid="cache-book" @click="cacheBookChapters">{{ cacheBusy ? '缓存中…' : '缓存 20 章' }}</button>
               <button class="mo-btn" :disabled="exportBusy" data-testid="export-book" @click="exportBook('txt')">{{ exportBusy ? '导出中…' : '导出 TXT' }}</button>
@@ -2040,19 +2913,56 @@ onMounted(async () => {
               <option value="updated">按更新时间</option>
               <option value="enabled">按启用状态</option>
             </select>
-            <button class="mo-btn" data-testid="source-check" @click="runSourceCheck">检查</button>
+            <select v-model="sourceLogin" class="mo-select" aria-label="登录要求">
+              <option value="all">全部</option>
+              <option value="required">需登录</option>
+              <option value="none">免登录</option>
+            </select>
+            <label class="mo-switch" title="只看开启发现且有发现地址的书源">
+              <input v-model="sourceExploreOnly" type="checkbox" data-testid="source-explore-only" />
+              有发现
+            </label>
+            <button class="mo-btn" data-testid="source-check" @click="runSourceCheck">结构检查</button>
           </div>
           <div class="mo-source-bulk">
             <label class="mo-switch"><input type="checkbox" :checked="allPageSelected" @change="toggleSelectPage" />本页全选</label>
             <span class="muted">已选 {{ selectedCount }} 个</span>
             <button class="mo-btn" :disabled="selectedCount === 0 || busy" data-testid="batch-enable" @click="batchSetEnabled(true)">批量启用</button>
             <button class="mo-btn" :disabled="selectedCount === 0 || busy" data-testid="batch-disable" @click="batchSetEnabled(false)">批量禁用</button>
+            <button class="mo-btn" :disabled="selectedCount === 0 || busy" data-testid="batch-export" @click="exportSelectedSources">导出选中</button>
+            <span v-if="sourceMessage" class="muted" data-testid="source-message">{{ sourceMessage }}</span>
           </div>
           <div v-if="checkReport" class="mo-check-report" data-testid="source-check-report">
             <p>检查 {{ checkReport.total }} 个：通过 {{ checkReport.ok }}，问题 {{ checkReport.problems.length }}</p>
             <ul v-if="checkReport.problems.length">
               <li v-for="item in checkReport.problems.slice(0, 8)" :key="item.name">{{ item.name }}：{{ item.message }}</li>
               <li v-if="checkReport.problems.length > 8" class="muted">…另有 {{ checkReport.problems.length - 8 }} 个</li>
+            </ul>
+          </div>
+          <div class="mo-source-online">
+            <button
+              class="mo-btn"
+              :disabled="onlineCheckBusy || onlineCheckTargets.length === 0"
+              data-testid="source-online-check"
+              @click="runOnlineSourceCheck"
+            >
+              {{ onlineCheckBusy ? '检查中' : '在线检查' }}
+            </button>
+            <span class="muted">{{ onlineCheckScope }}，检查能否打开</span>
+          </div>
+          <div v-if="onlineCheckReport" class="mo-check-report" data-testid="source-online-report">
+            <p>
+              在线检查（{{ onlineCheckReport.scope === 'selected' ? '已选' : '本页' }}）
+              {{ onlineCheckReport.total }} 个：可达 {{ onlineCheckReport.ok }}
+            </p>
+            <ul>
+              <li v-for="item in onlineCheckReport.results" :key="item.url" data-testid="source-online-row">
+                <span>{{ sourceNameOf(item.url) }}</span>
+                <span class="mo-tag soft">{{ item.ok ? '可达' : '不可达' }}</span>
+                <span v-if="item.status !== null" class="muted">HTTP {{ item.status }}</span>
+                <span class="muted">{{ item.elapsedMs }}ms</span>
+                <span v-if="item.error" class="muted">{{ item.error }}</span>
+              </li>
             </ul>
           </div>
           <div v-if="filteredSortedSources.length === 0" class="mo-empty small">没有匹配的书源。</div>
@@ -2072,9 +2982,10 @@ onMounted(async () => {
               <span class="mo-url">{{ source.bookSourceUrl }}</span>
               <span v-if="source.bookSourceGroup" class="mo-tag soft">{{ source.bookSourceGroup }}</span>
               <span class="mo-tag soft">{{ sourceTypeNames[source.bookSourceType ?? 0] ?? '文本' }}</span>
-              <span v-if="source.enabledExplore" class="mo-tag soft">发现</span>
-              <span v-if="source.loginUrl" class="mo-tag warn">需登录</span>
+              <span v-if="hasExplore(source)" class="mo-tag soft">发现</span>
+              <span v-if="needsLogin(source)" class="mo-tag warn">需登录</span>
               <span v-else-if="source.enabledCookieJar" class="mo-tag soft">Cookie</span>
+              <button class="mo-btn tiny" :disabled="busy" title="导出为 Legado JSON" data-testid="source-export" @click="exportSource(source)">导出</button>
               <button class="mo-icon-btn" title="编辑" data-testid="source-edit" @click="beginEdit(source)">✎</button>
               <button class="mo-icon-btn danger" title="删除" @click="removeSource(source)">✕</button>
             </li>
@@ -2083,6 +2994,123 @@ onMounted(async () => {
             <button class="mo-btn" :disabled="sourcePage <= 1" @click="sourcePage -= 1">上一页</button>
             <span class="muted">第 {{ sourcePage }} / {{ sourcePageCount }} 页</span>
             <button class="mo-btn" :disabled="sourcePage >= sourcePageCount" @click="sourcePage += 1">下一页</button>
+          </div>
+        </div>
+
+        <div ref="dictCardRef" class="mo-card" data-testid="dict-card">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">字典规则</h3>
+            <span class="muted">{{ dictRules.length }} 条 · 启用 {{ dictEnabledCount }}</span>
+            <div class="mo-dict-actions">
+              <button class="mo-btn tiny" data-testid="dict-add" @click="beginDictEdit()">新增</button>
+              <button class="mo-btn tiny" :disabled="busy" data-testid="dict-export" @click="exportDicts">导出</button>
+            </div>
+          </div>
+          <p v-pre class="muted">网址里用 {{key}} 占位，试查时替换成要查的词。</p>
+
+          <div v-if="dictRules.length" class="mo-dict-list">
+            <div v-for="(item, index) in dictRules" :key="item.id" class="mo-dict-row" data-testid="dict-row">
+              <label class="mo-switch">
+                <input type="checkbox" :checked="item.enabled !== false" @change="toggleDictRule(item)" />
+                <span class="mo-source-name">{{ item.name || '未命名字典' }}</span>
+              </label>
+              <span v-if="item.group" class="mo-tag soft">{{ item.group }}</span>
+              <span class="mo-url">{{ item.url }}</span>
+              <button class="mo-btn tiny" :disabled="index === 0" title="上移" @click="moveDictRule(item, -1)">上移</button>
+              <button class="mo-btn tiny" :disabled="index === dictRules.length - 1" title="下移" @click="moveDictRule(item, 1)">下移</button>
+              <button class="mo-btn tiny" :disabled="busy" @click="beginDictEdit(item)">编辑</button>
+              <button class="mo-btn tiny danger" :disabled="busy" @click="removeDictRule(item)">删除</button>
+            </div>
+          </div>
+          <div v-else class="mo-empty small">
+            <p>还没有字典规则</p>
+            <p class="muted">导入阅读的字典 JSON，或新增一条试试。</p>
+            <button class="mo-btn tiny primary" @click="beginDictEdit()">新增字典</button>
+          </div>
+
+          <textarea
+            v-model="dictImportText"
+            class="mo-json"
+            rows="3"
+            data-testid="dict-import-text"
+            placeholder='粘贴字典 JSON，如 [{"name":"…","url":"https://…/{{key}}","rule":"class.…@text"}]'
+          />
+          <div class="mo-row">
+            <label class="mo-file" title="选择字典 JSON 文件">
+              <input type="file" accept=".json,application/json" data-testid="dict-import-file" @change="onImportDictFile" />
+              <span class="mo-btn tiny">选择文件</span>
+            </label>
+            <button class="mo-btn tiny" :disabled="busy || !dictImportText.trim()" data-testid="dict-import" @click="importDicts">导入</button>
+            <span class="muted">{{ dictMessage }}</span>
+          </div>
+
+          <div class="mo-dict-trial">
+            <div class="mo-row">
+              <input v-model="dictQuery" placeholder="输入要查的词" data-testid="dict-query" @keyup.enter="runDictLookup" />
+              <button
+                class="mo-btn primary"
+                :disabled="dictTrialBusy || !dictQuery.trim()"
+                data-testid="dict-lookup"
+                @click="runDictLookup"
+              >
+                {{ dictTrialBusy ? '查询中…' : '试查' }}
+              </button>
+              <span class="muted">{{ dictEnabledCount ? `同时查询 ${dictEnabledCount} 本字典` : '先新增并启用字典' }}</span>
+            </div>
+            <div v-if="dictEnabledCount === 0" class="mo-empty small">
+              <p>还没有启用的字典</p>
+              <p class="muted">新增一条字典后，这里会同时查询所有启用的字典。</p>
+              <button class="mo-btn tiny primary" @click="beginDictEdit()">新增字典</button>
+            </div>
+            <template v-else-if="dictResults.length">
+              <div class="mo-dict-tabs" role="tablist">
+                <button
+                  v-for="item in dictResults"
+                  :key="item.id"
+                  :class="{ on: item.id === dictActiveResult?.id }"
+                  role="tab"
+                  @click="dictActiveTab = item.id"
+                >
+                  {{ item.name }}<span v-if="!item.ok" class="mo-dict-fail">失败</span>
+                </button>
+              </div>
+              <div v-if="dictActiveResult" class="mo-dict-result" data-testid="dict-result">
+                <template v-if="dictActiveResult.ok">
+                  <pre class="mo-dict-text" data-testid="dict-result-text">{{ dictActiveResult.text || '（没有提取到释义）' }}</pre>
+                  <div class="mo-row">
+                    <button class="mo-btn tiny" @click="copyDictResult(dictActiveResult)">复制</button>
+                    <button class="mo-btn tiny" :disabled="!dictActiveResult.url" @click="openDictResult(dictActiveResult)">打开</button>
+                    <span class="mo-url">{{ dictActiveResult.url }}</span>
+                  </div>
+                </template>
+                <p v-else class="muted">查询失败：{{ dictActiveResult.error }}</p>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <div v-if="dictEditing" class="mo-card" data-testid="dict-editor">
+          <h3 class="mo-card-title">编辑字典：{{ dictEditing.name || '新字典' }}</h3>
+          <div class="mo-row">
+            <input v-model="dictEditing.name" placeholder="名称" data-testid="dict-name" />
+            <input v-model="dictEditing.group" placeholder="分组（可选）" />
+            <label class="mo-switch"><input type="checkbox" v-model="dictEditing.enabled" />启用</label>
+          </div>
+          <div class="mo-row">
+            <input v-model="dictEditing.url" placeholder="地址，必须含 {{key}}" data-testid="dict-url" />
+          </div>
+          <div class="mo-row">
+            <input v-model="dictEditing.rule" placeholder="提取规则，如 class.meaning@text" data-testid="dict-rule" />
+          </div>
+          <textarea
+            v-model="dictEditing.header"
+            class="mo-json"
+            rows="2"
+            placeholder='请求头 JSON（可选），如 {"Referer":"https://…"}'
+          />
+          <div class="mo-row">
+            <button class="mo-btn primary" :disabled="busy" data-testid="dict-save" @click="saveDict">保存</button>
+            <button class="mo-btn" @click="dictEditing = null">取消</button>
           </div>
         </div>
 
@@ -2219,6 +3247,7 @@ onMounted(async () => {
             :battery-percent="batteryPercent"
             @page="onPage"
             @tap-action="onTapAction"
+            @select="onReaderSelect"
           />
           <ComicReader
             v-else-if="readerKind === 'images'"
@@ -2260,6 +3289,7 @@ onMounted(async () => {
               <button class="mo-icon-btn" title="书签列表" data-testid="reader-bookmarks" @click="bookmarksOpen = true">🔖</button>
               <button v-if="readerKind === 'text'" class="mo-icon-btn" title="笔记与划线" data-testid="reader-notes" @click="notesOpen = true">✎</button>
               <button v-if="readerKind === 'text'" class="mo-icon-btn" title="段评" data-testid="reader-review" @click="openReview">💬</button>
+              <button v-if="readerKind === 'text'" class="mo-icon-btn" title="书内搜索" aria-label="书内搜索" data-testid="reader-search" @click="openReaderSearch">🔍</button>
               <button class="mo-icon-btn" title="目录" data-testid="reader-toc" @click="tocOpen = true">☰</button>
             </div>
             <div class="mo-chrome-bottom">
@@ -2267,7 +3297,140 @@ onMounted(async () => {
               <button v-if="settings.menuItems.includes('settings') && readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-settings" @click="settingsOpen = true">Aa</button>
               <button v-if="readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-speak" @click="toggleSpeech">{{ speaking ? '暂停' : '朗读' }}</button>
               <button v-if="settings.menuItems.includes('toc')" class="mo-chrome-btn" @click="tocOpen = true">目录</button>
+              <button
+                v-if="currentBook && currentBook.origin !== 'local'"
+                class="mo-chrome-btn"
+                data-testid="reader-switch"
+                @click="openSwitchPanel"
+              >
+                换源
+              </button>
               <button v-if="settings.menuItems.includes('next')" class="mo-chrome-btn" :disabled="chapterIndex >= chapters.length - 1" @click="openAdjacent(1)">下一章</button>
+            </div>
+          </div>
+        </transition>
+
+        <div v-if="readerHint" class="mo-reader-hint" data-testid="reader-hint">{{ readerHint }}</div>
+
+        <transition name="mo-fade">
+          <div v-if="dictPanelOpen" class="mo-sheet-mask" data-testid="reader-dict-mask" @click.self="closeReaderDict">
+            <div class="mo-sheet mo-sheet-scroll mo-reader-dict" data-testid="reader-dict-panel" @pointerdown.stop @click.stop>
+              <div class="mo-sheet-head">
+                <strong>查字典</strong>
+                <span v-if="dictPanelFallback" class="muted">未定位到词，已取整行</span>
+                <button class="mo-icon-btn" data-testid="reader-dict-close" title="关闭" @click="closeReaderDict">✕</button>
+              </div>
+              <p v-if="dictPanelLine" class="muted mo-dict-line">「{{ dictPanelLine }}」</p>
+              <div class="mo-row">
+                <input
+                  v-model="dictPanelText"
+                  placeholder="要查的词"
+                  data-testid="reader-dict-query"
+                  @keyup.enter="runReaderLookup"
+                />
+                <button
+                  class="mo-btn primary"
+                  :disabled="dictPanelBusy || !dictPanelText.trim()"
+                  data-testid="reader-dict-lookup"
+                  @click="runReaderLookup"
+                >
+                  {{ dictPanelBusy ? '查询中…' : '查询' }}
+                </button>
+              </div>
+              <p v-if="dictPanelError" class="muted" data-testid="reader-dict-error">{{ dictPanelError }}</p>
+              <div v-if="dictEnabledCount === 0" class="mo-empty small" data-testid="reader-dict-empty">
+                <p>还没有启用的字典</p>
+                <p class="muted">添加并启用字典后，长按选词会同时查询所有字典。</p>
+                <button class="mo-btn tiny primary" data-testid="reader-dict-manage" @click="openDictManage">去添加字典</button>
+              </div>
+              <template v-else-if="dictPanelResults.length">
+                <div class="mo-dict-tabs" role="tablist">
+                  <button
+                    v-for="item in dictPanelResults"
+                    :key="item.id"
+                    :class="{ on: item.id === dictPanelActiveResult?.id }"
+                    role="tab"
+                    data-testid="reader-dict-tab"
+                    @click="dictPanelActive = item.id"
+                  >
+                    {{ item.name }}<span v-if="!item.ok" class="mo-dict-fail">失败</span>
+                  </button>
+                </div>
+                <div v-if="dictPanelActiveResult" class="mo-dict-result" data-testid="reader-dict-result">
+                  <template v-if="dictPanelActiveResult.ok">
+                    <pre class="mo-dict-text" data-testid="reader-dict-result-text">{{ dictPanelActiveResult.text || '（没有提取到释义）' }}</pre>
+                    <div class="mo-row">
+                      <button class="mo-btn tiny" data-testid="reader-dict-copy" @click="copyReaderDict(dictPanelActiveResult)">复制</button>
+                      <button class="mo-btn tiny" :disabled="!dictPanelActiveResult.url" data-testid="reader-dict-open" @click="openDictResult(dictPanelActiveResult)">打开原页</button>
+                      <span class="mo-url">{{ dictPanelActiveResult.url }}</span>
+                    </div>
+                  </template>
+                  <p v-else class="muted">查询失败：{{ dictPanelActiveResult.error }}</p>
+                </div>
+              </template>
+              <p v-else-if="!dictPanelBusy && !dictPanelError" class="muted">输入词后查询。</p>
+              <p v-if="dictPanelCopied" class="muted" data-testid="reader-dict-copied">{{ dictPanelCopied }}</p>
+            </div>
+          </div>
+        </transition>
+
+        <transition name="mo-fade">
+          <div v-if="readerSearchOpen" class="mo-sheet-mask" data-testid="reader-search-mask" @click.self="closeReaderSearch">
+            <div class="mo-sheet mo-sheet-scroll mo-reader-search" data-testid="reader-search-panel" @pointerdown.stop @click.stop>
+              <div class="mo-sheet-head">
+                <strong>书内搜索</strong>
+                <span class="muted">逐章查找正文</span>
+                <button class="mo-icon-btn" data-testid="reader-search-close" title="关闭" @click="closeReaderSearch">✕</button>
+              </div>
+              <div class="mo-row">
+                <input
+                  v-model="readerSearchKey"
+                  placeholder="输入关键词"
+                  data-testid="reader-search-input"
+                  @keyup.enter="startReaderSearch"
+                />
+                <button
+                  class="mo-btn primary"
+                  :disabled="readerSearchBusy || !readerSearchKey.trim()"
+                  data-testid="reader-search-run"
+                  @click="startReaderSearch"
+                >
+                  搜索
+                </button>
+                <button v-if="readerSearchBusy" class="mo-btn tiny" data-testid="reader-search-stop" @click="stopReaderSearch">停止</button>
+                <button
+                  v-else-if="readerSearchCanContinue"
+                  class="mo-btn tiny"
+                  data-testid="reader-search-continue"
+                  @click="continueReaderSearch"
+                >
+                  继续搜索
+                </button>
+              </div>
+              <p v-if="readerSearchStarted" class="muted mo-search-hint" data-testid="reader-search-progress">
+                已搜 {{ readerSearchScanned }}/{{ readerSearchTotal }} · 命中 {{ readerSearchResults.length }}
+              </p>
+              <p v-if="readerSearchHint" class="muted mo-search-hint" data-testid="reader-search-hint">{{ readerSearchHint }}</p>
+              <ul v-if="readerSearchResults.length" class="mo-search-list" data-testid="reader-search-results">
+                <li v-for="item in readerSearchResults" :key="item.chapterIndex">
+                  <button class="mo-search-item" data-testid="reader-search-result" @click="jumpToSearchResult(item)">
+                    <span class="mo-search-title">{{ item.chapterTitle }}</span>
+                    <span class="mo-search-count">{{ item.count }} 处</span>
+                    <span class="mo-search-snippet">{{ item.snippet }}</span>
+                  </button>
+                </li>
+              </ul>
+              <details v-if="readerSearchErrors.length" class="mo-search-errors" data-testid="reader-search-errors">
+                <summary>失败 {{ readerSearchErrors.length }} 章</summary>
+                <p v-for="error in readerSearchErrors" :key="error.chapterIndex" class="muted">
+                  {{ error.chapterTitle || `第 ${error.chapterIndex + 1} 章` }}：{{ error.message }}
+                </p>
+              </details>
+              <div v-if="readerSearchEmpty" class="mo-empty small" data-testid="reader-search-empty">
+                <p>{{ readerSearchDone ? '没有找到相关章节' : '暂未找到相关章节' }}</p>
+                <p class="muted">{{ readerSearchDone ? '换个关键词试试。' : '可继续搜索后面的章节。' }}</p>
+              </div>
+              <p v-else-if="!readerSearchStarted" class="muted">输入关键词，逐章查找正文。</p>
             </div>
           </div>
         </transition>
@@ -2543,6 +3706,80 @@ onMounted(async () => {
           </div>
         </transition>
 
+        <transition name="mo-fade">
+          <div v-if="switchOpen" class="mo-sheet-mask" data-testid="switch-mask" @click.self="closeSwitchPanel">
+            <div class="mo-sheet mo-sheet-scroll" data-testid="switch-panel">
+              <div class="mo-sheet-head">
+                <strong>换源</strong>
+                <span class="muted">
+                  {{ switchLoading ? '搜索中…' : switchCandidates.length + ' 个候选' }}
+                </span>
+                <button class="mo-icon-btn" title="关闭" @click="closeSwitchPanel">✕</button>
+              </div>
+
+              <p v-if="switchLoading" class="muted">正在搜索其他书源…</p>
+              <div v-else class="mo-switch-body">
+                <div class="mo-switch-list">
+                  <p v-if="switchCandidates.length === 0" class="muted">没有找到候选</p>
+                  <button
+                    v-for="candidate in switchCandidates"
+                    :key="switchCandidateKey(candidate)"
+                    class="mo-switch-row"
+                    :class="{ on: switchCandidateKey(candidate) === switchPreviewKey }"
+                    data-testid="switch-candidate"
+                    @click="previewCandidate(candidate)"
+                  >
+                    <span class="mo-switch-title">{{ candidate.name }}</span>
+                    <span class="muted">{{ candidate.author || '未知作者' }} · {{ candidate.sourceName }}</span>
+                    <span v-if="candidate.latestChapter" class="muted">最新：{{ candidate.latestChapter }}</span>
+                    <span class="mo-switch-tags">
+                      <span v-if="candidate.sameAuthor" class="mo-tag soft">同作者</span>
+                      <span v-if="candidate.possiblyNotSameBook" class="mo-tag soft">可能不是同一本</span>
+                      <span v-if="candidate.chapterCount" class="mo-tag soft">{{ candidate.chapterCount }} 章</span>
+                    </span>
+                  </button>
+                </div>
+
+                <div class="mo-switch-preview">
+                  <p v-if="switchPreviewBusy" class="muted">加载预览…</p>
+                  <p v-else-if="!switchPreview" class="muted">点候选预览目标目录</p>
+                  <template v-if="switchPreview">
+                    <h3>{{ switchPreview.book.name }}</h3>
+                    <p class="muted">
+                      {{ switchPreview.book.author || '未知作者' }} · {{ switchPreview.book.sourceName }}
+                    </p>
+                    <p class="muted">
+                      {{ switchPreview.chapterCount }} 章 · 最新：{{ switchPreview.latestChapter || '未知' }}
+                    </p>
+                    <p v-if="switchPreview.book.intro" class="mo-switch-intro">{{ switchPreview.book.intro }}</p>
+                    <p class="muted">目录预览</p>
+                    <ol class="mo-switch-toc">
+                      <li v-for="chapter in switchPreview.chapters" :key="chapter.url || chapter.title">
+                        {{ chapter.title }}
+                      </li>
+                    </ol>
+                  </template>
+                </div>
+              </div>
+
+              <p v-if="switchError" class="muted" data-testid="switch-error">{{ switchError }}</p>
+              <p v-if="switchErrors.length" class="muted">部分书源失败：{{ switchErrorText }}</p>
+
+              <div class="mo-row">
+                <button class="mo-btn" @click="closeSwitchPanel">取消</button>
+                <button
+                  class="mo-btn primary"
+                  data-testid="switch-confirm"
+                  :disabled="switchBusy || !switchPreview"
+                  @click="confirmSwitch"
+                >
+                  {{ switchBusy ? '切换中…' : '确认换源' }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </transition>
+
     </main>
   </div>
 </template>
@@ -2559,6 +3796,7 @@ onMounted(async () => {
   --mo-accent-soft: #e9efe9;
   display: flex;
   flex-direction: column;
+  position: relative;
   height: 100%;
   min-height: 480px;
   color: var(--mo-ink);
@@ -2949,6 +4187,61 @@ onMounted(async () => {
   padding-top: 10px;
   border-top: 1px dashed var(--mo-line);
 }
+.mo-explore-section {
+  padding-top: 14px;
+}
+.mo-explore-section:first-child {
+  padding-top: 0;
+}
+.mo-explore-section-title {
+  margin: 0;
+  font: 600 13px/1.4 -apple-system, 'Noto Sans SC', 'PingFang SC', sans-serif;
+  color: var(--mo-ink-3);
+  letter-spacing: 0.04em;
+}
+.mo-explore-group {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--mo-line);
+}
+.mo-explore-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.mo-explore-head h3 {
+  margin: 0;
+  font: 600 16px/1.3 'Songti SC', 'Noto Serif SC', serif;
+}
+.mo-explore-head .muted {
+  margin-left: auto;
+}
+.mo-explore-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.mo-chip.on {
+  border-color: var(--mo-accent);
+  background: var(--mo-accent-soft);
+  color: var(--mo-accent);
+}
+.mo-explore-error {
+  margin: 4px 0;
+  color: #a33;
+}
+.mo-explore-result {
+  margin-top: 22px;
+}
+.mo-explore-more {
+  display: flex;
+  justify-content: center;
+  margin: 16px 0;
+}
+.mo-explore-note {
+  margin: 10px 0;
+  text-align: center;
+}
 .mo-back {
   border: 0;
   background: none;
@@ -3162,6 +4455,15 @@ onMounted(async () => {
   color: #8a4b1e;
   border-color: #d8b28d;
 }
+.mo-source-online {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 2px 0 10px;
+  color: var(--mo-ink-2);
+  font-size: 12px;
+}
 .mo-check-report {
   margin: 6px 0 10px;
   padding: 10px 12px;
@@ -3303,6 +4605,154 @@ textarea {
   white-space: pre-wrap;
 }
 
+/* 字典规则 */
+.mo-btn.tiny {
+  padding: 3px 9px;
+  font-size: 12px;
+}
+.mo-dict-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+.mo-dict-list {
+  margin: 4px 0 10px;
+}
+.mo-dict-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--mo-line);
+}
+.mo-dict-row:last-child {
+  border-bottom: 0;
+}
+.mo-dict-row .mo-url {
+  flex: 1 1 180px;
+}
+.mo-dict-trial {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--mo-line);
+}
+.mo-dict-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 8px;
+}
+.mo-dict-tabs button {
+  padding: 4px 12px;
+  border: 1px solid var(--mo-line);
+  border-radius: 999px;
+  background: var(--mo-paper);
+  color: var(--mo-ink-2);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.mo-dict-tabs button.on {
+  border-color: var(--mo-accent);
+  background: var(--mo-accent-soft);
+  color: var(--mo-accent);
+}
+.mo-dict-fail {
+  margin-left: 5px;
+  color: #a8402e;
+  font-size: 11px;
+}
+.mo-dict-result {
+  padding: 10px 12px;
+  border: 1px solid var(--mo-line);
+  border-radius: 8px;
+  background: var(--mo-paper);
+}
+.mo-dict-text {
+  margin: 0 0 8px;
+  max-height: 280px;
+  overflow: auto;
+  font: 13px/1.8 -apple-system, 'Noto Sans SC', 'PingFang SC', sans-serif;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.mo-reader-dict .mo-dict-line {
+  margin: 4px 0 10px;
+  overflow-wrap: anywhere;
+}
+.mo-reader-dict .mo-dict-text {
+  max-height: 180px;
+}
+
+/* 书内搜索 */
+.mo-search-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+.mo-search-list li + li {
+  border-top: 1px solid var(--mo-line);
+}
+.mo-search-item {
+  display: block;
+  width: 100%;
+  padding: 10px 2px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.mo-search-title {
+  font-size: 14px;
+}
+.mo-search-count {
+  margin-left: 8px;
+  color: var(--mo-accent);
+  font-size: 12px;
+}
+.mo-search-snippet {
+  display: block;
+  margin-top: 4px;
+  color: var(--mo-ink-2);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.mo-search-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+}
+.mo-search-errors {
+  margin-top: 10px;
+  color: var(--mo-ink-2);
+  font-size: 12px;
+}
+.mo-search-errors summary {
+  cursor: pointer;
+}
+.mo-search-errors p {
+  margin: 4px 0 0;
+}
+.mo-reader-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 84px;
+  transform: translateX(-50%);
+  max-width: 82%;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: rgba(20, 21, 24, 0.86);
+  color: #d8d4c8;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+  z-index: 5;
+  pointer-events: none;
+}
+
 /* 阅读页 */
 .mo-reading-mode {
   background: #141518;
@@ -3397,6 +4847,75 @@ textarea {
 .mo-sheet-scroll {
   max-height: 78vh;
   overflow-y: auto;
+}
+.mo-switch-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+  min-height: 200px;
+}
+@media (max-width: 720px) {
+  .mo-switch-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.mo-switch-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.mo-switch-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--mo-line);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.mo-switch-row:hover {
+  border-color: var(--mo-accent);
+}
+.mo-switch-row.on {
+  border-color: var(--mo-accent);
+  background: var(--mo-accent-soft);
+}
+.mo-switch-title {
+  font-weight: 600;
+}
+.mo-switch-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+.mo-switch-preview {
+  min-width: 0;
+}
+.mo-switch-preview h3 {
+  margin: 0 0 4px;
+  font-size: 16px;
+}
+.mo-switch-intro {
+  max-height: 72px;
+  overflow-y: auto;
+  color: var(--mo-ink-2);
+  font-size: 12px;
+}
+.mo-switch-toc {
+  max-height: 140px;
+  margin: 4px 0 0;
+  padding-left: 18px;
+  overflow-y: auto;
+  color: var(--mo-ink-2);
+  font-size: 12px;
 }
 .mo-shelf-groups {
   display: flex;

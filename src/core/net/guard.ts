@@ -108,11 +108,13 @@ export function parseHttpUrl(raw: string): URL {
 export async function assertPublicHttpUrl(raw: string): Promise<URL> {
   const url = parseHttpUrl(raw)
   if (allowPrivateHosts()) return url
-  if (isIP(url.hostname)) return url
+  // Node 的 URL.hostname 对 IPv6 字面量保留方括号；isIP 只认裸地址。
+  const host = url.hostname.replace(/^\[|\]$/g, '')
+  if (isIP(host)) return url
 
   let addresses: Array<{ address: string; family: number }>
   try {
-    addresses = await lookup(url.hostname, { all: true, verbatim: true })
+    addresses = await lookup(host, { all: true, verbatim: true })
   } catch {
     throw new UnsafeUrlError(`DNS 解析失败：${url.hostname}`)
   }
