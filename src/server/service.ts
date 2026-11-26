@@ -27,6 +27,7 @@ import {
   htmlToText,
 } from '../core/source/analyze.js'
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
+import { bookNamesRelated, mapSwitchProgress, matchBookName, sameAuthorName } from '../core/source/switch.js'
 import { openReaderStorage } from './storage.js'
 import { hasCachedChapter, readCachedChapter, writeCachedChapter } from './cache.js'
 import { buildEpub } from './epub-export.js'
@@ -404,6 +405,166 @@ export class ReaderService extends TypertRemoteService {
     if (raw.status >= 400) throw new Error(`HTTP ${raw.status}`)
     const books = analyzeExplore(raw.text, source, raw.url)
     return { books, page, hasMore: books.length > 0 && canPaginate, url: raw.url }
+  }
+
+  /** 换源候选：按书名搜所有启用书源，排除当前来源；同作者、书名匹配度高的在前。 */
+  async findSourceCandidates(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const db = this.requireDb()
+    const book = db.books.get(bookId) as Record<string, unknown> | undefined
+    if (!book) throw new Error('书不存在')
+    const currentOrigin = String(book.origin ?? '')
+    if (currentOrigin === 'local') throw new Error('本地书不支持换源')
+    const bookName = String(book.name ?? '').trim()
+    if (!bookName) throw new Error('书名不能为空')
+
+    const sourceUrls: string[] = []
+    for (const [, value] of db.sources.entries()) {
+      const source = value as BookSource
+      if (source.enabled === false) continue
+      if (source.bookSourceUrl === currentOrigin) continue
+      sourceUrls.push(source.bookSourceUrl)
+    }
+    if (sourceUrls.length === 0) return { candidates: [], errors: [] }
+
+    const found = (await this.searchBooks({ key: bookName, sourceUrls })) as {
+      books: ReturnType<typeof analyzeSearch>
+      errors: Array<{ sourceUrl: string; message: string }>
+    }
+    const bookAuthor = String(book.author ?? '')
+    const candidates = found.books.map((item) => {
+      const name = String(item.name ?? '')
+      return {
+        sourceUrl: String(item.origin ?? ''),
+        sourceName: String(item.originName ?? ''),
+        bookUrl: String(item.bookUrl ?? ''),
+        name,
+        author: String(item.author ?? ''),
+        kind: String(item.kind ?? ''),
+        latestChapter: String(item.lastChapter ?? ''),
+        coverUrl: String(item.coverUrl ?? ''),
+        sameAuthor: sameAuthorName(bookAuthor, item.author),
+        nameMatch: matchBookName(bookName, name),
+        possiblyNotSameBook: !bookNamesRelated(bookName, name),
+      }
+    })
+    const rank = (item: (typeof candidates)[number]) => {
+      const nameRank = item.nameMatch === 'exact' ? 0 : item.nameMatch === 'contains' ? 1 : 2
+      // 作者权重高于书名，保证同作者候选始终排在前面。
+      return (item.sameAuthor ? 0 : 10) + nameRank
+    }
+    candidates.sort(
+      (left, right) =>
+        rank(left) - rank(right) ||
+        left.sourceName.localeCompare(right.sourceName, 'zh') ||
+        left.name.localeCompare(right.name, 'zh'),
+    )
+    return { candidates, errors: found.errors }
+  }
+
+  /** 预览目标详情与目录；只读，不写书、不写目录。 */
+  async previewSourceCandidate(args: Args) {
+    const source = this.getSource(stringArg(args, 'sourceUrl'))
+    if (source.enabled === false) throw new Error('书源已停用')
+    const target = await this.loadSwitchTarget(source, stringArg(args, 'bookUrl'))
+    return {
+      book: {
+        sourceUrl: source.bookSourceUrl,
+        sourceName: source.bookSourceName,
+        bookUrl: target.bookUrl,
+        tocUrl: target.tocUrl,
+        name: target.info.name,
+        author: target.info.author,
+        kind: target.info.kind,
+        coverUrl: target.info.coverUrl,
+        intro: target.info.intro,
+        totalChapterNum: target.chapters.length,
+        latestChapterTitle: target.latestChapter,
+      },
+      chapterCount: target.chapters.length,
+      latestChapter: target.latestChapter,
+      chapters: target.chapters.slice(0, 20),
+    }
+  }
+
+  /** 换源：先完整抓取并校验目标详情与目录，全部成功后才写入书目和进度。 */
+  async switchBookSource(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const sourceUrl = stringArg(args, 'sourceUrl')
+    const bookUrl = stringArg(args, 'bookUrl')
+    const db = this.requireDb()
+    const book = db.books.get(bookId) as Record<string, unknown> | undefined
+    if (!book) throw new Error('书不存在')
+    if (String(book.origin ?? '') === 'local') throw new Error('本地书不支持换源')
+    const source = this.getSource(sourceUrl)
+    if (source.enabled === false) throw new Error('书源已停用')
+
+    // 目标详情、目录与进度映射任何一步失败，都在写入前抛出。
+    const target = await this.loadSwitchTarget(source, bookUrl)
+    const previousProgress = db.readRecords.get(bookId) as Record<string, unknown> | undefined
+    const mapped = mapSwitchProgress(target.chapters, previousProgress ?? null)
+    const now = new Date().toISOString()
+
+    const updatedBook: Record<string, unknown> = {
+      ...book,
+      id: bookId,
+      origin: source.bookSourceUrl,
+      originName: source.bookSourceName,
+      bookUrl: target.bookUrl,
+      tocUrl: target.tocUrl,
+      coverUrl: target.info.coverUrl || String(book.coverUrl ?? ''),
+      intro: target.info.intro || String(book.intro ?? ''),
+      totalChapterNum: target.chapters.length,
+      latestChapterTitle: target.latestChapter,
+      updatedAt: now,
+    }
+    const nextProgress = mapped
+      ? {
+          ...(previousProgress ?? {}),
+          id: bookId,
+          bookId,
+          chapterIndex: mapped.chapterIndex,
+          chapterTitle: mapped.chapterTitle,
+          chapterUrl: mapped.chapterUrl,
+          position: mapped.position,
+          updatedAt: now,
+        }
+      : null
+
+    await db.books.put(bookId, updatedBook)
+    if (nextProgress) {
+      try {
+        await db.readRecords.put(bookId, nextProgress)
+      } catch (error) {
+        // 进度写失败时把书目恢复原样，避免只改了一半。
+        await db.books.put(bookId, book)
+        throw error
+      }
+    }
+    return { book: updatedBook, chapters: target.chapters, progress: nextProgress }
+  }
+
+  private async loadSwitchTarget(source: BookSource, bookUrl: string) {
+    const detail = await this.fetch({ url: bookUrl, method: 'GET', headers: {} }, source)
+    if (detail.status >= 400) throw new Error(`目标详情请求失败：HTTP ${detail.status}`)
+    const info = analyzeBookInfo(detail.text, source, detail.url, detail.url)
+    if (!info.name || !info.name.trim()) throw new Error('目标详情没有书名')
+    const tocUrl = String(info.tocUrl || detail.url).trim()
+    const toc = await this.fetch({ url: tocUrl, method: 'GET', headers: {} }, source)
+    if (toc.status >= 400) throw new Error(`目标目录请求失败：HTTP ${toc.status}`)
+    const chapters = analyzeToc(toc.text, source, toc.url)
+    const readable = chapters.filter(
+      (chapter) => !chapter.isVolume && String(chapter.url ?? '').trim(),
+    )
+    if (readable.length === 0) throw new Error('目标目录为空')
+    const last = readable[readable.length - 1]!
+    return {
+      info,
+      chapters,
+      bookUrl: detail.url,
+      tocUrl: toc.url || tocUrl,
+      latestChapter: String(info.lastChapter ?? '').trim() || String(last.title ?? '').trim(),
+    }
   }
 
   private exploreSource(url: string): BookSource {

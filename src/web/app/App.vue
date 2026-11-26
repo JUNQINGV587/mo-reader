@@ -1835,6 +1835,116 @@ function continueReading() {
   if (target) openChapter(target)
 }
 
+const switchOpen = ref(false)
+const switchLoading = ref(false)
+const switchBusy = ref(false)
+const switchPreviewBusy = ref(false)
+const switchCandidates = ref<any[]>([])
+const switchErrors = ref<Array<{ sourceUrl: string; message: string }>>([])
+const switchPreview = ref<any>(null)
+const switchPreviewKey = ref('')
+const switchError = ref('')
+
+const switchErrorText = computed(() =>
+  switchErrors.value.map((item) => `${item.sourceUrl}：${item.message}`).join('；'),
+)
+
+function switchCandidateKey(candidate: any) {
+  return `${candidate?.sourceUrl ?? ''}|${candidate?.bookUrl ?? ''}`
+}
+
+async function openSwitchPanel() {
+  const book = currentBook.value as any
+  if (!book?.id || String(book.origin ?? '') === 'local') {
+    status.value = '本地书不支持换源'
+    return
+  }
+  switchOpen.value = true
+  switchLoading.value = true
+  switchBusy.value = false
+  switchPreviewBusy.value = false
+  switchCandidates.value = []
+  switchErrors.value = []
+  switchPreview.value = null
+  switchPreviewKey.value = ''
+  switchError.value = ''
+  try {
+    const result: any = await call('findSourceCandidates', { bookId: book.id })
+    switchCandidates.value = result?.candidates ?? []
+    switchErrors.value = result?.errors ?? []
+  } catch (error) {
+    switchError.value = errorText(error)
+  } finally {
+    switchLoading.value = false
+  }
+}
+
+function closeSwitchPanel() {
+  switchOpen.value = false
+}
+
+async function previewCandidate(candidate: any) {
+  if (!candidate) return
+  const key = switchCandidateKey(candidate)
+  switchPreviewKey.value = key
+  switchPreview.value = null
+  switchPreviewBusy.value = true
+  switchError.value = ''
+  try {
+    const result: any = await call('previewSourceCandidate', {
+      sourceUrl: candidate.sourceUrl,
+      bookUrl: candidate.bookUrl,
+    })
+    if (switchPreviewKey.value !== key) return
+    switchPreview.value = result
+    const row = switchCandidates.value.find((item) => switchCandidateKey(item) === key)
+    if (row) row.chapterCount = result?.chapterCount ?? 0
+  } catch (error) {
+    if (switchPreviewKey.value === key) switchError.value = errorText(error)
+  } finally {
+    if (switchPreviewKey.value === key) switchPreviewBusy.value = false
+  }
+}
+
+async function confirmSwitch() {
+  const book = currentBook.value as any
+  const candidate = switchCandidates.value.find(
+    (item) => switchCandidateKey(item) === switchPreviewKey.value,
+  )
+  if (!book?.id || !candidate || !switchPreview.value) return
+  const wasReader = view.value === 'reader'
+  switchBusy.value = true
+  switchError.value = ''
+  try {
+    const result: any = await call('switchBookSource', {
+      bookId: book.id,
+      sourceUrl: candidate.sourceUrl,
+      bookUrl: candidate.bookUrl,
+    })
+    Object.assign(currentBook.value as any, result.book ?? {})
+    chapters.value = result.chapters ?? []
+    progress.value = result.progress ?? null
+    switchOpen.value = false
+    await loadBookmarks()
+    await loadNotes()
+    await refresh()
+    status.value = `已换源 · ${chapters.value.length} 章`
+    if (wasReader) {
+      const record = result.progress
+      const readable = chapters.value.filter((chapter: any) => !chapter.isVolume && chapter.url)
+      const target =
+        (record && readable.find((chapter: any) => chapter.url === record.chapterUrl)) ||
+        (record && readable[Math.min(Number(record.chapterIndex) || 0, readable.length - 1)]) ||
+        readable[0]
+      if (target) await openChapter(target, Number(record?.position ?? 0))
+    }
+  } catch (error) {
+    switchError.value = errorText(error)
+  } finally {
+    switchBusy.value = false
+  }
+}
+
 function onPage(payload: { page: number; total: number }) {
   initialPage.value = payload.page
   if (!currentBook.value?.id) return
@@ -2459,6 +2569,14 @@ onMounted(async () => {
               </button>
               <button v-if="!currentBook.id" class="mo-btn" data-testid="add-shelf" @click="addToShelf">加入书架</button>
               <span v-else class="mo-tag">已在书架</span>
+              <button
+                v-if="currentBook.id && currentBook.origin !== 'local'"
+                class="mo-btn"
+                data-testid="switch-source"
+                @click="openSwitchPanel"
+              >
+                换源
+              </button>
               <button class="mo-btn" data-testid="simulate" @click="openSimulate">模拟阅读</button>
               <button class="mo-btn" :disabled="cacheBusy" data-testid="cache-book" @click="cacheBookChapters">{{ cacheBusy ? '缓存中…' : '缓存 20 章' }}</button>
               <button class="mo-btn" :disabled="exportBusy" data-testid="export-book" @click="exportBook('txt')">{{ exportBusy ? '导出中…' : '导出 TXT' }}</button>
@@ -2875,6 +2993,14 @@ onMounted(async () => {
               <button v-if="settings.menuItems.includes('settings') && readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-settings" @click="settingsOpen = true">Aa</button>
               <button v-if="readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-speak" @click="toggleSpeech">{{ speaking ? '暂停' : '朗读' }}</button>
               <button v-if="settings.menuItems.includes('toc')" class="mo-chrome-btn" @click="tocOpen = true">目录</button>
+              <button
+                v-if="currentBook?.id && currentBook?.origin !== 'local'"
+                class="mo-chrome-btn"
+                data-testid="reader-switch"
+                @click="openSwitchPanel"
+              >
+                换源
+              </button>
               <button v-if="settings.menuItems.includes('next')" class="mo-chrome-btn" :disabled="chapterIndex >= chapters.length - 1" @click="openAdjacent(1)">下一章</button>
             </div>
           </div>
@@ -3213,6 +3339,80 @@ onMounted(async () => {
           </div>
         </transition>
 
+        <transition name="mo-fade">
+          <div v-if="switchOpen" class="mo-sheet-mask" data-testid="switch-mask" @click.self="closeSwitchPanel">
+            <div class="mo-sheet mo-sheet-scroll" data-testid="switch-panel">
+              <div class="mo-sheet-head">
+                <strong>换源</strong>
+                <span class="muted">
+                  {{ switchLoading ? '搜索中…' : switchCandidates.length + ' 个候选' }}
+                </span>
+                <button class="mo-icon-btn" title="关闭" @click="closeSwitchPanel">✕</button>
+              </div>
+
+              <p v-if="switchLoading" class="muted">正在搜索其他书源…</p>
+              <div v-else class="mo-switch-body">
+                <div class="mo-switch-list">
+                  <p v-if="switchCandidates.length === 0" class="muted">没有找到候选</p>
+                  <button
+                    v-for="candidate in switchCandidates"
+                    :key="switchCandidateKey(candidate)"
+                    class="mo-switch-row"
+                    :class="{ on: switchCandidateKey(candidate) === switchPreviewKey }"
+                    data-testid="switch-candidate"
+                    @click="previewCandidate(candidate)"
+                  >
+                    <span class="mo-switch-title">{{ candidate.name }}</span>
+                    <span class="muted">{{ candidate.author || '未知作者' }} · {{ candidate.sourceName }}</span>
+                    <span v-if="candidate.latestChapter" class="muted">最新：{{ candidate.latestChapter }}</span>
+                    <span class="mo-switch-tags">
+                      <span v-if="candidate.sameAuthor" class="mo-tag soft">同作者</span>
+                      <span v-if="candidate.possiblyNotSameBook" class="mo-tag soft">可能不是同一本</span>
+                      <span v-if="candidate.chapterCount" class="mo-tag soft">{{ candidate.chapterCount }} 章</span>
+                    </span>
+                  </button>
+                </div>
+
+                <div class="mo-switch-preview">
+                  <p v-if="switchPreviewBusy" class="muted">加载预览…</p>
+                  <p v-else-if="!switchPreview" class="muted">点候选预览目标目录</p>
+                  <template v-if="switchPreview">
+                    <h3>{{ switchPreview.book.name }}</h3>
+                    <p class="muted">
+                      {{ switchPreview.book.author || '未知作者' }} · {{ switchPreview.book.sourceName }}
+                    </p>
+                    <p class="muted">
+                      {{ switchPreview.chapterCount }} 章 · 最新：{{ switchPreview.latestChapter || '未知' }}
+                    </p>
+                    <p v-if="switchPreview.book.intro" class="mo-switch-intro">{{ switchPreview.book.intro }}</p>
+                    <p class="muted">目录预览</p>
+                    <ol class="mo-switch-toc">
+                      <li v-for="chapter in switchPreview.chapters" :key="chapter.url || chapter.title">
+                        {{ chapter.title }}
+                      </li>
+                    </ol>
+                  </template>
+                </div>
+              </div>
+
+              <p v-if="switchError" class="muted" data-testid="switch-error">{{ switchError }}</p>
+              <p v-if="switchErrors.length" class="muted">部分书源失败：{{ switchErrorText }}</p>
+
+              <div class="mo-row">
+                <button class="mo-btn" @click="closeSwitchPanel">取消</button>
+                <button
+                  class="mo-btn primary"
+                  data-testid="switch-confirm"
+                  :disabled="switchBusy || !switchPreview"
+                  @click="confirmSwitch"
+                >
+                  {{ switchBusy ? '切换中…' : '确认换源' }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </transition>
+
     </main>
   </div>
 </template>
@@ -3229,6 +3429,7 @@ onMounted(async () => {
   --mo-accent-soft: #e9efe9;
   display: flex;
   flex-direction: column;
+  position: relative;
   height: 100%;
   min-height: 480px;
   color: var(--mo-ink);
@@ -4190,6 +4391,75 @@ textarea {
 .mo-sheet-scroll {
   max-height: 78vh;
   overflow-y: auto;
+}
+.mo-switch-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+  min-height: 200px;
+}
+@media (max-width: 720px) {
+  .mo-switch-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.mo-switch-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.mo-switch-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--mo-line);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.mo-switch-row:hover {
+  border-color: var(--mo-accent);
+}
+.mo-switch-row.on {
+  border-color: var(--mo-accent);
+  background: var(--mo-accent-soft);
+}
+.mo-switch-title {
+  font-weight: 600;
+}
+.mo-switch-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+.mo-switch-preview {
+  min-width: 0;
+}
+.mo-switch-preview h3 {
+  margin: 0 0 4px;
+  font-size: 16px;
+}
+.mo-switch-intro {
+  max-height: 72px;
+  overflow-y: auto;
+  color: var(--mo-ink-2);
+  font-size: 12px;
+}
+.mo-switch-toc {
+  max-height: 140px;
+  margin: 4px 0 0;
+  padding-left: 18px;
+  overflow-y: auto;
+  color: var(--mo-ink-2);
+  font-size: 12px;
 }
 .mo-shelf-groups {
   display: flex;
