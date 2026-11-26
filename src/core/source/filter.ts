@@ -43,9 +43,17 @@ export function needsLogin(source: SourceFilterInput): boolean {
   return filled(source.loginUrl) || filled(source.loginUi) || filled(source.loginCheckJs)
 }
 
-/** 有发现：明确开启发现且填写了发现地址。 */
+/**
+ * 发现开关：未设置视为未开启。界面筛选、发现列表与分类解析共用，
+ * 避免「筛选里隐藏、发现页却列出」的不一致。
+ */
+export function isExploreEnabled(source: SourceFilterInput): boolean {
+  return source.enabledExplore === true
+}
+
+/** 有发现：开启发现且填写了发现地址。 */
 export function hasExplore(source: SourceFilterInput): boolean {
-  return source.enabledExplore === true && filled(source.exploreUrl)
+  return isExploreEnabled(source) && filled(source.exploreUrl)
 }
 
 export function filterSources<T extends SourceFilterInput>(

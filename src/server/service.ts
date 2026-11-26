@@ -6,6 +6,7 @@ import { parseSource, type BookSource } from '../core/model/source.js'
 import { dictRuleKey, parseDictRule, type DictRule } from '../core/model/dict.js'
 import { AnalyzeRule } from '../core/rules/analyze-rule.js'
 import { analyzeExplore, parseExploreCategories } from '../core/source/explore.js'
+import { isExploreEnabled } from '../core/source/filter.js'
 import { parseRssSources } from '../core/rss/source.js'
 import { parseFeed } from '../core/rss/feed.js'
 import { fetchText } from '../core/net/http.js'
@@ -24,10 +25,11 @@ import {
   analyzeSearch,
   analyzeToc,
   contentKindOf,
+  contentKindOfType,
   htmlToText,
 } from '../core/source/analyze.js'
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
-import { bookNamesRelated, mapSwitchProgress, matchBookName, sameAuthorName } from '../core/source/switch.js'
+import { mapSwitchProgress, matchBookName, sameAuthorName } from '../core/source/switch.js'
 import { openReaderStorage } from './storage.js'
 import { hasCachedChapter, readCachedChapter, writeCachedChapter } from './cache.js'
 import { buildEpub } from './epub-export.js'
@@ -353,12 +355,7 @@ export class ReaderService extends TypertRemoteService {
     const requestedId = typeof incoming.id === 'string' && incoming.id.trim() ? incoming.id.trim() : ''
     const key = requestedId && db.dictRules.get(requestedId) !== undefined ? requestedId : dictRuleKey(rule.name, rule.url)
     const existing = db.dictRules.get(key) as DictRule | undefined
-    const customOrder =
-      typeof incoming.customOrder === 'number' && Number.isFinite(incoming.customOrder)
-        ? incoming.customOrder
-        : existing && typeof existing.customOrder === 'number'
-          ? existing.customOrder
-          : this.nextDictOrder()
+    const customOrder = this.resolveDictOrder(incoming, existing)
     const saved = { ...rule, id: key, customOrder } as DictRule
     await db.dictRules.put(key, saved)
     return { rule: saved }
@@ -400,12 +397,7 @@ export class ReaderService extends TypertRemoteService {
         const key = dictRuleKey(rule.name, rule.url)
         const existing = db.dictRules.get(key) as DictRule | undefined
         const incoming = item as Record<string, unknown>
-        const customOrder =
-          typeof incoming.customOrder === 'number' && Number.isFinite(incoming.customOrder)
-            ? incoming.customOrder
-            : existing && typeof existing.customOrder === 'number'
-              ? existing.customOrder
-              : this.nextDictOrder()
+        const customOrder = this.resolveDictOrder(incoming, existing)
         await db.dictRules.put(key, { ...rule, id: key, customOrder })
         if (existing) updated += 1
         else added += 1
@@ -493,7 +485,7 @@ export class ReaderService extends TypertRemoteService {
     for (const [, value] of this.requireDb().sources.entries()) {
       const source = value as BookSource
       if (source.enabled === false) continue
-      if (source.enabledExplore === false) continue
+      if (!isExploreEnabled(source)) continue
       if (!source.exploreUrl || !source.exploreUrl.trim()) continue
       sources.push({
         bookSourceUrl: source.bookSourceUrl,
@@ -502,7 +494,12 @@ export class ReaderService extends TypertRemoteService {
         bookSourceType: source.bookSourceType ?? 0,
       })
     }
-    sources.sort((a, b) => a.bookSourceName.localeCompare(b.bookSourceName, 'zh'))
+    // 发现页按「书源分组 → 书源 → 分类」组织，服务端先定好分组/名称顺序。
+    sources.sort(
+      (a, b) =>
+        a.bookSourceGroup.localeCompare(b.bookSourceGroup, 'zh') ||
+        a.bookSourceName.localeCompare(b.bookSourceName, 'zh'),
+    )
     return { sources }
   }
 
@@ -564,6 +561,7 @@ export class ReaderService extends TypertRemoteService {
     const bookAuthor = String(book.author ?? '')
     const candidates = found.books.map((item) => {
       const name = String(item.name ?? '')
+      const nameMatch = matchBookName(bookName, name)
       return {
         sourceUrl: String(item.origin ?? ''),
         sourceName: String(item.originName ?? ''),
@@ -574,8 +572,8 @@ export class ReaderService extends TypertRemoteService {
         latestChapter: String(item.lastChapter ?? ''),
         coverUrl: String(item.coverUrl ?? ''),
         sameAuthor: sameAuthorName(bookAuthor, item.author),
-        nameMatch: matchBookName(bookName, name),
-        possiblyNotSameBook: !bookNamesRelated(bookName, name),
+        nameMatch,
+        possiblyNotSameBook: nameMatch === 'none',
       }
     })
     const rank = (item: (typeof candidates)[number]) => {
@@ -700,7 +698,7 @@ export class ReaderService extends TypertRemoteService {
   private exploreSource(url: string): BookSource {
     const source = this.getSource(url)
     if (source.enabled === false) throw new Error('书源已停用')
-    if (source.enabledExplore === false) throw new Error('书源未开启发现')
+    if (!isExploreEnabled(source)) throw new Error('书源未开启发现')
     if (!source.exploreUrl || !source.exploreUrl.trim()) throw new Error('书源没有发现分类')
     return source
   }
@@ -765,8 +763,7 @@ export class ReaderService extends TypertRemoteService {
   private bookContentKind(book: Record<string, unknown>): 'text' | 'images' | 'audio' | 'video' {
     const origin = String(book.origin ?? '')
     const type = Number(book.type ?? 0)
-    const fromRecord: 'text' | 'images' | 'audio' | 'video' =
-      type === 1 ? 'audio' : type === 2 ? 'images' : type === 4 ? 'video' : 'text'
+    const fromRecord = contentKindOfType(type)
     if (!origin || origin === 'local') return fromRecord
     try {
       return contentKindOf(this.getSource(origin))
@@ -1415,6 +1412,14 @@ export class ReaderService extends TypertRemoteService {
   private requireDb(): any {
     if (!this.db) throw new Error('存储尚未就绪')
     return this.db
+  }
+
+  /** 保存与导入共用的排序值：沿用导入值 > 已有值 > 追加到末尾。 */
+  private resolveDictOrder(incoming: Record<string, unknown>, existing: DictRule | undefined): number {
+    const requested = incoming.customOrder
+    if (typeof requested === 'number' && Number.isFinite(requested)) return requested
+    if (existing && typeof existing.customOrder === 'number') return existing.customOrder
+    return this.nextDictOrder()
   }
 
   private nextDictOrder(): number {
