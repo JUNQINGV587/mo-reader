@@ -451,6 +451,141 @@ test('本地文件缺失：删除索引并回退在线，不直接失败', async
   assert.equal(harness.mediaEntries.map.size, 0)
 })
 
+test('非零截断：本地缓存判失效、清理索引并回退在线', async () => {
+  const harness = await makeHarness({
+    toc: '<ul class="toc"><li><a href="/ch/1">第1章</a></li></ul>',
+    pages: { [`${HOST}/ch/1`]: '<div id="content"><img src="/img/1.jpg"></div>' },
+  })
+  await harness.service.startMediaDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForMediaDownloads()
+  const entry = [...harness.mediaEntries.entries()][0][1]
+  const filePath = path.join(process.env.MO_READER_MEDIA_ROOT, entry.files[0].path)
+  await writeFile(filePath, Buffer.from('x'))
+
+  const content = await harness.service.getContent({
+    sourceUrl: HOST,
+    chapterUrl: `${HOST}/ch/1`,
+    bookId: 'book-1',
+    chapterIndex: 0,
+  })
+  assert.equal(content.kind, 'images')
+  assert.notEqual(content.local, true)
+  assert.equal(content.localMissing, true)
+  assert.ok(content.images[0].startsWith(`${BASE}/reader/media/`), content.images[0])
+  assert.equal(harness.mediaEntries.map.size, 0, '坏索引必须清掉')
+})
+
+test('重新下载本章：同长度损坏时跳过续跑并真正重抓', async () => {
+  let calls = 0
+  const harness = await makeHarness({
+    toc: '<ul class="toc"><li><a href="/ch/1">第1章</a></li></ul>',
+    pages: { [`${HOST}/ch/1`]: '<div id="content"><img src="/img/1.jpg"></div>' },
+    opener: async () => {
+      calls += 1
+      return responseOf(Buffer.from(calls === 1 ? 'aaaa' : 'bbbb'), 'image/jpeg')()
+    },
+  })
+  await harness.service.startMediaDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForMediaDownloads()
+  const entry = [...harness.mediaEntries.entries()][0][1]
+  const filePath = path.join(process.env.MO_READER_MEDIA_ROOT, entry.files[0].path)
+  assert.equal((await readFile(filePath)).toString(), 'aaaa')
+
+  // 同长度损坏：索引与 stat 仍相等，普通读取发现不了；重下必须绕过续跑。
+  await writeFile(filePath, Buffer.from('xxxx'))
+  const second = await harness.service.startMediaDownload({
+    bookId: 'book-1',
+    fromIndex: 0,
+    toIndex: 0,
+    forceChapterIndex: 0,
+  })
+  await harness.service.waitForMediaDownloads()
+  const { job } = await harness.service.getJob({ id: second.job.id })
+  assert.equal(job.status, 'done')
+  assert.equal(job.completed, 1)
+  assert.equal(job.skipped, 0)
+  assert.equal(calls, 2, '必须真正重新抓取，而不是按索引跳过')
+  const updated = [...harness.mediaEntries.entries()][0][1]
+  assert.equal((await readFile(path.join(process.env.MO_READER_MEDIA_ROOT, updated.files[0].path))).toString(), 'bbbb')
+})
+
+test('旧索引 bytes<=0：按未知大小处理，不误伤完整文件', async () => {
+  const harness = await makeHarness({
+    toc: '<ul class="toc"><li><a href="/ch/1">第1章</a></li></ul>',
+    pages: { [`${HOST}/ch/1`]: '<div id="content"><img src="/img/1.jpg"></div>' },
+  })
+  await harness.service.startMediaDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForMediaDownloads()
+  const entry = [...harness.mediaEntries.entries()][0][1]
+  entry.bytes = 0
+  for (const file of entry.files) file.bytes = 0
+
+  const content = await harness.service.getContent({
+    sourceUrl: HOST,
+    chapterUrl: `${HOST}/ch/1`,
+    bookId: 'book-1',
+    chapterIndex: 0,
+  })
+  assert.equal(content.local, true)
+  assert.equal(harness.mediaEntries.map.size, 1, '完整文件不应被误删')
+})
+
+test('未请求 Range 却收到 206：不落盘、不发布索引，作业失败', async () => {
+  const harness = await makeHarness({
+    toc: '<ul class="toc"><li><a href="/ch/1">第1章</a></li></ul>',
+    pages: { [`${HOST}/ch/1`]: '<div id="content"><img src="/img/1.jpg"></div>' },
+    opener: async () => ({
+      response: new Response(Buffer.from('half'), {
+        status: 206,
+        headers: { 'content-type': 'image/jpeg', 'content-length': '4' },
+      }),
+      finalUrl: 'https://93.184.216.34/media',
+    }),
+  })
+  const started = await harness.service.startMediaDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForMediaDownloads()
+  const { job } = await harness.service.getJob({ id: started.job.id })
+  assert.equal(job.status, 'failed')
+  assert.equal(job.failed, 1)
+  assert.equal(harness.mediaEntries.map.size, 0)
+  const files = await readdir(process.env.MO_READER_MEDIA_ROOT, { recursive: true })
+  assert.ok(!files.some((name) => name.endsWith('.jpg')), '206 的字节不应落成缓存')
+})
+
+test('Content-Length 与实际落盘不一致：拒绝发布', async () => {
+  const harness = await makeHarness({
+    toc: '<ul class="toc"><li><a href="/ch/1">第1章</a></li></ul>',
+    pages: { [`${HOST}/ch/1`]: '<div id="content"><img src="/img/1.jpg"></div>' },
+    opener: async () => ({
+      response: new Response(Buffer.from('abc'), {
+        status: 200,
+        headers: { 'content-type': 'image/jpeg', 'content-length': '9' },
+      }),
+      finalUrl: 'https://93.184.216.34/media',
+    }),
+  })
+  const started = await harness.service.startMediaDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForMediaDownloads()
+  const { job } = await harness.service.getJob({ id: started.job.id })
+  assert.equal(job.status, 'failed')
+  assert.equal(harness.mediaEntries.map.size, 0)
+})
+
+test('发布前复核：索引字节数与磁盘文件不一致时拒绝写索引', async () => {
+  const harness = await makeHarness({
+    toc: '<ul class="toc"><li><a href="/ch/1">第1章</a></li></ul>',
+    pages: { [`${HOST}/ch/1`]: '<div id="content"><img src="/img/1.jpg"></div>' },
+  })
+  await harness.service.startMediaDownload({ bookId: 'book-1', all: true })
+  await harness.service.waitForMediaDownloads()
+  const [key, entry] = [...harness.mediaEntries.entries()][0]
+  await assert.rejects(
+    harness.service.putMediaEntry({ ...entry, bytes: Number(entry.bytes) + 1 }),
+    /媒体文件校验失败/,
+  )
+  assert.equal(harness.mediaEntries.get(key).bytes, entry.bytes)
+})
+
 test('其他书/其他章节不受影响', async () => {
   const harness = await makeHarness({ pages: imagePages(HOST, 2, 1) })
   await harness.service.startMediaDownload({ bookId: 'book-1', fromIndex: 0, toIndex: 0 })

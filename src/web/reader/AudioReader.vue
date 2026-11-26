@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import Hls from 'hls.js'
+import { hlsErrorInfo, mediaErrorInfo, type MediaErrorPayload } from './media-error'
 
 const props = defineProps<{
   src: string
@@ -14,7 +15,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'progress', seconds: number): void
   (e: 'ended'): void
-  (e: 'mediaError'): void
+  (e: 'mediaError', payload?: MediaErrorPayload): void
 }>()
 
 const audio = ref<HTMLAudioElement | null>(null)
@@ -23,12 +24,16 @@ let hls: Hls | null = null
 /** 一次播放只上报一次错误，避免在线回退也失败时反复触发。 */
 let reported = false
 
-function markFailed() {
+function markFailed(payload: MediaErrorPayload = { reason: '播放器报错', permanent: false }) {
   failed.value = true
   if (!reported) {
     reported = true
-    emit('mediaError')
+    emit('mediaError', payload)
   }
+}
+
+function onMediaError() {
+  markFailed(mediaErrorInfo(audio.value))
 }
 
 const isHls = computed(() => /\.m3u8(\?|#|$)/i.test(props.src || ''))
@@ -68,7 +73,7 @@ function attach() {
   if (isHls.value && Hls.isSupported()) {
     hls = new Hls({ enableWorker: true })
     hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (data?.fatal) markFailed()
+      if (data?.fatal) markFailed(hlsErrorInfo(data))
     })
     hls.loadSource(src)
     hls.attachMedia(el)
@@ -118,7 +123,7 @@ onUnmounted(destroyHls)
         preload="metadata"
         @timeupdate="onTimeUpdate"
         @ended="emit('ended')"
-        @error="markFailed"
+        @error="onMediaError"
       />
       <p v-if="failed" class="mo-audio-error" data-testid="audio-error">音频加载失败（代理播放失败或网络异常）：{{ src }}</p>
       <a v-if="failed" class="mo-audio-link" :href="src" target="_blank" rel="noreferrer">在浏览器打开</a>

@@ -59,6 +59,7 @@ import {
   type MediaFileRecord,
 } from './media-download.js'
 import {
+  assertMediaFilesOnDisk,
   clearBookMediaDirs,
   clearMediaDir,
   clearMediaRoot,
@@ -66,11 +67,13 @@ import {
   mediaFileName,
   mediaFileIdOf,
   mediaRoot,
-  mediaFilePresent,
+  mediaFileSize,
   mediaStoreId,
   prepareMediaDir,
+  recordedBytesMatch,
   saveMediaStream,
 } from './media-cache.js'
+import { assertCompleteMediaResponse, assertWrittenLength } from './media-integrity.js'
 import {
   MAX_MEDIA_QUOTA_BYTES,
   MEDIA_QUOTA_WARN_RATIO,
@@ -1120,13 +1123,25 @@ export class ReaderService extends TypertRemoteService {
   /** 媒体离线下载（#112）：漫画按章、音视频按单个文件；与文字下载同一套作业语义。 */
   async startMediaDownload(args: Args) {
     const bookId = stringArg(args, 'bookId')
-    const options: { fromIndex?: number; toIndex?: number; all?: boolean } = {}
+    const options: {
+      fromIndex?: number
+      toIndex?: number
+      all?: boolean
+      forceChapterIndex?: number
+    } = {}
     if (args?.all === true || args?.all === 'true') options.all = true
     if (args?.fromIndex !== undefined && args?.fromIndex !== null && args?.fromIndex !== '') {
       options.fromIndex = Number(args.fromIndex)
     }
     if (args?.toIndex !== undefined && args?.toIndex !== null && args?.toIndex !== '') {
       options.toIndex = Number(args.toIndex)
+    }
+    if (
+      args?.forceChapterIndex !== undefined &&
+      args?.forceChapterIndex !== null &&
+      args?.forceChapterIndex !== ''
+    ) {
+      options.forceChapterIndex = Number(args.forceChapterIndex)
     }
     // 开新作业前先腾地方：淘汰不动正在下载与置顶的书，还不达标就直接拒绝，别建必然失败的作业。
     const quota = await this.ensureMediaQuota()
@@ -2635,6 +2650,13 @@ export class ReaderService extends TypertRemoteService {
     const table = this.mediaEntriesTable()
     if (!table) return
     const key = mediaEntryKey(entry.bookId, entry.chapterIndex)
+    await assertMediaFilesOnDisk(key, entry.files)
+    const actualBytes = entry.files.reduce((sum, file) => sum + Number(file.bytes ?? 0), 0)
+    if (!Number.isFinite(entry.bytes) || entry.bytes !== actualBytes) {
+      throw new Error(
+        `媒体文件校验失败：索引记录 ${entry.bytes} 字节，文件合计 ${actualBytes} 字节`,
+      )
+    }
     const existing = table.get(key) as Record<string, unknown> | undefined
     const now = Date.now()
     await table.put(key, {
@@ -2822,8 +2844,9 @@ export class ReaderService extends TypertRemoteService {
     for (const file of files) {
       const id = String(file.id ?? '')
       const name = String(file.name ?? '')
-      if (!id || !name || !(await mediaFilePresent(storeId, name))) {
-        // 磁盘文件被删或损坏：索引立即作废，回退在线播放并提示。
+      const actual = name ? await mediaFileSize(storeId, name) : null
+      if (!id || !name || actual === null || !recordedBytesMatch(file.bytes, actual)) {
+        // 磁盘文件被删或非零截断：索引立即作废，回退在线播放并提示。
         await table.delete(key)
         return { localMissing: true }
       }
@@ -2850,11 +2873,18 @@ export class ReaderService extends TypertRemoteService {
     const files = Array.isArray(entry.files) ? (entry.files as Array<Record<string, unknown>>) : []
     if (!files.length) return null
     const storeId = mediaStoreId(bookId, chapterIndex)
+    let bytes = 0
     for (const file of files) {
-      if (!(await mediaFilePresent(storeId, String(file.name ?? '')))) return null
+      const name = String(file.name ?? '')
+      const actual = name ? await mediaFileSize(storeId, name) : null
+      if (!name || actual === null || !recordedBytesMatch(file.bytes, actual)) {
+        // 续跑前发现半份/截断缓存：作废索引，按未下载重新抓。
+        await table.delete(mediaEntryKey(bookId, chapterIndex))
+        return null
+      }
+      bytes += actual
     }
-    const bytes = files.reduce((sum, file) => sum + (Number(file.bytes) || 0), 0)
-    return bytes || Number(entry.bytes) || 0
+    return bytes
   }
 
   /**
@@ -3058,7 +3088,9 @@ export class ReaderService extends TypertRemoteService {
     const name = mediaFileName(index, item.ext)
     const opener = this.mediaStreamOpener ?? openMediaStream
     const { response } = await opener(item.url, { method: 'GET', headers: item.headers })
-    if (!response.ok && response.status !== 206) throw new Error(`HTTP ${response.status}`)
+    // 下载器没发 Range，206 只是半份表示；落盘后会与索引一起被当成完整缓存。
+    await assertCompleteMediaResponse(response)
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const contentType = (response.headers.get('content-type') ?? '').toLowerCase()
     if (/mpegurl/.test(contentType)) {
       try {
@@ -3072,6 +3104,7 @@ export class ReaderService extends TypertRemoteService {
     await beforeWrite?.()
     const bytes = await saveMediaStream(storeId, name, response.body, signal)
     if (!bytes) throw new Error('媒体文件为空')
+    assertWrittenLength(response, bytes, { what: '媒体文件' })
     return { id: mediaFileIdOf(storeId, index), name, mime, bytes }
   }
 

@@ -43,7 +43,11 @@ export interface MediaChapterDownload {
   files: MediaFileRecord[]
 }
 
-export type MediaJob = DownloadJob & { mediaKind: MediaEntryKind }
+export type MediaJob = DownloadJob & {
+  mediaKind: MediaEntryKind
+  /** 用户明确要求重下的章节：跳过「本章已完整落盘」的续跑判断，强制重新抓取。 */
+  forceChapterIndex?: number
+}
 
 export interface MediaChapterResult {
   skipped: boolean
@@ -99,6 +103,8 @@ export interface StartMediaOptions {
   fromIndex?: number
   toIndex?: number
   all?: boolean
+  /** 指定章节强制重下，忽略已有索引；调用方用于「重新下载本章」。 */
+  forceChapterIndex?: number
 }
 
 export interface MediaJobFilter {
@@ -216,6 +222,9 @@ export class MediaDownloadCoordinator {
       createdAt: now,
       updatedAt: now,
       mediaKind: kind,
+    }
+    if (Number.isInteger(options.forceChapterIndex)) {
+      job.forceChapterIndex = Number(options.forceChapterIndex)
     }
     this.live.set(job.id, job)
     await this.write(job, true)
@@ -490,6 +499,8 @@ export class MediaDownloadCoordinator {
   }
 
   private async chapterReadyBytes(job: MediaJob, index: number): Promise<number | null> {
+    // 用户点「重新下载本章」时索引可能仍然自洽（例如同长度损坏），必须绕过续跑。
+    if (job.forceChapterIndex === index) return null
     if (!this.host.chapterMediaBytes) return null
     try {
       return await this.host.chapterMediaBytes(job.bookId, index, job.mediaKind)

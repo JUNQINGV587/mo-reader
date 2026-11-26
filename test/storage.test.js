@@ -290,6 +290,7 @@ test('运行时复查配额：触发淘汰；仍超时永久失败并保留已�
   books.put('book-current', { id: 'book-current', name: '当前书', origin: HOST, lastReadAt: 999 })
   await putMediaBook(roots, { bookId: 'book-other', size: 200 })
   mediaEntries.put('m-book-other', mediaIndexRow('book-other', 0, 200))
+  await putMediaBook(roots, { bookId: 'book-current', size: 10 })
 
   const entry = {
     bookId: 'book-current',
@@ -300,7 +301,15 @@ test('运行时复查配额：触发淘汰；仍超时永久失败并保留已�
     kind: 'image',
     mime: 'image/jpeg',
     bytes: 10,
-    files: [],
+    files: [
+      {
+        id: 'file-current',
+        name: 'a.bin',
+        mime: 'image/jpeg',
+        bytes: 10,
+        path: `${mediaStoreId('book-current', 0)}/a.bin`,
+      },
+    ],
   }
   await service.mediaDownloadHost().recordMediaDownload(entry)
   const runtimeRows = [...mediaEntries.entries()]
@@ -313,6 +322,7 @@ test('运行时复查配额：触发淘汰；仍超时永久失败并保留已�
   setPinned({ mediaQuotaBytes: 10 })
   pinnedBooks.put('book-pin', { id: 'book-pin', name: '置顶', origin: HOST, pinned: true, lastReadAt: 1 })
   await putMediaBook(roots, { bookId: 'book-pin', size: 100 })
+  await putMediaBook(roots, { bookId: 'book-pin', chapterIndex: 1, size: 10 })
   pinnedEntries.put('m-book-pin', mediaIndexRow('book-pin', 0, 100))
   const pinnedEntry = { ...entry, bookId: 'book-pin', chapterIndex: 1, bytes: 10 }
   await assert.rejects(pinnedService.mediaDownloadHost().recordMediaDownload(pinnedEntry), (error) => {

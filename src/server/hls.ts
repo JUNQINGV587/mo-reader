@@ -18,6 +18,7 @@ import { join } from 'node:path'
 import { pipeline, Readable } from 'node:stream'
 import { readBodyLimited, type MediaStreamOptions, type MediaStreamResult } from '../core/net/http.js'
 import { MEDIA_ABORTED_MESSAGE, mediaRoot, prepareMediaDir, saveMediaStream, writeMediaFile } from './media-cache.js'
+import { assertCompleteMediaResponse, assertWrittenLength } from './media-integrity.js'
 import { contentTypeForExt, extFromUrl, PLAYLIST_MAX_BYTES } from './media.js'
 import { PermanentMediaError } from './media-download.js'
 
@@ -479,6 +480,8 @@ async function downloadMediaFile(
 ): Promise<number> {
   const key = target.key ? await loadKey(opener, target.key.uri, keyCache, headers, signal) : null
   const opened = await openStream(opener, target.uri, headers, signal)
+  // 分片请求没有 Range，206 说明只拿到半份；落盘后无法与完整分片区分。
+  await assertCompleteMediaResponse(opened.response, 'HLS 分片')
   const body = opened.response.body
   if (!body) throw new Error('媒体文件为空')
   throwIfAborted(signal)
@@ -492,6 +495,7 @@ async function downloadMediaFile(
   }
   const bytes = await saveMediaStream(storeId, target.name, stream, signal)
   if (!bytes) throw new Error('媒体文件为空')
+  assertWrittenLength(opened.response, bytes, { decrypted: key !== null, what: 'HLS 分片' })
   return bytes
 }
 

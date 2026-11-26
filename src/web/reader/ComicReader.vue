@@ -11,7 +11,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'page', payload: { page: number; total: number }): void
-  (e: 'mediaError'): void
+  (e: 'mediaError', payload?: { reason?: string; permanent?: boolean }): void
 }>()
 
 const scroller = ref<HTMLElement | null>(null)
@@ -53,7 +53,7 @@ function markBroken(event: Event) {
   broken.value += 1
   if (!reported) {
     reported = true
-    emit('mediaError')
+    emit('mediaError', { reason: `${broken.value} 张图片加载失败` })
   }
 }
 

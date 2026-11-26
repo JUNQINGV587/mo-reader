@@ -174,6 +174,11 @@ const readerMedia = ref('')
 const readerLocal = ref(false)
 /** 本地文件损坏/缺失时回退在线的提示，留在阅读页不解散。 */
 const readerMediaNotice = ref('')
+/** 本地播放失败后最多手动重下本章一次，避免「删→下→删」循环。 */
+let readerMediaRetryUsed = false
+const readerMediaRetryAvailable = ref(false)
+const readerMediaRetryBusy = ref(false)
+const readerMediaRetryChapter = ref<number | null>(null)
 let mediaFallbackBusy = false
 const replacedContent = computed(() => {
   let text = content.value
@@ -1080,6 +1085,7 @@ async function refreshMediaJob() {
     void refreshMediaSummary()
   }
   syncMediaTimer()
+  if (!isDownloadRunning(mediaJob.value)) void reopenReaderAfterMediaRetry()
 }
 
 /** 媒体离线统计：服务端按书聚合条目，kind 为空表示不是媒体书。 */
@@ -1190,6 +1196,77 @@ function cancelMediaDownload() {
 
 function retryMediaDownload() {
   void controlMediaDownload('retryDownload', '重试失败章节')
+}
+
+/** 阅读页「重新下载本章」：只重下当前章，完成后自动重开本章；不静默、不循环。 */
+async function retryReaderMedia() {
+  const book = currentBook.value as any
+  const index = readerMediaRetryChapter.value
+  const chapter = index === null ? null : chapters.value[index]
+  if (!book?.id || !chapter?.url || index === null || readerMediaRetryBusy.value || readerMediaRetryUsed || !readerMediaRetryAvailable.value) return
+  readerMediaRetryUsed = true
+  readerMediaRetryBusy.value = true
+  try {
+    const result: any = await call('startMediaDownload', {
+      bookId: book.id,
+      fromIndex: index,
+      toIndex: index,
+      // 索引可能仍然自洽（同长度损坏），必须让服务端跳过续跑，真正重抓这一章。
+      forceChapterIndex: index,
+    })
+    mediaJob.value = result?.job ?? null
+    mediaQuotaWarning.value = String(result?.warning ?? '')
+    if (result?.existing) {
+      // 已有作业不会带上强制重下标记；不消耗这一次额度，让用户等它收尾后再点。
+      readerMediaRetryUsed = false
+      readerMediaRetryAvailable.value = true
+      readerMediaNotice.value = `已有离线下载在进行，完成后再重下第 ${index + 1} 章。`
+      status.value = '已有进行中的离线下载'
+      void refreshMediaSummary()
+      syncMediaTimer()
+      return
+    }
+    readerMediaRetryAvailable.value = false
+    readerMediaNotice.value = `已开始重新下载第 ${index + 1} 章，完成后会重新打开本章。`
+    status.value = '已开始重新下载本章'
+    void refreshMediaSummary()
+    syncMediaTimer()
+    if (!isDownloadRunning(mediaJob.value)) void reopenReaderAfterMediaRetry()
+  } catch (error) {
+    readerMediaRetryUsed = false
+    readerMediaRetryAvailable.value = true
+    readerMediaNotice.value = `重新下载第 ${index + 1} 章失败：${errorText(error)}`
+    status.value = errorText(error)
+  } finally {
+    readerMediaRetryBusy.value = false
+  }
+}
+
+let readerMediaReopening = false
+/** 重下结束后只重开仍停留在阅读页的同一章；用户已离开就只清掉等待目标。 */
+async function reopenReaderAfterMediaRetry() {
+  const index = readerMediaRetryChapter.value
+  if (index === null || readerMediaReopening || isDownloadRunning(mediaJob.value)) return
+  const jobStatus = String(mediaJob.value?.status ?? '')
+  if (jobStatus === 'failed' || jobStatus === 'cancelled') {
+    readerMediaNotice.value = `重新下载第 ${index + 1} 章失败：${String(mediaJob.value?.error ?? '未知错误').slice(0, 120)}`
+    readerMediaRetryChapter.value = null
+    return
+  }
+  if (jobStatus !== 'done') return
+  const chapter = chapters.value[index]
+  if (!chapter || view.value !== 'reader' || currentChapter.value !== chapter) {
+    readerMediaRetryChapter.value = null
+    return
+  }
+  readerMediaReopening = true
+  try {
+    const page = progress.value?.chapterUrl === chapter.url ? Number(progress.value.position ?? 0) || 0 : 0
+    await openChapter(chapter, page, { afterMediaRetry: true })
+  } finally {
+    readerMediaReopening = false
+    readerMediaRetryChapter.value = null
+  }
 }
 
 /** 按书删除媒体离线文件与索引；文字缓存、书与进度保留。 */
@@ -2446,8 +2523,19 @@ async function addToShelf(): Promise<boolean> {
   }
 }
 
-async function openChapter(chapter: any, page?: number) {
+async function openChapter(
+  chapter: any,
+  page?: number,
+  options: { afterMediaRetry?: boolean } = {},
+) {
   if (!chapter || chapter.isVolume || !chapter.url) return
+  if (!options.afterMediaRetry) {
+    // 用户重新打开章节时重置「本章只重下一次」额度；重下后的自动重开不重置。
+    readerMediaRetryUsed = false
+    readerMediaRetryChapter.value = null
+    readerMediaRetryAvailable.value = false
+  }
+  readerMediaRetryBusy.value = false
   tocOpen.value = false
   bookmarksOpen.value = false
   closeReaderDict()
@@ -2479,7 +2567,12 @@ async function openChapter(chapter: any, page?: number) {
     readerMedia.value =
       kind === 'audio' || kind === 'video' ? (result.mediaUrl ?? chapter.url) : ''
     readerLocal.value = result.local === true
-    readerMediaNotice.value = result.localMissing === true ? '本地文件已失效，已改用在线内容' : ''
+    const retryable = result.localMissing === true && Number.isInteger(index) && index >= 0
+    readerMediaNotice.value = retryable
+      ? `第 ${index + 1} 章本地文件已失效，已改用在线内容。`
+      : ''
+    readerMediaRetryChapter.value = retryable ? index : null
+    readerMediaRetryAvailable.value = retryable && !readerMediaRetryUsed
     readerTitle.value = chapter.title
     view.value = 'reader'
     if (currentBook.value?.id) {
@@ -2501,7 +2594,7 @@ async function openChapter(chapter: any, page?: number) {
 }
 
 /** 本地文件被删/损坏：同一章改用在线代理重取，只回退一次，失败只提示。 */
-async function onReaderMediaError() {
+async function onReaderMediaError(payload?: { reason?: string; permanent?: boolean }) {
   if (!readerLocal.value || mediaFallbackBusy) return
   const book = currentBook.value as any
   const chapter = currentChapter.value
@@ -2509,6 +2602,12 @@ async function onReaderMediaError() {
   mediaFallbackBusy = true
   try {
     const index = chapters.value.indexOf(chapter)
+    const reason = String(payload?.reason ?? '').trim().slice(0, 60) || '播放器报错'
+    const permanent = payload?.permanent === true
+    const retryable = Number.isInteger(index) && index >= 0
+    readerMediaRetryChapter.value = retryable ? index : null
+    // 编码/格式不支持、DRM、4xx 属永久失败：提示里不给「重新下载」入口。
+    readerMediaRetryAvailable.value = retryable && !readerMediaRetryUsed && !permanent
     const result: any = await call('getContent', {
       sourceUrl: book.origin,
       chapterUrl: chapter.url,
@@ -2521,7 +2620,9 @@ async function onReaderMediaError() {
     if (kind === 'images') readerImages.value = result?.images ?? []
     else if (kind === 'audio' || kind === 'video') readerMedia.value = result?.mediaUrl ?? chapter.url
     readerLocal.value = false
-    readerMediaNotice.value = '本地文件不可用，已切换到在线播放'
+    readerMediaNotice.value = permanent
+      ? `第 ${index + 1} 章本地文件不可用（${reason}，无法通过重新下载修复），已切换到在线播放。`
+      : `第 ${index + 1} 章本地文件不可用（${reason}），已切换到在线播放。`
   } catch (error) {
     readerMediaNotice.value = `本地文件不可用，在线回退也失败了：${errorText(error)}`
   } finally {
@@ -4533,7 +4634,16 @@ onMounted(async () => {
           data-testid="media-fallback-notice"
           role="status"
         >
-          {{ readerMediaNotice }}
+          <span>{{ readerMediaNotice }}</span>
+          <button
+            v-if="readerMediaRetryAvailable"
+            class="mo-media-retry"
+            data-testid="media-retry-current"
+            :disabled="readerMediaRetryBusy"
+            @click="retryReaderMedia"
+          >
+            {{ readerMediaRetryBusy ? '重下中…' : '重下本章' }}
+          </button>
         </p>
         <div class="mo-reader-canvas" data-testid="reader-content">
           <CanvasReader
@@ -6147,6 +6257,20 @@ textarea {
   font-size: 13px;
   line-height: 1.5;
   text-align: center;
+}
+.mo-media-retry {
+  margin-left: 8px;
+  padding: 2px 8px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.mo-media-retry:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 .mo-reader-hint {
   position: absolute;

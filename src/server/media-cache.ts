@@ -133,12 +133,52 @@ export async function saveMediaStream(
   return total
 }
 
-/** 本地文件是否还在：索引存在但文件被删时，阅读要回退在线播放。 */
-export async function mediaFilePresent(storeId: string, name: string): Promise<boolean> {
+/** 本地文件大小；不存在或不是普通文件时返回 null。 */
+export async function mediaFileSize(storeId: string, name: string): Promise<number | null> {
   try {
     const info = await stat(join(mediaRoot(), storeId, name))
-    return info.isFile() && info.size > 0
+    return info.isFile() ? info.size : null
   } catch {
-    return false
+    return null
+  }
+}
+
+/**
+ * 索引记录的大小与实际文件是否可信：旧索引 bytes<=0 表示「未知」，只看文件非空；
+ * 记录了大小的必须相等，非零截断会在这里被判失效。
+ */
+export function recordedBytesMatch(recorded: unknown, actual: number): boolean {
+  if (!Number.isFinite(actual) || actual <= 0) return false
+  const expected = Number(recorded)
+  if (!Number.isFinite(expected) || expected <= 0) return true
+  return actual === expected
+}
+
+export interface MediaFileOnDisk {
+  name: string
+  bytes: number
+}
+
+/**
+ * 发布索引前的权威校验：每个文件都必须落盘、记录过正数大小、且 stat 与记录相等。
+ * 校验不过就不写索引，避免把半份文件发布成「可离线播放」。
+ */
+export async function assertMediaFilesOnDisk(
+  storeId: string,
+  files: MediaFileOnDisk[],
+): Promise<void> {
+  if (files.length === 0) throw new Error('媒体文件校验失败：没有可发布的文件')
+  for (const file of files) {
+    const recorded = Number(file.bytes)
+    if (!Number.isFinite(recorded) || recorded <= 0) {
+      throw new Error(`媒体文件校验失败：${file.name} 未记录大小`)
+    }
+    const actual = await mediaFileSize(storeId, file.name)
+    if (actual === null) throw new Error(`媒体文件校验失败：${file.name} 未落盘`)
+    if (actual !== recorded) {
+      throw new Error(
+        `媒体文件校验失败：${file.name} 记录 ${recorded} 字节，实际 ${actual} 字节`,
+      )
+    }
   }
 }
