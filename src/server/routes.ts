@@ -6,6 +6,8 @@ import { isArtifactFileName } from './exports.js'
 
 /** 通用受保护产物路由：目前服务导出文件，#109（PDF 原文件）与 #110（媒体代理）可复用同一套校验。 */
 export const EXPORT_ROUTE_PATH = '/reader/exports'
+/** 导出失败章节完整清单的下载路由：只有失败数超过界面展示上限时才有文件。 */
+export const EXPORT_FAILED_ROUTE_PATH = '/reader/exports-failed'
 /** 本地 PDF 原文件路由：URL 里是 24 位小写十六进制书 id，路径由服务端自己拼。 */
 export const LOCAL_PDF_ROUTE_PATH = '/reader/local-pdf'
 /** 本地媒体文件路由（#112）：URL 里是 24 位十六进制文件摘要，路径由索引反查。 */

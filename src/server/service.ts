@@ -37,7 +37,7 @@ import {
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
 import { mapSwitchProgress, matchBookName, sameAuthorName } from '../core/source/switch.js'
 import { openReaderStorage } from './storage.js'
-import { clearChapterCache, readCachedChapter } from './cache.js'
+import { clearChapterCache, readCachedChapter, writeCachedChapter } from './cache.js'
 import {
   DEFAULT_RETRY_BASE_MS,
   DOWNLOAD_KIND,
@@ -90,11 +90,13 @@ import {
   cleanupExpiredExports,
   contentTypeOf,
   exportArtifactExists,
+  exportFailedDisplayName,
   exportRoot,
   type ExportFormat,
   type ExportHost,
 } from './exports.js'
 import {
+  EXPORT_FAILED_ROUTE_PATH,
   EXPORT_ROUTE_PATH,
   LOCAL_MEDIA_ROUTE_PATH,
   LOCAL_PDF_ROUTE_PATH,
@@ -1532,6 +1534,19 @@ export class ReaderService extends TypertRemoteService {
     }
   }
 
+  /** 失败章节完整清单的受保护下载地址；只有失败数超过界面展示上限时才存在。 */
+  async getExportFailedDownload(args: Args) {
+    const jobId = stringArg(args, 'jobId')
+    const record = this.requireDb().jobs.get(jobId) as Record<string, unknown> | undefined
+    if (!record || record.kind !== EXPORT_KIND) throw new Error('作业不存在')
+    if (record.status !== 'done' && record.status !== 'failed') throw new Error('作业尚未结束')
+    const name = String(record.failedListFile ?? '')
+    if (!record.failedTruncated || !name) throw new Error('没有可下载的失败清单')
+    if (!(await exportArtifactExists(name))) throw new Error('失败清单已过期')
+    // 下载名给书名，别把作业 id 甩给用户；磁盘路径仍是 id 命名的单段文件名。
+    return { url: this.exportFailedUrl(jobId), fileName: exportFailedDisplayName(String(record.bookName ?? '')) }
+  }
+
   async getReviewSummary(args: Args) {
     const source = this.getSource(stringArg(args, 'sourceUrl'))
     const rule = reviewRule(source)
@@ -2080,6 +2095,21 @@ export class ReaderService extends TypertRemoteService {
         if (content?.kind && content.kind !== 'text') throw new Error('章节不是文本')
         const text = String(content?.content ?? '')
         if (!text.trim()) throw new Error('章节正文为空')
+        // 导出抓到的正文顺手回写章节缓存与下载索引：导出完成后阅读直接命中，不必再抓一遍。
+        try {
+          await writeCachedChapter(sourceUrl, chapterUrl, text)
+          const bookId = String(book.id || '')
+          if (bookId) {
+            await this.registerKnownDownload(
+              { bookId, chapterIndex, chapterTitle: chapter.title ?? '' },
+              sourceUrl,
+              chapterUrl,
+              Buffer.byteLength(text, 'utf8'),
+            )
+          }
+        } catch {
+          // 缓存与索引只是顺带的加速项，写不进去不影响导出本身。
+        }
         return text
       },
       loadCover: (book) => this.fetchExportCover(book),
@@ -2124,25 +2154,38 @@ export class ReaderService extends TypertRemoteService {
 
   /** PDF 原文件地址：宿主还没监听时返回相对路径，浏览器里同样能取到。 */
   private localPdfUrl(bookId: string): string {
-    let origin = ''
+    return `${this.webOrigin()}${LOCAL_PDF_ROUTE_PATH}/${bookId}`
+  }
+
+  /** 宿主监听地址；宿主还没监听时返回空串，调用方拼相对地址照样可用。 */
+  private webOrigin(): string {
     try {
       const value = (this.ctx as any)?.webServer?.getOrigin?.()
-      if (typeof value === 'string') origin = value.replace(/\/+$/, '')
+      if (typeof value === 'string') return value.replace(/\/+$/, '')
     } catch {
       // 拿不到 origin 不影响取文件：相对地址在页面里同样可用。
     }
-    return `${origin}${LOCAL_PDF_ROUTE_PATH}/${bookId}`
+    return ''
   }
 
   private exportDownloadUrl(jobId: string): string {
-    let origin = ''
+    return `${this.webOrigin()}${EXPORT_ROUTE_PATH}/${encodeURIComponent(jobId)}`
+  }
+
+  private exportFailedUrl(jobId: string): string {
+    return `${this.webOrigin()}${EXPORT_FAILED_ROUTE_PATH}/${encodeURIComponent(jobId)}`
+  }
+
+  /** 失败清单的产物定位：与下载地址共用同一套校验，取不到就按 404 处理。 */
+  private async locateExportFailedList(jobId: string): Promise<ArtifactDescriptor | null> {
     try {
-      const value = (this.ctx as any)?.webServer?.getOrigin?.()
-      if (typeof value === 'string') origin = value.replace(/\/+$/, '')
+      const { fileName } = await this.getExportFailedDownload({ jobId })
+      const record = this.db?.jobs?.get?.(jobId) as Record<string, unknown> | undefined
+      const filePath = String(record?.failedListFile ?? '')
+      return { filePath, fileName, contentType: 'text/plain; charset=utf-8' }
     } catch {
-      // 宿主还没监听时退回相对地址，页面内照样能下载。
+      return null
     }
-    return `${origin}${EXPORT_ROUTE_PATH}/${encodeURIComponent(jobId)}`
   }
 
   /** 宿主存在 webServer 时才注册下载路由，并随服务销毁释放。 */
@@ -2155,16 +2198,39 @@ export class ReaderService extends TypertRemoteService {
       if (typeof webCtx.effect !== 'function') return
       webCtx.effect(
         () => {
-          try {
-            return registerArtifactRoute(webServer, {
+          // 导出产物与失败清单是两条路由，一起注册、一起释放。
+          const disposers: Array<() => void> = []
+          const register = (factory: () => () => void): void => {
+            try {
+              disposers.push(factory())
+            } catch {
+              // 同一宿主里已经注册过同路径路由时不重复注册，也不让启动失败。
+            }
+          }
+          register(() =>
+            registerArtifactRoute(webServer, {
               path: EXPORT_ROUTE_PATH,
               auth: 'required',
               root: () => exportRoot(),
               locate: (jobId: string) => this.locateExportArtifact(jobId),
-            })
-          } catch {
-            // 同一宿主里已经注册过同路径路由时不重复注册，也不让启动失败。
-            return () => {}
+            }),
+          )
+          register(() =>
+            registerProtectedFileRoute(webServer, {
+              path: EXPORT_FAILED_ROUTE_PATH,
+              auth: 'required',
+              root: () => exportRoot(),
+              locate: (jobId: string) => this.locateExportFailedList(jobId),
+            }),
+          )
+          return () => {
+            for (const dispose of disposers) {
+              try {
+                dispose()
+              } catch {
+                // 释放失败不影响其它路由。
+              }
+            }
           }
         },
         'reader: export download route',

@@ -535,6 +535,8 @@ async function cacheBookChapters() {
 
 const exportJob = ref<any>(null)
 const exportDownload = ref<{ url: string; fileName: string } | null>(null)
+/** 失败章节超过界面展示上限时的完整清单（服务端生成，可下载）。 */
+const exportFailedDownload = ref<{ url: string; fileName: string } | null>(null)
 /** PDF 导出用的中文字体 id；空值交给服务端提示「请先上传中文字体」。 */
 const exportFontId = ref('')
 const exportMessage = ref('')
@@ -556,9 +558,12 @@ function exportStatusText(job: any) {
 
 function exportFailedChapters(job: any) {
   const list = Array.isArray(job?.failedChapters) ? job.failedChapters : []
-  if (!list.length) return ''
+  // 总数以 job.failed 为准：超过上限时列表被截断，但失败数量始终是真实值。
+  const total = Number(job?.failed) || list.length
+  if (!total) return ''
+  if (!list.length) return `共 ${total} 章`
   const shown = list.slice(0, 8).join('、')
-  return list.length > 8 ? `${shown} 等 ${list.length} 章` : shown
+  return total > 8 ? `${shown} 等 ${total} 章` : shown
 }
 
 const storageQuotaWarning = computed(() => {
@@ -590,18 +595,45 @@ function syncExportTimer() {
   }
 }
 
+/** 导出收尾的两种终态：只有它们才有可下载的东西（产物或失败清单）。 */
+function isExportFinished(job: any): boolean {
+  return job?.status === 'done' || job?.status === 'failed'
+}
+
 async function loadExportDownload() {
   const job = exportJob.value
-  if (!job?.id || job.status !== 'done') {
+  if (!job?.id || !isExportFinished(job)) {
     exportDownload.value = null
+    exportFailedDownload.value = null
+    return
+  }
+  if (job.status === 'done') {
+    try {
+      const result: any = await call('getExportDownload', { jobId: job.id })
+      exportDownload.value = { url: String(result?.url ?? ''), fileName: String(result?.fileName ?? '') }
+    } catch (error) {
+      exportDownload.value = null
+      status.value = errorText(error)
+    }
+  } else {
+    // 整本失败没有主产物，但失败清单照样值得给：它就是定位「哪几章没导出」的材料。
+    exportDownload.value = null
+  }
+  await loadExportFailedDownload()
+}
+
+/** 只有失败数超过展示上限时才有清单可下；取不到就当没有，不影响主产物。 */
+async function loadExportFailedDownload() {
+  const job = exportJob.value
+  if (!job?.id || !job.failedTruncated || !job.failedListFile) {
+    exportFailedDownload.value = null
     return
   }
   try {
-    const result: any = await call('getExportDownload', { jobId: job.id })
-    exportDownload.value = { url: String(result?.url ?? ''), fileName: String(result?.fileName ?? '') }
-  } catch (error) {
-    exportDownload.value = null
-    status.value = errorText(error)
+    const result: any = await call('getExportFailedDownload', { jobId: job.id })
+    exportFailedDownload.value = { url: String(result?.url ?? ''), fileName: String(result?.fileName ?? '') }
+  } catch {
+    exportFailedDownload.value = null
   }
 }
 
@@ -614,13 +646,14 @@ async function refreshExportJob() {
   } catch (error) {
     status.value = errorText(error)
   }
-  if (exportJob.value?.status === 'done') await loadExportDownload()
+  if (isExportFinished(exportJob.value)) await loadExportDownload()
   syncExportTimer()
 }
 
 async function loadActiveExport() {
   exportJob.value = null
   exportDownload.value = null
+  exportFailedDownload.value = null
   exportBusy.value = false
   const book = currentBook.value as any
   if (!book?.id) {
@@ -635,7 +668,7 @@ async function loadActiveExport() {
   } catch {
     exportJob.value = null
   }
-  if (exportJob.value?.status === 'done') await loadExportDownload()
+  if (isExportFinished(exportJob.value)) await loadExportDownload()
   syncExportTimer()
 }
 
@@ -654,6 +687,7 @@ async function startExport(format: 'txt' | 'epub' | 'pdf' = 'txt', fontId = '') 
   if (!book?.id) return
   exportBusy.value = true
   exportDownload.value = null
+  exportFailedDownload.value = null
   exportMessage.value = ''
   try {
     const payload: Record<string, unknown> = { bookId: book.id, format }
@@ -682,6 +716,7 @@ async function cancelExport() {
     const result: any = await call('cancelJob', { id: job.id })
     exportJob.value = result?.job ?? exportJob.value
     exportDownload.value = null
+    exportFailedDownload.value = null
     status.value = '已取消导出'
   } catch (error) {
     status.value = errorText(error)
@@ -3914,6 +3949,15 @@ onMounted(async () => {
               :download="exportDownload.fileName"
             >
               下载文件
+            </a>
+            <a
+              v-if="exportFailedDownload?.url"
+              class="mo-btn"
+              data-testid="export-failed-download"
+              :href="exportFailedDownload.url"
+              :download="exportFailedDownload.fileName"
+            >
+              下载失败清单
             </a>
             <button
               v-if="['queued', 'running', 'paused'].includes(exportJob.status)"

@@ -27,6 +27,7 @@ function fakeTable() {
 const ORIGIN = 'https://ex.example.com'
 const BASE = 'https://reader.example.com'
 const ROUTE = '/reader/exports'
+const FAILED_ROUTE = '/reader/exports-failed'
 const CONTENT = (n) => '<div id="content"><p>第' + n + '章正文内容。</p></div>'
 
 function buildToc(count) {
@@ -129,6 +130,7 @@ async function makeHarness(options = {}) {
     routes,
     effectDisposers,
     exportRoot,
+    failUrls,
     writeCachedChapter,
   }
 }
@@ -188,10 +190,127 @@ test('单章失败只计失败，整本继续导出', async () => {
   assert.equal(job.completed, 2)
   assert.equal(job.failed, 1)
   assert.deepEqual(job.failedChapters, ['第2章'], '记下没导出的章节名')
+  assert.equal(job.failedTruncated, false, '失败数没超过上限就不生成清单')
+  assert.equal(job.failedListFile, '')
+  await assert.rejects(harness.service.getExportFailedDownload({ jobId: job.id }), /没有可下载的失败清单/)
   const body = await readFile(path.join(harness.exportRoot, job.filePath), 'utf8')
   assert.ok(body.includes('第1章正文内容。'))
   assert.ok(!body.includes('第2章正文内容。'))
   assert.ok(body.includes('第3章正文内容。'))
+})
+
+test('暂停后继续：已完成章节不重新抓取，只补缺的分片', async () => {
+  const harness = await makeHarness({ chapters: 8, delayAll: 25 })
+  const started = await harness.service.startExport({ bookId: 'book-1', format: 'txt' })
+  await waitFor(async () => ((await harness.service.getJob({ id: started.job.id })).job.completed ?? 0) >= 2)
+  await harness.service.pauseJob({ id: started.job.id })
+  await harness.service.waitForExports()
+  const paused = (await harness.service.getJob({ id: started.job.id })).job
+  assert.equal(paused.status, 'paused')
+  const reuse = Number(paused.completed)
+  assert.ok(reuse >= 2)
+  // 暂停时保留章节级临时状态，「继续」才有依据。
+  const partsDir = started.job.id + '.parts'
+  assert.ok((await readdir(harness.exportRoot)).includes(partsDir), '暂停时保留章节级临时状态')
+  const parts = (await readdir(path.join(harness.exportRoot, partsDir)))
+    .map((name) => Number(name.replace(/\.json$/, '')))
+    .sort((left, right) => left - right)
+  assert.ok(parts.length >= 1, '至少有一章的分片落盘')
+  assert.ok(parts.length <= reuse, '分片数不超过已完成数')
+
+  // 清掉章节缓存：首轮抓到的正文已经回写缓存，不清掉的话「继续」即使不复用分片也能零联网，
+  // 断言就变成了假绿。清掉之后，只有真正复用了分片的章节才不需要重新抓。
+  const { clearChapterCache } = await import('../dist/server/cache.js')
+  await clearChapterCache('')
+
+  const before = harness.calls.length
+  await harness.service.resumeJob({ id: started.job.id })
+  await harness.service.waitForExports()
+  const { job } = await harness.service.getJob({ id: started.job.id })
+  assert.equal(job.status, 'done')
+  assert.equal(job.completed, 8)
+  assert.equal(job.failed, 0)
+  // 恢复时只为没有分片的章节联网：有分片的不联网、没分片的一定联网，一次不多一次不少。
+  const refetched = harness.calls
+    .slice(before)
+    .filter((item) => item.startsWith(ORIGIN + '/ch/'))
+    .map((item) => Number(item.split('/').pop()))
+    .sort((left, right) => left - right)
+  const missing = Array.from({ length: 8 }, (_, index) => index)
+    .filter((index) => !parts.includes(index))
+    .map((index) => index + 1)
+  assert.deepEqual(refetched, missing, '续跑只补没有分片的章节')
+  // 产物包含全部章节，且分段拼装没有空洞。
+  const body = await readFile(path.join(harness.exportRoot, job.filePath), 'utf8')
+  for (let i = 1; i <= 8; i += 1) assert.ok(body.includes('第' + i + '章正文内容。'), '产物含第' + i + '章')
+  // 终态不留临时状态。
+  assert.ok(!(await readdir(harness.exportRoot)).includes(partsDir))
+})
+
+test('暂停后取消：章节级临时状态被清掉', async () => {
+  const harness = await makeHarness({ chapters: 8, delayAll: 25 })
+  const started = await harness.service.startExport({ bookId: 'book-1', format: 'txt' })
+  await waitFor(async () => ((await harness.service.getJob({ id: started.job.id })).job.completed ?? 0) >= 2)
+  await harness.service.pauseJob({ id: started.job.id })
+  await harness.service.waitForExports()
+  const partsDir = started.job.id + '.parts'
+  assert.ok((await readdir(harness.exportRoot)).includes(partsDir), '暂停时保留临时状态')
+  // 暂停态的协程已经收尾，取消之后不会再有协程来清理，清理必须在取消这一侧完成。
+  await harness.service.cancelJob({ id: started.job.id })
+  await harness.service.waitForExports()
+  const { job } = await harness.service.getJob({ id: started.job.id })
+  assert.equal(job.status, 'cancelled')
+  const names = await readdir(harness.exportRoot)
+  assert.ok(!names.includes(partsDir), '取消后不留章节级临时状态')
+})
+
+test('重新导出后失败数没超上限：上一轮的失败清单被清掉', async () => {
+  const chapters = 120
+  const harness = await makeHarness({
+    chapters,
+    failUrls: Array.from({ length: chapters }, (_, index) => ORIGIN + '/ch/' + (index + 1)),
+  })
+  const started = await harness.service.startExport({ bookId: 'book-1', format: 'txt' })
+  await harness.service.waitForExports()
+  const first = (await harness.service.getJob({ id: started.job.id })).job
+  assert.equal(first.status, 'failed')
+  assert.equal(first.failedTruncated, true)
+  const listName = started.job.id + '.failed.txt'
+  assert.ok((await readdir(harness.exportRoot)).includes(listName))
+
+  harness.failUrls.clear()
+  await harness.service.resumeJob({ id: started.job.id })
+  await harness.service.waitForExports()
+  const second = (await harness.service.getJob({ id: started.job.id })).job
+  assert.equal(second.status, 'done')
+  assert.equal(second.failed, 0)
+  assert.equal(second.failedTruncated, false)
+  assert.equal(second.failedListFile, '')
+  assert.ok(!(await readdir(harness.exportRoot)).includes(listName), '旧清单不能留到 24 小时清理')
+})
+
+test('导出抓到的正文回写缓存，导出后阅读直接命中', async () => {
+  const harness = await makeHarness({ chapters: 2 })
+  const started = await harness.service.startExport({ bookId: 'book-1', format: 'txt' })
+  await harness.service.waitForExports()
+  const { job } = await harness.service.getJob({ id: started.job.id })
+  assert.equal(job.status, 'done')
+  const { readCachedChapter } = await import('../dist/server/cache.js')
+  assert.equal(await readCachedChapter(ORIGIN, ORIGIN + '/ch/1'), '第1章正文内容。')
+  assert.equal(await readCachedChapter(ORIGIN, ORIGIN + '/ch/2'), '第2章正文内容。')
+  // 索引也补登了：下载统计里能看到这两章。
+  const entries = [...harness.service.db.downloadEntries.map.values()]
+  assert.deepEqual(
+    entries.map((entry) => entry.chapterIndex).sort(),
+    [0, 1],
+  )
+  // 再导一次走缓存：目录可能还要各取一次，但章节一个都不再抓。
+  const chapterCalls = () => harness.calls.filter((url) => url.startsWith(ORIGIN + '/ch/')).length
+  const before = chapterCalls()
+  const again = await harness.service.startExport({ bookId: 'book-1', format: 'txt' })
+  await harness.service.waitForExports()
+  assert.equal(chapterCalls(), before, '第二次导出全部命中缓存')
+  assert.equal((await harness.service.getJob({ id: again.job.id })).job.completed, 2)
 })
 
 test('全部章节失败时作业失败且不留产物', async () => {
@@ -205,6 +324,41 @@ test('全部章节失败时作业失败且不留产物', async () => {
   assert.equal(job.failed, 2)
   await assert.rejects(harness.service.getExportDownload({ jobId: job.id }), /导出尚未完成/)
   assert.deepEqual((await readdir(harness.exportRoot)).filter((name) => name.endsWith('.txt')), [])
+})
+
+test('失败章节超过展示上限：完整清单可下载、路由受保护', async () => {
+  const total = 120
+  const failUrls = Array.from({ length: total }, (_, index) => ORIGIN + '/ch/' + (index + 1))
+  const harness = await makeHarness({ chapters: total, failUrls })
+  const started = await harness.service.startExport({ bookId: 'book-1', format: 'txt' })
+  await harness.service.waitForExports()
+  const { job } = await harness.service.getJob({ id: started.job.id })
+  assert.equal(job.status, 'failed')
+  assert.equal(job.failed, total, '失败数量始终是真实值')
+  assert.equal(job.failedChapters.length, 100, '作业记录里只留 100 条')
+  assert.equal(job.failedTruncated, true)
+  assert.equal(job.failedListFile, job.id + '.failed.txt')
+  const body = await readFile(path.join(harness.exportRoot, job.failedListFile), 'utf8')
+  const lines = body.trim().split('\n')
+  assert.equal(lines.length, total)
+  assert.equal(lines[0], '1\t第1章')
+  assert.equal(lines[total - 1], total + '\t第' + total + '章')
+
+  const download = await harness.service.getExportFailedDownload({ jobId: job.id })
+  assert.equal(download.url, BASE + FAILED_ROUTE + '/' + job.id)
+  assert.equal(download.fileName, '测试书-失败章节.txt', '下载名用书名，不甩作业 id')
+
+  const route = harness.routes.find((item) => item.path === FAILED_ROUTE)
+  assert.ok(route, '失败清单路由已注册')
+  const response = await route.resource(new Request(BASE + FAILED_ROUTE + '/' + job.id), owner)
+  assert.equal(response.status, 200)
+  assert.match(response.headers.get('content-type'), /^text\/plain/)
+  assert.equal((await response.text()).trim().split('\n').length, total)
+  assert.equal((await route.resource(new Request(BASE + FAILED_ROUTE + '/' + job.id))).status, 401)
+  assert.equal(
+    (await route.resource(new Request(BASE + FAILED_ROUTE + '/00000000-0000-4000-8000-000000000000'), owner)).status,
+    404,
+  )
 })
 
 test('同一本书同一格式同时只有一个活动作业', async () => {
@@ -230,6 +384,7 @@ test('导出可取消：作业置取消、不留产物', async () => {
   const { job } = await harness.service.getJob({ id: started.job.id })
   assert.equal(job.status, 'cancelled')
   assert.deepEqual((await readdir(harness.exportRoot)).filter((name) => name.endsWith('.txt')), [])
+  assert.ok(!(await readdir(harness.exportRoot)).some((name) => name.endsWith('.parts')), '取消后清理章节级临时状态')
 })
 
 test('作业进度可查，listJobs 同时返回下载与导出', async () => {
@@ -335,8 +490,8 @@ test('发起导出前顺带清理过期产物', async () => {
 
 test('受保护路由：200 返回文件与下载头', async () => {
   const harness = await makeHarness({ chapters: 2 })
-  assert.equal(harness.routes.length, 1)
-  const route = harness.routes[0]
+  const route = harness.routes.find((item) => item.path === ROUTE)
+  assert.ok(route, '导出产物路由已注册')
   assert.equal(route.kind, 'prefix')
   assert.equal(route.path, ROUTE)
   assert.equal(route.auth, 'required')
@@ -356,7 +511,7 @@ test('受保护路由：200 返回文件与下载头', async () => {
 
 test('受保护路由：未登录 401、非属主 403', async () => {
   const harness = await makeHarness({ chapters: 1 })
-  const route = harness.routes[0]
+  const route = harness.routes.find((item) => item.path === ROUTE)
   const started = await harness.service.startExport({ bookId: 'book-1', format: 'txt' })
   await harness.service.waitForExports()
   const url = BASE + ROUTE + '/' + started.job.id
@@ -368,7 +523,7 @@ test('受保护路由：未登录 401、非属主 403', async () => {
 
 test('受保护路由：非法 id、穿越路径与不存在作业都是 404', async () => {
   const harness = await makeHarness({ chapters: 1 })
-  const route = harness.routes[0]
+  const route = harness.routes.find((item) => item.path === ROUTE)
   const started = await harness.service.startExport({ bookId: 'book-1', format: 'txt' })
   await harness.service.waitForExports()
   const request = (pathname) => new Request(BASE + pathname)
@@ -404,7 +559,7 @@ test('受保护路由：作业记录的相对路径越过导出目录时 404', a
 
 test('受保护路由：HEAD 只回头、其他方法 405', async () => {
   const harness = await makeHarness({ chapters: 1 })
-  const route = harness.routes[0]
+  const route = harness.routes.find((item) => item.path === ROUTE)
   const started = await harness.service.startExport({ bookId: 'book-1', format: 'txt' })
   await harness.service.waitForExports()
   const url = BASE + ROUTE + '/' + started.job.id
@@ -480,7 +635,8 @@ test('EPUB 全本：目录 60 章全部导出，nav 与 ncx 可跳转', async ()
   const download = await harness.service.getExportDownload({ jobId: job.id })
   assert.equal(download.url, BASE + ROUTE + '/' + job.id)
   assert.equal(download.fileName, '测试书.epub')
-  const response = await harness.routes[0].resource(new Request(BASE + ROUTE + '/' + job.id), owner)
+  const route = harness.routes.find((item) => item.path === ROUTE)
+  const response = await route.resource(new Request(BASE + ROUTE + '/' + job.id), owner)
   assert.equal(response.status, 200)
   assert.equal(response.headers.get('content-type'), 'application/epub+zip')
 })

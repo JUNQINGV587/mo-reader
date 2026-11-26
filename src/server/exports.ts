@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { ChapterLimiter, isActiveJob, type JobStatus } from './download.js'
@@ -15,6 +15,12 @@ export const EXPORT_CONCURRENCY = 4
 export const EXPORT_SOURCE_CONCURRENCY = 2
 /** 进度落盘的节流窗口；没有定时器，只在章节收尾时按需写一次。 */
 export const EXPORT_FLUSH_MS = 500
+/** 界面直接列出的失败章节条数上限；超过这个数的完整清单另存文件。 */
+export const EXPORT_FAILED_LIMIT = 100
+/** 章节级临时状态目录后缀：<jobId>.parts/，暂停后继续时用它跳过已抓到的章节。 */
+export const EXPORT_PARTS_SUFFIX = '.parts'
+/** 失败章节完整清单的文件后缀：<jobId>.failed.txt。 */
+export const EXPORT_FAILED_FILE_SUFFIX = '.failed.txt'
 
 export type ExportFormat = 'txt' | 'epub' | 'pdf'
 
@@ -31,8 +37,12 @@ export interface ExportJob {
   filePath: string
   /** 产物字节数；导出过程中是已拼正文的累计字节。 */
   size: number
-  /** 导出失败的章节名（最多 100 条），完成后供界面列出「哪些章没导出」。 */
+  /** 导出失败的章节名（最多 EXPORT_FAILED_LIMIT 条），完成后供界面列出「哪些章没导出」。 */
   failedChapters: string[]
+  /** 失败章节数超过展示上限时为真：界面据此说明清单被截断，完整清单在 failedListFile。 */
+  failedTruncated: boolean
+  /** 完整失败清单（相对导出目录的单段文件名）；只有失败数超过展示上限时才写。 */
+  failedListFile: string
   /** 字体预留字段：#107 起排版类导出按它取字体。 */
   fontId: string
   fromIndex: number
@@ -89,16 +99,81 @@ export function exportArtifactName(jobId: string, format: ExportFormat): string 
   return `${jobId}.${format}`
 }
 
-/** 浏览器下载名：去掉路径分隔符与非法字符，保留中文书名。 */
-export function exportFileName(bookName: string, format: ExportFormat): string {
+/** 章节级临时状态目录：每次导出按作业 id 隔离，暂停后继续时先查它。 */
+export function exportPartsDir(jobId: string): string {
+  return join(exportRoot(), `${jobId}${EXPORT_PARTS_SUFFIX}`)
+}
+
+/** 失败章节完整清单的文件名（相对导出目录）。 */
+export function exportFailedFileName(jobId: string): string {
+  return `${jobId}${EXPORT_FAILED_FILE_SUFFIX}`
+}
+
+/** 单章临时状态：标题、正文与章节地址，够续跑时直接复用，不必回读缓存或联网。 */
+interface ExportPart {
+  title: string
+  text: string
+  /** 抓取时的章节地址；续跑时用来确认目录没换，避免按序号串章。 */
+  url: string
+}
+
+/**
+ * 读已抓到的章节；没有、损坏、形状不对或章节地址已经变了都当没抓到，本次重新抓。
+ * 地址对不上说明这一轮的目录和落盘时不同，宁可重抓也不能把别人的正文拼进去。
+ */
+async function readChapterPart(jobId: string, index: number, url: string): Promise<ExportPart | null> {
+  try {
+    const raw = await readFile(join(exportPartsDir(jobId), `${index}.json`), 'utf8')
+    const parsed = JSON.parse(raw) as Partial<ExportPart>
+    if (typeof parsed?.text !== 'string' || !parsed.text) return null
+    if (parsed.url !== url) return null
+    return { title: String(parsed.title ?? ''), text: parsed.text, url }
+  } catch {
+    return null
+  }
+}
+
+async function writeChapterPart(jobId: string, index: number, part: ExportPart): Promise<void> {
+  const dir = exportPartsDir(jobId)
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, `${index}.json`), JSON.stringify(part), 'utf8')
+}
+
+async function removeFailedList(jobId: string): Promise<void> {
+  try {
+    await rm(join(exportRoot(), exportFailedFileName(jobId)), { force: true })
+  } catch {
+    // 删不掉就交给 24 小时过期清理。
+  }
+}
+
+async function removeChapterParts(jobId: string): Promise<void> {
+  try {
+    await rm(exportPartsDir(jobId), { recursive: true, force: true })
+  } catch {
+    // 删不掉就交给 24 小时过期清理。
+  }
+}
+
+/** 下载名的公共清洗：去掉路径分隔符与非法字符，保留中文书名。 */
+function cleanDownloadName(bookName: string): string {
   const cleaned = String(bookName || '')
     .replace(/[\\/:*?"<>|]/g, ' ')
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/^\.+/, '')
-  const base = (cleaned || '未命名').slice(0, 80)
-  return `${base}.${format}`
+  return (cleaned || '未命名').slice(0, 80)
+}
+
+/** 浏览器下载名：去掉路径分隔符与非法字符，保留中文书名。 */
+export function exportFileName(bookName: string, format: ExportFormat): string {
+  return `${cleanDownloadName(bookName)}.${format}`
+}
+
+/** 失败清单的下载名：和主产物一样用书名，别把作业 id 甩给用户。 */
+export function exportFailedDisplayName(bookName: string): string {
+  return `${cleanDownloadName(bookName)}-失败章节.txt`
 }
 
 export function contentTypeOf(format: string): string {
@@ -207,6 +282,8 @@ export class ExportCoordinator {
       filePath: '',
       size: 0,
       failedChapters: [],
+      failedTruncated: false,
+      failedListFile: '',
       fontId: format === 'pdf' ? String(options.fontId ?? '') : '',
       fromIndex: 0,
       toIndex: 0,
@@ -289,7 +366,13 @@ export class ExportCoordinator {
     if (!isActiveJob(job.status) || job.status === status) return { job: { ...job } }
     job.status = status
     job.updatedAt = Date.now()
-    if (status === 'cancelled') await this.removeArtifactFile(job)
+    if (status === 'cancelled') {
+      // 取消是终态：暂停留下的章节级临时状态没有「继续」可用了，就地清掉。
+      // 还在跑的协程收尾时会再清一次，重复删除是幂等的。
+      await this.removeArtifactFile(job)
+      await removeChapterParts(id)
+      await removeFailedList(id)
+    }
     await this.put(job)
     return { job: { ...job } }
   }
@@ -353,8 +436,10 @@ export class ExportCoordinator {
       await this.finish(job, 'failed', errorMessage(error))
       return
     }
-    // 重新开始（继续/重试）时先删掉上一次的产物，避免新旧内容混淆。
+    // 重新开始（继续/重试）时先删掉上一次的产物与失败清单，避免新旧内容混淆；
+    // 清掉记录里的文件名后，磁盘上的旧清单就成了没人引用的孤儿，只等 24 小时清理。
     await this.removeArtifactFile(job)
+    await removeFailedList(job.id)
     job.status = 'running'
     job.error = ''
     job.total = chapters.length
@@ -363,6 +448,8 @@ export class ExportCoordinator {
     job.completed = 0
     job.failed = 0
     job.failedChapters = []
+    job.failedTruncated = false
+    job.failedListFile = ''
     job.skipped = 0
     job.bytes = 0
     job.updatedAt = Date.now()
@@ -371,6 +458,8 @@ export class ExportCoordinator {
     const sourceUrl = String(book.origin ?? '')
     const limiter = new ChapterLimiter(EXPORT_CONCURRENCY, EXPORT_SOURCE_CONCURRENCY)
     const texts: Array<{ title: string; text: string } | null> = new Array(chapters.length).fill(null)
+    /** 全部失败章节（按目录序号）；超过展示上限时收尾写进失败清单文件。 */
+    const failedAll: Array<{ index: number; title: string }> = []
     let nextIndex = 0
     const worker = async (): Promise<void> => {
       while (true) {
@@ -384,20 +473,36 @@ export class ExportCoordinator {
           await this.progress(job)
           continue
         }
+        // 续跑：上一轮抓到的章节已在章节级临时状态里，直接复用，不联网也不再占并发名额。
+        const reused = await readChapterPart(job.id, index, chapter.url)
+        if (reused) {
+          texts[index] = reused
+          job.completed += 1
+          job.bytes += Buffer.byteLength(reused.text, 'utf8')
+          await this.progress(job)
+          continue
+        }
         await limiter.acquire(sourceUrl)
         try {
           if (job.status !== 'running') return
           const text = await this.host.readChapter(book, index, chapter)
           if (job.status !== 'running') return
-          texts[index] = { title: String(chapter.title ?? ''), text }
+          const entry = { title: String(chapter.title ?? ''), text, url: chapter.url }
+          texts[index] = entry
           job.completed += 1
           job.bytes += Buffer.byteLength(text, 'utf8')
+          // 写临时状态是续跑的依据；写失败只影响续跑，不能让这一章计失败。
+          try {
+            await writeChapterPart(job.id, index, entry)
+          } catch {
+            // 磁盘写不进去时照常导出，下次从头抓。
+          }
         } catch {
           // 单章失败只计数，不中止整本导出；记下章节名，完成后界面能说清哪些章没导出。
+          const title = String(chapter.title || `第 ${index + 1} 章`)
           job.failed += 1
-          if (job.failedChapters.length < 100) {
-            job.failedChapters.push(String(chapter.title || `第 ${index + 1} 章`))
-          }
+          failedAll.push({ index, title })
+          if (job.failedChapters.length < EXPORT_FAILED_LIMIT) job.failedChapters.push(title)
         } finally {
           limiter.release(sourceUrl)
         }
@@ -416,7 +521,43 @@ export class ExportCoordinator {
         job.error = errorMessage(error)
       }
     }
+    await this.recordFailedList(job, failedAll)
     await this.finish(job)
+  }
+
+  /**
+   * 失败章节超过展示上限时，把完整清单落成导出目录里的一个文本文件：
+   * jobs 表里的 failedChapters 保持有限条数，界面靠 failedListFile 给出可定位的完整清单。
+   * 只有 done / failed 这两个终态写：暂停还要继续、取消已经没有产物可对照。
+   */
+  private async recordFailedList(job: ExportJob, failed: Array<{ index: number; title: string }>): Promise<void> {
+    if (job.status !== 'done' && job.status !== 'failed') return
+    if (failed.length <= EXPORT_FAILED_LIMIT) {
+      job.failedTruncated = false
+      job.failedListFile = ''
+      // 上一次导出可能留下过清单：重导出后失败数没超上限，旧清单必须一起清掉。
+      await removeFailedList(job.id)
+      return
+    }
+    const name = exportFailedFileName(job.id)
+    // 一行一章，按目录顺序排：失败是按完成先后记的，不排序的话清单顺序随并发变化。
+    // 章节名里的换行与制表符会把清单解析错位，落盘前统一压成空格。
+    const body =
+      [...failed]
+        .sort((left, right) => left.index - right.index)
+        .map((entry) => `${entry.index + 1}\t${String(entry.title).replace(/[\t\r\n]+/g, ' ')}`)
+        .join('\n') + '\n'
+    try {
+      await ensureExportRoot()
+      await writeFile(join(exportRoot(), name), body, 'utf8')
+      job.failedTruncated = true
+      job.failedListFile = name
+    } catch {
+      // 清单落盘失败只是少了一份定位材料，导出本身照常收尾。
+      job.failedTruncated = false
+      job.failedListFile = ''
+    }
+    job.updatedAt = Date.now()
   }
 
   /** 按格式构建产物：TXT 与旧 exportBook 的产物保持一致，EPUB 见 assembleEpub。 */
@@ -578,6 +719,8 @@ export class ExportCoordinator {
     }
     job.updatedAt = Date.now()
     await this.put(job)
+    // 暂停要把章节级临时状态留给「继续」；其它终态一律清掉，导出目录不留残留。
+    if (job.status !== 'paused') await removeChapterParts(job.id)
     this.live.delete(job.id)
     this.lastPut.delete(job.id)
   }
