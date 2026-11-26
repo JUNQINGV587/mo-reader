@@ -22,6 +22,7 @@ export const REMOTE_METHODS = Object.freeze([
   'getBookInfo',
   'getToc',
   'getContent',
+  'searchInBook',
   'getReviewSummary',
   'cacheBook',
   'exportBook',

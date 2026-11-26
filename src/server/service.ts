@@ -48,6 +48,29 @@ import { REMOTE_METHODS } from '../core/remote-methods.js'
 
 type Args = Record<string, unknown> | undefined
 
+/** pageHint 只是服务端按约 800 字/页给出的粗估，真实定位由阅读器 findPageFor 完成。 */
+const SEARCH_PAGE_HINT_CHARS = 800
+/** 结果片段在首个命中前后各保留的字数。 */
+const SEARCH_SNIPPET_CONTEXT = 30
+
+function countOccurrences(value: string, key: string): number {
+  if (!key) return 0
+  let count = 0
+  let index = value.indexOf(key)
+  while (index >= 0) {
+    count += 1
+    index = value.indexOf(key, index + key.length)
+  }
+  return count
+}
+
+function searchSnippet(value: string, start: number, length: number): string {
+  const from = Math.max(0, start - SEARCH_SNIPPET_CONTEXT)
+  const to = Math.min(value.length, start + length + SEARCH_SNIPPET_CONTEXT)
+  const body = value.slice(from, to).replace(/\s+/g, ' ').trim()
+  return `${from > 0 ? '…' : ''}${body}${to < value.length ? '…' : ''}`
+}
+
 function stringArg(args: Args, name: string): string {
   const value = args?.[name]
   if (typeof value !== 'string' || !value.trim()) {
@@ -630,6 +653,107 @@ export class ReaderService extends TypertRemoteService {
     const raw = await this.fetch({ url: chapterUrl, method: 'GET', headers: {} }, source)
     const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
     return { ...parsed, content: parsed.text, url: raw.url }
+  }
+
+  private bookContentKind(book: Record<string, unknown>): 'text' | 'images' | 'audio' | 'video' {
+    const origin = String(book.origin ?? '')
+    const type = Number(book.type ?? 0)
+    const fromRecord: 'text' | 'images' | 'audio' | 'video' =
+      type === 1 ? 'audio' : type === 2 ? 'images' : type === 4 ? 'video' : 'text'
+    if (!origin || origin === 'local') return fromRecord
+    try {
+      return contentKindOf(this.getSource(origin))
+    } catch {
+      // 书源已删 / 未导入时按书目记录兜底，非文本书仍能给出明确拒绝。
+      if (fromRecord !== 'text') return fromRecord
+      throw new Error(`书源不存在：${origin}`)
+    }
+  }
+
+  /** 书内搜索的一章正文：本地正文 > 已缓存正文 > 在线抓取。 */
+  private async chapterTextForSearch(
+    book: Record<string, unknown>,
+    chapter: Record<string, unknown>,
+  ): Promise<string> {
+    const origin = String(book.origin ?? '')
+    const url = String(chapter.url ?? '')
+    const localMatch = /^local:\/\/([^/]+)\/(\d+)/.exec(url)
+    if (localMatch) {
+      const local = await localContent(localMatch[1]!, Number(localMatch[2]))
+      if (!local) throw new Error('本地章节不存在')
+      return local.content
+    }
+    const cached = await readCachedChapter(origin, url)
+    if (cached !== null && cached.trim()) return cached
+    const source = this.getSource(origin)
+    const raw = await this.fetch({ url, method: 'GET', headers: {} }, source)
+    if (raw.status >= 400) throw new Error(`HTTP ${raw.status}`)
+    const parsed = analyzeChapterContent(raw.text, source, raw.url, raw.url)
+    if (parsed.kind !== 'text') throw new Error('该章节不是文本类型')
+    return parsed.text
+  }
+
+  async searchInBook(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const key = stringArg(args, 'key')
+    const db = this.requireDb()
+    const book = db.books.get(bookId) as Record<string, unknown> | undefined
+    if (!book) throw new Error('书不存在')
+    if (this.bookContentKind(book) !== 'text') {
+      throw new Error('该书不是文本类型，无法搜索')
+    }
+
+    const origin = String(book.origin ?? '')
+    const tocUrl = String(book.tocUrl || book.bookUrl || '')
+    if (!tocUrl) throw new Error('书没有目录地址')
+    const toc = await (this as any).getToc({ tocUrl, sourceUrl: origin })
+    const chapters = (toc?.chapters ?? []) as Array<Record<string, unknown>>
+
+    const rawFrom = Number(args?.fromIndex ?? 0)
+    const fromIndex = Number.isFinite(rawFrom)
+      ? Math.max(0, Math.min(chapters.length, Math.floor(rawFrom)))
+      : 0
+    // 单批上限固定 200 章；maxChapters 只能调小，避免长书一次阻塞。
+    const rawMax = Number(args?.maxChapters ?? 200)
+    const maxChapters = Number.isFinite(rawMax) ? Math.max(1, Math.min(200, Math.floor(rawMax))) : 200
+    const window = chapters.slice(fromIndex, fromIndex + maxChapters)
+    const nextIndex = fromIndex + window.length
+
+    const results: Array<{
+      chapterIndex: number
+      chapterTitle: string
+      count: number
+      snippet: string
+      pageHint: number
+    }> = []
+    const errors: Array<{ chapterIndex: number; chapterTitle: string; message: string }> = []
+    for (let offset = 0; offset < window.length; offset += 1) {
+      const chapterIndex = fromIndex + offset
+      const chapter = window[offset]!
+      if (chapter.isVolume || !chapter.url) continue
+      const chapterTitle = String(chapter.title ?? '')
+      try {
+        const text = htmlToText(await this.chapterTextForSearch(book, chapter))
+        const count = countOccurrences(text, key)
+        if (count > 0) {
+          const first = text.indexOf(key)
+          results.push({
+            chapterIndex,
+            chapterTitle,
+            count,
+            snippet: searchSnippet(text, first, key.length),
+            pageHint: Math.floor(first / SEARCH_PAGE_HINT_CHARS) + 1,
+          })
+        }
+      } catch (error) {
+        errors.push({
+          chapterIndex,
+          chapterTitle,
+          message: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+    return { results, nextIndex, done: nextIndex >= chapters.length, errors }
   }
 
   async cacheBook(args: Args) {
