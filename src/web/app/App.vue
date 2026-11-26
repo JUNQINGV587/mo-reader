@@ -436,6 +436,7 @@ async function refresh() {
     try {
       const fontResult = await call('listFonts')
       customFonts.value = fontResult?.fonts ?? []
+      syncExportFont()
       if (settings.value.fontId) await applyCustomFont(settings.value.fontId)
     } catch (error) {
       fontMessage.value = `字体加载失败：${errorText(error)}`
@@ -517,6 +518,9 @@ async function cacheBookChapters() {
 
 const exportJob = ref<any>(null)
 const exportDownload = ref<{ url: string; fileName: string } | null>(null)
+/** PDF 导出用的中文字体 id；空值交给服务端提示「请先上传中文字体」。 */
+const exportFontId = ref('')
+const exportMessage = ref('')
 let exportTimer: ReturnType<typeof setInterval> | null = null
 
 function isExportRunning(job: any) {
@@ -604,18 +608,36 @@ async function loadActiveExport() {
   syncExportTimer()
 }
 
-async function startExport(format: 'txt' | 'epub' = 'txt') {
+/** 导出字体默认跟随阅读字体，没设过就用列表第一个；是否可嵌入由服务端开工前校验。 */
+function syncExportFont() {
+  if (exportFontId.value && customFonts.value.some((font) => font.id === exportFontId.value)) return
+  const preferred = settings.value.fontId
+  exportFontId.value =
+    preferred && customFonts.value.some((font) => font.id === preferred)
+      ? preferred
+      : (customFonts.value[0]?.id ?? '')
+}
+
+async function startExport(format: 'txt' | 'epub' | 'pdf' = 'txt', fontId = '') {
   const book = currentBook.value as any
   if (!book?.id) return
   exportBusy.value = true
   exportDownload.value = null
+  exportMessage.value = ''
   try {
-    const result: any = await call('startExport', { bookId: book.id, format })
+    const payload: Record<string, unknown> = { bookId: book.id, format }
+    if (format === 'pdf') {
+      payload.fontId = fontId || exportFontId.value || settings.value.fontId || customFonts.value[0]?.id || ''
+    }
+    const result: any = await call('startExport', payload)
     exportJob.value = result?.job ?? null
     status.value = result?.existing ? '已有进行中的导出' : '已开始导出'
     syncExportTimer()
   } catch (error) {
-    status.value = errorText(error)
+    const message = errorText(error)
+    status.value = message
+    // 面板里也要能看到缺字体一类的失败原因。
+    if (format === 'pdf') exportMessage.value = message
   } finally {
     exportBusy.value = false
   }
@@ -1683,6 +1705,7 @@ async function uploadFontFile(event: Event) {
     const result = await call('uploadFont', { fileName: file.name, dataBase64: toBase64(bytes) })
     const list = await call('listFonts')
     customFonts.value = list?.fonts ?? []
+    exportFontId.value = result.font.id
     settings.value.fontId = result.font.id
     await applyCustomFont(settings.value.fontId)
     await persistSettings()
@@ -1708,6 +1731,7 @@ async function deleteFont(font: { id: string; name: string }) {
     }
     const list = await call('listFonts')
     customFonts.value = list?.fonts ?? []
+    syncExportFont()
     fontMessage.value = `已删除「${font.name}」`
   } catch (error) {
     fontMessage.value = `字体删除失败：${errorText(error)}`
@@ -3170,7 +3194,7 @@ onMounted(async () => {
                 data-testid="export-start"
                 @click="startExport('txt')"
               >
-                {{ isExportRunning(exportJob) && exportJob?.format !== 'epub' ? '导出中…' : '导出 TXT' }}
+                {{ isExportRunning(exportJob) && exportJob?.format === 'txt' ? '导出中…' : '导出 TXT' }}
               </button>
               <button
                 class="mo-btn"
@@ -3293,7 +3317,26 @@ onMounted(async () => {
             <h3>导出全本</h3>
             <span v-if="exportJob" class="mo-tag" data-testid="export-status">{{ exportStatusText(exportJob) }}</span>
           </div>
-          <p class="mo-download-summary">导出 TXT 或 EPUB 全本，目录多少章都导完；生成的文件保留 24 小时。</p>
+          <p class="mo-download-summary">导出 TXT、EPUB 或 PDF 全本，目录多少章都导完；生成的文件保留 24 小时。</p>
+          <div class="mo-download-actions">
+            <label class="mo-export-font">
+              <span>中文字体</span>
+              <select v-model="exportFontId" class="mo-select" data-testid="export-font">
+                <option value="">未选择</option>
+                <option v-for="font in customFonts" :key="font.id" :value="font.id">{{ font.name }}</option>
+              </select>
+            </label>
+            <button
+              class="mo-btn"
+              data-testid="export-pdf"
+              :disabled="exportBusy || isExportRunning(exportJob)"
+              @click="startExport('pdf')"
+            >
+              {{ isExportRunning(exportJob) && exportJob?.format === 'pdf' ? '导出中…' : '导出 PDF' }}
+            </button>
+          </div>
+          <p v-if="!customFonts.length" class="muted">PDF 需要使用中文字体，请先在阅读设置里上传。</p>
+          <p v-if="exportMessage" class="muted" data-testid="export-error">{{ exportMessage }}</p>
           <div v-if="exportJob" class="mo-download-progress">
             <span class="mo-download-bar"><span :style="{ width: `${exportPercent(exportJob)}%` }" /></span>
             <span>已完成 {{ exportJob.completed }} / {{ exportJob.total }} 章</span>
@@ -3324,7 +3367,7 @@ onMounted(async () => {
               v-if="!isExportRunning(exportJob) && exportJob.status !== 'done'"
               class="mo-btn"
               :disabled="exportBusy"
-              @click="startExport(exportJob.format)"
+              @click="startExport(exportJob.format, exportJob.fontId)"
             >
               重新导出
             </button>
@@ -5826,6 +5869,12 @@ textarea {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 10px;
+}
+.mo-export-font {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
 }
 
 </style>

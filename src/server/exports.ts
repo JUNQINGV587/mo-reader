@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { ChapterLimiter, isActiveJob, type JobStatus } from './download.js'
 import { buildEpub, type EpubCover } from './epub-export.js'
+import { buildPdf, type PdfCover } from './pdf-export.js'
 
 /** 导出作业的 kind：与下载作业共用 jobs 表，靠它区分。 */
 export const EXPORT_KIND = 'export'
@@ -15,7 +16,7 @@ export const EXPORT_SOURCE_CONCURRENCY = 2
 /** 进度落盘的节流窗口；没有定时器，只在章节收尾时按需写一次。 */
 export const EXPORT_FLUSH_MS = 500
 
-export type ExportFormat = 'txt' | 'epub'
+export type ExportFormat = 'txt' | 'epub' | 'pdf'
 
 export interface ExportJob {
   id: string
@@ -56,8 +57,10 @@ export interface ExportHost {
   loadToc(book: Record<string, unknown>): Promise<ExportChapter[]>
   /** 取一章正文：缓存优先，未缓存时在线抓取；非文本或空正文应抛错，由协调器计失败。 */
   readChapter(book: Record<string, unknown>, chapterIndex: number, chapter: ExportChapter): Promise<string>
-  /** 可选：取封面用于嵌入 EPUB；返回 null 或抛错都按无封面继续导出。 */
+  /** 可选：取封面用于嵌入 EPUB / PDF；返回 null 或抛错都按无封面继续导出。 */
   loadCover?(book: Record<string, unknown>): Promise<EpubCover | null>
+  /** 可选：按字体 id 取用户已上传的中文字体，PDF 导出必须在启动前校验可嵌入。 */
+  loadFont?(fontId: string): Promise<{ data: Buffer; format: string }>
 }
 
 export interface ExportListFilter {
@@ -99,6 +102,7 @@ export function exportFileName(bookName: string, format: ExportFormat): string {
 export function contentTypeOf(format: string): string {
   if (format === 'txt') return 'text/plain; charset=utf-8'
   if (format === 'epub') return 'application/epub+zip'
+  if (format === 'pdf') return 'application/pdf'
   return 'application/octet-stream'
 }
 
@@ -173,7 +177,11 @@ export class ExportCoordinator {
 
   constructor(private readonly host: ExportHost) {}
 
-  async start(bookId: string, format: ExportFormat): Promise<{ job: ExportJob; existing: boolean }> {
+  async start(
+    bookId: string,
+    format: ExportFormat,
+    options: { fontId?: string } = {},
+  ): Promise<{ job: ExportJob; existing: boolean }> {
     const db = this.host.db()
     const book = db.books.get(bookId) as Record<string, unknown> | undefined
     if (!book) throw new Error('书不存在')
@@ -196,7 +204,7 @@ export class ExportCoordinator {
       fileName: exportFileName(String(book.name ?? ''), format),
       filePath: '',
       size: 0,
-      fontId: '',
+      fontId: format === 'pdf' ? String(options.fontId ?? '') : '',
       fromIndex: 0,
       toIndex: 0,
       all: true,
@@ -411,6 +419,7 @@ export class ExportCoordinator {
     texts: Array<{ title: string; text: string } | null>,
   ): Promise<void> {
     if (job.format === 'epub') return this.assembleEpub(job, book, texts)
+    if (job.format === 'pdf') return this.assemblePdf(job, book, texts)
     return this.assembleTxt(job, book, texts)
   }
 
@@ -474,6 +483,68 @@ export class ExportCoordinator {
       title: String(book.name || '未命名'),
       author: String(book.author || ''),
       chapters,
+      cover,
+    })
+    const root = await ensureExportRoot()
+    const relative = exportArtifactName(job.id, job.format)
+    const absolute = join(root, relative)
+    await writeFile(absolute, data)
+    const info = await stat(absolute)
+    job.filePath = relative
+    job.fileName = exportFileName(String(book.name || ''), job.format)
+    job.size = info.size
+    job.bytes = info.size
+    job.status = 'done'
+    job.error = ''
+  }
+
+  /**
+   * PDF 全本：A5 版心、章节标题与页码、中文字体子集内嵌；
+   * 封面可选（PDFKit 只认 JPEG/PNG，webp 直接跳过），无封面不影响成书。
+   */
+  private async assemblePdf(
+    job: ExportJob,
+    book: Record<string, unknown>,
+    texts: Array<{ title: string; text: string } | null>,
+  ): Promise<void> {
+    const chapters: Array<{ title: string; text: string }> = []
+    for (const entry of texts) {
+      if (!entry) continue
+      chapters.push({ title: entry.title || `第${chapters.length + 1}章`, text: entry.text })
+    }
+    if (!chapters.length) {
+      job.status = 'failed'
+      job.error = job.failed > 0 ? '全部章节导出失败' : '没有可导出的章节'
+      return
+    }
+    if (!this.host.loadFont) {
+      job.status = 'failed'
+      job.error = '请先上传中文字体'
+      return
+    }
+    let font: { data: Buffer; format: string }
+    try {
+      font = await this.host.loadFont(job.fontId)
+    } catch {
+      // 字体在排队期间被删掉时也不生成半成品。
+      job.status = 'failed'
+      job.error = '请先上传中文字体'
+      return
+    }
+    let cover: PdfCover | null = null
+    if (this.host.loadCover) {
+      try {
+        cover = await this.host.loadCover(book)
+      } catch {
+        // 封面只是加分项：抓取失败按无封面继续导出。
+        cover = null
+      }
+    }
+    const data = await buildPdf({
+      title: String(book.name || '未命名'),
+      author: String(book.author || ''),
+      chapters,
+      font: font.data,
       cover,
     })
     const root = await ensureExportRoot()

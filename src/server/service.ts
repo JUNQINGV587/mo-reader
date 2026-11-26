@@ -44,6 +44,7 @@ import {
   type DownloadHost,
 } from './download.js'
 import { buildEpub } from './epub-export.js'
+import { assertEmbeddableFont } from './pdf-export.js'
 import { loadCoverImage } from './export-cover.js'
 import {
   EXPORT_KIND,
@@ -1141,13 +1142,28 @@ export class ReaderService extends TypertRemoteService {
   }
 
   /**
-   * 发起全本导出（TXT / EPUB）：不截断目录，缓存优先、未缓存的在线抓，单章失败只计失败。
-   * 同一本书同一格式同时只保留一个活动作业。
+   * 发起全本导出（TXT / EPUB / PDF）：不截断目录，缓存优先、未缓存的在线抓，单章失败只计失败。
+   * 同一本书同一格式同时只保留一个活动作业；PDF 必须在创建作业前确认中文字体可用。
    */
   async startExport(args: Args) {
     const bookId = stringArg(args, 'bookId')
     const format = String(args?.format ?? 'txt').trim().toLowerCase()
-    if (format !== 'txt' && format !== 'epub') throw new Error('暂只支持 TXT / EPUB 导出')
+    if (format !== 'txt' && format !== 'epub' && format !== 'pdf') {
+      throw new Error('暂只支持 TXT / EPUB / PDF 导出')
+    }
+    if (format === 'pdf') {
+      // 校验放在起作业之前：没有可用中文字体时直接拒绝，不排半成品作业。
+      const fontId = typeof args?.fontId === 'string' ? args.fontId.trim() : ''
+      if (!fontId) throw new Error('请先上传中文字体')
+      try {
+        const { font, data } = await readCustomFont(fontId)
+        if (font.format !== 'truetype' && font.format !== 'opentype') throw new Error('字体格式不可嵌入')
+        assertEmbeddableFont(data)
+      } catch {
+        throw new Error('请先上传中文字体')
+      }
+      return this.exportManager().start(bookId, 'pdf', { fontId })
+    }
     return this.exportManager().start(bookId, format as ExportFormat)
   }
 
@@ -1668,6 +1684,10 @@ export class ReaderService extends TypertRemoteService {
         return text
       },
       loadCover: (book) => this.fetchExportCover(book),
+      loadFont: async (fontId) => {
+        const { font, data } = await readCustomFont(fontId)
+        return { data, format: font.format }
+      },
     }
   }
 

@@ -430,7 +430,10 @@ test('导出地址只在完成后给出，产物过期报错', async () => {
 
 test('暂不支持的导出格式直接拒绝', async () => {
   const harness = await makeHarness({ chapters: 1 })
-  await assert.rejects(harness.service.startExport({ bookId: 'book-1', format: 'pdf' }), /暂只支持 TXT \/ EPUB 导出/)
+  await assert.rejects(
+    harness.service.startExport({ bookId: 'book-1', format: 'mobi' }),
+    /暂只支持 TXT \/ EPUB \/ PDF 导出/,
+  )
 })
 
 // 1x1 透明 PNG：封面测试只关心字节原样嵌入，不需要真实图片内容。
