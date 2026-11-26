@@ -1,6 +1,5 @@
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
-import { pathToFileURL } from 'node:url'
 import type { ImportedBook, ImportedChapter } from './txt.js'
 
 interface PdfInfo {
@@ -52,8 +51,13 @@ function packageDirectory(): string {
   return dirname(require.resolve('pdfjs-dist/package.json'))
 }
 
-function directoryUrl(path: string): string {
-  return pathToFileURL(join(path, '/')).href
+/**
+ * 两条约束：pdfjs 在 Node 下用 `fs.readFile` 读取这些资源，所以只能给文件系统路径（file:// 读不到，
+ * CMap 缺失时字体文本项为空）；`getFactoryUrlProp` 又要求字符串以 `/` 结尾，否则抛 Invalid factory url。
+ * 浏览器侧（原版阅读）走的是 /reader/pdfjs/ HTTP 路由，见 core/pdfjs-assets.ts。
+ */
+function assetDirectory(root: string, name: string): string {
+  return join(root, name) + '/'
 }
 
 /** 将 PDF 按原页序提取为可检索的本地文本章节。 */
@@ -69,10 +73,10 @@ export async function parsePdf(buffer: Uint8Array, fileName: string): Promise<Im
   data.set(buffer)
   const loadingTask = getDocument({
     data,
-    cMapUrl: directoryUrl(join(root, 'cmaps')),
+    cMapUrl: assetDirectory(root, 'cmaps'),
     cMapPacked: true,
-    standardFontDataUrl: directoryUrl(join(root, 'standard_fonts')),
-    wasmUrl: directoryUrl(join(root, 'wasm')),
+    standardFontDataUrl: assetDirectory(root, 'standard_fonts'),
+    wasmUrl: assetDirectory(root, 'wasm'),
     disableAutoFetch: true,
     disableStream: true,
     useSystemFonts: true,

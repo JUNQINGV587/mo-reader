@@ -113,6 +113,36 @@ function makePdf(pages, { title = 'PDF Fixture', author = 'Author A' } = {}) {
   return Buffer.from(pdf, 'ascii')
 }
 
+function makeCjkPdf({ withLatin = true } = {}) {
+  // CID 编码、字体不嵌入：文本提取与字形都依赖 pdfjs 的 cmaps。
+  // withLatin=false 时整页只有中文，旧实现会把它当扫描件拒收。
+  const content = [
+    ...(withLatin ? ['BT /F1 12 Tf 72 720 Td (Hello Reader) Tj ET'] : []),
+    'BT /F2 36 Tf 72 660 Td <4F60597D> Tj ET',
+  ].join('\n')
+  const objects = []
+  objects[1] = '<< /Type /Catalog /Pages 2 0 R >>'
+  objects[2] = '<< /Type /Pages /Count 1 /Kids [3 0 R] >>'
+  objects[3] = '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 7 0 R >>'
+  objects[4] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+  objects[5] = '<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H /DescendantFonts [6 0 R] >>'
+  objects[6] = '<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 2 >> /DW 1000 >>'
+  objects[7] = `<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}\nendstream`
+
+  let pdf = '%PDF-1.4\n'
+  const offsets = [0]
+  for (let index = 1; index <= 7; index += 1) {
+    offsets[index] = Buffer.byteLength(pdf)
+    pdf += `${index} 0 obj\n${objects[index]}\nendobj\n`
+  }
+  const xref = Buffer.byteLength(pdf)
+  pdf += 'xref\n0 8\n0000000000 65535 f \n'
+  for (let index = 1; index <= 7; index += 1) {
+    pdf += `${String(offsets[index]).padStart(10, '0')} 00000 n \n`
+  }
+  pdf += `trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`
+  return Buffer.from(pdf, 'latin1')
+}
 test('TXT 解码与章节切分', () => {
   const chaptered = parseTxt(Buffer.from(TXT, 'utf8'), '测试书.txt')
   assert.equal(chaptered.name, '测试书')
@@ -166,6 +196,19 @@ test('EPUB 解析与本地导入 Remote', async () => {
   const removed = await service.removeBooks({ ids: [imported.book.id] })
   assert.equal(removed.deleted, 1)
   await rm(join(LOCAL_ROOT, imported.book.id), { recursive: true, force: true })
+})
+
+test('未嵌入字体的 CID 中文 PDF 能提取文字', async () => {
+  const parsed = await parsePdf(makeCjkPdf(), 'cjk.pdf')
+  const text = parsed.chapters.map((chapter) => chapter.content).join('\n')
+  assert.match(text, /Hello Reader/)
+  assert.match(text, /你好/)
+})
+
+test('纯 CID 中文 PDF 不再被当成扫描件拒收', async () => {
+  const parsed = await parsePdf(makeCjkPdf({ withLatin: false }), 'cjk-only.pdf')
+  const text = parsed.chapters.map((chapter) => chapter.content).join('\n')
+  assert.equal(text.trim(), '你好')
 })
 
 test('PDF 解析与本地导入 Remote', async () => {
