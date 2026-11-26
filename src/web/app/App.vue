@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import CanvasReader from '../reader/CanvasReader.vue'
 import ComicReader from '../reader/ComicReader.vue'
 import AudioReader from '../reader/AudioReader.vue'
@@ -539,6 +539,157 @@ async function exportBook(format: 'txt' | 'epub') {
     exportBusy.value = false
   }
 }
+
+
+type DownloadScope = 'rest' | 'all' | 'range'
+const downloadScope = ref<DownloadScope>('rest')
+const downloadFrom = ref(1)
+const downloadTo = ref(1)
+const downloadJob = ref<any>(null)
+const downloadBusy = ref(false)
+let downloadTimer: ReturnType<typeof setInterval> | null = null
+
+function formatBytes(value: number) {
+  const size = Number(value) || 0
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
+function isDownloadRunning(job: any) {
+  return job?.status === 'running' || job?.status === 'queued'
+}
+
+function downloadStatusText(job: any) {
+  if (!job) return ''
+  if (job.status === 'paused') return job.error === '宿主重启' ? '已暂停（宿主重启）' : '已暂停'
+  if (job.status === 'queued') return '排队中'
+  if (job.status === 'running') return '下载中'
+  if (job.status === 'done') return '已完成'
+  if (job.status === 'cancelled') return '已取消'
+  return job.status === 'failed' ? '失败' : String(job.status)
+}
+
+function downloadPercent(job: any) {
+  const total = Number(job?.total) || 0
+  if (!total) return 0
+  const handled = Number(job.completed) + Number(job.failed) + Number(job.skipped)
+  return Math.max(0, Math.min(100, Math.round((handled / total) * 100)))
+}
+
+function stopDownloadTimer() {
+  if (downloadTimer !== null) {
+    clearInterval(downloadTimer)
+    downloadTimer = null
+  }
+}
+
+function syncDownloadTimer() {
+  if (isDownloadRunning(downloadJob.value)) {
+    if (downloadTimer === null) downloadTimer = setInterval(refreshDownloadJob, 600)
+  } else {
+    stopDownloadTimer()
+  }
+}
+
+async function refreshDownloadJob() {
+  const job = downloadJob.value
+  if (!job?.id) return
+  try {
+    const result: any = await call('getJob', { id: job.id })
+    downloadJob.value = result?.job ?? downloadJob.value
+  } catch (error) {
+    status.value = errorText(error)
+  }
+  syncDownloadTimer()
+}
+
+async function loadActiveDownload() {
+  downloadJob.value = null
+  const book = currentBook.value as any
+  downloadFrom.value = 1
+  downloadTo.value = Math.max(1, chapters.value.length)
+  if (!book?.id) {
+    syncDownloadTimer()
+    return
+  }
+  try {
+    const result: any = await call('listJobs', { bookId: book.id, kind: 'download' })
+    const jobs: any[] = Array.isArray(result?.jobs) ? result.jobs : []
+    const active = jobs.find((job) => ['queued', 'running', 'paused'].includes(job.status))
+    downloadJob.value = active ?? jobs[0] ?? null
+  } catch {
+    downloadJob.value = null
+  }
+  syncDownloadTimer()
+}
+
+async function startDownload() {
+  const book = currentBook.value as any
+  if (!book?.id) return
+  const args: any = { bookId: book.id }
+  if (downloadScope.value === 'all') {
+    args.all = true
+  } else if (downloadScope.value === 'range') {
+    const last = Math.max(1, chapters.value.length)
+    const from = Math.max(1, Math.min(last, Number(downloadFrom.value) || 1))
+    const to = Math.max(from, Math.min(last, Number(downloadTo.value) || last))
+    args.fromIndex = from - 1
+    args.toIndex = to - 1
+  } else {
+    args.fromIndex = Math.max(0, Number(progress.value?.chapterIndex ?? 0) || 0)
+  }
+  downloadBusy.value = true
+  try {
+    const result: any = await call('startDownload', args)
+    downloadJob.value = result?.job ?? null
+    status.value = result?.existing ? '已有进行中的下载' : '已开始下载'
+    syncDownloadTimer()
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    downloadBusy.value = false
+  }
+}
+
+async function controlDownload(method: string, message: string) {
+  const job = downloadJob.value
+  if (!job?.id) return
+  downloadBusy.value = true
+  try {
+    const result: any = await call(method, { id: job.id })
+    downloadJob.value = result?.job ?? downloadJob.value
+    status.value = message
+  } catch (error) {
+    status.value = errorText(error)
+  } finally {
+    downloadBusy.value = false
+    syncDownloadTimer()
+  }
+}
+
+function pauseDownload() {
+  void controlDownload('pauseJob', '已暂停下载')
+}
+
+function resumeDownload() {
+  void controlDownload('resumeJob', '继续下载')
+}
+
+function cancelDownload() {
+  void controlDownload('cancelJob', '已取消下载')
+}
+
+function retryDownload() {
+  void controlDownload('retryDownload', '重试失败章节')
+}
+
+watch(view, (next) => {
+  if (next === 'detail') void loadActiveDownload()
+  else stopDownloadTimer()
+})
+
+onUnmounted(stopDownloadTimer)
 
 const reviewOpen = ref(false)
 const reviewBusy = ref(false)
@@ -2851,6 +3002,77 @@ onMounted(async () => {
                 {{ progress.chapterTitle || `第 ${progress.chapterIndex + 1} 章` }}
               </span>
             </div>
+          </div>
+        </div>
+
+        <div v-if="currentBook.origin !== 'local'" class="mo-download" data-testid="download-panel">
+          <div class="mo-download-head">
+            <h3>离线下载</h3>
+            <span v-if="downloadJob" class="mo-tag" data-testid="download-status">{{ downloadStatusText(downloadJob) }}</span>
+          </div>
+          <div class="mo-download-scope">
+            <label><input v-model="downloadScope" type="radio" value="rest" />从当前章到末尾</label>
+            <label><input v-model="downloadScope" type="radio" value="all" />整本</label>
+            <label><input v-model="downloadScope" type="radio" value="range" />指定起止</label>
+            <template v-if="downloadScope === 'range'">
+              <input v-model.number="downloadFrom" type="number" min="1" :max="chapters.length" aria-label="起始章" />
+              <span>至</span>
+              <input v-model.number="downloadTo" type="number" min="1" :max="chapters.length" aria-label="结束章" />
+            </template>
+            <button
+              class="mo-btn primary"
+              data-testid="download-start"
+              :disabled="downloadBusy || isDownloadRunning(downloadJob)"
+              @click="startDownload"
+            >
+              开始下载
+            </button>
+          </div>
+          <div v-if="downloadJob" class="mo-download-progress">
+            <span class="mo-download-bar"><span :style="{ width: `${downloadPercent(downloadJob)}%` }" /></span>
+            <span data-testid="download-done">已完成 {{ downloadJob.completed }} / {{ downloadJob.total }} 章</span>
+            <span>失败 {{ downloadJob.failed }}</span>
+            <span>跳过 {{ downloadJob.skipped }}</span>
+            <span>{{ formatBytes(downloadJob.bytes) }}</span>
+          </div>
+          <p v-if="downloadJob?.error && downloadJob.status !== 'paused'" class="muted">{{ downloadJob.error }}</p>
+          <div v-if="downloadJob" class="mo-download-actions">
+            <button
+              v-if="isDownloadRunning(downloadJob)"
+              class="mo-btn"
+              data-testid="download-pause"
+              :disabled="downloadBusy"
+              @click="pauseDownload"
+            >
+              暂停
+            </button>
+            <button
+              v-if="downloadJob.status === 'paused'"
+              class="mo-btn primary"
+              data-testid="download-resume"
+              :disabled="downloadBusy"
+              @click="resumeDownload"
+            >
+              继续
+            </button>
+            <button
+              v-if="['queued', 'running', 'paused'].includes(downloadJob.status)"
+              class="mo-btn danger"
+              data-testid="download-cancel"
+              :disabled="downloadBusy"
+              @click="cancelDownload"
+            >
+              取消
+            </button>
+            <button
+              v-if="downloadJob.failed > 0 && !isDownloadRunning(downloadJob)"
+              class="mo-btn"
+              data-testid="download-retry"
+              :disabled="downloadBusy"
+              @click="retryDownload"
+            >
+              重试失败章
+            </button>
           </div>
         </div>
 
@@ -5263,4 +5485,70 @@ textarea {
   line-height: 1.9;
   font-size: 15px;
 }
+.mo-download {
+  margin: 16px 0 4px;
+  padding: 14px 16px;
+  border: 1px solid var(--mo-line);
+  border-radius: 10px;
+}
+.mo-download-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.mo-download-head h3 {
+  margin: 0;
+  font: 600 15px/1.3 'Songti SC', 'Noto Serif SC', serif;
+}
+.mo-download-scope {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+}
+.mo-download-scope label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.mo-download-scope input[type='number'] {
+  width: 64px;
+  padding: 4px 6px;
+  border: 1px solid var(--mo-line);
+  border-radius: 6px;
+  background: var(--mo-paper);
+  color: inherit;
+  font: inherit;
+}
+.mo-download-progress {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 0;
+  font-size: 13px;
+}
+.mo-download-bar {
+  flex: 1 1 120px;
+  min-width: 120px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--mo-line);
+  overflow: hidden;
+}
+.mo-download-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--mo-accent);
+}
+.mo-download-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 </style>

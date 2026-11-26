@@ -30,13 +30,17 @@ export async function writeCachedChapter(sourceUrl: string, chapterUrl: string, 
   return Buffer.byteLength(text, 'utf8')
 }
 
-export async function hasCachedChapter(sourceUrl: string, chapterUrl: string): Promise<boolean> {
+export async function cachedChapterSize(sourceUrl: string, chapterUrl: string): Promise<number> {
   try {
     const info = await stat(fileOf(sourceUrl, chapterUrl))
-    return info.isFile() && info.size > 0
+    return info.isFile() ? info.size : 0
   } catch {
-    return false
+    return 0
   }
+}
+
+export async function hasCachedChapter(sourceUrl: string, chapterUrl: string): Promise<boolean> {
+  return (await cachedChapterSize(sourceUrl, chapterUrl)) > 0
 }
 
 export async function clearChapterCache(sourceUrl: string, chapterUrl?: string): Promise<number> {

@@ -4,6 +4,28 @@ import { DEFAULT_MENU_ITEMS, DEFAULT_TAP_ZONES } from '../core/reader/reader-con
 
 const identified = z.object({ id: z.string().min(1).max(4096) }).passthrough()
 
+/** 下载/导出等后台作业：服务重启后据它恢复暂停态，故记录需带完整进度字段。 */
+const jobRecord = z
+  .object({
+    id: z.string().min(1).max(4096),
+    kind: z.string().min(1).max(80).default('download'),
+    bookId: z.string().max(4096).default(''),
+    bookName: z.string().max(4096).default(''),
+    status: z.enum(['queued', 'running', 'paused', 'done', 'failed', 'cancelled']).default('queued'),
+    fromIndex: z.number().int().min(0).default(0),
+    toIndex: z.number().int().min(0).default(0),
+    all: z.boolean().default(false),
+    total: z.number().int().min(0).default(0),
+    completed: z.number().int().min(0).default(0),
+    failed: z.number().int().min(0).default(0),
+    skipped: z.number().int().min(0).default(0),
+    bytes: z.number().int().min(0).default(0),
+    error: z.string().max(4096).default(''),
+    createdAt: z.number().int().min(0).default(0),
+    updatedAt: z.number().int().min(0).default(0),
+  })
+  .passthrough()
+
 /**
  * 墨读的新领域：与旧实现的 `reader` 域分开，避免旧记录过不了新 schema。
  * 旧数据按设计不迁移，书源/书架/进度在 M1 起重新导入。
@@ -97,7 +119,7 @@ export const ReaderDomain = defineDomain({
     notes: domainTable(identified),
     bookmarks: domainTable(identified),
     read_records: domainTable(identified),
-    jobs: domainTable(identified),
+    jobs: domainTable(jobRecord),
     subscriptions: domainTable(identified),
   },
 })

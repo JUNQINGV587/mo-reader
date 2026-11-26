@@ -31,7 +31,14 @@ import {
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
 import { mapSwitchProgress, matchBookName, sameAuthorName } from '../core/source/switch.js'
 import { openReaderStorage } from './storage.js'
-import { hasCachedChapter, readCachedChapter, writeCachedChapter } from './cache.js'
+import { readCachedChapter } from './cache.js'
+import {
+  DEFAULT_RETRY_BASE_MS,
+  DownloadCoordinator,
+  ensureChapterCached,
+  recoverInterruptedJobs,
+  type DownloadHost,
+} from './download.js'
 import { buildEpub } from './epub-export.js'
 import { listCustomFonts, readCustomFont, removeCustomFont, saveCustomFont } from './fonts.js'
 import { isKnownTheme, normalizeCustomThemes } from '../core/reader/theme.js'
@@ -153,6 +160,11 @@ export class ReaderService extends TypertRemoteService {
 
   db: any = null
 
+  /** 下载作业协调器，按需创建；测试可直接改 downloadRetryBaseMs 缩短重试间隔。 */
+  downloadsCoordinator: DownloadCoordinator | null = null
+
+  downloadRetryBaseMs = DEFAULT_RETRY_BASE_MS
+
   constructor(ctx: any, _options: any = {}) {
     super(ctx, 'reader')
     const service: any = this
@@ -171,9 +183,20 @@ export class ReaderService extends TypertRemoteService {
 
   async [Service.init]() {
     this.db = await openReaderStorage(this.ctx)
+    // 重启后残留的 running/queued 作业没人接手：标为暂停并注明原因。
+    try {
+      await recoverInterruptedJobs(this.db.jobs)
+    } catch {
+      // 作业恢复失败不应阻止服务启动。
+    }
     const ctx = this.ctx as any
     ctx.effect(
       () => async () => {
+        try {
+          await this.downloadsCoordinator?.shutdown()
+        } finally {
+          this.downloadsCoordinator = null
+        }
         await this.db?.domain?.close?.()
         this.db = null
       },
@@ -872,6 +895,8 @@ export class ReaderService extends TypertRemoteService {
     const toc = await (this as any).getToc({ tocUrl: String(book.tocUrl || book.bookUrl || ''), sourceUrl })
     const chapters = (toc?.chapters ?? []) as Array<{ url?: string; title?: string }>
     const start = Number(book.durChapterIndex ?? 0) || 0
+    const host = this.downloadHost()
+    const retryBase = this.retryBase()
     let cached = 0
     let failed = 0
     let bytes = 0
@@ -879,27 +904,63 @@ export class ReaderService extends TypertRemoteService {
       const url = chapters[i]?.url
       if (!url) continue
       try {
-        if (await hasCachedChapter(sourceUrl, url)) {
-          cached += 1
-          continue
-        }
-        const content = await (this as any).getContent({ sourceUrl, chapterUrl: url })
-        if (content?.kind && content.kind !== 'text') {
-          failed += 1
-          continue
-        }
-        const text = String(content?.content ?? '')
-        if (!text) {
-          failed += 1
-          continue
-        }
-        bytes += await writeCachedChapter(sourceUrl, url, text)
+        // 与整本下载共用同一段单章逻辑：命中缓存直接计完成，否则抓取并写缓存。
+        const result = await ensureChapterCached(host, sourceUrl, url, retryBase)
+        if (!result.cached) bytes += result.bytes
         cached += 1
       } catch {
         failed += 1
       }
     }
     return { cached, failed, bytes, total: chapters.length, start }
+  }
+
+  async startDownload(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const options: { fromIndex?: number; toIndex?: number; all?: boolean } = {}
+    if (args?.all === true || args?.all === 'true') options.all = true
+    if (args?.fromIndex !== undefined && args?.fromIndex !== null && args?.fromIndex !== '') {
+      options.fromIndex = Number(args.fromIndex)
+    }
+    if (args?.toIndex !== undefined && args?.toIndex !== null && args?.toIndex !== '') {
+      options.toIndex = Number(args.toIndex)
+    }
+    return this.downloadManager().start(bookId, options)
+  }
+
+  async pauseJob(args: Args) {
+    return this.downloadManager().pause(stringArg(args, 'id'))
+  }
+
+  async resumeJob(args: Args) {
+    return this.downloadManager().resume(stringArg(args, 'id'))
+  }
+
+  async cancelJob(args: Args) {
+    return this.downloadManager().cancel(stringArg(args, 'id'))
+  }
+
+  async retryDownload(args: Args) {
+    return this.downloadManager().retry(stringArg(args, 'id'))
+  }
+
+  async getJob(args: Args) {
+    return this.downloadManager().get(stringArg(args, 'id'))
+  }
+
+  async listJobs(args: Args) {
+    return {
+      jobs: this.downloadManager().list({
+        bookId: typeof args?.bookId === 'string' ? args.bookId : undefined,
+        kind: typeof args?.kind === 'string' ? args.kind : undefined,
+        status: typeof args?.status === 'string' ? args.status : undefined,
+      }),
+    }
+  }
+
+  /** 测试/关停用：等待所有下载协程收尾。 */
+  async waitForDownloads() {
+    await this.downloadManager().waitIdle()
   }
 
   async exportBook(args: Args) {
@@ -1407,6 +1468,38 @@ export class ReaderService extends TypertRemoteService {
       await this.requireDb().settings.set({ ...current, fontId: '' })
     }
     return result
+  }
+
+  private downloadManager(): DownloadCoordinator {
+    if (!this.downloadsCoordinator) {
+      this.downloadsCoordinator = new DownloadCoordinator(this.downloadHost())
+    }
+    return this.downloadsCoordinator
+  }
+
+  private downloadHost(): DownloadHost {
+    return {
+      db: () => this.requireDb(),
+      getContent: (args) => (this as any).getContent(args),
+      loadToc: async (book) => {
+        const toc = await (this as any).getToc({
+          tocUrl: String(book.tocUrl || book.bookUrl || ''),
+          sourceUrl: String(book.origin || ''),
+        })
+        return (toc?.chapters ?? []) as Array<{ title: string; url: string; isVolume: boolean }>
+      },
+      currentChapterIndex: (bookId, book) => {
+        const record = this.requireDb().readRecords?.get(bookId)
+        const index = Number(record?.chapterIndex ?? book.durChapterIndex ?? 0)
+        return Number.isFinite(index) ? index : 0
+      },
+      retryBaseMs: () => this.downloadRetryBaseMs,
+    }
+  }
+
+  private retryBase(): number {
+    const value = Number(this.downloadRetryBaseMs)
+    return Number.isFinite(value) && value >= 0 ? value : DEFAULT_RETRY_BASE_MS
   }
 
   private requireDb(): any {
