@@ -95,6 +95,57 @@ function sourceKey(bookSourceUrl: string): string {
     : `src-${createHash('sha1').update(bookSourceUrl).digest('hex').slice(0, 24)}`
 }
 
+/** 在线检查并发上限与超时范围：一次只打 8 个源，单请求 0.5–30 秒。 */
+const SOURCE_CHECK_CONCURRENCY = 8
+const SOURCE_CHECK_TIMEOUT_MS = 5000
+const SOURCE_CHECK_TIMEOUT_MIN_MS = 500
+const SOURCE_CHECK_TIMEOUT_MAX_MS = 30_000
+
+interface SourceCheckResult {
+  url: string
+  ok: boolean
+  status: number | null
+  elapsedMs: number
+  error: string
+}
+
+function clampCheckTimeout(value: unknown): number {
+  const raw =
+    typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : SOURCE_CHECK_TIMEOUT_MS
+  return Math.min(SOURCE_CHECK_TIMEOUT_MAX_MS, Math.max(SOURCE_CHECK_TIMEOUT_MIN_MS, raw))
+}
+
+function checkErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    if (error.name === 'TimeoutError' || error.name === 'AbortError') return '请求超时'
+    return error.message || '请求失败'
+  }
+  return String(error)
+}
+
+async function checkOneSource(url: string, timeoutMs: number): Promise<SourceCheckResult> {
+  const started = Date.now()
+  try {
+    const response = await fetchText(url, { timeoutMs })
+    const ok = response.status >= 200 && response.status < 400
+    return {
+      url,
+      ok,
+      status: response.status,
+      elapsedMs: Date.now() - started,
+      error: ok ? '' : `HTTP ${response.status}`,
+    }
+  } catch (error) {
+    return {
+      url,
+      ok: false,
+      status: null,
+      elapsedMs: Date.now() - started,
+      error: checkErrorMessage(error),
+    }
+  }
+}
+
 export class ReaderService extends TypertRemoteService {
   static inject = ['storageDomain', 'timer']
 
@@ -220,6 +271,62 @@ export class ReaderService extends TypertRemoteService {
       updated += 1
     }
     return { updated }
+  }
+
+  /** 导出书源为 Legado 兼容 JSON：去掉内部存储 id，其余字段原样保留。 */
+  async exportSources(args: Args) {
+    const raw = args?.ids
+    const ids = Array.isArray(raw)
+      ? raw
+          .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+          .map((id) => id.trim())
+      : []
+    if (ids.length === 0) throw new Error('缺少参数 ids')
+    const db = this.requireDb()
+    const sources: Array<Record<string, unknown>> = []
+    const seen = new Set<string>()
+    for (const id of ids) {
+      // 兼容两种入参：存储 key（listSources 返回的 id）或书源 URL。
+      const key = db.sources.get(id) !== undefined ? id : sourceKey(id)
+      if (seen.has(key)) continue
+      const source = db.sources.get(key) as (BookSource & { id?: string }) | undefined
+      if (!source) continue
+      seen.add(key)
+      const out: Record<string, unknown> = { ...source }
+      delete out.id
+      sources.push(out)
+    }
+    if (sources.length === 0) throw new Error('书源不存在')
+    return { json: JSON.stringify(sources, null, 2), count: sources.length }
+  }
+
+  /**
+   * 在线可达性检查：逐条请求书源地址，按输入顺序返回结果。
+   * 与静态结构检查（checkReport）无关，只回答「现在能不能连上」。
+   */
+  async checkSources(args: Args) {
+    const raw = args?.urls
+    const urls = Array.isArray(raw)
+      ? raw
+          .filter((url): url is string => typeof url === 'string' && url.trim().length > 0)
+          .map((url) => url.trim())
+      : []
+    if (urls.length === 0) throw new Error('缺少参数 urls')
+    const timeoutMs = clampCheckTimeout(args?.timeoutMs)
+    const results: SourceCheckResult[] = new Array(urls.length)
+    let cursor = 0
+    const worker = async () => {
+      for (;;) {
+        const index = cursor
+        cursor += 1
+        if (index >= urls.length) return
+        results[index] = await checkOneSource(urls[index], timeoutMs)
+      }
+    }
+    await Promise.all(
+      Array.from({ length: Math.min(SOURCE_CHECK_CONCURRENCY, urls.length) }, () => worker()),
+    )
+    return { results }
   }
 
   async listDictRules() {

@@ -6,6 +6,8 @@ export const REMOTE_METHODS = Object.freeze([
   'saveSource',
   'deleteSources',
   'setSourcesEnabled',
+  'exportSources',
+  'checkSources',
   'listDictRules',
   'saveDictRule',
   'deleteDictRules',
