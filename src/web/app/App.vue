@@ -10,6 +10,7 @@ import {
   buildSpeechPlan,
   classifySpeechError,
   segmentIndexForOffset,
+  speechBlockedMessage,
   speechErrorNotice,
   SpeechCursor,
   SPEECH_NO_VOICE_MESSAGE,
@@ -253,6 +254,8 @@ const settings = ref<ReaderSettings>(defaultReaderSettings())
 type SettingsScope = 'global' | 'book'
 /** 作用域是用户选择，记在本机，刷新后仍停在同一层。 */
 const SETTINGS_SCOPE_KEY = 'mo-reader-settings-scope'
+/** Chrome 的音色列表常异步到达：最多等这么久，仍为空即认定没有中文音色 */
+const SPEECH_VOICE_WAIT_MS = 1200
 function storedSettingsScope(): SettingsScope {
   try {
     return localStorage.getItem(SETTINGS_SCOPE_KEY) === 'book' ? 'book' : 'global'
@@ -312,6 +315,8 @@ const speechSegmentIndex = ref(0)
 const speechSegmentTotal = ref(0)
 const speechChapterTitle = ref('')
 const speechVoices = ref<SpeechSynthesisVoice[]>([])
+const speechVoicesLoaded = ref(false)
+let speechVoiceWaitTimer = 0
 /** 搜索高亮：关键词命中的原文绝对范围（与朗读高亮分开，朗读优先） */
 const highlightText = ref<{ start: number; end: number } | null>(null)
 let speechPlan: SpeechPlan | null = null
@@ -1646,6 +1651,7 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onReaderEscape)
   document.removeEventListener('visibilitychange', onReaderVisibilityChange)
   window.speechSynthesis?.removeEventListener?.('voiceschanged', loadSpeechVoices)
+  clearSpeechVoiceWait()
   stopSpeech()
   if (readerHintTimer) clearTimeout(readerHintTimer)
   releaseKeepAwake()
@@ -3428,24 +3434,48 @@ const chineseSpeechVoices = computed(() =>
   speechVoices.value.filter((voice) => voice.lang?.toLowerCase().startsWith('zh')),
 )
 
-/** 入口禁用原因；音色列表尚未加载时为空，避免首屏误判 */
-const speechBlockedReason = computed(() => {
-  if (!speechSupported.value) return SPEECH_UNSUPPORTED_MESSAGE
-  if (speechVoices.value.length === 0) return ''
-  return chineseSpeechVoices.value.length === 0 ? SPEECH_NO_VOICE_MESSAGE : ''
-})
+/** 入口禁用原因；音色列表还没结论时为空，避免首屏误判，等过一次 voiceschanged 仍为空则禁用 */
+const speechBlockedReason = computed(() =>
+  speechBlockedMessage({
+    supported: speechSupported.value,
+    loaded: speechVoicesLoaded.value,
+    voiceLangs: speechVoices.value.map((voice) => voice.lang),
+  }),
+)
 
 /** 阅读页高亮：朗读范围优先，其次搜索命中范围 */
 const readerHighlight = computed(() => speechHighlight.value ?? highlightText.value)
 
+function clearSpeechVoiceWait() {
+  if (speechVoiceWaitTimer) {
+    window.clearTimeout(speechVoiceWaitTimer)
+    speechVoiceWaitTimer = 0
+  }
+}
+
+/**
+ * 读取音色列表：一次拿不到（Chrome 常见）就等 voiceschanged；
+ * 等待窗口结束仍为空即认定为「没有中文音色」，禁用朗读入口并说明原因。
+ */
 function loadSpeechVoices() {
   if (!speechSupported.value) return
+  let voices: SpeechSynthesisVoice[] = []
   try {
-    const voices = window.speechSynthesis?.getVoices?.() ?? []
-    if (voices.length > 0) speechVoices.value = voices
+    voices = window.speechSynthesis?.getVoices?.() ?? []
   } catch {
-    // 枚举音色失败时保持未知，朗读入口仍可尝试
+    voices = []
   }
+  if (voices.length > 0) {
+    speechVoices.value = voices
+    speechVoicesLoaded.value = true
+    clearSpeechVoiceWait()
+    return
+  }
+  if (speechVoicesLoaded.value || speechVoiceWaitTimer) return
+  speechVoiceWaitTimer = window.setTimeout(() => {
+    speechVoiceWaitTimer = 0
+    speechVoicesLoaded.value = true
+  }, SPEECH_VOICE_WAIT_MS)
 }
 
 function pickSpeechVoice(): SpeechSynthesisVoice | null {
@@ -3626,7 +3656,13 @@ function startSpeech() {
   loadSpeechVoices()
   const reason = speechBlockedReason.value
   if (reason) {
+    speechVoicesLoaded.value = true
     showReaderHint(reason)
+    return
+  }
+  if (!pickSpeechVoice()) {
+    speechVoicesLoaded.value = true
+    showReaderHint(SPEECH_NO_VOICE_MESSAGE)
     return
   }
   if (!replacedContent.value.trim()) {

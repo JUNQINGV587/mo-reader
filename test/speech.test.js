@@ -12,7 +12,11 @@ const {
   segmentIndexForOffset,
   classifySpeechError,
   speechErrorNotice,
+  speechBlockedMessage,
+  isChineseVoiceLang,
   SPEECH_NOT_ALLOWED_NOTICE,
+  SPEECH_NO_VOICE_MESSAGE,
+  SPEECH_UNSUPPORTED_MESSAGE,
 } = await import('../dist/core/reader/speech.js')
 
 test('朗读计划：标题一段 + 正文按换行切段，记录绝对偏移', () => {
@@ -148,3 +152,21 @@ test('错误文案：not-allowed 要求点页面，其它给可读原因', () =>
   assert.match(speechErrorNotice('audio-hardware'), /朗读失败/)
   assert.match(speechErrorNotice('network'), /朗读失败/)
 })
+
+test('朗读入口可用性：未取到音色结论前不禁用，确认无中文音色才禁用并说明原因', () => {
+  assert.equal(speechBlockedMessage({ supported: true, loaded: false, voiceLangs: [] }), '')
+  assert.equal(speechBlockedMessage({ supported: true, loaded: false, voiceLangs: ['en-US'] }), '')
+  assert.equal(speechBlockedMessage({ supported: true, loaded: true, voiceLangs: [] }), SPEECH_NO_VOICE_MESSAGE)
+  assert.equal(speechBlockedMessage({ supported: true, loaded: true, voiceLangs: ['en-US', 'ja-JP'] }), SPEECH_NO_VOICE_MESSAGE)
+  assert.equal(speechBlockedMessage({ supported: true, loaded: true, voiceLangs: ['en-US', 'zh-CN'] }), '')
+  assert.equal(speechBlockedMessage({ supported: false, loaded: true, voiceLangs: ['zh-CN'] }), SPEECH_UNSUPPORTED_MESSAGE)
+})
+
+test('中文音色判定只看语言标签前缀', () => {
+  assert.equal(isChineseVoiceLang('zh'), true)
+  assert.equal(isChineseVoiceLang('zh-CN'), true)
+  assert.equal(isChineseVoiceLang('ZH-hant'), true)
+  assert.equal(isChineseVoiceLang('en-US'), false)
+  assert.equal(isChineseVoiceLang(undefined), false)
+})
+

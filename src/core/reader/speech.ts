@@ -221,3 +221,30 @@ export function speechErrorNotice(error: string): string {
   if (code === 'invalid-argument') return '朗读失败：语音参数无效'
   return '朗读失败：未知错误'
 }
+
+export interface SpeechAvailability {
+  /** 浏览器是否提供 speechSynthesis + SpeechSynthesisUtterance */
+  supported: boolean
+  /** 是否已经尝试读取过音色列表（含等待 voiceschanged 之后仍为空的情况） */
+  loaded: boolean
+  /** 当前可用音色的语言标签，如 'zh-CN' */
+  voiceLangs: readonly string[]
+}
+
+/** 是否中文音色 */
+export function isChineseVoiceLang(lang: string | undefined): boolean {
+  return typeof lang === 'string' && lang.toLowerCase().startsWith('zh')
+}
+
+/**
+ * 朗读入口禁用原因：
+ * - 不支持语音合成 → 说明不支持；
+ * - 还没有音色结论（刚进页面、voiceschanged 未到）→ 不禁用，避免首屏误判；
+ * - 已确认没有任何音色或没有中文音色 → 禁用并说明原因。
+ */
+export function speechBlockedMessage(availability: SpeechAvailability): string {
+  if (!availability.supported) return SPEECH_UNSUPPORTED_MESSAGE
+  if (!availability.loaded) return ''
+  return availability.voiceLangs.some((lang) => isChineseVoiceLang(lang)) ? '' : SPEECH_NO_VOICE_MESSAGE
+}
+
