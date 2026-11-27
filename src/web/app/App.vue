@@ -12,10 +12,11 @@ import {
   DEFAULT_TAP_ZONES,
   MENU_ITEMS,
   READER_PRESETS,
-  TAP_ACTIONS,
   TAP_ZONE_NAMES,
   TIP_MODES,
+  sanitizeTapZones,
   tapActionLabel,
+  visibleTapActions,
 } from '../../core/reader/reader-config'
 import {
   BUILTIN_THEMES,
@@ -35,6 +36,8 @@ import {
   type ReaderSettings,
   type SettingsGroupKey,
 } from '../../core/reader/settings'
+import { AutoPageController } from '../../core/reader/auto-page'
+import { KeepAwake } from '../../core/reader/wake-lock'
 import { enabledDictRules, lookupAll, type DictLookupOutcome } from '../../core/dict/lookup-all'
 import { swapDictOrder } from '../../core/dict/order'
 import { filterSources, hasExplore, needsLogin, sourceHost } from '../../core/source/filter'
@@ -316,6 +319,280 @@ const readerHint = ref('')
 let readerSearchToken = 0
 let readerHintTimer: ReturnType<typeof setTimeout> | undefined
 
+// ---- 自动翻页（#126）：控制器、章末续章、常亮与状态条 ----
+const autoPage = new AutoPageController()
+const autoPageStatus = ref<'idle' | 'running' | 'paused'>('idle')
+const autoPageLabel = ref('')
+const autoPageNotice = ref('')
+const tapActionChoices = computed(() => visibleTapActions())
+const readerTotalPages = ref(0)
+const boundaryLoading = ref(false)
+const boundaryDirection = ref<1 | -1>(1)
+let autoPageTimer: ReturnType<typeof setInterval> | undefined
+let autoPagePendingChapter = false
+let autoPageChapterFailed = false
+let keepAwake: KeepAwake | null = null
+let tapZonesRevertedNotified = false
+
+function refreshAutoPageState() {
+  autoPageStatus.value = autoPage.status
+  autoPageLabel.value = autoPage.label
+  autoPageNotice.value = autoPage.notice
+}
+
+function autoPageHasNextChapter(): boolean {
+  return chapterIndex.value >= 0 && chapterIndex.value < chapters.value.length - 1
+}
+
+function syncAutoPagePosition(page = initialPage.value, pages = readerTotalPages.value) {
+  autoPage.setPosition({ page, pages, hasNextChapter: autoPageHasNextChapter() })
+}
+
+function ensureKeepAwake(): KeepAwake {
+  if (!keepAwake) {
+    keepAwake = new KeepAwake({
+      request: async () => {
+        const api = (navigator as Navigator & { wakeLock?: { request?: (type: 'screen') => Promise<any> } }).wakeLock
+        if (!api?.request) throw new Error('wakeLock unavailable')
+        return await api.request('screen')
+      },
+      onNotice: (message) => {
+        if (view.value === 'reader') showReaderHint(message)
+      },
+    })
+  }
+  return keepAwake
+}
+
+function releaseKeepAwake() {
+  if (!keepAwake) return
+  void keepAwake.release()
+}
+
+async function startAutoPage() {
+  if (view.value !== 'reader' || readerKind.value !== 'text') {
+    showReaderHint('仅文字阅读支持自动翻页')
+    return
+  }
+  if (settingsOpen.value) closeSettings()
+  chrome.value = false
+  autoPage.setSeconds(settings.value.autoPageSeconds)
+  syncAutoPagePosition()
+  autoPage.start()
+  autoPageChapterFailed = false
+  autoPagePendingChapter = false
+  refreshAutoPageState()
+  void ensureKeepAwake().acquire()
+}
+
+function pauseAutoPage() {
+  autoPage.pause()
+  refreshAutoPageState()
+}
+
+async function resumeAutoPage() {
+  autoPage.resume()
+  refreshAutoPageState()
+  if (autoPageChapterFailed) {
+    autoPageChapterFailed = false
+    await loadAutoPageChapter()
+    return
+  }
+  void ensureKeepAwake().acquire()
+}
+
+function stopAutoPage() {
+  autoPage.stop()
+  autoPageChapterFailed = false
+  autoPagePendingChapter = false
+  refreshAutoPageState()
+  releaseKeepAwake()
+}
+
+/** 章末续章：先加载，成功后才由 onReaderPageState 恢复计时。 */
+async function loadAutoPageChapter() {
+  if (view.value !== 'reader' || boundaryLoading.value) return
+  const target = chapters.value[chapterIndex.value + 1]
+  if (!target) {
+    autoPageChapterFailed = true
+    autoPage.failedChapter('没有下一章可续')
+    refreshAutoPageState()
+    releaseKeepAwake()
+    return
+  }
+  boundaryDirection.value = 1
+  boundaryLoading.value = true
+  try {
+    const ok = await openChapter(target, 0)
+    if (!ok) {
+      autoPageChapterFailed = true
+      autoPage.failedChapter('下一章加载失败，点「继续」重试')
+      releaseKeepAwake()
+    } else {
+      autoPagePendingChapter = true
+    }
+  } finally {
+    boundaryLoading.value = false
+    refreshAutoPageState()
+  }
+}
+
+function runAutoPageTick() {
+  if (view.value !== 'reader' || autoPage.status !== 'running') return
+  if (chrome.value || tocOpen.value || settingsOpen.value) return
+  const action = autoPage.tick()
+  if (action.kind === 'turn') {
+    readerRef.value?.goto?.(action.page)
+    refreshAutoPageState()
+    return
+  }
+  if (action.kind === 'load-chapter') {
+    refreshAutoPageState()
+    void loadAutoPageChapter()
+    return
+  }
+  if (action.kind === 'book-end') {
+    refreshAutoPageState()
+    showReaderHint(action.message)
+    releaseKeepAwake()
+  }
+}
+
+/** 翻页到章边界：先加载相邻章，成功后再落到新章首页/末页。 */
+async function onChapterBoundary(payload: { direction: 1 | -1 }) {
+  if (boundaryLoading.value || busy.value) return
+  const target = chapters.value[chapterIndex.value + payload.direction]
+  if (!target) {
+    showReaderHint(payload.direction > 0 ? '已到全书末尾' : '已是第一章')
+    return
+  }
+  boundaryDirection.value = payload.direction
+  boundaryLoading.value = true
+  autoPage.addPauseReason('loading')
+  refreshAutoPageState()
+  try {
+    const page = payload.direction > 0 ? 0 : Number.MAX_SAFE_INTEGER
+    const ok = await openChapter(target, page)
+    if (!ok) {
+      showReaderHint(payload.direction > 0 ? '下一章加载失败，请重试' : '上一章加载失败，请重试')
+      if (autoPage.status !== 'idle') {
+        autoPageChapterFailed = true
+        autoPage.failedChapter('相邻章节加载失败，点「继续」重试')
+      }
+    } else if (autoPage.status !== 'idle') {
+      autoPage.removePauseReason('loading')
+      autoPage.notifyTurn()
+    }
+  } finally {
+    boundaryLoading.value = false
+    refreshAutoPageState()
+  }
+}
+
+function onReaderTurnState(animating: boolean) {
+  if (animating) autoPage.addPauseReason('turn')
+  else autoPage.removePauseReason('turn')
+  refreshAutoPageState()
+}
+
+function onReaderPageState(payload: { page: number; total: number }) {
+  readerTotalPages.value = Math.max(0, payload.total)
+  syncAutoPagePosition(payload.page, payload.total)
+  if (autoPagePendingChapter) {
+    autoPagePendingChapter = false
+    autoPage.loadedChapter({ pages: payload.total })
+    autoPage.setPosition({ page: payload.page })
+    void ensureKeepAwake().acquire()
+  } else {
+    autoPage.notifyTurn()
+  }
+  refreshAutoPageState()
+}
+
+function setAutoPause(reason: 'menu' | 'toc' | 'settings' | 'hidden' | 'loading', active: boolean) {
+  if (active) autoPage.addPauseReason(reason)
+  else autoPage.removePauseReason(reason)
+  refreshAutoPageState()
+}
+
+function onReaderVisibilityChange() {
+  const hidden = document.hidden
+  setAutoPause('hidden', hidden)
+  if (keepAwake) void keepAwake.visibilityChanged(!hidden)
+}
+
+/** Esc：依次收起设置、目录、各类面板、朗读条与菜单。 */
+function closeReaderOverlays(): boolean {
+  if (settingsOpen.value) {
+    closeSettings()
+    return true
+  }
+  if (tocOpen.value) {
+    tocOpen.value = false
+    return true
+  }
+  if (bookmarksOpen.value) {
+    bookmarksOpen.value = false
+    return true
+  }
+  if (notesOpen.value) {
+    notesOpen.value = false
+    return true
+  }
+  if (readerSearchOpen.value) {
+    readerSearchOpen.value = false
+    return true
+  }
+  if (dictPanelOpen.value) {
+    dictPanelOpen.value = false
+    return true
+  }
+  if (underlineOpen.value) {
+    underlineOpen.value = false
+    return true
+  }
+  if (speaking.value) {
+    stopSpeech()
+    return true
+  }
+  if (chrome.value) {
+    chrome.value = false
+    return true
+  }
+  return false
+}
+
+function onReaderEscape(event: KeyboardEvent) {
+  if (event.key !== 'Escape' || event.defaultPrevented) return
+  if (view.value !== 'reader') return
+  if (closeReaderOverlays()) event.preventDefault()
+}
+
+watch(
+  [chrome, bookmarksOpen, notesOpen, readerSearchOpen, dictPanelOpen, underlineOpen],
+  ([bar, bookmarks, notes, search, dict, underline]) => {
+    if (view.value === 'reader') setAutoPause('menu', Boolean(bar || bookmarks || notes || search || dict || underline))
+  },
+)
+watch(busy, (loading) => {
+  if (view.value === 'reader') setAutoPause('loading', loading)
+})
+watch(tocOpen, (open) => {
+  if (view.value === 'reader') setAutoPause('toc', open)
+})
+watch(settingsOpen, (open) => {
+  if (view.value === 'reader') setAutoPause('settings', open)
+})
+watch(
+  () => settings.value.autoPageSeconds,
+  (value) => {
+    autoPage.setSeconds(value)
+    refreshAutoPageState()
+  },
+)
+watch(view, (next, prev) => {
+  if (prev === 'reader' && next !== 'reader') stopAutoPage()
+})
 const editing = ref<any>(null)
 const editingJson = ref('')
 const debugType = ref('search')
@@ -1309,6 +1586,14 @@ onUnmounted(() => {
   stopMediaTimer()
   stopExportTimer()
   if (settingsPersistTimer) clearTimeout(settingsPersistTimer)
+  if (autoPageTimer) {
+    clearInterval(autoPageTimer)
+    autoPageTimer = undefined
+  }
+  window.removeEventListener('keydown', onReaderEscape)
+  document.removeEventListener('visibilitychange', onReaderVisibilityChange)
+  if (readerHintTimer) clearTimeout(readerHintTimer)
+  releaseKeepAwake()
 })
 
 const reviewOpen = ref(false)
@@ -2542,7 +2827,7 @@ async function openChapter(
   page?: number,
   options: { afterMediaRetry?: boolean } = {},
 ) {
-  if (!chapter || chapter.isVolume || !chapter.url) return
+  if (!chapter || chapter.isVolume || !chapter.url) return false
   if (!options.afterMediaRetry) {
     // 用户重新打开章节时重置「本章只重下一次」额度；重下后的自动重开不重置。
     readerMediaRetryUsed = false
@@ -2595,13 +2880,16 @@ async function openChapter(
         chapterIndex: index,
         chapterTitle: chapter.title,
         chapterUrl: chapter.url,
-        position: initialPage.value,
+        // 跳章末时是 MAX_SAFE_INTEGER，先按 0 记，等页面渲染后由 onPage 写入真实页码。
+        position: initialPage.value === Number.MAX_SAFE_INTEGER ? 0 : initialPage.value,
       }).catch(() => undefined)
     }
+    return true
   } catch (error) {
     const message = errorText(error)
     chapterError.value = `本章暂不可读：${message}。未下载的章节需要联网后阅读。`
     status.value = message
+    return false
   } finally {
     busy.value = false
   }
@@ -3057,6 +3345,7 @@ async function confirmSwitch() {
 }
 
 function onPage(payload: { page: number; total: number }) {
+  onReaderPageState(payload)
   initialPage.value = payload.page
   if (!currentBook.value?.id) return
   if (pageTimer) clearTimeout(pageTimer)
@@ -3421,6 +3710,18 @@ async function loadSettings() {
     const stored = scope === 'book' ? await call('getSettings', { bookId }) : await call('getSettings')
     if (!stored?.settings) return
     settings.value = { ...defaultReaderSettings(), ...stored.settings } as ReaderSettings
+    // 旧配置里可能存着已隐藏的点击动作（8/9/11/12）：回退为无动作并保存一次。
+    const sanitizedZones = sanitizeTapZones(settings.value.tapZones)
+    if (sanitizedZones.changed) {
+      settings.value.tapZones = sanitizedZones.zones
+      if (!tapZonesRevertedNotified) {
+        tapZonesRevertedNotified = true
+        const message = '部分点击区域的功能未开放，已改为无动作'
+        if (view.value === 'reader') showReaderHint(message)
+        else status.value = message
+      }
+      void persistSettings()
+    }
     settingsBaseline.value = cloneSettings(settings.value)
     bookOverridden.value = scope === 'book' ? Boolean(stored.bookOverridden) : false
     settingsError.value = ''
@@ -3627,6 +3928,10 @@ function openArticle(item: any) {
 }
 
 onMounted(async () => {
+  window.addEventListener('keydown', onReaderEscape)
+  document.addEventListener('visibilitychange', onReaderVisibilityChange)
+  autoPage.setSeconds(settings.value.autoPageSeconds)
+  if (!autoPageTimer) autoPageTimer = setInterval(runAutoPageTick, 250)
   try {
     const raw = localStorage.getItem(SEARCH_HISTORY_KEY)
     if (raw) {
@@ -4826,6 +5131,7 @@ onMounted(async () => {
             :theme="theme"
             :theme-colors="activeThemeColors"
             :animation="settings.pageAnimation"
+            :keys-enabled="!settingsOpen && !tocOpen && !bookmarksOpen && !notesOpen && !readerSearchOpen && !dictPanelOpen && !underlineOpen"
             :header-mode="settings.headerMode"
             :footer-mode="settings.footerMode"
             :show-header-line="settings.showHeaderLine"
@@ -4836,6 +5142,8 @@ onMounted(async () => {
             @page="onPage"
             @tap-action="onTapAction"
             @select="onReaderSelect"
+            @chapter-boundary="onChapterBoundary"
+            @turn-state="onReaderTurnState"
           />
           <PdfReader
             v-else-if="readerKind === 'pdf' && pdfOriginalUrl && !pdfError"
@@ -4887,6 +5195,18 @@ onMounted(async () => {
             @media-error="onReaderMediaError"
           />
           <p v-else class="muted mo-reader-loading">{{ chapterError || (busy ? '加载中…' : '（空章节）') }}</p>
+        </div>
+
+        <p v-if="boundaryLoading" class="mo-reader-hint" data-testid="chapter-boundary-loading">
+          {{ boundaryDirection > 0 ? '正在加载下一章…' : '正在加载上一章…' }}
+        </p>
+
+        <div v-if="autoPageStatus !== 'idle'" class="mo-auto-page" data-testid="auto-page-bar">
+          <span class="mo-auto-page-label">{{ autoPageLabel }}</span>
+          <span v-if="autoPageNotice" class="mo-auto-page-notice">{{ autoPageNotice }}</span>
+          <button v-if="autoPageStatus === 'running'" class="mo-btn tiny" data-testid="auto-page-pause" @click="pauseAutoPage">暂停</button>
+          <button v-else class="mo-btn tiny" data-testid="auto-page-resume" @click="resumeAutoPage">继续</button>
+          <button class="mo-btn tiny" data-testid="auto-page-stop" @click="stopAutoPage">停止</button>
         </div>
 
         <transition name="mo-fade">
@@ -5304,7 +5624,7 @@ onMounted(async () => {
                   <div v-for="(zone, index) in settings.tapZones" :key="index" class="mo-zone-cell">
                     <span>{{ TAP_ZONE_NAMES[index] }}</span>
                     <select :value="zone" class="mo-select" @change="setTapZone(index, $event)">
-                      <option v-for="action in TAP_ACTIONS" :key="action.code" :value="action.code">{{ action.label }}{{ action.available ? '' : '（未开放）' }}</option>
+                      <option v-for="action in tapActionChoices" :key="action.code" :value="action.code">{{ action.label }}</option>
                     </select>
                   </div>
                 </div>
@@ -5319,6 +5639,12 @@ onMounted(async () => {
                   <input v-model.number="settings.autoPageSeconds" type="range" min="1" max="60" step="1" @input="schedulePersistSettings" />
                   <b>{{ settings.autoPageSeconds }} 秒</b>
                 </label>
+                <div class="mo-theme-row">
+                  <span>自动翻页</span>
+                  <button class="mo-btn tiny" data-testid="auto-page-start" :disabled="view !== 'reader' || readerKind !== 'text'" @click="startAutoPage">
+                    {{ autoPageStatus === 'idle' ? '开始' : autoPageStatus === 'running' ? '重新计时' : '继续' }}
+                  </button>
+                </div>
               </details>
               
               <details class="mo-settings-group">
@@ -6609,6 +6935,32 @@ textarea {
   text-align: center;
   z-index: 5;
   pointer-events: none;
+}
+.mo-auto-page {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(20, 21, 24, 0.86);
+  color: #d8d4c8;
+  font-size: 12px;
+  z-index: 6;
+}
+.mo-auto-page-notice {
+  max-width: 42vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #e6a23c;
+}
+.mo-auto-page .mo-btn.tiny {
+  padding: 2px 8px;
+  font-size: 12px;
 }
 
 /* 阅读页 */

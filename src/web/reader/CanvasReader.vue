@@ -10,8 +10,11 @@ import {
   type PaginatePage,
   type PaginateResult,
 } from '../../core/reader/paginate'
+import { pageTurnFrame, resolvePageTurn, turnDurationMs } from '../../core/reader/page-turn'
 import { DEFAULT_TAP_ZONES, tapZoneIndex, tipText } from '../../core/reader/reader-config'
 import { isDarkColor, type ThemeColors } from '../../core/reader/theme'
+import { TurnAnimator } from '../../core/reader/turn-animator'
+import type { TurnCancelReason, TurnState } from '../../core/reader/turn-animator'
 
 type Theme = 'light' | 'sepia' | 'dark'
 type Turn = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
@@ -53,6 +56,8 @@ const props = withDefaults(
     kinsoku?: boolean
     dualColumn?: boolean
     inkMode?: boolean
+    /** 设置/目录等面板打开时由宿主关掉键盘翻页，避免按键穿透 */
+    keysEnabled?: boolean
   }>(),
   {
     title: '',
@@ -85,6 +90,7 @@ const props = withDefaults(
     kinsoku: false,
     dualColumn: false,
     inkMode: false,
+    keysEnabled: true,
   },
 )
 
@@ -105,6 +111,10 @@ const emit = defineEmits<{
   page: [payload: { page: number; total: number }]
   tapAction: [code: number]
   select: [selection: ReaderSelection]
+  /** 到章边界：交宿主加载相邻章，成功后再 goto，失败留原页 */
+  chapterBoundary: [payload: { direction: 1 | -1 }]
+  /** 翻页动画开始/结束，自动翻页据此暂停计时 */
+  turnState: [animating: boolean]
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
@@ -120,6 +130,11 @@ let dpr = 1
 let width = 0
 let height = 0
 let animating = false
+let animator: TurnAnimator | null = null
+let rafId = 0
+let turnImages: { before: HTMLCanvasElement; after: HTMLCanvasElement; targetPage: number } | null = null
+let motionQuery: MediaQueryList | null = null
+const reducedMotion = ref(false)
 
 const layoutCache = new LayoutCache<PaginateResult>(6)
 let layoutJob: LayoutJob<PaginateResult> | null = null
@@ -146,7 +161,9 @@ let swallowClick = false
 const SERIF = "'Noto Serif SC', 'Songti SC', 'Noto Sans SC', serif"
 const ACCENT = '#3d6b53'
 
-const effectiveAnimation = computed<Turn>(() => (props.inkMode ? 'none' : props.animation))
+const effectiveAnimation = computed<Turn>(() =>
+  resolvePageTurn(props.animation, { reducedMotion: reducedMotion.value, inkMode: props.inkMode }),
+)
 
 const palette = computed<ThemeColors>(() => {
   if (props.inkMode) {
@@ -254,6 +271,7 @@ function layout(keepOffset = true) {
   const canvas = canvasRef.value
   const host = canvas?.parentElement
   if (!canvas || !host || !ctx) return
+  cancelTurn('setting')
   const rect = host.getBoundingClientRect()
   if (!rect.width || !rect.height) return
 
@@ -598,80 +616,120 @@ function snapshot(): HTMLCanvasElement | null {
   return copy
 }
 
-function restore(image: HTMLCanvasElement) {
+function stopFrames() {
+  cancelAnimationFrame(rafId)
+  rafId = 0
+}
+
+/** 动画结束（自然完成）：画目标页并恢复交互。 */
+function finishTurn() {
+  stopFrames()
+  animating = false
+  turnImages = null
+  emit('turnState', false)
+  render()
+}
+
+/** 取消动画：切后台、尺寸/设置变化、关闭或新翻页打断，都直接落到目标页。 */
+function cancelTurn(reason: TurnCancelReason) {
+  if (!animating) return
+  const pending = turnImages?.targetPage ?? page.value
+  animator?.cancel(reason)
+  stopFrames()
+  animating = false
+  turnImages = null
+  emit('turnState', false)
+  if (reason !== 'close' && !document.hidden) {
+    page.value = pending
+    syncAnchor()
+  }
+  render()
+}
+
+/** Canvas 2D 合成一帧：覆盖/平移/滚动直接平移两页，仿真按折线裁切旧页并画纸背。 */
+function drawTurn(state: TurnState) {
   const canvas = canvasRef.value
-  const context = canvas?.getContext('2d')
-  if (!canvas || !context) return
-  context.setTransform(1, 0, 0, 1, 0, 0)
-  context.clearRect(0, 0, canvas.width, canvas.height)
-  context.drawImage(image, 0, 0)
-}
+  const images = turnImages
+  if (!canvas || !ctx || !images) return
+  const c = ctx
+  const scale = dpr
+  const { before, after } = images
+  const frame = state.frame
+  c.setTransform(1, 0, 0, 1, 0, 0)
+  c.clearRect(0, 0, canvas.width, canvas.height)
+  c.fillStyle = palette.value.bg
+  c.fillRect(0, 0, canvas.width, canvas.height)
 
-function overlayWith(image: HTMLCanvasElement): HTMLCanvasElement | null {
-  const host = canvasRef.value?.parentElement
-  if (!host) return null
-  const layer = document.createElement('canvas')
-  layer.width = image.width
-  layer.height = image.height
-  layer.getContext('2d')?.drawImage(image, 0, 0)
-  Object.assign(layer.style, {
-    position: 'absolute',
-    inset: '0',
-    width: '100%',
-    height: '100%',
-    pointerEvents: 'none',
-    willChange: 'transform',
-  })
-  host.appendChild(layer)
-  return layer
-}
-
-function animate(mode: Turn, direction: 1 | -1, before: HTMLCanvasElement, after: HTMLCanvasElement) {
-  let layer: HTMLCanvasElement | null = null
-  const finish = () => {
-    layer?.remove()
-    animating = false
-    render()
+  if (frame.kind === 'simulate' && frame.curl) {
+    const curl = frame.curl
+    const foldX = curl.foldX * scale
+    const bulge = Math.max(1, curl.bulge * scale)
+    const dir = frame.direction
+    // 新页铺底，旧页露出被掀起的那一侧
+    c.drawImage(after, 0, 0)
+    c.save()
+    c.beginPath()
+    if (dir > 0) c.rect(0, 0, foldX, canvas.height)
+    else c.rect(foldX, 0, canvas.width - foldX, canvas.height)
+    c.clip()
+    c.drawImage(before, 0, 0)
+    c.restore()
+    // 折线旁压暗新页，制造隆起
+    const band = Math.max(6 * scale, curl.shadowWidth * scale)
+    const gradient = c.createLinearGradient(foldX, 0, dir > 0 ? foldX + band : foldX - band, 0)
+    gradient.addColorStop(0, 'rgba(0,0,0,0.26)')
+    gradient.addColorStop(1, 'rgba(0,0,0,0)')
+    c.fillStyle = gradient
+    c.save()
+    c.beginPath()
+    if (dir > 0) c.rect(foldX, 0, band, canvas.height)
+    else c.rect(foldX - band, 0, band, canvas.height)
+    c.fill()
+    c.restore()
+    // 卷起的纸背：折线与反向弧之间的一条月牙
+    const lift = dir > 0 ? bulge : -bulge
+    c.save()
+    c.beginPath()
+    c.moveTo(foldX, 0)
+    c.quadraticCurveTo(foldX + lift, canvas.height / 2, foldX, canvas.height)
+    c.quadraticCurveTo(foldX + lift * 0.55, canvas.height / 2, foldX, 0)
+    c.closePath()
+    c.fillStyle = palette.value.bg
+    c.fill()
+    c.strokeStyle = 'rgba(0,0,0,0.12)'
+    c.lineWidth = Math.max(1, scale)
+    c.stroke()
+    c.restore()
+    return
   }
 
-  if (mode === 'cover' || mode === 'simulate') {
-    restore(before)
-    layer = overlayWith(after)
-    if (!layer) return finish()
-    if (mode === 'simulate') layer.style.filter = 'drop-shadow(-8px 0 14px rgba(0,0,0,0.25))'
-    layer.style.transform = 'translateX(100%)'
-    requestAnimationFrame(() => {
-      layer!.style.transition = 'transform 260ms cubic-bezier(.25,.8,.25,1)'
-      layer!.style.transform = 'translateX(0)'
-    })
-  } else if (mode === 'scroll') {
-    restore(before)
-    layer = overlayWith(after)
-    if (!layer) return finish()
-    layer.style.transform = direction > 0 ? 'translateY(100%)' : 'translateY(-100%)'
-    requestAnimationFrame(() => {
-      layer!.style.transition = 'transform 260ms ease-out'
-      layer!.style.transform = 'translateY(0)'
-    })
-  } else {
-    restore(after)
-    layer = overlayWith(before)
-    if (!layer) return finish()
-    layer.style.transform = 'translateX(0)'
-    requestAnimationFrame(() => {
-      layer!.style.transition = 'transform 240ms ease-out'
-      layer!.style.transform = `translateX(${direction > 0 ? '-100%' : '100%'})`
-    })
-  }
-  window.setTimeout(finish, 300)
+  c.drawImage(before, frame.from.x * scale, frame.from.y * scale)
+  c.drawImage(after, frame.to.x * scale, frame.to.y * scale)
 }
 
 function turn(direction: 1 | -1) {
-  if (animating) return
-  const nextPage = page.value + direction
-  if (nextPage < 0 || nextPage >= total.value) return
+  // 新翻页打断旧动画：先结束旧的、画它要到的页，再开始新的一次
+  if (animating) {
+    const pending = turnImages?.targetPage ?? page.value
+    animator?.cancel('interrupt')
+    stopFrames()
+    animating = false
+    turnImages = null
+    emit('turnState', false)
+    page.value = pending
+    syncAnchor()
+    render()
+  }
 
-  if (effectiveAnimation.value === 'none' || !canvasRef.value) {
+  const nextPage = page.value + direction
+  if (nextPage < 0 || nextPage >= total.value) {
+    // 章边界：先让宿主加载相邻章，加载成功前不播动画
+    emit('chapterBoundary', { direction })
+    return
+  }
+
+  const mode = effectiveAnimation.value
+  if (mode === 'none' || !canvasRef.value) {
     page.value = nextPage
     syncAnchor()
     render()
@@ -685,8 +743,22 @@ function turn(direction: 1 | -1) {
   render()
   const after = snapshot()
   if (!after) return
+  turnImages = { before, after, targetPage: nextPage }
   animating = true
-  animate(effectiveAnimation.value, direction, before, after)
+  emit('turnState', true)
+  if (!animator) {
+    animator = new TurnAnimator({
+      now: () => performance.now(),
+      onUpdate: (state) => drawTurn(state),
+      onComplete: () => finishTurn(),
+    })
+  }
+  animator.begin(mode, direction, { width, height, durationMs: turnDurationMs(mode) })
+  const step = () => {
+    animator?.tick()
+    if (animator?.animating) rafId = requestAnimationFrame(step)
+  }
+  rafId = requestAnimationFrame(step)
 }
 
 function next() {
@@ -812,15 +884,26 @@ function onCanvasContextMenu(event: MouseEvent) {
 }
 
 function onKey(event: KeyboardEvent) {
+  if (!props.keysEnabled) return
   const target = event.target as HTMLElement | null
-  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return
-  if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
+  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON|A)$/.test(target.tagName))) return
+  if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === 'ArrowDown' || event.key === ' ') {
     event.preventDefault()
     next()
-  } else if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
+  } else if (event.key === 'ArrowLeft' || event.key === 'PageUp' || event.key === 'ArrowUp') {
     event.preventDefault()
     prev()
   }
+}
+
+function onVisibilityChange() {
+  if (document.hidden) cancelTurn('hidden')
+}
+
+function onMotionPreferenceChange(event: MediaQueryListEvent) {
+  reducedMotion.value = event.matches
+  cancelTurn('setting')
+  render()
 }
 
 onMounted(() => {
@@ -829,8 +912,17 @@ onMounted(() => {
   ctx = canvas.getContext('2d')
   anchorOffset.value = -1
   page.value = Math.max(0, props.initialPage)
+  motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
+  reducedMotion.value = motionQuery.matches
+  if (typeof motionQuery.addEventListener === 'function') {
+    motionQuery.addEventListener('change', onMotionPreferenceChange)
+  }
+  document.addEventListener('visibilitychange', onVisibilityChange)
   layout(false)
-  observer = new ResizeObserver(() => layout(true))
+  observer = new ResizeObserver(() => {
+    cancelTurn('resize')
+    layout(true)
+  })
   if (canvas.parentElement) observer.observe(canvas.parentElement)
   window.addEventListener('keydown', onKey)
   window.addEventListener('pointermove', onWindowPointerMove)
@@ -839,6 +931,12 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  cancelTurn('close')
+  animator = null
+  if (motionQuery && typeof motionQuery.removeEventListener === 'function') {
+    motionQuery.removeEventListener('change', onMotionPreferenceChange)
+  }
+  document.removeEventListener('visibilitychange', onVisibilityChange)
   observer?.disconnect()
   layoutJob?.cancel()
   cancelAnimationFrame(layoutFrame)
@@ -910,6 +1008,7 @@ watch(
 )
 
 function goto(target: number) {
+  cancelTurn('interrupt')
   const nextPage = Math.max(0, Math.min(total.value - 1, target))
   if (nextPage === page.value) {
     render()
@@ -943,7 +1042,7 @@ function currentPageLines() {
   return pageLinesOf(pageData).map((line) => line.text).filter(Boolean)
 }
 
-defineExpose({ next, prev, total, page, goto, findPageFor, currentPageLines })
+defineExpose({ next, prev, total, page, goto, findPageFor, currentPageLines, isAnimating: () => animating })
 </script>
 
 <template>
