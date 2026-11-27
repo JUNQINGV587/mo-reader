@@ -82,10 +82,39 @@ function backupImportTempDir(jobId: string): string {
   return join(exportRoot(), `${jobId}${BACKUP_IMPORT_TEMP_SUFFIX}`)
 }
 
-function decodeArchive(dataBase64: string): Buffer {
+const BASE64_SCAN_CHUNK = 1 << 20
+
+/**
+ * 分段校验 base64 字符集（#136）：整串正则会在数 MB 输入上触发 V8 回溯栈溢出。
+ */
+function isBase64Text(text: string): boolean {
+  for (let start = 0; start < text.length; start += BASE64_SCAN_CHUNK) {
+    const end = Math.min(text.length, start + BASE64_SCAN_CHUNK)
+    for (let i = start; i < end; i += 1) {
+      const code = text.charCodeAt(i)
+      const ok =
+        (code >= 65 && code <= 90) ||
+        (code >= 97 && code <= 122) ||
+        (code >= 48 && code <= 57) ||
+        code === 43 ||
+        code === 47 ||
+        code === 61 ||
+        code === 32 ||
+        code === 10 ||
+        code === 13 ||
+        code === 9 ||
+        code === 12
+      if (!ok) return false
+    }
+  }
+  return true
+}
+
+export function decodeArchive(dataBase64: string): Buffer {
   const text = String(dataBase64 ?? '').trim()
   if (!text) throw new Error('没有选择备份文件')
-  if (!/^[A-Za-z0-9+/=\s]+$/.test(text)) throw new Error('备份文件内容不完整，请重新选择')
+  assertImportArchiveSize(Math.ceil((text.length * 3) / 4))
+  if (!isBase64Text(text)) throw new Error('备份文件内容不完整，请重新选择')
   const buffer = Buffer.from(text, 'base64')
   if (buffer.length === 0) throw new Error('备份文件是空的')
   assertImportArchiveSize(buffer.length)

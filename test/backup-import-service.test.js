@@ -8,6 +8,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import JSZip from 'jszip'
+import { decodeArchive } from '../dist/server/backup-import.js'
 import { ReaderService } from '../dist/server/service.js'
 
 const EXPORT_ROOT = await mkdtemp(join(tmpdir(), 'mo-reader-import-'))
@@ -169,6 +170,15 @@ async function preview(service, zip) {
   await service.waitForBackupImports()
   return service.getBackupJob({ jobId: started.job.id })
 }
+
+test('decodeArchive 处理数 MB 的 base64 不再触发正则栈溢出（#136）', () => {
+  const buffer = decodeArchive('A'.repeat(9_800_796))
+  assert.equal(buffer.length, 7_350_597)
+})
+
+test('decodeArchive 仍拒绝非法字符（#136）', () => {
+  assert.throws(() => decodeArchive('AAAA!'), /备份文件内容不完整/)
+})
 
 test('preview 只生成预览，不写任何数据', async () => {
   const db = makeDb({ fontSize: 24 })
