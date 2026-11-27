@@ -326,7 +326,6 @@ const autoPageLabel = ref('')
 const autoPageNotice = ref('')
 const tapActionChoices = computed(() => visibleTapActions())
 const readerTotalPages = ref(0)
-const readerTurnAnimating = ref(false)
 const boundaryLoading = ref(false)
 const boundaryDirection = ref<1 | -1>(1)
 let autoPageTimer: ReturnType<typeof setInterval> | undefined
@@ -474,9 +473,12 @@ async function onChapterBoundary(payload: { direction: 1 | -1 }) {
   try {
     const page = payload.direction > 0 ? 0 : Number.MAX_SAFE_INTEGER
     const ok = await openChapter(target, page)
-    if (!ok && autoPage.status !== 'idle') {
-      autoPageChapterFailed = true
-      autoPage.failedChapter('相邻章节加载失败，点「继续」重试')
+    if (!ok) {
+      showReaderHint(payload.direction > 0 ? '下一章加载失败，请重试' : '上一章加载失败，请重试')
+      if (autoPage.status !== 'idle') {
+        autoPageChapterFailed = true
+        autoPage.failedChapter('相邻章节加载失败，点「继续」重试')
+      }
     } else if (autoPage.status !== 'idle') {
       autoPage.removePauseReason('loading')
       autoPage.notifyTurn()
@@ -488,7 +490,6 @@ async function onChapterBoundary(payload: { direction: 1 | -1 }) {
 }
 
 function onReaderTurnState(animating: boolean) {
-  readerTurnAnimating.value = animating
   if (animating) autoPage.addPauseReason('turn')
   else autoPage.removePauseReason('turn')
   refreshAutoPageState()
