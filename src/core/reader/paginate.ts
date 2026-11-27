@@ -125,6 +125,11 @@ function isPunctuation(char: string): boolean {
   return PUNCTUATION.includes(char)
 }
 
+/** 供渲染层判断标点压缩的边界（只给出是否标点）。 */
+export function isPunctuationChar(char: string): boolean {
+  return isPunctuation(char)
+}
+
 interface Item {
   char: string
   width: number
