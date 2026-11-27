@@ -102,7 +102,16 @@ import {
   cleanupExpiredBackups,
   recoverInterruptedBackups,
   type BackupHost,
+  type BackupJob,
 } from './backup.js'
+import {
+  BACKUP_IMPORT_KIND,
+  BackupImportCoordinator,
+  cleanupExpiredBackupImports,
+  recoverInterruptedBackupImports,
+  type BackupImportHost,
+  type BackupImportJob,
+} from './backup-import.js'
 import { BACKUP_TOKEN_TTL_MS } from '../core/reader/backup.js'
 import {
   WEBDAV_PASSWORD_MAX,
@@ -339,6 +348,9 @@ export class ReaderService extends TypertRemoteService {
   /** 整包备份协调器（#130），按需创建；产物同样落导出目录，但只走一次性 token。 */
   backupCoordinator: BackupCoordinator | null = null
 
+  /** 备份导入协调器（#132）：预览计划留在内存，写库复用 jobs 表。 */
+  backupImportCoordinator: BackupImportCoordinator | null = null
+
   /** 媒体离线下载协调器（#112），按需创建；与文字下载共用作业表与暂停/重试语义。 */
   mediaDownloadsCoordinator: MediaDownloadCoordinator | null = null
 
@@ -393,6 +405,8 @@ export class ReaderService extends TypertRemoteService {
     try {
       await recoverInterruptedBackups(this.db.jobs)
       await cleanupExpiredBackups(this.db.jobs)
+      await recoverInterruptedBackupImports(this.db.jobs)
+      await cleanupExpiredBackupImports(this.db.jobs)
     } catch {
       // 清理失败不影响启动。
     }
@@ -405,6 +419,11 @@ export class ReaderService extends TypertRemoteService {
     const ctx = this.ctx as any
     ctx.effect(
       () => async () => {
+        try {
+          await this.backupImportCoordinator?.shutdown()
+        } finally {
+          this.backupImportCoordinator = null
+        }
         try {
           await this.backupCoordinator?.shutdown()
         } finally {
@@ -1245,6 +1264,8 @@ export class ReaderService extends TypertRemoteService {
     switch (this.jobKindOf(id)) {
       case 'backup':
         throw new Error('备份不能暂停，请取消后重新导出')
+      case 'backupImport':
+        throw new Error('导入不能暂停，请取消后重新选择文件')
       case 'export':
         return this.exportManager().pause(id)
       case 'media':
@@ -1259,6 +1280,8 @@ export class ReaderService extends TypertRemoteService {
     switch (this.jobKindOf(id)) {
       case 'backup':
         throw new Error('备份不能继续，请重新导出')
+      case 'backupImport':
+        throw new Error('导入不能继续，请取消后重新选择文件')
       case 'export':
         return this.exportManager().resume(id)
       case 'media':
@@ -1268,12 +1291,14 @@ export class ReaderService extends TypertRemoteService {
     }
   }
 
-  /** 取消对文字下载、媒体下载、导出、备份四种作业通用：按 jobs 表里的 kind 分派。 */
+  /** 取消对文字下载、媒体下载、导出、备份、备份导入五类作业通用：按 jobs 表里的 kind 分派。 */
   async cancelJob(args: Args) {
     const id = stringArg(args, 'id')
     switch (this.jobKindOf(id)) {
       case 'backup':
         return this.backupManager().cancel(id)
+      case 'backupImport':
+        return this.backupImportManager().cancel(id)
       case 'export':
         return this.exportManager().cancel(id)
       case 'media':
@@ -1286,6 +1311,8 @@ export class ReaderService extends TypertRemoteService {
   async retryDownload(args: Args) {
     const id = stringArg(args, 'id')
     switch (this.jobKindOf(id)) {
+      case 'backupImport':
+        throw new Error('导入失败后请重新选择同一文件')
       case 'export':
         return this.exportManager().retry(id)
       case 'media':
@@ -1299,6 +1326,8 @@ export class ReaderService extends TypertRemoteService {
     const id = stringArg(args, 'id')
     const backup = this.backupCoordinator?.peek(id)
     if (backup) return { job: { ...backup } }
+    const backupImport = this.backupImportCoordinator?.peek(id)
+    if (backupImport) return { job: { ...backupImport } }
     const live = this.exportsCoordinator?.peek(id)
     if (live) return { job: { ...live } }
     const media = this.mediaDownloadsCoordinator?.peek(id)
@@ -1306,6 +1335,7 @@ export class ReaderService extends TypertRemoteService {
     const record = this.db?.jobs?.get?.(id) as Record<string, unknown> | undefined
     if (record?.kind === MEDIA_DOWNLOAD_KIND) return this.mediaManager().get(id)
     if (record?.kind === BACKUP_KIND) return { job: await this.backupManager().get(id) }
+    if (record?.kind === BACKUP_IMPORT_KIND) return { job: await this.backupImportManager().get(id) }
     return this.downloadManager().get(id)
   }
 
@@ -1321,6 +1351,7 @@ export class ReaderService extends TypertRemoteService {
     for (const job of this.mediaManager().list(filter)) merged.set(job.id, job)
     for (const job of this.exportsCoordinator?.list(filter) ?? []) merged.set(job.id, job)
     for (const job of this.backupCoordinator?.list() ?? []) merged.set(job.id, job)
+    for (const job of this.backupImportCoordinator?.list() ?? []) merged.set(job.id, job)
     return {
       jobs: [...merged.values()].sort(
         (left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0),
@@ -1346,6 +1377,11 @@ export class ReaderService extends TypertRemoteService {
   /** 测试/关停用：等待所有备份协程收尾。 */
   async waitForBackups() {
     await this.backupCoordinator?.waitIdle()
+  }
+
+  /** 测试/关停用：等待所有备份导入协程收尾。 */
+  async waitForBackupImports() {
+    await this.backupImportCoordinator?.waitIdle()
   }
 
   /** 按书聚合下载结果：书架/详情只调一次就能显示进度、体积与当前作业。 */
@@ -1711,6 +1747,20 @@ export class ReaderService extends TypertRemoteService {
     return this.backupManager().start({ light: args?.light === true })
   }
 
+  /** 上传备份文件并生成导入预览（#132）；预览阶段不写任何业务数据。 */
+  async previewBackupImport(args: Args) {
+    const dataBase64 = typeof args?.dataBase64 === 'string' ? args.dataBase64 : ''
+    if (!dataBase64) throw new Error('没有选择备份文件')
+    const fileName = typeof args?.fileName === 'string' ? args.fileName.trim() : ''
+    return this.backupImportManager().start({ fileName, dataBase64 })
+  }
+
+  /** 用户确认预览后写库；写库失败自动按已写条目逆序回滚。 */
+  async applyBackupImport(args: Args) {
+    const jobId = stringArg(args, 'jobId')
+    return this.backupImportManager().apply(jobId)
+  }
+
   /**
    * 备份完成后签发一次性下载链接：10 分钟有效，第一次取用后立即失效。
    * URL 里是随机 token，不含作业 id，不能靠猜作业 id 拿到别人的备份。
@@ -1732,15 +1782,26 @@ export class ReaderService extends TypertRemoteService {
     }
   }
 
-  /** 备份进度；不传 jobId 时返回最近一次，打开「我的」页就能接着看。 */
+  /** 备份/导入作业的进度；不传 jobId 时返回最近一次，打开「我的」页就能接着看。 */
   async getBackupJob(args: Args) {
     const jobId = typeof args?.jobId === 'string' ? args.jobId.trim() : ''
-    const job = await this.backupManager().get(jobId || undefined)
-    return { job }
+    if (jobId) {
+      const backup = await this.backupManager().get(jobId)
+      if (backup) return { job: backup }
+      return { job: await this.backupImportManager().get(jobId) }
+    }
+    const backup = await this.backupManager().get()
+    const imported = await this.backupImportManager().get()
+    const candidates: Array<BackupJob | BackupImportJob> = []
+    if (backup) candidates.push(backup)
+    if (imported) candidates.push(imported)
+    candidates.sort((left, right) => right.createdAt - left.createdAt)
+    return { job: candidates[0] ?? null }
   }
 
   async cancelBackupJob(args: Args) {
     const id = stringArg(args, 'id')
+    if (this.jobKindOf(id) === 'backupImport') return this.backupImportManager().cancel(id)
     return this.backupManager().cancel(id)
   }
 
@@ -2522,6 +2583,17 @@ export class ReaderService extends TypertRemoteService {
     }
   }
 
+  private backupImportManager(): BackupImportCoordinator {
+    if (!this.backupImportCoordinator) {
+      this.backupImportCoordinator = new BackupImportCoordinator(this.backupImportHost())
+    }
+    return this.backupImportCoordinator
+  }
+
+  private backupImportHost(): BackupImportHost {
+    return { db: () => this.requireDb() }
+  }
+
   private exportManager(): ExportCoordinator {
     if (!this.exportsCoordinator) {
       this.exportsCoordinator = new ExportCoordinator(this.exportHost())
@@ -2586,12 +2658,14 @@ export class ReaderService extends TypertRemoteService {
   }
 
   /** 作业分派：活动作业先问协调器，再读 jobs 表里的 kind。 */
-  private jobKindOf(id: string): 'export' | 'media' | 'download' | 'backup' {
+  private jobKindOf(id: string): 'export' | 'media' | 'download' | 'backup' | 'backupImport' {
     if (this.backupCoordinator?.peek(id)) return 'backup'
+    if (this.backupImportCoordinator?.peek(id)) return 'backupImport'
     if (this.exportsCoordinator?.peek(id)) return 'export'
     if (this.mediaDownloadsCoordinator?.peek(id)) return 'media'
     const record = this.db?.jobs?.get?.(id) as Record<string, unknown> | undefined
     if (record?.kind === BACKUP_KIND) return 'backup'
+    if (record?.kind === BACKUP_IMPORT_KIND) return 'backupImport'
     if (record?.kind === EXPORT_KIND) return 'export'
     if (record?.kind === MEDIA_DOWNLOAD_KIND) return 'media'
     return 'download'

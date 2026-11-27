@@ -44,6 +44,8 @@ export const REMOTE_METHODS = Object.freeze([
   'startExport',
   'getExportDownload',
   'startBackup',
+  'previewBackupImport',
+  'applyBackupImport',
   'getBackupDownload',
   'getBackupJob',
   'cancelBackupJob',

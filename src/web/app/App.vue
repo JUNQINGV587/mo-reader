@@ -1195,11 +1195,20 @@ async function refreshBackupJob() {
 
 async function loadBackupJob() {
   backupJob.value = null
+  backupImportJob.value = null
   backupDownload.value = null
   backupMessage.value = ''
   try {
     const result: any = await call('getBackupJob', {})
-    backupJob.value = result?.job ?? null
+    const job = result?.job ?? null
+    if (job?.kind === 'backupImport') {
+      // 离开「我的」页再回来时接着显示导入进度或待确认的预览。
+      backupImportJob.value = job
+      if (job.status === 'failed' && job.error) backupImportMessage.value = String(job.error)
+      syncBackupImportTimer()
+      return
+    }
+    backupJob.value = job
   } catch (error) {
     backupMessage.value = errorText(error)
   }
@@ -1241,6 +1250,257 @@ async function cancelBackup() {
     syncBackupTimer()
   }
 }
+
+// —— 备份导入（#132）：先预览，确认后才写库 ——
+const backupImportInput = ref<HTMLInputElement | null>(null)
+const backupImportJob = ref<any>(null)
+const backupImportBusy = ref(false)
+const backupImportMessage = ref('')
+const backupImportFile = ref<File | null>(null)
+let backupImportTimer: ReturnType<typeof setInterval> | null = null
+
+const BACKUP_IMPORT_SETTING_LABELS: Record<string, string> = {
+  theme: '主题',
+  customThemes: '自定义主题',
+  fontId: '字体',
+  fontFamily: '字体族',
+  fontSize: '字号',
+  letterSpacing: '字距',
+  lineSpacing: '行距',
+  paragraphSpacing: '段距',
+  indent: '首行缩进',
+  bold: '加粗',
+  titleMode: '标题样式',
+  titleSize: '标题字号',
+  align: '对齐方式',
+  compressPunctuation: '标点压缩',
+  kinsoku: '避头尾',
+  padding: '页边距',
+  headerMode: '页眉',
+  footerMode: '页脚',
+  showHeaderLine: '页眉线',
+  showFooterLine: '页脚线',
+  dualColumn: '双栏',
+  inkMode: '墨水屏',
+  pageAnimation: '翻页动画',
+  tapZones: '点击区域',
+  menuItems: '菜单项',
+  autoPageSeconds: '自动翻页',
+  ttsVoice: '朗读音色',
+  ttsRate: '朗读语速',
+  ttsContinuous: '连续朗读',
+  replaceRules: '替换规则',
+  mediaQuotaBytes: '缓存上限',
+  webdavUrl: 'WebDAV 地址',
+  webdavUsername: 'WebDAV 用户',
+  webdavAllowPrivate: '允许内网地址',
+}
+
+function backupImportSettingLabel(key: string) {
+  return BACKUP_IMPORT_SETTING_LABELS[key] ?? key
+}
+
+function isBackupImportRunning(job: any) {
+  return job?.status === 'running' || job?.status === 'queued'
+}
+
+function stopBackupImportTimer() {
+  if (backupImportTimer !== null) {
+    clearInterval(backupImportTimer)
+    backupImportTimer = null
+  }
+}
+
+function syncBackupImportTimer() {
+  if (isBackupImportRunning(backupImportJob.value)) {
+    if (backupImportTimer === null) backupImportTimer = setInterval(refreshBackupImportJob, 800)
+  } else {
+    stopBackupImportTimer()
+  }
+}
+
+function backupImportStatusText(job: any) {
+  if (!job) return ''
+  if (job.status === 'queued') return '排队中'
+  if (job.status === 'running') return job.stage === 'preview' ? '校验中' : '导入中'
+  if (job.status === 'paused') return '待确认'
+  if (job.status === 'done') return '已完成'
+  if (job.status === 'cancelled') return '已取消'
+  return job.status === 'failed' ? '失败' : String(job.status ?? '')
+}
+
+function backupImportStageText(job: any) {
+  if (!job) return ''
+  if (job.stageText) return String(job.stageText)
+  if (job.stage === 'preview') return '正在校验备份'
+  if (job.stage === 'apply') return '正在写入数据'
+  return ''
+}
+
+function backupImportPercent(job: any) {
+  const total = Number(job?.total) || 0
+  if (!total) return 0
+  const done = Number(job.completed) || 0
+  return Math.max(0, Math.min(100, Math.round((done / total) * 100)))
+}
+
+function backupImportRows(job: any) {
+  const preview = job?.preview
+  if (!preview) return []
+  const labels: Array<[string, string]> = [
+    ['books', '书目'],
+    ['sources', '书源'],
+    ['bookmarks', '书签'],
+    ['notes', '笔记'],
+    ['progress', '阅读进度'],
+    ['groups', '分组'],
+    ['dictRules', '字典规则'],
+    ['subscriptions', '订阅'],
+    ['replaceRules', '替换规则'],
+    ['readConfigs', '单书设置'],
+  ]
+  return labels
+    .map(([key, label]) => ({ key, label, ...(preview[key] ?? {}) }))
+    .filter((row: any) => Number(row.total) > 0)
+}
+
+function backupImportSettingLabels(job: any) {
+  const keys: string[] = job?.preview?.settings?.added ?? []
+  return keys.map((key) => backupImportSettingLabel(key))
+}
+
+async function previewBackupImportFile(file: File) {
+  backupImportBusy.value = true
+  backupImportMessage.value = ''
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    const result: any = await call('previewBackupImport', {
+      fileName: file.name,
+      dataBase64: toBase64(bytes),
+    })
+    backupImportJob.value = result?.job ?? null
+    if (backupImportJob.value?.status === 'failed') {
+      backupImportMessage.value = String(backupImportJob.value.error || '备份无法导入')
+    } else {
+      backupImportMessage.value = '校验完成，确认后开始导入'
+    }
+  } catch (error) {
+    backupImportJob.value = null
+    backupImportMessage.value = errorText(error)
+  } finally {
+    backupImportBusy.value = false
+    syncBackupImportTimer()
+  }
+}
+
+function startBackupImport() {
+  if (backupImportBusy.value) return
+  backupImportInput.value?.click()
+}
+
+async function chooseBackupImport(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  backupImportFile.value = file
+  stopBackupImportTimer()
+  backupImportJob.value = null
+  await previewBackupImportFile(file)
+}
+
+/** 失败后重试同一文件：重新上传校验，可直接再次导入。 */
+async function retryBackupImport() {
+  const file = backupImportFile.value
+  if (!file) {
+    startBackupImport()
+    return
+  }
+  stopBackupImportTimer()
+  backupImportJob.value = null
+  await previewBackupImportFile(file)
+}
+
+async function refreshBackupImportJob() {
+  const job = backupImportJob.value
+  if (!job?.id) return
+  try {
+    const result: any = await call('getBackupJob', { jobId: job.id })
+    backupImportJob.value = result?.job ?? backupImportJob.value
+  } catch (error) {
+    backupImportMessage.value = errorText(error)
+  }
+  const current = backupImportJob.value
+  if (current?.status === 'failed' && current?.error) backupImportMessage.value = String(current.error)
+  if (current?.status === 'done') {
+    backupImportMessage.value = backupImportResultText(current)
+    backupImportJob.value = null
+    await refresh()
+    void loadReadingStats()
+  }
+  syncBackupImportTimer()
+}
+
+function backupImportResultText(job: any) {
+  const preview = job?.preview
+  if (!preview) return '导入完成'
+  const parts = [
+    `新增 ${Number(preview.books?.added) || 0} 本`,
+    `更新 ${Number(preview.books?.updated) || 0} 本`,
+    `跳过 ${Number(preview.books?.skipped) || 0} 本`,
+  ]
+  const extra = [
+    Number(preview.bookmarks?.total) ? `书签 ${preview.bookmarks.total}` : '',
+    Number(preview.notes?.total) ? `笔记 ${preview.notes.total}` : '',
+    Number(preview.sources?.total) ? `书源 ${preview.sources.total}` : '',
+    Number(preview.covers) ? `封面 ${preview.covers} 张` : '',
+  ].filter(Boolean)
+  return `导入完成：${parts.join('，')}` + (extra.length ? `；${extra.join('，')}` : '')
+}
+
+async function confirmBackupImport() {
+  const job = backupImportJob.value
+  if (!job?.id || backupImportBusy.value) return
+  backupImportBusy.value = true
+  backupImportMessage.value = '正在导入'
+  try {
+    const result: any = await call('applyBackupImport', { jobId: job.id })
+    backupImportJob.value = result?.job ?? backupImportJob.value
+    if (backupImportJob.value?.status === 'done') {
+      backupImportMessage.value = backupImportResultText(backupImportJob.value)
+      backupImportJob.value = null
+      await refresh()
+      void loadReadingStats()
+    }
+  } catch (error) {
+    backupImportMessage.value = errorText(error)
+  } finally {
+    backupImportBusy.value = false
+    syncBackupImportTimer()
+  }
+}
+
+async function cancelBackupImport() {
+  const job = backupImportJob.value
+  if (backupImportBusy.value) return
+  if (!job?.id) {
+    backupImportJob.value = null
+    backupImportMessage.value = ''
+    return
+  }
+  backupImportBusy.value = true
+  try {
+    const result: any = await call('cancelBackupJob', { id: job.id })
+    backupImportJob.value = result?.job ?? null
+    backupImportMessage.value = '已取消导入，本机数据没有改动'
+  } catch (error) {
+    backupImportMessage.value = errorText(error)
+  } finally {
+    backupImportBusy.value = false
+    stopBackupImportTimer()
+  }
+}
+
 
 /** 重新签发一次性链接；旧链接（含已用过的）随之作废。 */
 async function regenerateBackupLink() {
@@ -5957,6 +6217,44 @@ onMounted(async () => {
 
           <p v-if="backupMessage" class="muted" data-testid="backup-message" role="status">{{ backupMessage }}</p>
 
+          <div class="mo-row">
+            <input
+              ref="backupImportInput"
+              type="file"
+              accept=".zip,.json,application/zip,application/json"
+              style="display: none"
+              data-testid="backup-import-input"
+              @change="chooseBackupImport"
+            />
+            <button
+              class="mo-btn"
+              :disabled="backupImportBusy || isBackupImportRunning(backupImportJob)"
+              data-testid="backup-import-start"
+              @click="startBackupImport"
+            >导入备份</button>
+            <span class="muted">支持墨读备份、阅读备份与旧书架 JSON</span>
+          </div>
+
+          <p v-if="backupImportMessage" class="muted" data-testid="backup-import-message" role="status">{{ backupImportMessage }}</p>
+
+          <div v-if="backupImportJob" class="mo-backup-progress" data-testid="backup-import-progress">
+            <div class="mo-row">
+              <span class="mo-tag" :class="{ soft: !isBackupImportRunning(backupImportJob) }">{{ backupImportStatusText(backupImportJob) }}</span>
+              <span v-if="backupImportStageText(backupImportJob)" class="muted">{{ backupImportStageText(backupImportJob) }}</span>
+              <span class="muted">{{ backupImportPercent(backupImportJob) }}%</span>
+            </div>
+            <span class="mo-download-bar">
+              <span :style="{ width: `${backupImportPercent(backupImportJob)}%` }" />
+            </span>
+            <div v-if="backupImportJob.status === 'failed'" class="mo-row" data-testid="backup-import-error" role="alert">
+              <span class="muted">{{ backupImportJob.error || '导入失败' }}</span>
+              <button class="mo-btn" :disabled="backupImportBusy" data-testid="backup-import-retry" @click="retryBackupImport">重试</button>
+            </div>
+            <div v-else-if="isBackupImportRunning(backupImportJob)" class="mo-row">
+              <button class="mo-btn danger" :disabled="backupImportBusy" data-testid="backup-import-cancel" @click="cancelBackupImport">取消</button>
+            </div>
+          </div>
+
           <template v-if="backupJob">
             <div class="mo-backup-progress" data-testid="backup-progress">
               <div class="mo-row">
@@ -5995,6 +6293,42 @@ onMounted(async () => {
               <span class="muted">{{ backupJob.fileName }}</span>
             </div>
           </template>
+        </div>
+
+        <div v-if="backupImportJob && backupImportJob.status === 'paused' && backupImportJob.preview" class="mo-sheet-mask" data-testid="backup-import-mask" @click.self="cancelBackupImport">
+          <div class="mo-sheet mo-sheet-scroll" role="dialog" aria-modal="true" aria-label="导入备份预览" data-testid="backup-import-preview">
+            <div class="mo-sheet-head">
+              <strong>导入预览</strong>
+              <button class="mo-icon-btn" title="取消" :disabled="backupImportBusy" data-testid="backup-import-close" @click="cancelBackupImport">✕</button>
+            </div>
+            <p class="muted">先核对账目，点「开始导入」才会写进本机；取消不会改动任何数据。</p>
+            <p v-if="backupImportJob.fileName" class="muted">{{ backupImportJob.fileName }}</p>
+            <ul class="mo-import-list">
+              <li v-for="row in backupImportRows(backupImportJob)" :key="row.key">
+                <strong>{{ row.label }}</strong>
+                <span class="muted">新增 {{ row.added }} · 更新 {{ row.updated }} · 跳过 {{ row.skipped }}</span>
+              </li>
+              <li v-if="backupImportJob.preview.themes?.total">
+                <strong>自定义主题</strong>
+                <span class="muted">新增 {{ backupImportJob.preview.themes.added }} · 同名跳过 {{ backupImportJob.preview.themes.skipped }}</span>
+              </li>
+              <li v-if="backupImportJob.preview.covers">
+                <strong>封面</strong>
+                <span class="muted">{{ backupImportJob.preview.covers }} 张</span>
+              </li>
+              <li>
+                <strong>补齐设置</strong>
+                <span class="muted">{{ backupImportSettingLabels(backupImportJob).length ? backupImportSettingLabels(backupImportJob).join('、') : '没有缺项' }}</span>
+              </li>
+            </ul>
+            <p v-for="warning in backupImportJob.preview.warnings || []" :key="warning" class="muted">· {{ warning }}</p>
+            <div class="mo-row">
+              <button class="mo-btn" :disabled="backupImportBusy" data-testid="backup-import-dismiss" @click="cancelBackupImport">取消</button>
+              <button class="mo-btn primary" :disabled="backupImportBusy" data-testid="backup-import-confirm" @click="confirmBackupImport">
+                {{ backupImportBusy ? '导入中…' : '开始导入' }}
+              </button>
+            </div>
+          </div>
         </div>
 
         <div class="mo-card" data-testid="webdav-card">
@@ -9035,6 +9369,23 @@ textarea {
   display: block;
   width: 100%;
   margin-top: 6px;
+}
+/* 导入预览：分项计数两列对齐，长文案自动折行。 */
+.mo-import-list {
+  list-style: none;
+  margin: 10px 0;
+  padding: 0;
+}
+.mo-import-list li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--mo-line);
+  font-size: 13px;
+}
+.mo-import-list li:last-child {
+  border-bottom: 0;
 }
 .mo-profile .mo-card p.muted {
   margin: 6px 0;
