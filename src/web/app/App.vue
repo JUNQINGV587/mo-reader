@@ -954,6 +954,14 @@ const storageQuotaWarning = computed(() => {
   return `媒体缓存已用 ${Math.round((used / quota) * 100)}%，接近配额，建议按书清理`
 })
 
+// 「我的」页的存储摘要：与存储页共用同一份占用数据，不另开清理入口。
+const storageProfileSummary = computed(() => {
+  if (!storageUsage.value) return '存储占用统计中…'
+  const total = formatBytes(Number(storageUsage.value?.total?.bytes ?? 0))
+  const media = formatBytes(Number(storageUsage.value?.media?.bytes ?? 0))
+  return `存储占用 ${total}（媒体缓存 ${media}）`
+})
+
 function exportPercent(job: any) {
   const total = Number(job?.total) || 0
   if (!total) return 0
@@ -1996,9 +2004,9 @@ async function clearAllCachesStorage() {
   }
 }
 
-// 切到存储页时刷新一次，配额或清理改动后也会再刷。
+// 切到存储页或「我的」时刷新一次，配额或清理改动后也会再刷。
 watch(view, (next) => {
-  if (next === 'storage') void loadStorageUsage()
+  if (next === 'storage' || next === 'profile') void loadStorageUsage()
 })
 // 阅读统计与「我的」页：只在阅读页、标签页可见、窗口聚焦时计时，5 秒落盘，离开或失焦立即落盘。
 const stats = ref<ReadingStats | null>(null)
@@ -6707,6 +6715,8 @@ onMounted(async () => {
             <h3 class="mo-card-title">设置</h3>
             <span class="muted">存储 · 主题 · 关于</span>
           </div>
+          <p class="muted" data-testid="profile-storage-summary">{{ storageProfileSummary }}</p>
+          <p v-if="storageQuotaWarning" class="muted" data-testid="profile-storage-warning">{{ storageQuotaWarning }}</p>
           <div class="mo-row">
             <button class="mo-btn" data-testid="profile-storage" @click="view = 'storage'">存储</button>
             <button
