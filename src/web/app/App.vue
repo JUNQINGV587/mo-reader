@@ -32,6 +32,7 @@ import {
 } from '../../core/reader/reader-config'
 import {
   BUILTIN_THEMES,
+  BUILTIN_THEME_NAMES,
   createCustomTheme,
   exportFullThemes,
   exportLegadoThemes,
@@ -53,6 +54,7 @@ import {
 } from '../../core/reader/settings'
 import { dualColumnAvailability } from '../../core/reader/paginate'
 import { AutoPageController } from '../../core/reader/auto-page'
+import { ReadingTimer, formatReadingDuration, localDateKey, shouldCountReading, type ReadingStats } from '../../core/reader/stats'
 import { KeepAwake } from '../../core/reader/wake-lock'
 import { enabledDictRules, lookupAll, type DictLookupOutcome } from '../../core/dict/lookup-all'
 import { swapDictOrder } from '../../core/dict/order'
@@ -61,7 +63,7 @@ import { groupExploreBySourceGroup } from '../../core/source/group'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
-type View = 'shelf' | 'sources' | 'search' | 'explore' | 'detail' | 'reader' | 'storage'
+type View = 'shelf' | 'sources' | 'search' | 'explore' | 'detail' | 'reader' | 'storage' | 'profile'
 type Theme = 'light' | 'sepia' | 'dark'
 type Turn = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
 type DictResult = DictLookupOutcome
@@ -87,6 +89,7 @@ function plainText(input?: string | null): string {
 
 const view = ref<View>('shelf')
 const version = ref('')
+const dataDir = ref('')
 const status = ref('')
 const busy = ref(false)
 const cacheBusy = ref(false)
@@ -569,6 +572,7 @@ function setAutoPause(reason: 'menu' | 'toc' | 'settings' | 'hidden' | 'loading'
 
 function onReaderVisibilityChange() {
   const hidden = document.hidden
+  syncReadingTimer()
   setAutoPause('hidden', hidden)
   if (keepAwake) void keepAwake.visibilityChanged(!hidden)
   if (hidden) return
@@ -821,6 +825,7 @@ async function refresh() {
   try {
     const state = await call('state')
     version.value = state?.version ?? ''
+    dataDir.value = state?.dataDir ?? ''
     const [sourceResult, bookResult] = await Promise.all([call('listSources'), call('listBooks')])
     sources.value = sourceResult?.sources ?? []
     shelfBooks.value = bookResult?.books ?? []
@@ -947,6 +952,14 @@ const storageQuotaWarning = computed(() => {
   const quota = Number(storageUsage.value?.quota?.bytes ?? 0)
   if (!quota || used / quota < 0.8) return ''
   return `媒体缓存已用 ${Math.round((used / quota) * 100)}%，接近配额，建议按书清理`
+})
+
+// 「我的」页的存储摘要：与存储页共用同一份占用数据，不另开清理入口。
+const storageProfileSummary = computed(() => {
+  if (!storageUsage.value) return '存储占用统计中…'
+  const total = formatBytes(Number(storageUsage.value?.total?.bytes ?? 0))
+  const media = formatBytes(Number(storageUsage.value?.media?.bytes ?? 0))
+  return `存储占用 ${total}（媒体缓存 ${media}）`
 })
 
 function exportPercent(job: any) {
@@ -1102,6 +1115,767 @@ async function cancelExport() {
   }
 }
 
+const backupJob = ref<any>(null)
+const backupBusy = ref(false)
+const backupMessage = ref('')
+const backupDownload = ref<{ url: string; fileName: string; expiresAt: number } | null>(null)
+let backupTimer: ReturnType<typeof setInterval> | null = null
+
+function isBackupRunning(job: any) {
+  return job?.status === 'running' || job?.status === 'queued'
+}
+
+function backupStatusText(job: any) {
+  if (!job) return ''
+  if (job.status === 'queued') return '排队中'
+  if (job.status === 'running') return '备份中'
+  if (job.status === 'done') return '已完成'
+  if (job.status === 'cancelled') return '已取消'
+  return job.status === 'failed' ? '失败' : String(job.status ?? '')
+}
+
+/** 阶段文案优先用服务端给的 stageText，缺了就按 stage 兜底。 */
+function backupStageText(job: any) {
+  if (!job) return ''
+  if (job.stageText) return String(job.stageText)
+  const stage = String(job.stage ?? '')
+  if (stage === 'collecting') return '整理数据'
+  if (stage === 'covers') return '打包封面'
+  if (stage === 'manifest') return '写入清单'
+  if (stage === 'packing') return '压缩文件'
+  return ''
+}
+
+function backupPercent(job: any) {
+  const total = Number(job?.total) || 0
+  if (!total) return 0
+  const done = Number(job.completed) || 0
+  return Math.max(0, Math.min(100, Math.round((done / total) * 100)))
+}
+
+function stopBackupTimer() {
+  if (backupTimer !== null) {
+    clearInterval(backupTimer)
+    backupTimer = null
+  }
+}
+
+function syncBackupTimer() {
+  if (isBackupRunning(backupJob.value)) {
+    if (backupTimer === null) backupTimer = setInterval(refreshBackupJob, 800)
+  } else {
+    stopBackupTimer()
+  }
+}
+
+async function loadBackupDownload() {
+  const job = backupJob.value
+  if (!job?.id || job.status !== 'done') {
+    backupDownload.value = null
+    return
+  }
+  try {
+    const result: any = await call('getBackupDownload', { jobId: job.id })
+    backupDownload.value = {
+      url: String(result?.url ?? ''),
+      fileName: String(result?.fileName ?? ''),
+      expiresAt: Number(result?.expiresAt) || 0,
+    }
+  } catch (error) {
+    backupDownload.value = null
+    backupMessage.value = errorText(error)
+  }
+}
+
+async function refreshBackupJob() {
+  const job = backupJob.value
+  if (!job?.id) return
+  try {
+    const result: any = await call('getBackupJob', { jobId: job.id })
+    backupJob.value = result?.job ?? backupJob.value
+  } catch (error) {
+    backupMessage.value = errorText(error)
+  }
+  if (backupJob.value?.status === 'done') {
+    latestBackup.value = backupJob.value
+    if (!webdavDownloadName.value && backupJob.value.fileName) {
+      webdavDownloadName.value = String(backupJob.value.fileName)
+    }
+  }
+  if (backupJob.value?.status === 'done' && !backupDownload.value) await loadBackupDownload()
+  if (backupJob.value?.status === 'failed' && backupJob.value?.error) backupMessage.value = String(backupJob.value.error)
+  syncBackupTimer()
+}
+
+async function loadBackupJob() {
+  backupJob.value = null
+  backupImportJob.value = null
+  backupDownload.value = null
+  backupMessage.value = ''
+  latestBackup.value = null
+  webdavTransferJob.value = null
+  webdavTransferMessage.value = ''
+  try {
+    const result: any = await call('getBackupJob', {})
+    latestBackup.value = result?.backup ?? null
+    if (!webdavDownloadName.value && latestBackup.value?.fileName) {
+      webdavDownloadName.value = String(latestBackup.value.fileName)
+    }
+    const transfer = result?.transfer ?? null
+    if (transfer) {
+      webdavTransferJob.value = transfer
+      if (transfer.status === 'failed' && transfer.error) webdavTransferMessage.value = String(transfer.error)
+      syncWebdavTransferTimer()
+    }
+    const job = result?.job ?? null
+    if (job?.kind === 'backupImport') {
+      // 离开「我的」页再回来时接着显示导入进度或待确认的预览。
+      backupImportJob.value = job
+      if (job.status === 'failed' && job.error) backupImportMessage.value = String(job.error)
+      syncBackupImportTimer()
+      return
+    }
+    if (job?.kind === 'webdavTransfer') {
+      // 传输作业在跑时，备份卡仍显示它上传的那份备份。
+      backupJob.value = latestBackup.value
+      if (job.status === 'done' && job.importJobId) await adoptWebdavImport(String(job.importJobId))
+    } else {
+      backupJob.value = job
+    }
+  } catch (error) {
+    backupMessage.value = errorText(error)
+  }
+  if (backupJob.value?.status === 'done') await loadBackupDownload()
+  if (backupJob.value?.status === 'failed' && backupJob.value?.error) backupMessage.value = String(backupJob.value.error)
+  syncBackupTimer()
+}
+
+async function startBackup(light = false) {
+  if (backupBusy.value) return
+  backupBusy.value = true
+  backupMessage.value = ''
+  backupDownload.value = null
+  try {
+    const result: any = await call('startBackup', { light })
+    backupJob.value = result?.job ?? null
+    latestBackup.value = backupJob.value
+    backupMessage.value = result?.existing ? '已有备份在进行，完成后会给出下载链接' : '已开始备份'
+    syncBackupTimer()
+  } catch (error) {
+    backupMessage.value = errorText(error)
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+async function cancelBackup() {
+  const job = backupJob.value
+  if (!job?.id) return
+  backupBusy.value = true
+  try {
+    const result: any = await call('cancelBackupJob', { id: job.id })
+    backupJob.value = result?.job ?? backupJob.value
+    backupDownload.value = null
+    backupMessage.value = '已取消备份，临时文件已清理'
+  } catch (error) {
+    backupMessage.value = errorText(error)
+  } finally {
+    backupBusy.value = false
+    syncBackupTimer()
+  }
+}
+
+// —— 备份导入（#132）：先预览，确认后才写库 ——
+const backupImportInput = ref<HTMLInputElement | null>(null)
+const backupImportJob = ref<any>(null)
+const backupImportBusy = ref(false)
+const backupImportMessage = ref('')
+const backupImportFile = ref<File | null>(null)
+let backupImportTimer: ReturnType<typeof setInterval> | null = null
+
+const BACKUP_IMPORT_SETTING_LABELS: Record<string, string> = {
+  theme: '主题',
+  customThemes: '自定义主题',
+  fontId: '字体',
+  fontFamily: '字体族',
+  fontSize: '字号',
+  letterSpacing: '字距',
+  lineSpacing: '行距',
+  paragraphSpacing: '段距',
+  indent: '首行缩进',
+  bold: '加粗',
+  titleMode: '标题样式',
+  titleSize: '标题字号',
+  align: '对齐方式',
+  compressPunctuation: '标点压缩',
+  kinsoku: '避头尾',
+  padding: '页边距',
+  headerMode: '页眉',
+  footerMode: '页脚',
+  showHeaderLine: '页眉线',
+  showFooterLine: '页脚线',
+  dualColumn: '双栏',
+  inkMode: '墨水屏',
+  pageAnimation: '翻页动画',
+  tapZones: '点击区域',
+  menuItems: '菜单项',
+  autoPageSeconds: '自动翻页',
+  ttsVoice: '朗读音色',
+  ttsRate: '朗读语速',
+  ttsContinuous: '连续朗读',
+  replaceRules: '替换规则',
+  mediaQuotaBytes: '缓存上限',
+  webdavUrl: 'WebDAV 地址',
+  webdavUsername: 'WebDAV 用户',
+  webdavAllowPrivate: '允许内网地址',
+}
+
+function backupImportSettingLabel(key: string) {
+  return BACKUP_IMPORT_SETTING_LABELS[key] ?? key
+}
+
+function isBackupImportRunning(job: any) {
+  return job?.status === 'running' || job?.status === 'queued'
+}
+
+function stopBackupImportTimer() {
+  if (backupImportTimer !== null) {
+    clearInterval(backupImportTimer)
+    backupImportTimer = null
+  }
+}
+
+function syncBackupImportTimer() {
+  if (isBackupImportRunning(backupImportJob.value)) {
+    if (backupImportTimer === null) backupImportTimer = setInterval(refreshBackupImportJob, 800)
+  } else {
+    stopBackupImportTimer()
+  }
+}
+
+function backupImportStatusText(job: any) {
+  if (!job) return ''
+  if (job.status === 'queued') return '排队中'
+  if (job.status === 'running') return job.stage === 'preview' ? '校验中' : '导入中'
+  if (job.status === 'paused') return '待确认'
+  if (job.status === 'done') return '已完成'
+  if (job.status === 'cancelled') return '已取消'
+  return job.status === 'failed' ? '失败' : String(job.status ?? '')
+}
+
+function backupImportStageText(job: any) {
+  if (!job) return ''
+  if (job.stageText) return String(job.stageText)
+  if (job.stage === 'preview') return '正在校验备份'
+  if (job.stage === 'apply') return '正在写入数据'
+  return ''
+}
+
+function backupImportPercent(job: any) {
+  const total = Number(job?.total) || 0
+  if (!total) return 0
+  const done = Number(job.completed) || 0
+  return Math.max(0, Math.min(100, Math.round((done / total) * 100)))
+}
+
+function backupImportRows(job: any) {
+  const preview = job?.preview
+  if (!preview) return []
+  const labels: Array<[string, string]> = [
+    ['books', '书目'],
+    ['sources', '书源'],
+    ['bookmarks', '书签'],
+    ['notes', '笔记'],
+    ['progress', '阅读进度'],
+    ['groups', '分组'],
+    ['dictRules', '字典规则'],
+    ['subscriptions', '订阅'],
+    ['replaceRules', '替换规则'],
+    ['readConfigs', '单书设置'],
+  ]
+  return labels
+    .map(([key, label]) => ({ key, label, ...(preview[key] ?? {}) }))
+    .filter((row: any) => Number(row.total) > 0)
+}
+
+function backupImportSettingLabels(job: any) {
+  const keys: string[] = job?.preview?.settings?.added ?? []
+  return keys.map((key) => backupImportSettingLabel(key))
+}
+
+async function previewBackupImportFile(file: File) {
+  backupImportBusy.value = true
+  backupImportMessage.value = ''
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    const result: any = await call('previewBackupImport', {
+      fileName: file.name,
+      dataBase64: toBase64(bytes),
+    })
+    backupImportJob.value = result?.job ?? null
+    if (backupImportJob.value?.status === 'failed') {
+      backupImportMessage.value = String(backupImportJob.value.error || '备份无法导入')
+    } else {
+      backupImportMessage.value = '校验完成，确认后开始导入'
+    }
+  } catch (error) {
+    backupImportJob.value = null
+    backupImportMessage.value = errorText(error)
+  } finally {
+    backupImportBusy.value = false
+    syncBackupImportTimer()
+  }
+}
+
+function startBackupImport() {
+  if (backupImportBusy.value) return
+  backupImportInput.value?.click()
+}
+
+async function chooseBackupImport(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  backupImportFile.value = file
+  stopBackupImportTimer()
+  backupImportJob.value = null
+  await previewBackupImportFile(file)
+}
+
+/** 失败后重试同一文件：重新上传校验，可直接再次导入。 */
+async function retryBackupImport() {
+  const file = backupImportFile.value
+  if (!file) {
+    startBackupImport()
+    return
+  }
+  stopBackupImportTimer()
+  backupImportJob.value = null
+  await previewBackupImportFile(file)
+}
+
+async function refreshBackupImportJob() {
+  const job = backupImportJob.value
+  if (!job?.id) return
+  try {
+    const result: any = await call('getBackupJob', { jobId: job.id })
+    backupImportJob.value = result?.job ?? backupImportJob.value
+  } catch (error) {
+    backupImportMessage.value = errorText(error)
+  }
+  const current = backupImportJob.value
+  if (current?.status === 'failed' && current?.error) backupImportMessage.value = String(current.error)
+  if (current?.status === 'done') {
+    backupImportMessage.value = backupImportResultText(current)
+    backupImportJob.value = null
+    await refresh()
+    void loadReadingStats()
+  }
+  syncBackupImportTimer()
+}
+
+function backupImportResultText(job: any) {
+  const preview = job?.preview
+  if (!preview) return '导入完成'
+  const parts = [
+    `新增 ${Number(preview.books?.added) || 0} 本`,
+    `更新 ${Number(preview.books?.updated) || 0} 本`,
+    `跳过 ${Number(preview.books?.skipped) || 0} 本`,
+  ]
+  const extra = [
+    Number(preview.bookmarks?.total) ? `书签 ${preview.bookmarks.total}` : '',
+    Number(preview.notes?.total) ? `笔记 ${preview.notes.total}` : '',
+    Number(preview.sources?.total) ? `书源 ${preview.sources.total}` : '',
+    Number(preview.covers) ? `封面 ${preview.covers} 张` : '',
+  ].filter(Boolean)
+  return `导入完成：${parts.join('，')}` + (extra.length ? `；${extra.join('，')}` : '')
+}
+
+async function confirmBackupImport() {
+  const job = backupImportJob.value
+  if (!job?.id || backupImportBusy.value) return
+  backupImportBusy.value = true
+  backupImportMessage.value = '正在导入'
+  try {
+    const result: any = await call('applyBackupImport', { jobId: job.id })
+    backupImportJob.value = result?.job ?? backupImportJob.value
+    if (backupImportJob.value?.status === 'done') {
+      backupImportMessage.value = backupImportResultText(backupImportJob.value)
+      backupImportJob.value = null
+      await refresh()
+      void loadReadingStats()
+    }
+  } catch (error) {
+    backupImportMessage.value = errorText(error)
+  } finally {
+    backupImportBusy.value = false
+    syncBackupImportTimer()
+  }
+}
+
+async function cancelBackupImport() {
+  const job = backupImportJob.value
+  if (backupImportBusy.value) return
+  if (!job?.id) {
+    backupImportJob.value = null
+    backupImportMessage.value = ''
+    return
+  }
+  backupImportBusy.value = true
+  try {
+    const result: any = await call('cancelBackupJob', { id: job.id })
+    backupImportJob.value = result?.job ?? null
+    backupImportMessage.value = '已取消导入，本机数据没有改动'
+  } catch (error) {
+    backupImportMessage.value = errorText(error)
+  } finally {
+    backupImportBusy.value = false
+    stopBackupImportTimer()
+  }
+}
+
+
+/** 重新签发一次性链接；旧链接（含已用过的）随之作废。 */
+async function regenerateBackupLink() {
+  backupBusy.value = true
+  try {
+    await loadBackupDownload()
+    if (backupDownload.value) backupMessage.value = '已生成新的下载链接，10 分钟内有效'
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+async function downloadBackup() {
+  const link = backupDownload.value
+  if (!link?.url) return
+  backupBusy.value = true
+  try {
+    const response = await fetch(link.url, { credentials: 'same-origin' })
+    if (!response.ok) {
+      let message = `下载链接不可用（${response.status}）`
+      try {
+        const payload: any = await response.json()
+        if (payload?.error) message = String(payload.error)
+      } catch {
+        // 响应不是 JSON 时保留状态码文案。
+      }
+      backupMessage.value = message
+      backupDownload.value = null
+      return
+    }
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = link.fileName || 'mo-reader-backup.zip'
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    backupMessage.value = '已开始下载；链接只能用一次，需要再下请重新生成'
+    backupDownload.value = null
+  } catch (error) {
+    backupMessage.value = errorText(error)
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+function backupCoverNote(job: any) {
+  const skipped = Number(job?.skippedCovers) || 0
+  if (!skipped) return ''
+  return `有 ${skipped} 张封面因超过 2MB 或取不到未打包`
+}
+/**
+ * WebDAV 配置（#131）：密码只在服务端，页面只拿「是否已设置」；
+ * 表单是内存草稿，切到别的页面再回来还在，离开浏览器即丢。
+ */
+const webdavConfig = ref<{ url: string; username: string; hasPassword: boolean; allowPrivate: boolean } | null>(null)
+const webdavDraft = ref({ url: '', username: '', password: '', allowPrivate: false })
+const webdavDraftTouched = ref(false)
+const webdavBusy = ref(false)
+const webdavSaving = ref(false)
+const webdavMessage = ref('')
+const webdavError = ref('')
+const webdavClearOpen = ref(false)
+const webdavTest = ref<{ ok: boolean; code: string; status: number | null; elapsedMs: number; message: string } | null>(null)
+
+/** 用服务端配置重置草稿；密码框永远从空开始，留空即「不改」。 */
+function resetWebdavDraft(config: any) {
+  webdavDraft.value = {
+    url: String(config?.url ?? ''),
+    username: String(config?.username ?? ''),
+    password: '',
+    allowPrivate: !!config?.allowPrivate,
+  }
+  webdavDraftTouched.value = false
+}
+
+async function loadWebdavConfig() {
+  try {
+    const result: any = await call('getWebdavConfig')
+    webdavConfig.value = result?.config ?? null
+    // 用户改过草稿就保留，避免每次回页面把刚填的内容冲掉。
+    if (!webdavDraftTouched.value) resetWebdavDraft(webdavConfig.value)
+  } catch (error) {
+    webdavError.value = `配置读取失败：${errorText(error)}`
+  }
+}
+
+function webdavDraftArgs() {
+  return {
+    url: webdavDraft.value.url,
+    username: webdavDraft.value.username,
+    password: webdavDraft.value.password,
+    allowPrivate: webdavDraft.value.allowPrivate,
+  }
+}
+
+/** 输入即算改过草稿，之后回页面不再用已存配置覆盖。 */
+function markWebdavTouched() {
+  webdavDraftTouched.value = true
+}
+
+async function saveWebdav() {
+  if (webdavSaving.value) return
+  webdavSaving.value = true
+  webdavError.value = ''
+  webdavMessage.value = ''
+  webdavTest.value = null
+  try {
+    const result: any = await call('saveWebdavConfig', webdavDraftArgs())
+    webdavConfig.value = result?.config ?? null
+    resetWebdavDraft(webdavConfig.value)
+    const warning = String(result?.warning ?? '')
+    webdavMessage.value = warning ? `已保存。${warning}` : '已保存'
+  } catch (error) {
+    webdavError.value = `保存失败：${errorText(error)}`
+  } finally {
+    webdavSaving.value = false
+  }
+}
+
+/** 测试的是表单里的草稿，不写库；密码留空时服务端沿用已存密码。 */
+async function testWebdav() {
+  if (webdavBusy.value) return
+  webdavBusy.value = true
+  webdavError.value = ''
+  webdavMessage.value = ''
+  webdavTest.value = null
+  try {
+    const result: any = await call('testWebdav', webdavDraftArgs())
+    webdavTest.value = result ?? null
+  } catch (error) {
+    webdavError.value = `测试失败：${errorText(error)}`
+  } finally {
+    webdavBusy.value = false
+  }
+}
+
+/** 结果一行：原因 + 状态码 + 耗时；失败时也走 role=alert 让读屏念出来。 */
+function webdavTestText(result: any) {
+  if (!result) return ''
+  const parts = [String(result.message ?? '')]
+  if (result.status) parts.push(`HTTP ${result.status}`)
+  parts.push(`${Number(result.elapsedMs) || 0} ms`)
+  return parts.filter(Boolean).join(' · ')
+}
+
+// —— WebDAV 上传与下载（#133）：上传当前备份，取回后走与本地导入相同的预览 ——
+const latestBackup = ref<any>(null)
+const webdavTransferJob = ref<any>(null)
+const webdavTransferBusy = ref(false)
+const webdavTransferMessage = ref('')
+const webdavDownloadName = ref('')
+let webdavTransferTimer: ReturnType<typeof setInterval> | null = null
+
+function isWebdavTransferRunning(job: any) {
+  return job?.status === 'running' || job?.status === 'queued'
+}
+
+function webdavTransferStatusText(job: any) {
+  if (!job) return ''
+  if (job.status === 'queued') return '排队中'
+  if (job.status === 'running') return job.direction === 'upload' ? '上传中' : '取回中'
+  if (job.status === 'paused') return '待确认'
+  if (job.status === 'done') return '已完成'
+  if (job.status === 'cancelled') return '已取消'
+  return job.status === 'failed' ? '失败' : String(job.status ?? '')
+}
+
+function webdavTransferPercent(job: any) {
+  const total = Number(job?.total) || 0
+  if (!total) return 0
+  const done = Number(job?.completed) || 0
+  return Math.max(0, Math.min(100, Math.round((done / total) * 100)))
+}
+
+/** 字节进度：上传/取回都以「已传 / 总共」显示，取不回总大小时只显示已传。 */
+function webdavTransferBytesText(job: any) {
+  const done = Number(job?.completed) || 0
+  if (!done) return ''
+  const total = Number(job?.total) || 0
+  return total ? `${formatBytes(done)} / ${formatBytes(total)}` : formatBytes(done)
+}
+
+function stopWebdavTransferTimer() {
+  if (webdavTransferTimer !== null) {
+    clearInterval(webdavTransferTimer)
+    webdavTransferTimer = null
+  }
+}
+
+function syncWebdavTransferTimer() {
+  if (isWebdavTransferRunning(webdavTransferJob.value)) {
+    if (webdavTransferTimer === null) webdavTransferTimer = setInterval(refreshWebdavTransferJob, 800)
+  } else {
+    stopWebdavTransferTimer()
+  }
+}
+
+/** 取回完成后的导入作业交给导入卡与预览：校验、确认、写库全部沿用 #132 的流程。 */
+async function adoptWebdavImport(importJobId: string) {
+  try {
+    const result: any = await call('getBackupJob', { jobId: importJobId })
+    const imported = result?.job ?? null
+    if (!imported) return
+    backupImportJob.value = imported
+    if (imported.status === 'failed') {
+      backupImportMessage.value = String(imported.error || '备份无法导入')
+    } else if (imported.status === 'paused') {
+      backupImportMessage.value = '校验完成，确认后开始导入'
+    } else {
+      backupImportMessage.value = '正在校验备份'
+    }
+    syncBackupImportTimer()
+  } catch (error) {
+    webdavTransferMessage.value = errorText(error)
+  }
+}
+
+async function refreshWebdavTransferJob() {
+  const job = webdavTransferJob.value
+  if (!job?.id) return
+  try {
+    const result: any = await call('getBackupJob', { jobId: job.id })
+    webdavTransferJob.value = result?.job ?? webdavTransferJob.value
+    latestBackup.value = result?.backup ?? latestBackup.value
+  } catch (error) {
+    webdavTransferMessage.value = errorText(error)
+  }
+  const current = webdavTransferJob.value
+  if (current?.status === 'failed' && current?.error) webdavTransferMessage.value = String(current.error)
+  if (current?.status === 'done') {
+    webdavTransferMessage.value =
+      current.direction === 'upload'
+        ? `已上传：${current.fileName}`
+        : `已取回：${current.fileName}，请确认导入`
+    if (current.importJobId) await adoptWebdavImport(String(current.importJobId))
+  }
+  syncWebdavTransferTimer()
+}
+
+/** 上传前先确认当前备份可用；没备份就先提示去备份。 */
+async function startWebdavUpload() {
+  if (webdavTransferBusy.value) return
+  webdavTransferBusy.value = true
+  webdavTransferMessage.value = ''
+  try {
+    const result: any = await call('uploadBackupToWebdav', { backupJobId: latestBackup.value?.id || '' })
+    webdavTransferJob.value = result?.job ?? null
+    webdavTransferMessage.value = '正在检查远端目录'
+    syncWebdavTransferTimer()
+  } catch (error) {
+    webdavTransferMessage.value = errorText(error)
+  } finally {
+    webdavTransferBusy.value = false
+  }
+}
+
+async function confirmWebdavOverwrite() {
+  const job = webdavTransferJob.value
+  if (!job?.id || webdavTransferBusy.value) return
+  webdavTransferBusy.value = true
+  try {
+    const result: any = await call('uploadBackupToWebdav', { id: job.id })
+    webdavTransferJob.value = result?.job ?? webdavTransferJob.value
+    webdavTransferMessage.value = '正在上传'
+    syncWebdavTransferTimer()
+  } catch (error) {
+    webdavTransferMessage.value = errorText(error)
+  } finally {
+    webdavTransferBusy.value = false
+  }
+}
+
+async function cancelWebdavTransfer() {
+  const job = webdavTransferJob.value
+  if (!job?.id || webdavTransferBusy.value) return
+  webdavTransferBusy.value = true
+  try {
+    const result: any = await call('cancelBackupJob', { id: job.id })
+    webdavTransferJob.value = result?.job ?? webdavTransferJob.value
+    webdavTransferMessage.value = '已取消，临时文件已清理'
+  } catch (error) {
+    webdavTransferMessage.value = errorText(error)
+  } finally {
+    webdavTransferBusy.value = false
+    stopWebdavTransferTimer()
+  }
+}
+
+async function retryWebdavTransfer() {
+  const job = webdavTransferJob.value
+  if (job?.direction === 'download') {
+    await startWebdavDownload()
+    return
+  }
+  await startWebdavUpload()
+}
+
+/** 取回的远端文件名默认用当前备份名，也可以手填别的。 */
+async function startWebdavDownload() {
+  if (webdavTransferBusy.value) return
+  const fileName = webdavDownloadName.value.trim() || latestBackup.value?.fileName || ''
+  if (!fileName) {
+    webdavTransferMessage.value = '请填写远端备份文件名'
+    return
+  }
+  webdavTransferBusy.value = true
+  webdavTransferMessage.value = ''
+  try {
+    const result: any = await call('downloadBackupFromWebdav', { fileName })
+    webdavTransferJob.value = result?.job ?? null
+    webdavTransferMessage.value = '正在取回备份'
+    syncWebdavTransferTimer()
+  } catch (error) {
+    webdavTransferMessage.value = errorText(error)
+  } finally {
+    webdavTransferBusy.value = false
+  }
+}
+
+async function clearWebdav() {
+  if (webdavSaving.value) return
+  webdavSaving.value = true
+  webdavError.value = ''
+  webdavMessage.value = ''
+  webdavTest.value = null
+  try {
+    const result: any = await call('saveWebdavConfig', { clear: true })
+    webdavConfig.value = result?.config ?? null
+    resetWebdavDraft(webdavConfig.value)
+    webdavClearOpen.value = false
+    webdavMessage.value = '已清空 WebDAV 配置'
+  } catch (error) {
+    webdavError.value = `清空失败：${errorText(error)}`
+  } finally {
+    webdavSaving.value = false
+  }
+}
+
 
 type DownloadScope = 'rest' | 'all' | 'range'
 const downloadScope = ref<DownloadScope>('rest')
@@ -1230,9 +2004,123 @@ async function clearAllCachesStorage() {
   }
 }
 
-// 切到存储页时刷新一次，配额或清理改动后也会再刷。
+// 切到存储页或「我的」时刷新一次，配额或清理改动后也会再刷。
 watch(view, (next) => {
-  if (next === 'storage') void loadStorageUsage()
+  if (next === 'storage' || next === 'profile') void loadStorageUsage()
+})
+// 阅读统计与「我的」页：只在阅读页、标签页可见、窗口聚焦时计时，5 秒落盘，离开或失焦立即落盘。
+const stats = ref<ReadingStats | null>(null)
+const statsBusy = ref(false)
+const statsError = ref('')
+const statsClearOpen = ref(false)
+const statsClearBusy = ref(false)
+const statsExpanded = ref(false)
+const todayReadingMs = ref(0)
+const PROFILE_RANK_LIMIT = 50
+
+const statsBooks = computed(() => stats.value?.books ?? [])
+const visibleStatsBooks = computed(() =>
+  statsExpanded.value ? statsBooks.value : statsBooks.value.slice(0, PROFILE_RANK_LIMIT),
+)
+const last7MaxMs = computed(() => {
+  const days = stats.value?.last7Days ?? []
+  return Math.max(1, ...days.map((day) => day.ms))
+})
+const last7TotalMs = computed(() =>
+  (stats.value?.last7Days ?? []).reduce((sum, day) => sum + day.ms, 0),
+)
+
+function statsBarHeight(ms: number) {
+  const ratio = Math.max(0, Number(ms) || 0) / last7MaxMs.value
+  return `${Math.round(ratio * 100)}%`
+}
+
+function formatStatDate(value: string) {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '—'
+  const now = new Date()
+  const prefix = date.getFullYear() === now.getFullYear() ? '' : `${date.getFullYear()}年`
+  return `${prefix}${date.getMonth() + 1}月${date.getDate()}日`
+}
+
+async function loadReadingStats() {
+  statsBusy.value = true
+  statsError.value = ''
+  try {
+    const result = await call('getReadingStats')
+    stats.value = result as ReadingStats
+    todayReadingMs.value = Number(result?.todayMs ?? 0)
+  } catch (error) {
+    statsError.value = `统计读取失败：${errorText(error)}`
+  } finally {
+    statsBusy.value = false
+  }
+}
+
+let readingTimer: ReadingTimer | null = null
+let statsFlushChain: Promise<void> = Promise.resolve()
+
+function queueReadingTime(bookId: string, daily: Record<string, number>) {
+  const todayKey = localDateKey(new Date())
+  todayReadingMs.value += Number(daily[todayKey] ?? 0)
+  const at = new Date().toISOString()
+  statsFlushChain = statsFlushChain
+    .then(() => call('saveReadingTime', { bookId, daily, at }))
+    .then(() => undefined)
+    .catch(() => undefined)
+}
+
+function syncReadingTimer() {
+  if (!readingTimer) {
+    readingTimer = new ReadingTimer({
+      flush: (payload) => queueReadingTime(payload.bookId, payload.daily),
+    })
+  }
+  const bookId = String(currentBook.value?.id ?? '')
+  if (bookId) readingTimer.setBook(bookId)
+  const timing = shouldCountReading({
+    readingPage: view.value === 'reader',
+    bookId,
+    hidden: document.hidden,
+    focused: document.hasFocus(),
+  })
+  readingTimer.setActive(timing)
+}
+
+function flushReadingTimer() {
+  readingTimer?.flush()
+}
+
+async function clearReadingStats() {
+  statsClearBusy.value = true
+  statsError.value = ''
+  try {
+    await statsFlushChain
+    await call('clearReadingStats')
+    todayReadingMs.value = 0
+    statsClearOpen.value = false
+    await loadReadingStats()
+  } catch (error) {
+    statsError.value = `清空失败：${errorText(error)}`
+  } finally {
+    statsClearBusy.value = false
+  }
+}
+
+watch([view, () => currentBook.value?.id, readerKind], () => syncReadingTimer())
+
+watch(view, (next) => {
+  if (next === 'profile') {
+    statsClearOpen.value = false
+    webdavClearOpen.value = false
+    void loadReadingStats()
+    void loadBackupJob()
+    void loadWebdavConfig()
+  } else {
+    stopBackupTimer()
+    stopWebdavTransferTimer()
+  }
 })
 
 function isDownloadRunning(job: any) {
@@ -1669,9 +2557,15 @@ watch(view, (next) => {
 })
 
 onUnmounted(() => {
+  window.removeEventListener('focus', syncReadingTimer)
+  window.removeEventListener('blur', syncReadingTimer)
+  window.removeEventListener('pagehide', flushReadingTimer)
+  readingTimer?.stop()
   stopDownloadTimer()
   stopMediaTimer()
   stopExportTimer()
+  stopBackupTimer()
+  stopWebdavTransferTimer()
   if (settingsPersistTimer) clearTimeout(settingsPersistTimer)
   if (autoPageTimer) {
     clearInterval(autoPageTimer)
@@ -4391,6 +5285,9 @@ onMounted(async () => {
   window.addEventListener('resize', syncViewportWidth)
   syncViewportWidth()
   document.addEventListener('visibilitychange', onReaderVisibilityChange)
+  window.addEventListener('focus', syncReadingTimer)
+  window.addEventListener('blur', syncReadingTimer)
+  window.addEventListener('pagehide', flushReadingTimer)
   loadSpeechVoices()
   window.speechSynthesis?.addEventListener?.('voiceschanged', loadSpeechVoices)
   autoPage.setSeconds(effectiveSettings.value.autoPageSeconds)
@@ -4408,6 +5305,8 @@ onMounted(async () => {
   }
   void loadBattery()
   await refresh()
+  void loadReadingStats()
+  syncReadingTimer()
   void loadRssSources()
 })
 </script>
@@ -4430,6 +5329,7 @@ onMounted(async () => {
         <button :class="{ on: view === 'explore' }" data-testid="nav-explore" @click="openExplore">发现</button>
         <button :class="{ on: view === 'sources' }" data-testid="nav-sources" @click="view = 'sources'">书源</button>
         <button :class="{ on: view === 'rss' }" data-testid="nav-rss" @click="view = 'rss'">订阅</button>
+        <button :class="{ on: view === 'profile' }" data-testid="nav-profile" @click="view = 'profile'">我的</button>
         <button :class="{ on: view === 'storage' }" data-testid="nav-storage" @click="view = 'storage'">存储</button>
         <span class="mo-version">v{{ version }}</span>
       </nav>
@@ -5416,6 +6316,423 @@ onMounted(async () => {
         </transition>
       </section>
 
+      <section v-if="view === 'profile'" class="mo-pane mo-profile" data-testid="profile-pane">
+        <div class="mo-section-head">
+          <h2>我的</h2>
+          <span class="muted">阅读统计 · 设置入口</span>
+          <button class="mo-btn" :disabled="statsBusy" data-testid="stats-refresh" @click="loadReadingStats">刷新</button>
+        </div>
+
+        <div class="mo-card mo-stat-summary" data-testid="stats-summary">
+          <div class="mo-stat-big">
+            <span class="muted">今日</span>
+            <strong data-testid="stats-today">{{ formatReadingDuration(todayReadingMs) }}</strong>
+          </div>
+          <div class="mo-stat-big">
+            <span class="muted">累计</span>
+            <strong data-testid="stats-total">{{ formatReadingDuration(stats?.totalMs || 0) }}</strong>
+          </div>
+        </div>
+
+        <p v-if="statsBusy && !stats" class="muted" role="status">统计加载中…</p>
+        <div v-else-if="statsError" class="mo-card mo-stats-error" role="alert">
+          <p class="muted">{{ statsError }}</p>
+          <button class="mo-btn" data-testid="stats-retry" @click="loadReadingStats">重试</button>
+        </div>
+        <template v-else-if="stats">
+          <div class="mo-card" data-testid="stats-week">
+            <div class="mo-card-head">
+              <h3 class="mo-card-title">近 7 天</h3>
+              <span class="muted">近 30 天 {{ formatReadingDuration(stats.last30Ms) }}</span>
+            </div>
+            <div
+              class="mo-bars"
+              role="img"
+              :aria-label="`近 7 天阅读 ${formatReadingDuration(last7TotalMs)}`"
+            >
+              <div v-for="day in stats.last7Days" :key="day.date" class="mo-bar-col">
+                <span class="mo-bar-value">{{ day.ms ? formatReadingDuration(day.ms) : '' }}</span>
+                <div class="mo-bar-track" :title="`${day.date} ${formatReadingDuration(day.ms)}`">
+                  <div class="mo-bar" :style="{ height: statsBarHeight(day.ms) }"></div>
+                </div>
+                <span class="mo-bar-label">{{ day.label }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="mo-card" data-testid="stats-books">
+            <div class="mo-card-head">
+              <h3 class="mo-card-title">按书排行</h3>
+              <span class="muted">{{ statsBooks.length }} 本</span>
+            </div>
+            <p v-if="statsBooks.length === 0" class="muted">还没有阅读时长，去书架挑一本吧。</p>
+            <ol v-else class="mo-rank">
+              <li v-for="book in visibleStatsBooks" :key="book.bookId" class="mo-rank-item">
+                <div class="mo-rank-head">
+                  <span class="mo-rank-name">
+                    {{ book.name }}
+                    <span v-if="book.deleted" class="mo-tag soft" data-testid="stats-deleted">已删除</span>
+                  </span>
+                  <strong>{{ formatReadingDuration(book.readMs) }}</strong>
+                </div>
+                <div class="mo-rank-meta">
+                  <span>{{ book.percent }}% · {{ book.chapterTitle || `第 ${book.chapterIndex + 1} 章` }}</span>
+                  <span>最后阅读 {{ formatStatDate(book.lastReadAt) }}</span>
+                </div>
+              </li>
+            </ol>
+            <button
+              v-if="statsBooks.length > PROFILE_RANK_LIMIT"
+              class="mo-btn mo-rank-more"
+              data-testid="stats-more"
+              :aria-label="statsExpanded ? '收起其余书目' : `展开其余 ${statsBooks.length - PROFILE_RANK_LIMIT} 本`"
+              @click="statsExpanded = !statsExpanded"
+            >{{ statsExpanded ? '收起' : '展开' }}</button>
+          </div>
+        </template>
+
+        <div class="mo-card" data-testid="stats-clear">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">清空统计</h3>
+            <span class="muted">保留进度和书签</span>
+          </div>
+          <div v-if="statsClearOpen" class="mo-row">
+            <span class="muted">只清空阅读时长，进度和书签都会保留。</span>
+            <button class="mo-btn danger" :disabled="statsClearBusy" data-testid="stats-clear-confirm" @click="clearReadingStats">
+              {{ statsClearBusy ? '清空中…' : '确认清空' }}
+            </button>
+            <button class="mo-btn" :disabled="statsClearBusy" @click="statsClearOpen = false">取消</button>
+          </div>
+          <button v-else class="mo-btn danger" data-testid="stats-clear-open" @click="statsClearOpen = true">清空统计</button>
+        </div>
+
+        <div class="mo-card" data-testid="backup-card">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">备份</h3>
+            <span class="muted">整包导出 · 一次性下载</span>
+          </div>
+          <p class="muted" data-testid="backup-note">
+            打包书目、阅读进度、书签、笔记、书源、订阅、分组、设置、主题、替换规则、字典规则和封面，不含正文、缓存与字体。
+          </p>
+          <p class="muted">备份生成后提供一次性下载链接，10 分钟内有效，只能下载一次。</p>
+          <div class="mo-row">
+            <button class="mo-btn primary" :disabled="backupBusy || isBackupRunning(backupJob)" data-testid="backup-start-full" @click="startBackup(false)">
+              {{ backupBusy ? '处理中…' : '完整备份' }}
+            </button>
+            <button class="mo-btn" :disabled="backupBusy || isBackupRunning(backupJob)" data-testid="backup-start-light" @click="startBackup(true)">
+              轻量备份
+            </button>
+            <span class="muted">轻量备份只含书目与阅读进度</span>
+          </div>
+
+          <p v-if="backupMessage" class="muted" data-testid="backup-message" role="status">{{ backupMessage }}</p>
+
+          <div class="mo-row">
+            <input
+              ref="backupImportInput"
+              type="file"
+              accept=".zip,.json,application/zip,application/json"
+              style="display: none"
+              data-testid="backup-import-input"
+              @change="chooseBackupImport"
+            />
+            <button
+              class="mo-btn"
+              :disabled="backupImportBusy || isBackupImportRunning(backupImportJob)"
+              data-testid="backup-import-start"
+              @click="startBackupImport"
+            >导入备份</button>
+            <span class="muted">支持墨读备份、阅读备份与旧书架 JSON</span>
+          </div>
+
+          <p v-if="backupImportMessage" class="muted" data-testid="backup-import-message" role="status">{{ backupImportMessage }}</p>
+
+          <div v-if="backupImportJob" class="mo-backup-progress" data-testid="backup-import-progress">
+            <div class="mo-row">
+              <span class="mo-tag" :class="{ soft: !isBackupImportRunning(backupImportJob) }">{{ backupImportStatusText(backupImportJob) }}</span>
+              <span v-if="backupImportStageText(backupImportJob)" class="muted">{{ backupImportStageText(backupImportJob) }}</span>
+              <span class="muted">{{ backupImportPercent(backupImportJob) }}%</span>
+            </div>
+            <span class="mo-download-bar">
+              <span :style="{ width: `${backupImportPercent(backupImportJob)}%` }" />
+            </span>
+            <div v-if="backupImportJob.status === 'failed'" class="mo-row" data-testid="backup-import-error" role="alert">
+              <span class="muted">{{ backupImportJob.error || '导入失败' }}</span>
+              <button class="mo-btn" :disabled="backupImportBusy" data-testid="backup-import-retry" @click="retryBackupImport">重试</button>
+            </div>
+            <div v-else-if="isBackupImportRunning(backupImportJob)" class="mo-row">
+              <button class="mo-btn danger" :disabled="backupImportBusy" data-testid="backup-import-cancel" @click="cancelBackupImport">取消</button>
+            </div>
+          </div>
+
+          <template v-if="backupJob">
+            <div class="mo-backup-progress" data-testid="backup-progress">
+              <div class="mo-row">
+                <span class="mo-tag" :class="{ soft: !isBackupRunning(backupJob) }">{{ backupStatusText(backupJob) }}</span>
+                <span class="muted">{{ backupJob.light ? '轻量备份' : '完整备份' }}</span>
+                <span v-if="backupStageText(backupJob)" class="muted" data-testid="backup-stage">{{ backupStageText(backupJob) }}</span>
+                <span class="muted">{{ backupPercent(backupJob) }}%</span>
+              </div>
+              <span class="mo-download-bar">
+                <span :style="{ width: `${backupPercent(backupJob)}%` }" />
+              </span>
+              <p v-if="backupCoverNote(backupJob)" class="muted" data-testid="backup-skipped-covers">{{ backupCoverNote(backupJob) }}</p>
+            </div>
+
+            <div v-if="backupJob.status === 'failed'" class="mo-row" data-testid="backup-error" role="alert">
+              <span class="muted">{{ backupJob.error || '备份失败，请重试' }}</span>
+              <button class="mo-btn" :disabled="backupBusy" data-testid="backup-retry" @click="startBackup(backupJob.light)">重试</button>
+            </div>
+            <div v-else-if="backupJob.status === 'cancelled'" class="mo-row">
+              <button class="mo-btn" :disabled="backupBusy" data-testid="backup-retry" @click="startBackup(backupJob.light)">重试</button>
+            </div>
+            <div v-else-if="isBackupRunning(backupJob)" class="mo-row">
+              <button class="mo-btn danger" :disabled="backupBusy" data-testid="backup-cancel" @click="cancelBackup">取消</button>
+            </div>
+            <div v-else-if="backupJob.status === 'done'" class="mo-row">
+              <button
+                v-if="backupDownload"
+                class="mo-btn primary"
+                :disabled="backupBusy"
+                data-testid="backup-download"
+                @click="downloadBackup"
+              >下载备份</button>
+              <button v-else class="mo-btn" :disabled="backupBusy" data-testid="backup-download-retry" @click="regenerateBackupLink">
+                重新生成下载链接
+              </button>
+              <span class="muted">{{ backupJob.fileName }}</span>
+            </div>
+          </template>
+        </div>
+
+        <div v-if="backupImportJob && backupImportJob.status === 'paused' && backupImportJob.preview" class="mo-sheet-mask" data-testid="backup-import-mask" @click.self="cancelBackupImport">
+          <div class="mo-sheet mo-sheet-scroll" role="dialog" aria-modal="true" aria-label="导入备份预览" data-testid="backup-import-preview">
+            <div class="mo-sheet-head">
+              <strong>导入预览</strong>
+              <button class="mo-icon-btn" title="取消" :disabled="backupImportBusy" data-testid="backup-import-close" @click="cancelBackupImport">✕</button>
+            </div>
+            <p class="muted">先核对账目，点「开始导入」才会写进本机；取消不会改动任何数据。</p>
+            <p v-if="backupImportJob.fileName" class="muted">{{ backupImportJob.fileName }}</p>
+            <ul class="mo-import-list">
+              <li v-for="row in backupImportRows(backupImportJob)" :key="row.key">
+                <strong>{{ row.label }}</strong>
+                <span class="muted">新增 {{ row.added }} · 更新 {{ row.updated }} · 跳过 {{ row.skipped }}</span>
+              </li>
+              <li v-if="backupImportJob.preview.themes?.total">
+                <strong>自定义主题</strong>
+                <span class="muted">新增 {{ backupImportJob.preview.themes.added }} · 同名跳过 {{ backupImportJob.preview.themes.skipped }}</span>
+              </li>
+              <li v-if="backupImportJob.preview.covers">
+                <strong>封面</strong>
+                <span class="muted">{{ backupImportJob.preview.covers }} 张</span>
+              </li>
+              <li>
+                <strong>补齐设置</strong>
+                <span class="muted">{{ backupImportSettingLabels(backupImportJob).length ? backupImportSettingLabels(backupImportJob).join('、') : '没有缺项' }}</span>
+              </li>
+            </ul>
+            <p v-for="warning in backupImportJob.preview.warnings || []" :key="warning" class="muted">· {{ warning }}</p>
+            <div class="mo-row">
+              <button class="mo-btn" :disabled="backupImportBusy" data-testid="backup-import-dismiss" @click="cancelBackupImport">取消</button>
+              <button class="mo-btn primary" :disabled="backupImportBusy" data-testid="backup-import-confirm" @click="confirmBackupImport">
+                {{ backupImportBusy ? '导入中…' : '开始导入' }}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="mo-card" data-testid="webdav-card">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">WebDAV</h3>
+            <span class="muted">{{ webdavConfig?.url ? "已配置" : "未配置" }}</span>
+          </div>
+          <p class="muted">地址填网盘上的目录，例如 Nextcloud 的 /remote.php/dav/files/账号/墨读/；只支持 http 和 https。</p>
+          <div class="mo-webdav-form">
+            <label class="mo-webdav-field">
+              <span>地址</span>
+              <input
+                v-model="webdavDraft.url"
+                class="mo-input"
+                type="url"
+                inputmode="url"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="https://网盘地址/目录/"
+                data-testid="webdav-url"
+                @input="markWebdavTouched"
+              />
+            </label>
+            <label class="mo-webdav-field">
+              <span>账号</span>
+              <input
+                v-model="webdavDraft.username"
+                class="mo-input"
+                type="text"
+                autocomplete="username"
+                spellcheck="false"
+                placeholder="网盘账号"
+                data-testid="webdav-username"
+                @input="markWebdavTouched"
+              />
+            </label>
+            <label class="mo-webdav-field">
+              <span>密码</span>
+              <input
+                v-model="webdavDraft.password"
+                class="mo-input"
+                type="password"
+                autocomplete="new-password"
+                :placeholder="webdavConfig?.hasPassword ? '已设置，留空不改' : '网盘密码'"
+                data-testid="webdav-password"
+                @input="markWebdavTouched"
+              />
+            </label>
+          </div>
+          <label class="mo-webdav-allow">
+            <input
+              v-model="webdavDraft.allowPrivate"
+              type="checkbox"
+              data-testid="webdav-allow-private"
+              @change="markWebdavTouched"
+            />
+            <span>允许私网</span>
+          </label>
+          <p class="muted">只有自己的 NAS、内网网盘才需要打开；打开后允许访问本机和内网地址，公网地址不用开。</p>
+          <div class="mo-row">
+            <button class="mo-btn primary" :disabled="webdavSaving" data-testid="webdav-save" @click="saveWebdav">
+              {{ webdavSaving ? "保存中…" : "保存" }}
+            </button>
+            <button
+              class="mo-btn"
+              :disabled="webdavBusy || !webdavDraft.url"
+              data-testid="webdav-test"
+              @click="testWebdav"
+            >{{ webdavBusy ? "测试中…" : "测试连通" }}</button>
+            <button
+              v-if="!webdavClearOpen"
+              class="mo-btn danger"
+              :disabled="webdavSaving"
+              data-testid="webdav-clear-open"
+              @click="webdavClearOpen = true"
+            >清空配置</button>
+          </div>
+          <div v-if="webdavClearOpen" class="mo-row">
+            <span class="muted">清空会删掉地址、账号、密码和私网开关。</span>
+            <button class="mo-btn danger" :disabled="webdavSaving" data-testid="webdav-clear-confirm" @click="clearWebdav">
+              确认清空
+            </button>
+            <button class="mo-btn" @click="webdavClearOpen = false">取消</button>
+          </div>
+          <p
+            v-if="webdavTest"
+            class="mo-webdav-result"
+            :role="webdavTest.ok ? 'status' : 'alert'"
+            data-testid="webdav-test-result"
+          >
+            <span class="mo-tag" :class="{ soft: !webdavTest.ok }">{{ webdavTest.ok ? "可用" : "不可用" }}</span>
+            <span>{{ webdavTestText(webdavTest) }}</span>
+          </p>
+          <p v-if="webdavError" class="muted" role="alert" data-testid="webdav-error">{{ webdavError }}</p>
+          <p v-if="webdavMessage" class="muted" role="status" data-testid="webdav-message">{{ webdavMessage }}</p>
+
+          <div class="mo-webdav-transfer" data-testid="webdav-transfer">
+            <h4 class="mo-webdav-subtitle">备份上传与取回</h4>
+            <p class="muted">上传会把当前整包备份写到上面目录的同名文件；取回先校验和预览，确认后才写进本机。</p>
+            <div class="mo-row">
+              <button
+                class="mo-btn primary"
+                :disabled="webdavTransferBusy || isWebdavTransferRunning(webdavTransferJob) || latestBackup?.status !== 'done'"
+                data-testid="webdav-upload"
+                aria-label="上传当前备份到 WebDAV"
+                @click="startWebdavUpload"
+              >上传备份</button>
+              <span class="muted" data-testid="webdav-upload-note">
+                {{ latestBackup?.status === 'done' && latestBackup?.fileName ? `当前备份：${latestBackup.fileName}` : "先在上方做一次备份，再上传" }}
+              </span>
+            </div>
+            <div class="mo-webdav-file">
+              <label class="mo-webdav-field">
+                <span>远端文件名</span>
+                <input
+                  v-model="webdavDownloadName"
+                  class="mo-input"
+                  type="text"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="默认用当前备份的文件名"
+                  data-testid="webdav-download-name"
+                />
+              </label>
+              <button
+                class="mo-btn"
+                :disabled="webdavTransferBusy || isWebdavTransferRunning(webdavTransferJob)"
+                data-testid="webdav-download"
+                aria-label="从 WebDAV 取回备份"
+                @click="startWebdavDownload"
+              >取回备份</button>
+            </div>
+            <p class="muted">只读这个文件名对应的备份，不会列出或改动网盘上的其他文件。</p>
+
+            <div v-if="webdavTransferJob" class="mo-backup-progress" data-testid="webdav-transfer-progress">
+              <div class="mo-row">
+                <span class="mo-tag" :class="{ soft: !isWebdavTransferRunning(webdavTransferJob) }">{{ webdavTransferStatusText(webdavTransferJob) }}</span>
+                <span class="muted">{{ webdavTransferJob.direction === "upload" ? "上传到 WebDAV" : "从 WebDAV 取回" }}</span>
+                <span v-if="webdavTransferJob.stageText" class="muted">{{ webdavTransferJob.stageText }}</span>
+                <span v-if="webdavTransferBytesText(webdavTransferJob)" class="muted">{{ webdavTransferBytesText(webdavTransferJob) }}</span>
+                <span v-if="webdavTransferJob.total" class="muted">{{ webdavTransferPercent(webdavTransferJob) }}%</span>
+              </div>
+              <span v-if="webdavTransferJob.total" class="mo-download-bar">
+                <span :style="{ width: `${webdavTransferPercent(webdavTransferJob)}%` }" />
+              </span>
+              <div v-if="isWebdavTransferRunning(webdavTransferJob)" class="mo-row">
+                <button class="mo-btn danger" :disabled="webdavTransferBusy" data-testid="webdav-transfer-cancel" @click="cancelWebdavTransfer">取消</button>
+                <span class="muted">取消后临时文件会清掉，远端原有备份不受影响</span>
+              </div>
+              <div v-else-if="webdavTransferJob.status === 'paused'" class="mo-row" data-testid="webdav-transfer-confirm-row">
+                <span class="muted">远端已有 {{ webdavTransferJob.fileName }}，覆盖会替换旧备份。</span>
+                <button
+                  class="mo-btn primary"
+                  :disabled="webdavTransferBusy"
+                  data-testid="webdav-transfer-confirm"
+                  aria-label="确认覆盖远端同名备份"
+                  @click="confirmWebdavOverwrite"
+                >确认覆盖</button>
+                <button class="mo-btn" :disabled="webdavTransferBusy" data-testid="webdav-transfer-dismiss" @click="cancelWebdavTransfer">取消</button>
+              </div>
+              <div v-else-if="webdavTransferJob.status === 'failed'" class="mo-row" data-testid="webdav-transfer-error" role="alert">
+                <span class="muted">{{ webdavTransferJob.error || "上传下载失败，请重试" }}</span>
+                <button class="mo-btn" :disabled="webdavTransferBusy" data-testid="webdav-transfer-retry" @click="retryWebdavTransfer">重试</button>
+              </div>
+              <div v-else-if="webdavTransferJob.status === 'cancelled'" class="mo-row">
+                <button class="mo-btn" :disabled="webdavTransferBusy" data-testid="webdav-transfer-retry" @click="retryWebdavTransfer">重试</button>
+              </div>
+            </div>
+            <p v-if="webdavTransferMessage" class="muted" role="status" data-testid="webdav-transfer-message">{{ webdavTransferMessage }}</p>
+          </div>
+        </div>
+        <div class="mo-card" data-testid="profile-entries">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">设置</h3>
+            <span class="muted">存储 · 主题 · 关于</span>
+          </div>
+          <p class="muted" data-testid="profile-storage-summary">{{ storageProfileSummary }}</p>
+          <p v-if="storageQuotaWarning" class="muted" data-testid="profile-storage-warning">{{ storageQuotaWarning }}</p>
+          <div class="mo-row">
+            <button class="mo-btn" data-testid="profile-storage" @click="view = 'storage'">存储</button>
+            <button
+              v-for="themeName in BUILTIN_THEME_NAMES"
+              :key="themeName"
+              class="mo-btn"
+              :class="{ primary: settings.theme === themeName }"
+              :aria-pressed="settings.theme === themeName"
+              :data-testid="`profile-theme-${themeName}`"
+              @click="selectTheme(themeName)"
+            >{{ BUILTIN_THEMES[themeName].name }}</button>
+          </div>
+          <p class="muted mo-about" data-testid="profile-about">墨读 v{{ version }} · GPL-3.0 · 数据目录 {{ dataDir || '—' }}</p>
+        </div>
+      </section>
+
       <section v-if="view === 'storage'" class="mo-pane" data-testid="storage-pane">
         <div class="mo-section-head">
           <h2>存储</h2>
@@ -5710,6 +7027,7 @@ onMounted(async () => {
               </button>
             </div>
             <div class="mo-chrome-bottom">
+              <span class="mo-chrome-today" :aria-label="`今日阅读 ${formatReadingDuration(todayReadingMs)}`">今日 {{ formatReadingDuration(todayReadingMs) }}</span>
               <button v-if="settings.menuItems.includes('prev')" class="mo-chrome-btn" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
               <button v-if="settings.menuItems.includes('settings') && readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-settings" @click="openSettings($event)">Aa</button>
               <button
@@ -5883,6 +7201,7 @@ onMounted(async () => {
                 <strong id="mo-settings-title">阅读设置</strong>
                 <button class="mo-icon-btn" data-testid="settings-close" title="关闭" @click="closeSettings">✕</button>
               </div>
+              <p class="muted mo-settings-today" data-testid="settings-today">今日阅读 {{ formatReadingDuration(todayReadingMs) }}</p>
               
               <div class="mo-scope-row">
                 <div class="mo-scope-tabs" role="tablist" aria-label="设置作用范围">
@@ -6455,8 +7774,9 @@ onMounted(async () => {
 }
 .mo-nav {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 22px;
+  gap: 6px 14px;
   padding: 0 22px;
   border-bottom: 1px solid var(--mo-line);
 }
@@ -6481,6 +7801,13 @@ onMounted(async () => {
   bottom: -1px;
   height: 2px;
   background: var(--mo-accent);
+}
+.mo-nav button:focus-visible,
+.mo-btn:focus-visible,
+.mo-icon-btn:focus-visible,
+.mo-chrome-btn:focus-visible {
+  outline: 2px solid var(--mo-accent);
+  outline-offset: 2px;
 }
 .mo-version {
   margin-left: auto;
@@ -7074,6 +8401,105 @@ onMounted(async () => {
 .mo-card-head .mo-filter {
   margin-left: auto;
 }
+/* 「我的」：统计大数、7 天柱状（原生 div 手绘，不引图表库）与按书排行。 */
+.mo-stat-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 14px;
+}
+.mo-stat-big {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.mo-stat-big strong {
+  font: 700 24px/1.25 'Songti SC', 'Noto Serif SC', serif;
+  overflow-wrap: anywhere;
+}
+.mo-bars {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 6px;
+}
+.mo-bar-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.mo-bar-value {
+  max-width: 100%;
+  font-size: 11px;
+  color: var(--mo-ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mo-bar-track {
+  display: flex;
+  align-items: flex-end;
+  width: 100%;
+  max-width: 34px;
+  height: 90px;
+  border-radius: 4px;
+  background: var(--mo-line);
+}
+.mo-bar {
+  width: 100%;
+  border-radius: 4px;
+  background: var(--mo-accent);
+}
+.mo-bar-label {
+  font-size: 11px;
+  color: var(--mo-ink-3);
+  white-space: nowrap;
+}
+.mo-rank {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.mo-rank-item {
+  padding: 8px 0;
+  border-top: 1px solid var(--mo-line);
+}
+.mo-rank-item:first-child {
+  border-top: 0;
+}
+.mo-rank-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.mo-rank-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.mo-rank-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--mo-ink-3);
+}
+.mo-rank-more {
+  margin-top: 10px;
+}
+.mo-about {
+  margin: 10px 0 0;
+  overflow-wrap: anywhere;
+}
+.mo-stats-error p {
+  margin: 0 0 8px;
+}
 .mo-source-tools {
   display: flex;
   flex-wrap: wrap;
@@ -7534,8 +8960,14 @@ textarea {
   text-overflow: ellipsis;
 }
 .mo-chrome-bottom {
+  flex-wrap: wrap;
   justify-content: space-around;
   padding: 12px 14px;
+}
+.mo-chrome-today {
+  font-size: 12px;
+  color: rgba(216, 212, 200, 0.75);
+  white-space: nowrap;
 }
 .mo-chrome-btn {
   border: 0;
@@ -7585,6 +9017,9 @@ textarea {
 .mo-settings-sheet:focus-visible {
   outline: 2px solid var(--mo-accent);
   outline-offset: -2px;
+}
+.mo-settings-today {
+  margin: -4px 0 8px;
 }
 .mo-settings-group {
   border-top: 1px solid var(--mo-line);
@@ -7706,6 +9141,25 @@ textarea {
   }
   .mo-settings-sheet .mo-input {
     font-size: 16px;
+  }
+  .mo-nav {
+    padding: 0 14px;
+  }
+  .mo-nav button {
+    font-size: 13px;
+  }
+  .mo-profile .mo-section-head {
+    flex-wrap: wrap;
+  }
+  .mo-bar-track {
+    height: 70px;
+  }
+  .mo-bar-value {
+    display: none;
+  }
+  .mo-chrome-today {
+    width: 100%;
+    text-align: center;
   }
 }
 .mo-switch-body {
@@ -8192,6 +9646,113 @@ textarea {
   height: 100%;
   border-radius: inherit;
   background: var(--mo-accent);
+}
+/* 备份卡片：元信息一行、进度条独占一行，窄屏也不会挤在一起。 */
+.mo-backup-progress {
+  margin: 10px 0 0;
+  font-size: 13px;
+}
+.mo-backup-progress .mo-download-bar {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+}
+/* 导入预览：分项计数两列对齐，长文案自动折行。 */
+.mo-import-list {
+  list-style: none;
+  margin: 10px 0;
+  padding: 0;
+}
+.mo-import-list li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--mo-line);
+  font-size: 13px;
+}
+.mo-import-list li:last-child {
+  border-bottom: 0;
+}
+.mo-profile .mo-card p.muted {
+  margin: 6px 0;
+  line-height: 1.6;
+}
+@media (max-width: 720px) {
+  .mo-profile .mo-card .mo-btn {
+    min-height: 44px;
+  }
+}
+/* WebDAV 卡片（#131）：表单单列栅格，窄屏按钮自动折行，输入框保持 44px 点击高度。 */
+.mo-webdav-form {
+  display: grid;
+  gap: 10px;
+  margin: 10px 0;
+}
+.mo-webdav-field {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--mo-ink-2);
+}
+.mo-webdav-field input {
+  width: 100%;
+  min-width: 0;
+}
+.mo-webdav-allow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  font-size: 13px;
+  color: var(--mo-ink-2);
+  cursor: pointer;
+}
+.mo-webdav-allow input {
+  accent-color: var(--mo-accent);
+}
+.mo-webdav-result {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--mo-ink-2);
+}
+/* WebDAV 上传与取回（#133）：与配置表单隔开，文件名输入与按钮同一行，窄屏折行。 */
+.mo-webdav-transfer {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--mo-line);
+}
+.mo-webdav-subtitle {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.mo-webdav-file {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin: 8px 0;
+}
+.mo-webdav-file .mo-webdav-field {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+@media (max-width: 720px) {
+  .mo-webdav-field input {
+    min-height: 44px;
+    font-size: 16px;
+  }
+  .mo-webdav-allow {
+    min-height: 44px;
+  }
+  .mo-webdav-file .mo-btn {
+    flex: 1 1 100%;
+  }
 }
 .mo-download-actions {
   display: flex;

@@ -197,6 +197,11 @@ export const ReaderDomain = defineDomain({
           clampNumber(0, Number.MAX_SAFE_INTEGER, true),
           z.number().int().min(0).default(0),
         ),
+        /** WebDAV 同步（#131）：地址、账号、密码只存服务端，读取设置时整组剔除。 */
+        webdavUrl: z.string().max(2048).default(''),
+        webdavUsername: z.string().max(200).default(''),
+        webdavPassword: z.string().max(500).default(''),
+        webdavAllowPrivate: z.preprocess(pickBoolean, z.boolean().default(false)),
       })
       .passthrough(),
     initial: {
@@ -231,6 +236,10 @@ export const ReaderDomain = defineDomain({
       ttsContinuous: true,
       replaceRules: [],
       mediaQuotaBytes: 0,
+      webdavUrl: '',
+      webdavUsername: '',
+      webdavPassword: '',
+      webdavAllowPrivate: false,
     },
   },
   tables: {

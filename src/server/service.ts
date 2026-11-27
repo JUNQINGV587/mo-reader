@@ -1,7 +1,15 @@
 import { createHash } from 'node:crypto'
 import { Service } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { stat } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { VERSION } from '../core/version.js'
+import {
+  addReadingTime,
+  aggregateReadingStats,
+  normalizeReadingTime,
+  type AggregatableBook,
+} from '../core/reader/stats.js'
 import { parseSource, type BookSource } from '../core/model/source.js'
 import { dictRuleKey, parseDictRule, type DictRule } from '../core/model/dict.js'
 import { AnalyzeRule } from '../core/rules/analyze-rule.js'
@@ -89,6 +97,43 @@ import { buildEpub } from './epub-export.js'
 import { assertEmbeddableFont } from './pdf-export.js'
 import { loadCoverImage } from './export-cover.js'
 import {
+  BACKUP_KIND,
+  BackupCoordinator,
+  backupArtifactAvailable,
+  cleanupExpiredBackups,
+  recoverInterruptedBackups,
+  type BackupHost,
+  type BackupJob,
+} from './backup.js'
+import {
+  BACKUP_IMPORT_KIND,
+  BackupImportCoordinator,
+  cleanupExpiredBackupImports,
+  recoverInterruptedBackupImports,
+  type BackupImportHost,
+  type BackupImportJob,
+} from './backup-import.js'
+import {
+  WEBDAV_TRANSFER_KIND,
+  WebdavTransferCoordinator,
+  cleanupExpiredWebdavTransfers,
+  recoverInterruptedWebdavTransfers,
+  type WebdavTransferHost,
+  type WebdavTransferJob,
+} from './webdav-transfer.js'
+import { BACKUP_TOKEN_TTL_MS } from '../core/reader/backup.js'
+import {
+  WEBDAV_PASSWORD_MAX,
+  WEBDAV_SETTING_KEYS,
+  isPrivateWebdavHost,
+  normalizeWebdavConfig,
+  parseWebdavAddress,
+  publicWebdavConfig,
+  withoutWebdavSettings,
+  type WebdavConfig,
+} from '../core/webdav/config.js'
+import { WebdavClient, type WebdavFetch } from '../core/webdav/client.js'
+import {
   EXPORT_KIND,
   ExportCoordinator,
   cleanupExpiredExports,
@@ -100,13 +145,16 @@ import {
   type ExportHost,
 } from './exports.js'
 import {
+  BACKUP_ROUTE_PATH,
   EXPORT_FAILED_ROUTE_PATH,
   EXPORT_ROUTE_PATH,
   LOCAL_MEDIA_ROUTE_PATH,
   LOCAL_PDF_ROUTE_PATH,
+  isArtifactRefusal,
   registerArtifactRoute,
   registerProtectedFileRoute,
   type ArtifactDescriptor,
+  type ArtifactLookupResult,
   type FileArtifactDescriptor,
 } from './routes.js'
 import { registerPdfjsAssetRoute } from './pdfjs-assets.js'
@@ -198,6 +246,23 @@ function stringArg(args: Args, name: string): string {
   return value.trim()
 }
 
+/**
+ * 连接测试的配置草稿：按「字段是否出现」区分「没改」与「改成空」。
+ * 密码草稿是空串时沿用已存密码——页面拿不到原密码，只能这样保留。
+ */
+function webdavDraftFromArgs(args: Args | undefined, stored: WebdavConfig): WebdavConfig {
+  if (!args || typeof args !== 'object') return stored
+  const has = (name: string) => Object.prototype.hasOwnProperty.call(args, name)
+  return {
+    url: has('url') && typeof args.url === 'string' ? args.url.trim() : stored.url,
+    username: has('username') && typeof args.username === 'string' ? args.username.trim() : stored.username,
+    password: has('password') && typeof args.password === 'string' && args.password !== ''
+      ? args.password
+      : stored.password,
+    allowPrivate: typeof args.allowPrivate === 'boolean' ? args.allowPrivate : stored.allowPrivate,
+  }
+}
+
 const SAFE_KEY = /^[a-z][a-z0-9_-]+$/
 
 function sameRequest(a: RequestSpec, b: RequestSpec): boolean {
@@ -239,6 +304,13 @@ interface SourceCheckResult {
   status: number | null
   elapsedMs: number
   error: string
+}
+
+/** 取 createdAt 最新的一条；空列表返回 null。 */
+function latestOf<T extends { createdAt: number }>(jobs: Array<T | null | undefined>): T | null {
+  const list = jobs.filter((job): job is T => Boolean(job))
+  list.sort((left, right) => right.createdAt - left.createdAt)
+  return list[0] ?? null
 }
 
 function clampCheckTimeout(value: unknown): number {
@@ -289,6 +361,15 @@ export class ReaderService extends TypertRemoteService {
   /** 导出作业协调器，按需创建；产物落导出目录并由受保护路由下发。 */
   exportsCoordinator: ExportCoordinator | null = null
 
+  /** 整包备份协调器（#130），按需创建；产物同样落导出目录，但只走一次性 token。 */
+  backupCoordinator: BackupCoordinator | null = null
+
+  /** 备份导入协调器（#132）：预览计划留在内存，写库复用 jobs 表。 */
+  backupImportCoordinator: BackupImportCoordinator | null = null
+
+  /** WebDAV 上传下载协调器（#133）：进度与取消复用 jobs 表。 */
+  webdavTransferCoordinator: WebdavTransferCoordinator | null = null
+
   /** 媒体离线下载协调器（#112），按需创建；与文字下载共用作业表与暂停/重试语义。 */
   mediaDownloadsCoordinator: MediaDownloadCoordinator | null = null
 
@@ -299,6 +380,12 @@ export class ReaderService extends TypertRemoteService {
   mediaStreamOpener: ((url: string, options: MediaStreamOptions) => Promise<MediaStreamResult>) | null = null
 
   downloadRetryBaseMs = DEFAULT_RETRY_BASE_MS
+
+  /** WebDAV 请求实现（#131），默认用 Node 内置 fetch；测试注入假实现即可不联网。 */
+  webdavFetch: WebdavFetch | null = null
+
+  /** WebDAV 连通测试超时（毫秒）。 */
+  webdavTimeoutMs = 15000
 
   /** 配额读改串行：并发章节发布会同时触发淘汰，排队执行避免重复删同一本书。 */
   storageLock: Promise<unknown> | null = null
@@ -333,7 +420,19 @@ export class ReaderService extends TypertRemoteService {
     } catch {
       // 清理失败不影响启动。
     }
+    // 备份作业与半成品同样要在启动时收口，避免重启后留下假的「进行中」。
+    try {
+      await recoverInterruptedBackups(this.db.jobs)
+      await cleanupExpiredBackups(this.db.jobs)
+      await recoverInterruptedBackupImports(this.db.jobs)
+      await cleanupExpiredBackupImports(this.db.jobs)
+      await recoverInterruptedWebdavTransfers(this.db.jobs)
+      await cleanupExpiredWebdavTransfers(this.db.jobs)
+    } catch {
+      // 清理失败不影响启动。
+    }
     this.registerExportRoute()
+    this.registerBackupRoute()
     this.registerLocalPdfRoute()
     this.registerPdfjsAssetRoute()
     this.registerMediaRoute()
@@ -341,6 +440,21 @@ export class ReaderService extends TypertRemoteService {
     const ctx = this.ctx as any
     ctx.effect(
       () => async () => {
+        try {
+          await this.webdavTransferCoordinator?.shutdown()
+        } finally {
+          this.webdavTransferCoordinator = null
+        }
+        try {
+          await this.backupImportCoordinator?.shutdown()
+        } finally {
+          this.backupImportCoordinator = null
+        }
+        try {
+          await this.backupCoordinator?.shutdown()
+        } finally {
+          this.backupCoordinator = null
+        }
         try {
           await this.exportsCoordinator?.shutdown()
         } finally {
@@ -368,6 +482,7 @@ export class ReaderService extends TypertRemoteService {
       ok: true,
       version: VERSION,
       methods: REMOTE_METHODS,
+      dataDir: dirname(mediaRoot()),
     }
   }
 
@@ -1173,6 +1288,12 @@ export class ReaderService extends TypertRemoteService {
   async pauseJob(args: Args) {
     const id = stringArg(args, 'id')
     switch (this.jobKindOf(id)) {
+      case 'backup':
+        throw new Error('备份不能暂停，请取消后重新导出')
+      case 'backupImport':
+        throw new Error('导入不能暂停，请取消后重新选择文件')
+      case 'webdav':
+        throw new Error('上传下载不能暂停，请取消后重新操作')
       case 'export':
         return this.exportManager().pause(id)
       case 'media':
@@ -1185,6 +1306,12 @@ export class ReaderService extends TypertRemoteService {
   async resumeJob(args: Args) {
     const id = stringArg(args, 'id')
     switch (this.jobKindOf(id)) {
+      case 'backup':
+        throw new Error('备份不能继续，请重新导出')
+      case 'backupImport':
+        throw new Error('导入不能继续，请取消后重新选择文件')
+      case 'webdav':
+        throw new Error('上传下载不能继续，请取消后重新操作')
       case 'export':
         return this.exportManager().resume(id)
       case 'media':
@@ -1194,10 +1321,16 @@ export class ReaderService extends TypertRemoteService {
     }
   }
 
-  /** 取消对文字下载、媒体下载、导出三种作业通用：按 jobs 表里的 kind 分派。 */
+  /** 取消对文字下载、媒体下载、导出、备份、备份导入五类作业通用：按 jobs 表里的 kind 分派。 */
   async cancelJob(args: Args) {
     const id = stringArg(args, 'id')
     switch (this.jobKindOf(id)) {
+      case 'backup':
+        return this.backupManager().cancel(id)
+      case 'backupImport':
+        return this.backupImportManager().cancel(id)
+      case 'webdav':
+        return this.webdavTransferManager().cancel(id)
       case 'export':
         return this.exportManager().cancel(id)
       case 'media':
@@ -1210,6 +1343,10 @@ export class ReaderService extends TypertRemoteService {
   async retryDownload(args: Args) {
     const id = stringArg(args, 'id')
     switch (this.jobKindOf(id)) {
+      case 'backupImport':
+        throw new Error('导入失败后请重新选择同一文件')
+      case 'webdav':
+        throw new Error('上传下载失败后请重新操作')
       case 'export':
         return this.exportManager().retry(id)
       case 'media':
@@ -1221,12 +1358,21 @@ export class ReaderService extends TypertRemoteService {
 
   async getJob(args: Args) {
     const id = stringArg(args, 'id')
+    const backup = this.backupCoordinator?.peek(id)
+    if (backup) return { job: { ...backup } }
+    const backupImport = this.backupImportCoordinator?.peek(id)
+    if (backupImport) return { job: { ...backupImport } }
+    const transfer = this.webdavTransferCoordinator?.peek(id)
+    if (transfer) return { job: { ...transfer } }
     const live = this.exportsCoordinator?.peek(id)
     if (live) return { job: { ...live } }
     const media = this.mediaDownloadsCoordinator?.peek(id)
     if (media) return { job: { ...media } }
     const record = this.db?.jobs?.get?.(id) as Record<string, unknown> | undefined
     if (record?.kind === MEDIA_DOWNLOAD_KIND) return this.mediaManager().get(id)
+    if (record?.kind === BACKUP_KIND) return { job: await this.backupManager().get(id) }
+    if (record?.kind === BACKUP_IMPORT_KIND) return { job: await this.backupImportManager().get(id) }
+    if (record?.kind === WEBDAV_TRANSFER_KIND) return { job: await this.webdavTransferManager().get(id) }
     return this.downloadManager().get(id)
   }
 
@@ -1241,6 +1387,9 @@ export class ReaderService extends TypertRemoteService {
     for (const job of this.downloadManager().list(filter)) merged.set(job.id, job)
     for (const job of this.mediaManager().list(filter)) merged.set(job.id, job)
     for (const job of this.exportsCoordinator?.list(filter) ?? []) merged.set(job.id, job)
+    for (const job of this.backupCoordinator?.list() ?? []) merged.set(job.id, job)
+    for (const job of this.backupImportCoordinator?.list() ?? []) merged.set(job.id, job)
+    for (const job of this.webdavTransferCoordinator?.list() ?? []) merged.set(job.id, job)
     return {
       jobs: [...merged.values()].sort(
         (left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0),
@@ -1261,6 +1410,21 @@ export class ReaderService extends TypertRemoteService {
   /** 测试/关停用：等待所有导出协程收尾。 */
   async waitForExports() {
     await this.exportsCoordinator?.waitIdle()
+  }
+
+  /** 测试/关停用：等待所有备份协程收尾。 */
+  async waitForBackups() {
+    await this.backupCoordinator?.waitIdle()
+  }
+
+  /** 测试/关停用：等待所有备份导入协程收尾。 */
+  async waitForBackupImports() {
+    await this.backupImportCoordinator?.waitIdle()
+  }
+
+  /** 测试/关停用：等待所有 WebDAV 上传下载协程收尾。 */
+  async waitForWebdavTransfers() {
+    await this.webdavTransferCoordinator?.waitIdle()
   }
 
   /** 按书聚合下载结果：书架/详情只调一次就能显示进度、体积与当前作业。 */
@@ -1437,7 +1601,7 @@ export class ReaderService extends TypertRemoteService {
     // 与 saveSettings 同样整条合并：只改配额，别的设置原样保留。
     const next = { ...db.settings.get(), mediaQuotaBytes: raw }
     await db.settings.set(next)
-    return { settings: next }
+    return { settings: withoutWebdavSettings(next) }
   }
 
   /** 按书清理文字与媒体缓存：取消该书活动作业并等在途收尾，索引与占用同步更新。 */
@@ -1619,6 +1783,154 @@ export class ReaderService extends TypertRemoteService {
     if (!(await exportArtifactExists(name))) throw new Error('失败清单已过期')
     // 下载名给书名，别把作业 id 甩给用户；磁盘路径仍是 id 命名的单段文件名。
     return { url: this.exportFailedUrl(jobId), fileName: exportFailedDisplayName(String(record.bookName ?? '')) }
+  }
+
+  /** 发起整包备份；light=true 只导书目与进度。已有进行中的备份时返回 existing。 */
+  async startBackup(args: Args) {
+    return this.backupManager().start({ light: args?.light === true })
+  }
+
+  /** 上传备份文件并生成导入预览（#132）；预览阶段不写任何业务数据。 */
+  async previewBackupImport(args: Args) {
+    const dataBase64 = typeof args?.dataBase64 === 'string' ? args.dataBase64 : ''
+    if (!dataBase64) throw new Error('没有选择备份文件')
+    const fileName = typeof args?.fileName === 'string' ? args.fileName.trim() : ''
+    return this.backupImportManager().start({ fileName, dataBase64 })
+  }
+
+  /** 用户确认预览后写库；写库失败自动按已写条目逆序回滚。 */
+  async applyBackupImport(args: Args) {
+    const jobId = stringArg(args, 'jobId')
+    return this.backupImportManager().apply(jobId)
+  }
+
+  /**
+   * 备份完成后签发一次性下载链接：10 分钟有效，第一次取用后立即失效。
+   * URL 里是随机 token，不含作业 id，不能靠猜作业 id 拿到别人的备份。
+   */
+  async getBackupDownload(args: Args) {
+    const jobId = stringArg(args, 'jobId')
+    const job = await this.backupManager().get(jobId)
+    if (!job) throw new Error('作业不存在')
+    if (job.status !== 'done') throw new Error('备份还没有完成')
+    if (!(await backupArtifactAvailable(job.filePath))) throw new Error('备份文件不存在，请重新导出')
+    const ticket = this.backupManager().tickets.issue(job)
+    if (!ticket) throw new Error('备份文件不存在，请重新导出')
+    return {
+      url: `${this.webOrigin()}${BACKUP_ROUTE_PATH}/${ticket.token}`,
+      fileName: job.fileName,
+      expiresAt: ticket.expiresAt,
+      ttlMs: BACKUP_TOKEN_TTL_MS,
+      singleUse: true,
+    }
+  }
+
+  /**
+   * 备份/导入/上传下载作业的进度；不传 jobId 时返回最近一次，打开「我的」页就能接着看。
+   * backup/transfer 额外返回最近一次备份与传输，界面据此显示上传入口和进度。
+   */
+  async getBackupJob(args: Args) {
+    const jobId = typeof args?.jobId === 'string' ? args.jobId.trim() : ''
+    const backup = await this.backupManager().get()
+    const transfer = await this.webdavTransferManager().get()
+    if (jobId) {
+      const matched = await this.backupManager().get(jobId)
+      if (matched) return { job: matched, backup, transfer }
+      const imported = await this.backupImportManager().get(jobId)
+      if (imported) return { job: imported, backup, transfer }
+      return { job: await this.webdavTransferManager().get(jobId), backup, transfer }
+    }
+    const imported = await this.backupImportManager().get()
+    const job = latestOf([backup, imported, transfer])
+    return { job, backup, transfer }
+  }
+
+  /** 把当前（或指定）备份上传到 WebDAV；带 id 表示确认覆盖后继续那次上传。 */
+  async uploadBackupToWebdav(args: Args) {
+    const id = typeof args?.id === 'string' ? args.id.trim() : ''
+    if (id) return this.webdavTransferManager().confirmUpload(id)
+    const backupJobId = typeof args?.backupJobId === 'string' ? args.backupJobId.trim() : ''
+    return this.webdavTransferManager().startUpload({ backupJobId })
+  }
+
+  /** 从 WebDAV 取回备份；取回后先预览，确认前不写库。 */
+  async downloadBackupFromWebdav(args: Args) {
+    const fileName = typeof args?.fileName === 'string' ? args.fileName.trim() : ''
+    return this.webdavTransferManager().startDownload({ fileName })
+  }
+
+  async cancelBackupJob(args: Args) {
+    const id = stringArg(args, 'id')
+    const kind = this.jobKindOf(id)
+    if (kind === 'backupImport') return this.backupImportManager().cancel(id)
+    if (kind === 'webdav') return this.webdavTransferManager().cancel(id)
+    return this.backupManager().cancel(id)
+  }
+
+  /** 读 WebDAV 配置（#131）：密码只回「是否已设置」，原值永不出服务端。 */
+  async getWebdavConfig() {
+    const db = this.requireDb()
+    const config = normalizeWebdavConfig(db.settings.get())
+    return { config: publicWebdavConfig(config), configured: config.url.length > 0 }
+  }
+
+  /**
+   * 保存 WebDAV 配置：url/username 传空串表示清空，password 传空串表示「不改」，
+   * allowPrivate 缺省沿用旧值；clear=true 一键清空（地址、账号、密码、私网开关一起复位）。
+   * 地址先校验再落库，坏地址不会把设置写坏。
+   */
+  async saveWebdavConfig(args: Args) {
+    const db = this.requireDb()
+    const current = normalizeWebdavConfig(db.settings.get())
+    if (args?.clear === true) {
+      const cleared: WebdavConfig = { url: '', username: '', password: '', allowPrivate: false }
+      await this.writeWebdavConfig(db, cleared)
+      return { config: publicWebdavConfig(cleared), warning: '', cleared: true }
+    }
+    const url = typeof args?.url === 'string' ? args.url.trim() : current.url
+    const username = typeof args?.username === 'string' ? args.username.trim() : current.username
+    // 空串是「保留原密码」的约定，不能当成把密码清空（清空走 clear）。
+    const password = typeof args?.password === 'string' && args.password !== '' ? args.password : current.password
+    const allowPrivate = typeof args?.allowPrivate === 'boolean' ? args.allowPrivate : current.allowPrivate
+    if (password.length > WEBDAV_PASSWORD_MAX) throw new Error(`密码不能超过 ${WEBDAV_PASSWORD_MAX} 个字符`)
+    // 清空只能走 clear：保存时地址必填且必须是合法的 http(s) 目录地址。
+    const hostname = parseWebdavAddress(url).hostname
+    const next: WebdavConfig = { url, username, password, allowPrivate }
+    await this.writeWebdavConfig(db, next)
+    const warning = hostname && !allowPrivate && isPrivateWebdavHost(hostname)
+      ? '这是内网地址，测试连通前需打开「允许私网」'
+      : ''
+    return { config: publicWebdavConfig(next), warning, cleared: false }
+  }
+
+  /**
+   * 测试 WebDAV 连通：带参数按表单草稿试（不写库），不带参数用已存配置。
+   * PROPFIND depth 0 打招呼，目录 404 时逐级 MKCOL；错误已映射成可读文案。
+   */
+  async testWebdav(args?: Args) {
+    const db = this.requireDb()
+    const stored = normalizeWebdavConfig(db.settings.get())
+    const draft = webdavDraftFromArgs(args, stored)
+    return this.webdavClient(draft).testConnection()
+  }
+
+  private webdavClient(config: WebdavConfig) {
+    return new WebdavClient(config, {
+      fetchImpl: this.webdavFetch ?? undefined,
+      timeoutMs: this.webdavTimeoutMs,
+    })
+  }
+
+  /** 把 WebDAV 四字段整组并进设置表；其它设置原样保留。 */
+  private async writeWebdavConfig(db: any, config: WebdavConfig) {
+    const next = normalizeReaderSettings({
+      ...db.settings.get(),
+      webdavUrl: config.url,
+      webdavUsername: config.username,
+      webdavPassword: config.password,
+      webdavAllowPrivate: config.allowPrivate,
+    })
+    await db.settings.set(next)
   }
 
   async getReviewSummary(args: Args) {
@@ -1897,7 +2209,13 @@ export class ReaderService extends TypertRemoteService {
         throw new Error(`删除《${name}》失败：${reason}；缓存未清完的书仍留在书架，可再次删除`)
       }
       await db.books.delete(id)
-      await db.readRecords.delete(id)
+      const progress = db.readRecords.get(id) as Record<string, unknown> | undefined
+      // 删书但保留阅读统计：记一条墓碑，「我的」页还能看到这本书用了多少时间。
+      if (normalizeReadingTime(progress).readMs > 0) {
+        await db.readRecords.put(id, { ...progress, id, bookId: id, bookName: name, deleted: true })
+      } else {
+        await db.readRecords.delete(id)
+      }
       if (book?.origin === 'local') await removeLocalBook(id).catch(() => undefined)
       if (book) deleted += 1
     }
@@ -1934,6 +2252,8 @@ export class ReaderService extends TypertRemoteService {
       if (Number.isFinite(zoom)) record.pdfZoom = Math.min(300, Math.max(50, Math.round(zoom)))
     }
     if (typeof args?.pdfFitWidth === 'boolean') record.pdfFitWidth = args.pdfFitWidth
+    // 重新加入或重新打开一本书时，旧的「已删除」标记不能挡住进度保存。
+    delete record.deleted
     record.updatedAt = new Date().toISOString()
     await this.requireDb().readRecords.put(bookId, record)
     const book = this.requireDb().books.get(bookId) as Record<string, unknown> | undefined
@@ -1946,6 +2266,61 @@ export class ReaderService extends TypertRemoteService {
   async getProgress(args: Args) {
     const bookId = stringArg(args, 'bookId')
     return { progress: this.requireDb().readRecords.get(bookId) ?? null }
+  }
+
+  /**
+   * 阅读计时落盘：把这次累计的本地日桶并进阅读记录，不动章节进度。
+   * 日桶超过 400 天会折进 archiveMs，由纯函数负责，服务端只做校验与合并。
+   */
+  async saveReadingTime(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const db = this.requireDb()
+    const existing = (db.readRecords.get(bookId) ?? {}) as Record<string, unknown>
+    const daily = args?.daily && typeof args.daily === 'object' && !Array.isArray(args.daily)
+      ? (args.daily as Record<string, number>)
+      : {}
+    const at = typeof args?.at === 'string' && !Number.isNaN(Date.parse(args.at))
+      ? new Date(args.at)
+      : new Date()
+    const record: Record<string, unknown> = {
+      ...existing,
+      id: bookId,
+      bookId,
+      ...addReadingTime(existing, daily, at),
+    }
+    if (db.books.get(bookId)) delete record.deleted
+    await db.readRecords.put(bookId, record)
+    return { readMs: record.readMs, dailyMs: record.dailyMs, updatedAt: record.updatedAt }
+  }
+
+  /** 「我的」页的阅读统计；记录里已删除的书保留在排行里。 */
+  async getReadingStats() {
+    const db = this.requireDb()
+    const records: unknown[] = []
+    for (const [, value] of db.readRecords.entries()) records.push(value)
+    const books: AggregatableBook[] = []
+    for (const [, value] of db.books.entries()) books.push(value as AggregatableBook)
+    return aggregateReadingStats(records, books)
+  }
+
+  /** 清空阅读统计：只清时长，保留章节进度、书签与「最后阅读」。 */
+  async clearReadingStats() {
+    const db = this.requireDb()
+    let cleared = 0
+    const keys = Array.from(db.readRecords.keys()) as string[]
+    for (const key of keys) {
+      const record = { ...((db.readRecords.get(key) ?? {}) as Record<string, unknown>) }
+      const hasProgress = ['chapterIndex', 'chapterUrl', 'chapterTitle', 'position', 'pdfPage', 'pdfZoom', 'pdfFitWidth']
+        .some((field) => record[field] !== undefined && record[field] !== '')
+      if (record.deleted === true && !hasProgress) {
+        await db.readRecords.delete(key)
+        cleared += 1
+        continue
+      }
+      await db.readRecords.put(key, { ...record, readMs: 0, dailyMs: {}, archiveMs: {} })
+      cleared += 1
+    }
+    return { cleared }
   }
 
   async listBookmarks(args: Args) {
@@ -2102,12 +2477,13 @@ export class ReaderService extends TypertRemoteService {
     const db = this.requireDb()
     const global = normalizeReaderSettings(db.settings.get())
     const bookId = typeof args?.bookId === 'string' ? args.bookId.trim() : ''
-    if (!bookId) return { settings: global }
+    // WebDAV 凭据只在服务端流转，任何下发给页面的设置都整组剔除。
+    if (!bookId) return { settings: withoutWebdavSettings(global) }
     const bookOverrides = normalizeBookOverrides(db.readConfigs?.get(bookId), {
       knownThemeIds: global.customThemes.map((theme) => theme.id),
     })
     return {
-      settings: mergeReaderSettings(global, bookOverrides),
+      settings: withoutWebdavSettings(mergeReaderSettings(global, bookOverrides)),
       bookOverridden: Object.keys(bookOverrides).length > 0,
       bookOverrides,
     }
@@ -2124,6 +2500,8 @@ export class ReaderService extends TypertRemoteService {
     const bookId = typeof args?.bookId === 'string' ? args.bookId.trim() : ''
     const current = normalizeReaderSettings(db.settings.get())
     const patchRecord = patch as Record<string, unknown>
+    // WebDAV 凭据只走 saveWebdavConfig；设置补丁里出现该组字段一律忽略。
+    for (const key of WEBDAV_SETTING_KEYS) delete patchRecord[key]
     const changedFont = typeof patchRecord.fontId === 'string' && patchRecord.fontId !== current.fontId
     if (changedFont && patchRecord.fontId) {
       const fonts = await listCustomFonts()
@@ -2149,7 +2527,7 @@ export class ReaderService extends TypertRemoteService {
         ...(requestedTheme === undefined ? {} : { theme: requestedTheme }),
       })
       await db.settings.set(next)
-      return { settings: next }
+      return { settings: withoutWebdavSettings(next) }
     }
 
     const overrides: Record<string, unknown> = { ...normalizeBookOverrides(db.readConfigs?.get(bookId), { knownThemeIds }) }
@@ -2158,7 +2536,7 @@ export class ReaderService extends TypertRemoteService {
       overrides[field] = (normalizedPatch as Record<string, unknown>)[field]
     }
     if (Object.keys(overrides).length === 0) {
-      return { settings: mergeReaderSettings(current, overrides), bookOverridden: false, bookOverrides: {} }
+      return { settings: withoutWebdavSettings(mergeReaderSettings(current, overrides)), bookOverridden: false, bookOverrides: {} }
     }
     const now = new Date().toISOString()
     const existing = db.readConfigs?.get(bookId) as Record<string, unknown> | undefined
@@ -2170,7 +2548,7 @@ export class ReaderService extends TypertRemoteService {
       updatedAt: now,
     })
     return {
-      settings: mergeReaderSettings(current, overrides),
+      settings: withoutWebdavSettings(mergeReaderSettings(current, overrides)),
       bookOverridden: true,
       bookOverrides: overrides,
     }
@@ -2181,7 +2559,7 @@ export class ReaderService extends TypertRemoteService {
     const bookId = stringArg(args, 'bookId')
     const db = this.requireDb()
     await db.readConfigs.delete(bookId)
-    return { settings: normalizeReaderSettings(db.settings.get()), bookOverridden: false, bookOverrides: {} }
+    return { settings: withoutWebdavSettings(normalizeReaderSettings(db.settings.get())), bookOverridden: false, bookOverrides: {} }
   }
 
   /** 恢复本节默认：全局层回到默认值，本书层删掉该分区的覆盖并继承全局。 */
@@ -2195,7 +2573,7 @@ export class ReaderService extends TypertRemoteService {
     if (!bookId) {
       const next = normalizeReaderSettings({ ...global, ...defaultGroupSettings(definition.key) })
       await db.settings.set(next)
-      return { settings: next }
+      return { settings: withoutWebdavSettings(next) }
     }
     const overrides = {
       ...normalizeBookOverrides(db.readConfigs?.get(bookId), {
@@ -2217,7 +2595,7 @@ export class ReaderService extends TypertRemoteService {
       })
     }
     return {
-      settings: mergeReaderSettings(global, overrides),
+      settings: withoutWebdavSettings(mergeReaderSettings(global, overrides)),
       bookOverridden: Object.keys(overrides).length > 0,
       bookOverrides: overrides,
     }
@@ -2251,6 +2629,57 @@ export class ReaderService extends TypertRemoteService {
       await this.requireDb().settings.set({ ...current, fontId: '' })
     }
     return result
+  }
+
+  private backupManager(): BackupCoordinator {
+    if (!this.backupCoordinator) {
+      this.backupCoordinator = new BackupCoordinator(this.backupHost())
+    }
+    return this.backupCoordinator
+  }
+
+  private backupHost(): BackupHost {
+    return {
+      db: () => this.requireDb(),
+      loadCover: (book) => this.fetchExportCover(book),
+    }
+  }
+
+  private backupImportManager(): BackupImportCoordinator {
+    if (!this.backupImportCoordinator) {
+      this.backupImportCoordinator = new BackupImportCoordinator(this.backupImportHost())
+    }
+    return this.backupImportCoordinator
+  }
+
+  private backupImportHost(): BackupImportHost {
+    return { db: () => this.requireDb() }
+  }
+
+  private webdavTransferManager(): WebdavTransferCoordinator {
+    if (!this.webdavTransferCoordinator) {
+      this.webdavTransferCoordinator = new WebdavTransferCoordinator(this.webdavTransferHost())
+    }
+    return this.webdavTransferCoordinator
+  }
+
+  private webdavTransferHost(): WebdavTransferHost {
+    return {
+      db: () => this.requireDb(),
+      config: () => normalizeWebdavConfig(this.requireDb().settings.get()),
+      client: (config) => this.webdavClient(config),
+      timeoutMs: () => this.webdavTimeoutMs,
+      backupArtifact: async (jobId) => {
+        const job = jobId ? await this.backupManager().get(jobId) : await this.backupManager().get()
+        if (!job) throw new Error('还没有备份，请先做一次备份')
+        if (job.status !== 'done') throw new Error('备份还没有完成，请稍后再上传')
+        if (!(await backupArtifactAvailable(job.filePath))) throw new Error('备份文件已过期，请重新备份')
+        const absolute = join(exportRoot(), job.filePath)
+        const info = await stat(absolute)
+        return { id: job.id, fileName: job.fileName, filePath: absolute, size: info.size }
+      },
+      importFromFile: (input) => this.backupImportManager().startFromFile(input),
+    }
   }
 
   private exportManager(): ExportCoordinator {
@@ -2317,10 +2746,18 @@ export class ReaderService extends TypertRemoteService {
   }
 
   /** 作业分派：活动作业先问协调器，再读 jobs 表里的 kind。 */
-  private jobKindOf(id: string): 'export' | 'media' | 'download' {
+  private jobKindOf(
+    id: string,
+  ): 'export' | 'media' | 'download' | 'backup' | 'backupImport' | 'webdav' {
+    if (this.backupCoordinator?.peek(id)) return 'backup'
+    if (this.backupImportCoordinator?.peek(id)) return 'backupImport'
+    if (this.webdavTransferCoordinator?.peek(id)) return 'webdav'
     if (this.exportsCoordinator?.peek(id)) return 'export'
     if (this.mediaDownloadsCoordinator?.peek(id)) return 'media'
     const record = this.db?.jobs?.get?.(id) as Record<string, unknown> | undefined
+    if (record?.kind === BACKUP_KIND) return 'backup'
+    if (record?.kind === BACKUP_IMPORT_KIND) return 'backupImport'
+    if (record?.kind === WEBDAV_TRANSFER_KIND) return 'webdav'
     if (record?.kind === EXPORT_KIND) return 'export'
     if (record?.kind === MEDIA_DOWNLOAD_KIND) return 'media'
     return 'download'
@@ -2425,6 +2862,62 @@ export class ReaderService extends TypertRemoteService {
           }
         },
         'reader: export download route',
+      )
+    })
+  }
+
+  /**
+   * 一次性下载路由：auth 匿名，但 URL 里带 64 位随机 token，只有 token 有效时才定位到文件。
+   * 过期/已用返回 410 与可读文案，token 不存在返回 404。
+   */
+  private async locateBackupTicket(token: string): Promise<ArtifactLookupResult> {
+    const manager = this.backupCoordinator
+    if (!manager) return null
+    const result = manager.tickets.consume(token)
+    if ('error' in result) return { status: result.error.status, message: result.error.message }
+    if (!(await backupArtifactAvailable(result.descriptor.filePath))) {
+      return { status: 404, message: '备份文件不存在，请重新导出' }
+    }
+    return result.descriptor
+  }
+
+  /** 备份下载路由：按 token 取产物，与登录态无关，因此不能复用 /reader/exports 的作业 id 直链。 */
+  private registerBackupRoute(): void {
+    const ctx = this.ctx as any
+    if (typeof ctx?.inject !== 'function') return
+    ctx.inject(['webServer'], (webCtx: any) => {
+      const webServer = webCtx?.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+      if (typeof webCtx.effect !== 'function') return
+      webCtx.effect(
+        () => {
+          const disposers: Array<() => void> = []
+          try {
+            disposers.push(
+              registerArtifactRoute(webServer, {
+                path: BACKUP_ROUTE_PATH,
+                auth: 'anonymous',
+                root: () => exportRoot(),
+                idPattern: /^[0-9a-f]{64}$/,
+                requirePeer: false,
+                allow: () => true,
+                locate: (token: string) => this.locateBackupTicket(token),
+              }),
+            )
+          } catch {
+            // 同路径已注册时不重复注册，也不让启动失败。
+          }
+          return () => {
+            for (const dispose of disposers) {
+              try {
+                dispose()
+              } catch {
+                // 释放失败不影响其它路由。
+              }
+            }
+          }
+        },
+        'reader: backup download route',
       )
     })
   }
