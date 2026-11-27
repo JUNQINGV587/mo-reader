@@ -602,12 +602,42 @@ test('合并：不删本机独有数据，再次导入同一备份全部跳过',
   assert.ok(applied.sources.some((source) => source.id === 'keep-source'))
 })
 
-test('合并：书源按 bookSourceUrl 更新已有记录', () => {
+test('合并：书源按 bookSourceUrl 更新已有记录，并沿用本机安全 key', () => {
   const existing = emptyExisting()
-  existing.sources.push({ id: 'https://source.example.com', bookSourceUrl: 'https://source.example.com', bookSourceName: '旧名字', enabled: false })
+  existing.sources.push({ id: 'src-existing', bookSourceUrl: 'https://source.example.com', bookSourceName: '旧名字', enabled: false })
   const plan = mergeOf(moReaderZip(), existing)
   assert.equal(plan.preview.sources.updated, 1)
   const source = plan.operations.find((op) => op.table === 'sources')
-  assert.equal(source.key, 'https://source.example.com')
+  assert.equal(source.key, 'src-existing')
+  assert.equal(source.record.id, 'src-existing')
   assert.equal(source.record.bookSourceName, '示例源')
+})
+
+test('合并：URL 书源、中文分组与中文字典规则的 key 都 path-safe', () => {
+  const plan = mergeOf(
+    moReaderZip({
+      sections: {
+        bookGroup: [{ id: '', name: '我的 分组/科幻' }],
+        dictRule: [{ id: '', name: '中文 词典', rules: [] }],
+        bookSource: [{ bookSourceUrl: 'https://book.eayue.com', bookSourceName: '示例源' }],
+      },
+    }),
+  )
+  assert.ok(plan.operations.length > 0)
+  for (const operation of plan.operations) {
+    assert.match(operation.key, /^[A-Za-z0-9_-]+$/, operation.table + ' 的 key 不安全：' + operation.key)
+    assert.match(String(operation.record.id), /^[A-Za-z0-9_-]+$/, operation.table + ' 的 id 不安全')
+  }
+  const source = plan.operations.find((op) => op.table === 'sources')
+  assert.match(source.key, /^src-[0-9a-f]{24}$/)
+  const group = plan.operations.find((op) => op.table === 'groups')
+  assert.match(group.key, /^grp-[0-9a-f]{12}$/)
+  const dict = plan.operations.find((op) => op.table === 'dictRules')
+  assert.match(dict.key, /^dict-[0-9a-f]{12}$/)
+  const sameSource = { bookSourceUrl: 'https://book.eayue.com', bookSourceName: '示例源' }
+  const second = mergeBackupImport({
+    backup: parseBackupImport({ data: moReaderZip({ sections: { bookSource: [sameSource] } }), fileName: 'backup.zip' }),
+    existing: applyPlan(emptyExisting(), plan),
+  })
+  assert.equal(second.preview.sources.updated + second.preview.sources.skipped, 1)
 })

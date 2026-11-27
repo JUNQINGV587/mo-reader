@@ -24,6 +24,7 @@ import {
   parseShelfImport,
   type TransferBook,
 } from './shelf-transfer.js'
+import { bookSourceStorageKey, isStorageKey } from './storage-key.js'
 
 /** 单条目解压上限：64 MB。 */
 export const IMPORT_MAX_ENTRY_BYTES = 64 * 1024 * 1024
@@ -331,9 +332,10 @@ function fallbackUrl(name: string, author: string): string {
   return `legado://${hashText(`${name.toLowerCase()}|${author.toLowerCase()}`)}`
 }
 
+/** 只有能直接当 per-record 文件名段的 id 才沿用，否则调用方另算稳定 key。 */
 function safeId(value: unknown): string {
   const id = text(value)
-  return /^[0-9A-Za-z][0-9A-Za-z._-]{0,127}$/.test(id) ? id : ''
+  return id.length <= 128 && isStorageKey(id) ? id : ''
 }
 
 function meaningful(value: unknown): boolean {
@@ -1039,16 +1041,19 @@ export function mergeBackupImport(input: BackupImportMergeInput): BackupImportPl
     }
     preview.sources.total += 1
     const match = existingSources.get(url)
-    const record: Record<string, unknown> = { ...(match ?? {}), ...incoming, id: url, bookSourceUrl: url }
+    // key 会变成存储文件名段：优先沿用本机已有 key，其次备份里的安全 id，
+    // 最后才按 URL 生成 src-<sha1>，与 service.ts 的正常写入保持一致。
+    const key = safeId(match?.id) || safeId(incoming.id) || bookSourceStorageKey(url)
+    const record: Record<string, unknown> = { ...(match ?? {}), ...incoming, id: key, bookSourceUrl: url }
     if (match) {
       if (sameRecord(match, record)) preview.sources.skipped += 1
       else {
         preview.sources.updated += 1
-        operations.push({ table: 'sources', key: url, record, existed: true })
+        operations.push({ table: 'sources', key, record, existed: true })
       }
     } else {
       preview.sources.added += 1
-      operations.push({ table: 'sources', key: url, record, existed: false })
+      operations.push({ table: 'sources', key, record, existed: false })
     }
     existingSources.set(url, record)
   }
@@ -1063,7 +1068,8 @@ export function mergeBackupImport(input: BackupImportMergeInput): BackupImportPl
     }
     groupNames.add(group.name)
     preview.groups.added += 1
-    operations.push({ table: 'groups', key: group.name, record: { id: group.id || group.name, name: group.name }, existed: false })
+    const key = safeId(group.id) || `grp-${sha1(group.name).slice(0, 12)}`
+    operations.push({ table: 'groups', key, record: { id: key, name: group.name }, existed: false })
   }
 
   // 每本书的设置覆盖：本机没有才补。
@@ -1200,7 +1206,8 @@ export function mergeBackupImport(input: BackupImportMergeInput): BackupImportPl
     }
     dictNames.add(name)
     preview.dictRules.added += 1
-    operations.push({ table: 'dictRules', key: safeId(rule.id) || name, record: { ...rule, id: safeId(rule.id) || name, name }, existed: false })
+    const key = safeId(rule.id) || `dict-${sha1(name).slice(0, 12)}`
+    operations.push({ table: 'dictRules', key, record: { ...rule, id: key, name }, existed: false })
   }
 
   // 订阅 / RSS：按地址跳过重复。

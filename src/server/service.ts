@@ -4,6 +4,7 @@ import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { VERSION } from '../core/version.js'
+import { bookSourceStorageKey as sourceKey } from '../core/reader/storage-key.js'
 import {
   addReadingTime,
   aggregateReadingStats,
@@ -263,8 +264,6 @@ function webdavDraftFromArgs(args: Args | undefined, stored: WebdavConfig): Webd
   }
 }
 
-const SAFE_KEY = /^[a-z][a-z0-9_-]+$/
-
 function sameRequest(a: RequestSpec, b: RequestSpec): boolean {
   return a.url === b.url && a.method === b.method && (a.body ?? '') === (b.body ?? '')
 }
@@ -280,16 +279,6 @@ class HlsMediaDetected extends Error {
     this.url = url
     this.headers = { ...headers }
   }
-}
-
-/**
- * 存储的 per-record key 只能是路径安全的小写串；书源的 bookSourceUrl
- * 常是完整 URL，用 sha1 生成稳定 key，兼容旧数据里本身就是安全串的 key。
- */
-function sourceKey(bookSourceUrl: string): string {
-  return SAFE_KEY.test(bookSourceUrl)
-    ? bookSourceUrl
-    : `src-${createHash('sha1').update(bookSourceUrl).digest('hex').slice(0, 24)}`
 }
 
 /** 在线检查并发上限与超时范围：一次只打 8 个源，单请求 0.5–30 秒。 */
