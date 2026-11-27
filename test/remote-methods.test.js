@@ -35,6 +35,9 @@ test('备份导出与导入方法注册给客户端，且都接收 args 对象',
     'getBackupJob',
     'cancelBackupJob',
     'previewBackupImport',
+    'beginBackupImportUpload',
+    'appendBackupImportUpload',
+    'finishBackupImportUpload',
     'applyBackupImport',
   ]) {
     assert.ok(REMOTE_METHODS.includes(method), `${method} 不在 REMOTE_METHODS`)

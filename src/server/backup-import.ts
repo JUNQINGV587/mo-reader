@@ -8,7 +8,7 @@
  * - 失败后可用同一文件重新 preview，不残留半份数据。
  */
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   assertImportArchiveSize,
@@ -31,6 +31,12 @@ export const BACKUP_IMPORT_TEMP_SUFFIX = '.import.parts'
 export const BACKUP_IMPORT_JOB_TTL_MS = 24 * 60 * 60 * 1000
 const BACKUP_IMPORT_FLUSH_MS = 500
 const UPLOAD_FILE = 'upload.bin'
+/** 分块上传的单块上限（#137）：客户端按它切文件，服务端按它校验，避免整包 base64 进内存。 */
+export const BACKUP_IMPORT_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+/** 单块 base64 字符数上限，留 3 字节对齐的余量。 */
+const BACKUP_IMPORT_UPLOAD_CHUNK_CHARS = Math.ceil(BACKUP_IMPORT_UPLOAD_CHUNK_BYTES / 3) * 4 + 4
+/** 上传会话闲置多久算中断：只在下一次开始导入时顺手清理，不影响进行中的上传。 */
+const BACKUP_IMPORT_UPLOAD_STALE_MS = 30 * 60 * 1000
 
 export interface BackupImportHost {
   db(): any
@@ -69,6 +75,15 @@ interface ImportSession {
   abort: AbortController
 }
 
+/** 分块上传会话：只保留落盘进度，不持有整包内容（#137）。 */
+interface UploadSession {
+  filePath: string
+  fileName: string
+  expectedBytes: number
+  received: number
+  nextIndex: number
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message
   return String(error)
@@ -76,6 +91,12 @@ function errorMessage(error: unknown): string {
 
 function isActiveStatus(status: string): boolean {
   return status === 'queued' || status === 'running'
+}
+
+function formatUploadSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${bytes} B`
 }
 
 function backupImportTempDir(jobId: string): string {
@@ -175,6 +196,7 @@ export class BackupImportCoordinator {
   private readonly live = new Map<string, BackupImportJob>()
   private readonly sessions = new Map<string, ImportSession>()
   private readonly runners = new Map<string, Promise<void>>()
+  private readonly uploads = new Map<string, UploadSession>()
   private readonly flushMs: number
   private lastPutAt = 0
   private shuttingDown = false
@@ -227,6 +249,125 @@ export class BackupImportCoordinator {
     this.live.set(job.id, job)
     await this.put(job)
     this.launchPreview(job, { fileName: job.fileName, sourcePath: target })
+    return { job: { ...job } }
+  }
+
+  /**
+   * 分块上传第一步（#137）：建作业和空文件，返回作业 id。之后每块只落盘，
+   * 内存里始终只有一个分块，不再拼整包 base64。
+   */
+  async beginUpload(input: { fileName?: string; size?: number }): Promise<{ job: BackupImportJob }> {
+    const db = this.host.db()
+    try {
+      await cleanupExpiredBackupImports(db.jobs)
+    } catch {
+      // 清理失败不影响本次导入。
+    }
+    await this.dropStaleUploads()
+    const size = Number(input.size)
+    if (!Number.isSafeInteger(size) || size <= 0) throw new Error('没有选择备份文件')
+    assertImportArchiveSize(size)
+    const job = this.buildJob(input.fileName)
+    job.status = 'running'
+    job.stage = 'upload'
+    job.stageText = '上传备份文件'
+    job.total = size
+    const tempDir = backupImportTempDir(job.id)
+    const target = join(tempDir, UPLOAD_FILE)
+    await ensureExportRoot()
+    await mkdir(tempDir, { recursive: true })
+    await writeFile(target, Buffer.alloc(0))
+    this.uploads.set(job.id, {
+      filePath: target,
+      fileName: job.fileName,
+      expectedBytes: size,
+      received: 0,
+      nextIndex: 0,
+    })
+    this.live.set(job.id, job)
+    await this.put(job)
+    return { job: { ...job } }
+  }
+
+  /** 关页/断网留下的上传作业：下一次导入时记为中断并清掉半成品。 */
+  private async dropStaleUploads(): Promise<void> {
+    const cutoff = Date.now() - BACKUP_IMPORT_UPLOAD_STALE_MS
+    for (const [id, job] of [...this.live]) {
+      if (job.stage !== 'upload' || !isActiveStatus(job.status) || job.updatedAt >= cutoff) continue
+      this.uploads.delete(id)
+      this.live.delete(id)
+      job.status = 'failed'
+      job.stage = 'failed'
+      job.stageText = '已中断'
+      job.error = '上传中断，请重新选择文件'
+      await rm(backupImportTempDir(id), { recursive: true, force: true }).catch(() => undefined)
+      try {
+        await this.put(job)
+      } catch {
+        // 记账失败不影响新上传。
+      }
+    }
+  }
+
+  /** 分块上传：按 index 顺序追加，单块受 4 MB 上限约束，总量不得超过声明大小。 */
+  async appendUpload(input: { jobId?: string; index?: number; dataBase64?: string }): Promise<{ job: BackupImportJob }> {
+    const jobId = String(input.jobId ?? '')
+    const upload = this.uploads.get(jobId)
+    if (!upload) throw new Error('上传已结束，请重新选择文件')
+    const job = this.live.get(jobId) ?? (await this.requireJob(jobId))
+    if (job.status === 'cancelled') throw new Error('已取消导入')
+    if (job.status !== 'running') throw new Error('上传已结束，请重新选择文件')
+    const index = Number(input.index)
+    if (!Number.isSafeInteger(index) || index !== upload.nextIndex) {
+      throw new Error('上传顺序异常，请重新选择文件')
+    }
+    const text = String(input.dataBase64 ?? '')
+    if (!text) throw new Error('上传分块为空，请重新选择文件')
+    if (text.length > BACKUP_IMPORT_UPLOAD_CHUNK_CHARS) throw new Error('上传分块过大，请重试')
+    if (!isBase64Text(text)) throw new Error('备份文件内容不完整，请重新选择')
+    const bytes = Buffer.from(text, 'base64')
+    if (bytes.length === 0) throw new Error('上传分块为空，请重新选择文件')
+    if (upload.received + bytes.length > upload.expectedBytes) {
+      throw new Error('备份文件上传超出声明大小，请重新选择')
+    }
+    await appendFile(upload.filePath, bytes)
+    upload.received += bytes.length
+    upload.nextIndex += 1
+    job.bytes = upload.received
+    job.completed = upload.received
+    await this.progress(job)
+    return { job: { ...job } }
+  }
+
+  /** 分块上传收尾：字节数对上才进入原有的校验/预览通路，缺字节就清临时目录并报可读错误。 */
+  async finishUpload(input: { jobId?: string }): Promise<{ job: BackupImportJob }> {
+    const jobId = String(input.jobId ?? '')
+    const upload = this.uploads.get(jobId)
+    if (!upload) throw new Error('上传已结束，请重新选择文件')
+    const job = this.live.get(jobId) ?? (await this.requireJob(jobId))
+    if (job.status === 'cancelled') throw new Error('已取消导入')
+    if (upload.received !== upload.expectedBytes) {
+      this.uploads.delete(jobId)
+      job.status = 'failed'
+      job.stage = 'failed'
+      job.stageText = '导入失败'
+      job.error = `备份文件上传不完整（已收到 ${formatUploadSize(upload.received)}，应为 ${formatUploadSize(upload.expectedBytes)}），请重新选择`
+      this.live.delete(jobId)
+      await rm(backupImportTempDir(jobId), { recursive: true, force: true }).catch(() => undefined)
+      try {
+        await this.put(job)
+      } catch {
+        // 失败记账不再抛。
+      }
+      throw new Error(job.error)
+    }
+    this.uploads.delete(jobId)
+    job.bytes = upload.received
+    job.status = 'running'
+    job.stage = 'queued'
+    job.stageText = '读取备份文件'
+    await this.put(job)
+    this.launchPreview(job, { fileName: job.fileName, sourcePath: upload.filePath })
     return { job: { ...job } }
   }
 
@@ -305,6 +446,7 @@ export class BackupImportCoordinator {
     await rm(backupImportTempDir(id), { recursive: true, force: true }).catch(() => undefined)
     this.sessions.delete(id)
     this.runners.delete(id)
+    this.uploads.delete(id)
     job.updatedAt = Date.now()
     await this.put(job)
     this.live.delete(id)
@@ -366,6 +508,7 @@ export class BackupImportCoordinator {
       await rm(backupImportTempDir(job.id), { recursive: true, force: true }).catch(() => undefined)
     }
     this.sessions.clear()
+    this.uploads.clear()
     this.live.clear()
     this.runners.clear()
   }

@@ -1798,6 +1798,29 @@ export class ReaderService extends TypertRemoteService {
     return this.backupImportManager().start({ fileName, dataBase64 })
   }
 
+  /** 分块上传第一步（#137）：建导入作业并返回 id，之后按块追加，不再整包 base64。 */
+  async beginBackupImportUpload(args: Args) {
+    const fileName = typeof args?.fileName === 'string' ? args.fileName.trim() : ''
+    return this.backupImportManager().beginUpload({ fileName, size: Number(args?.size) })
+  }
+
+  /** 分块上传：index 从 0 递增，单块 ≤ 4 MB；越界、乱序、超量都报可读错误。 */
+  async appendBackupImportUpload(args: Args) {
+    const jobId = stringArg(args, 'jobId')
+    const dataBase64 = typeof args?.dataBase64 === 'string' ? args.dataBase64 : ''
+    return this.backupImportManager().appendUpload({
+      jobId,
+      index: Number(args?.index),
+      dataBase64,
+    })
+  }
+
+  /** 分块上传收尾：字节数校验通过后进入原有的校验/预览/合并通路。 */
+  async finishBackupImportUpload(args: Args) {
+    const jobId = stringArg(args, 'jobId')
+    return this.backupImportManager().finishUpload({ jobId })
+  }
+
   /** 用户确认预览后写库；写库失败自动按已写条目逆序回滚。 */
   async applyBackupImport(args: Args) {
     const jobId = stringArg(args, 'jobId')

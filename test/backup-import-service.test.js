@@ -4,6 +4,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -171,6 +172,25 @@ async function preview(service, zip) {
   return service.getBackupJob({ jobId: started.job.id })
 }
 
+/** 按小块走 #137 的分块上传通路；返回收尾后的作业。 */
+async function previewChunked(service, zip, chunkSize = 512) {
+  const started = await service.beginBackupImportUpload({
+    fileName: 'mo-reader-backup.zip',
+    size: zip.length,
+  })
+  const jobId = started.job.id
+  let index = 0
+  for (let offset = 0; offset < zip.length; offset += chunkSize) {
+    const piece = zip.subarray(offset, Math.min(zip.length, offset + chunkSize))
+    await service.appendBackupImportUpload({ jobId, index, dataBase64: piece.toString('base64') })
+    index += 1
+  }
+  await service.finishBackupImportUpload({ jobId })
+  await service.waitForBackupImports()
+  const result = await service.getBackupJob({ jobId })
+  return { jobId, started, job: result.job }
+}
+
 test('decodeArchive 处理数 MB 的 base64 不再触发正则栈溢出（#136）', () => {
   const buffer = decodeArchive('A'.repeat(9_800_796))
   assert.equal(buffer.length, 7_350_597)
@@ -178,6 +198,90 @@ test('decodeArchive 处理数 MB 的 base64 不再触发正则栈溢出（#136�
 
 test('decodeArchive 仍拒绝非法字符（#136）', () => {
   assert.throws(() => decodeArchive('AAAA!'), /备份文件内容不完整/)
+})
+
+test('分块上传与整包上传得到同一份预览，确认后照常写库（#137）', async () => {
+  const db = makeDb({ fontSize: 24 })
+  const service = makeService(db)
+  const zip = await makeZip()
+  const chunked = await previewChunked(service, zip, 300)
+  assert.equal(chunked.job.status, 'paused')
+  assert.equal(chunked.job.stage, 'preview')
+  assert.equal(chunked.job.bytes, zip.length)
+  assert.equal(chunked.job.preview.books.added, 1)
+  assert.equal(chunked.job.preview.covers, 1)
+  assert.equal(db.books.map.size, 0)
+  const applied = await service.applyBackupImport({ jobId: chunked.jobId })
+  assert.equal(applied.job.status, 'done')
+  assert.equal(db.books.map.size, 1)
+  assert.match(db.books.map.get('b1').coverUrl, /^data:image\/png;base64,/)
+})
+
+test('分块上传乱序、坏字符、超量、缺字节都报可读错误（#137）', async () => {
+  const db = makeDb()
+  const service = makeService(db)
+  const zip = await makeZip()
+
+  const outOfOrder = await service.beginBackupImportUpload({ fileName: 'a.zip', size: zip.length })
+  await assert.rejects(
+    service.appendBackupImportUpload({ jobId: outOfOrder.job.id, index: 1, dataBase64: zip.toString('base64') }),
+    /上传顺序异常/,
+  )
+  await assert.rejects(
+    service.appendBackupImportUpload({ jobId: outOfOrder.job.id, index: 0, dataBase64: 'AAAA!' }),
+    /备份文件内容不完整/,
+  )
+  await service.cancelBackupJob({ id: outOfOrder.job.id })
+
+  const tooBig = await service.beginBackupImportUpload({ fileName: 'a.zip', size: 3 })
+  await assert.rejects(
+    service.appendBackupImportUpload({ jobId: tooBig.job.id, index: 0, dataBase64: Buffer.alloc(10, 1).toString('base64') }),
+    /超出声明大小/,
+  )
+  await service.cancelBackupJob({ id: tooBig.job.id })
+
+  const incomplete = await service.beginBackupImportUpload({ fileName: 'a.zip', size: zip.length })
+  const half = zip.subarray(0, Math.floor(zip.length / 2))
+  await service.appendBackupImportUpload({ jobId: incomplete.job.id, index: 0, dataBase64: half.toString('base64') })
+  await assert.rejects(service.finishBackupImportUpload({ jobId: incomplete.job.id }), /上传不完整/)
+  const failed = await service.getBackupJob({ jobId: incomplete.job.id })
+  assert.equal(failed.job.status, 'failed')
+  assert.equal(existsSync(join(EXPORT_ROOT, incomplete.job.id + '.import.parts')), false)
+  await assert.rejects(
+    service.appendBackupImportUpload({ jobId: incomplete.job.id, index: 1, dataBase64: 'AAAA' }),
+    /上传已结束/,
+  )
+})
+
+test('分块上传中取消：作业已取消、临时文件删除、后续分块被拒绝（#137）', async () => {
+  const db = makeDb()
+  const service = makeService(db)
+  const zip = await makeZip()
+  const started = await service.beginBackupImportUpload({ fileName: 'a.zip', size: zip.length })
+  const first = zip.subarray(0, 100)
+  await service.appendBackupImportUpload({ jobId: started.job.id, index: 0, dataBase64: first.toString('base64') })
+  const cancelled = await service.cancelBackupJob({ id: started.job.id })
+  assert.equal(cancelled.job.status, 'cancelled')
+  assert.equal(existsSync(join(EXPORT_ROOT, started.job.id + '.import.parts')), false)
+  await assert.rejects(
+    service.finishBackupImportUpload({ jobId: started.job.id }),
+    /上传已结束/,
+  )
+  assert.equal(db.books.map.size, 0)
+})
+
+test('分块上传的备份导入两次，第二次全部跳过（#137）', async () => {
+  const db = makeDb()
+  const service = makeService(db)
+  const zip = await makeZip()
+  const first = await previewChunked(service, zip, 700)
+  await service.applyBackupImport({ jobId: first.jobId })
+  const second = await previewChunked(service, zip, 700)
+  assert.equal(second.job.preview.books.skipped, 1)
+  assert.equal(second.job.preview.bookmarks.skipped, 1)
+  assert.equal(second.job.preview.notes.skipped, 1)
+  assert.deepEqual(second.job.preview.settings.added, [])
+  assert.equal(db.books.map.size, 1)
 })
 
 test('preview 只生成预览，不写任何数据', async () => {

@@ -1289,6 +1289,8 @@ async function cancelBackup() {
 const backupImportInput = ref<HTMLInputElement | null>(null)
 const backupImportJob = ref<any>(null)
 const backupImportBusy = ref(false)
+const backupImportUploading = ref(false)
+const backupImportCancel = ref(false)
 const backupImportMessage = ref('')
 const backupImportFile = ref<File | null>(null)
 let backupImportTimer: ReturnType<typeof setInterval> | null = null
@@ -1356,7 +1358,10 @@ function syncBackupImportTimer() {
 function backupImportStatusText(job: any) {
   if (!job) return ''
   if (job.status === 'queued') return '排队中'
-  if (job.status === 'running') return job.stage === 'preview' ? '校验中' : '导入中'
+  if (job.status === 'running') {
+    if (job.stage === 'upload') return '上传中'
+    return job.stage === 'preview' ? '校验中' : '导入中'
+  }
   if (job.status === 'paused') return '待确认'
   if (job.status === 'done') return '已完成'
   if (job.status === 'cancelled') return '已取消'
@@ -1403,25 +1408,56 @@ function backupImportSettingLabels(job: any) {
   return keys.map((key) => backupImportSettingLabel(key))
 }
 
+/** 单块 4 MB：base64 后约 5.3 MB，远低于 RPC 与内存上限；整包不再一次性读入（#137）。 */
+const BACKUP_IMPORT_CHUNK_BYTES = 4 * 1024 * 1024
+
 async function previewBackupImportFile(file: File) {
   backupImportBusy.value = true
+  backupImportUploading.value = false
+  backupImportCancel.value = false
   backupImportMessage.value = ''
   try {
-    const bytes = new Uint8Array(await file.arrayBuffer())
-    const result: any = await call('previewBackupImport', {
-      fileName: file.name,
-      dataBase64: toBase64(bytes),
-    })
-    backupImportJob.value = result?.job ?? null
-    if (backupImportJob.value?.status === 'failed') {
-      backupImportMessage.value = String(backupImportJob.value.error || '备份无法导入')
-    } else {
-      backupImportMessage.value = '校验完成，确认后开始导入'
+    if (!file.size) throw new Error('没有选择备份文件')
+    const started: any = await call('beginBackupImportUpload', { fileName: file.name, size: file.size })
+    const jobId = String(started?.job?.id ?? '')
+    if (!jobId) throw new Error('上传没有开始，请重新选择文件')
+    backupImportJob.value = started.job
+    backupImportUploading.value = true
+    let index = 0
+    let sent = 0
+    while (sent < file.size) {
+      if (backupImportCancel.value) throw new Error('已取消导入')
+      const slice = file.slice(sent, Math.min(file.size, sent + BACKUP_IMPORT_CHUNK_BYTES))
+      const bytes = new Uint8Array(await slice.arrayBuffer())
+      const result: any = await call('appendBackupImportUpload', {
+        jobId,
+        index,
+        dataBase64: toBase64(bytes),
+      })
+      index += 1
+      sent += bytes.length
+      if (result?.job) backupImportJob.value = result.job
+      backupImportMessage.value = `正在上传 ${Math.round((sent / file.size) * 100)}%`
     }
+    backupImportUploading.value = false
+    if (backupImportCancel.value) throw new Error('已取消导入')
+    const finished: any = await call('finishBackupImportUpload', { jobId })
+    backupImportJob.value = finished?.job ?? backupImportJob.value
+    backupImportMessage.value = '正在校验备份，完成后确认导入'
   } catch (error) {
-    backupImportJob.value = null
-    backupImportMessage.value = errorText(error)
+    backupImportUploading.value = false
+    const cancelled = backupImportCancel.value
+    if (backupImportJob.value?.id) {
+      try {
+        await refreshBackupImportJob()
+      } catch {
+        // 刷新失败不覆盖下面的提示。
+      }
+    }
+    if (cancelled) backupImportMessage.value = '已取消导入，本机数据没有改动'
+    else backupImportMessage.value = errorText(error)
   } finally {
+    backupImportUploading.value = false
     backupImportBusy.value = false
     syncBackupImportTimer()
   }
@@ -1516,10 +1552,21 @@ async function confirmBackupImport() {
 
 async function cancelBackupImport() {
   const job = backupImportJob.value
-  if (backupImportBusy.value) return
+  if (backupImportBusy.value && !backupImportUploading.value) return
   if (!job?.id) {
     backupImportJob.value = null
     backupImportMessage.value = ''
+    return
+  }
+  // 上传中取消：置标记让分块循环退出，同时通知服务端删除临时文件。
+  if (backupImportUploading.value) {
+    backupImportCancel.value = true
+    backupImportMessage.value = '正在取消上传'
+    try {
+      await call('cancelBackupJob', { id: job.id })
+    } catch (error) {
+      backupImportMessage.value = errorText(error)
+    }
     return
   }
   backupImportBusy.value = true
@@ -6461,7 +6508,7 @@ onMounted(async () => {
               <button class="mo-btn" :disabled="backupImportBusy" data-testid="backup-import-retry" @click="retryBackupImport">重试</button>
             </div>
             <div v-else-if="isBackupImportRunning(backupImportJob)" class="mo-row">
-              <button class="mo-btn danger" :disabled="backupImportBusy" data-testid="backup-import-cancel" @click="cancelBackupImport">取消</button>
+              <button class="mo-btn danger" :disabled="backupImportBusy && !backupImportUploading" data-testid="backup-import-cancel" @click="cancelBackupImport">取消</button>
             </div>
           </div>
 
