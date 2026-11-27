@@ -17,6 +17,7 @@ export type AutoPagePauseReason =
   | 'turn'
   | 'loading'
   | 'chapter-failed'
+  | 'tts'
 
 export type AutoPageTick =
   | { kind: 'idle' }

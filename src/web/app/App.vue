@@ -6,6 +6,17 @@ import PdfReader from '../reader/PdfReader.vue'
 import AudioReader from '../reader/AudioReader.vue'
 import VideoReader from '../reader/VideoReader.vue'
 import { simulatedChapterCount, simulatedProgress } from '../../core/reader/simulate'
+import {
+  buildSpeechPlan,
+  classifySpeechError,
+  segmentIndexForOffset,
+  speechErrorNotice,
+  SpeechCursor,
+  SPEECH_NO_VOICE_MESSAGE,
+  SPEECH_NOT_ALLOWED_NOTICE,
+  SPEECH_UNSUPPORTED_MESSAGE,
+  type SpeechPlan,
+} from '../../core/reader/speech'
 import { chapterForPdfPage, pdfPageOfChapterTitle } from '../../core/pdf-pages'
 import {
   DEFAULT_MENU_ITEMS,
@@ -293,10 +304,25 @@ const noteDraft = ref('')
 const underlineOpen = ref(false)
 const underlineLines = ref<string[]>([])
 const selectedUnderlines = ref<string[]>([])
-const speaking = ref(false)
-const highlightText = ref('')
-let speechSegments: Array<{ text: string; start: number }> = []
-let speechIndex = 0
+const speechStatus = ref<'idle' | 'speaking' | 'paused'>('idle')
+const speechNotice = ref('')
+const speechLoading = ref(false)
+const speechHighlight = ref<{ start: number; end: number } | null>(null)
+const speechSegmentIndex = ref(0)
+const speechSegmentTotal = ref(0)
+const speechChapterTitle = ref('')
+const speechVoices = ref<SpeechSynthesisVoice[]>([])
+/** 搜索高亮：关键词命中的原文绝对范围（与朗读高亮分开，朗读优先） */
+const highlightText = ref<{ start: number; end: number } | null>(null)
+let speechPlan: SpeechPlan | null = null
+let speechCursor: SpeechCursor | null = null
+let speechUtterance: SpeechSynthesisUtterance | null = null
+let speechToken = 0
+let speechResumeTimer: ReturnType<typeof setTimeout> | undefined
+let speechBusyRetried = false
+let speechUserCancel = false
+/** 上次失败是 not-allowed：只有用户手势里的 speak 才可能恢复 */
+let speechNotAllowed = false
 let pageTimer: ReturnType<typeof setTimeout> | undefined
 
 // 阅读页「书内搜索」：跨批自动推进，令牌用于停止后丢弃在途批次。
@@ -376,6 +402,8 @@ async function startAutoPage() {
   }
   if (settingsOpen.value) closeSettings()
   chrome.value = false
+  // 自动翻页与朗读互斥：暂停朗读但保留游标，之后再继续。
+  if (speechStatus.value === 'speaking') pauseSpeech()
   autoPage.setSeconds(settings.value.autoPageSeconds)
   syncAutoPagePosition()
   autoPage.start()
@@ -519,6 +547,14 @@ function onReaderVisibilityChange() {
   const hidden = document.hidden
   setAutoPause('hidden', hidden)
   if (keepAwake) void keepAwake.visibilityChanged(!hidden)
+  if (hidden) return
+  // 后台朗读可能被系统打断：回前台发现已不在 speaking 就显示「朗读已暂停」，位置保留可继续。
+  if (speechStatus.value === 'speaking' && !window.speechSynthesis?.speaking) {
+    speechStatus.value = 'paused'
+    speechNotice.value = '朗读已暂停'
+    showReaderHint('朗读已暂停')
+  }
+  if (speechHighlight.value) alignSpeechPage(speechHighlight.value.start)
 }
 
 /** Esc：依次收起设置、目录、各类面板、朗读条与菜单。 */
@@ -551,7 +587,7 @@ function closeReaderOverlays(): boolean {
     underlineOpen.value = false
     return true
   }
-  if (speaking.value) {
+  if (speechStatus.value !== 'idle') {
     stopSpeech()
     return true
   }
@@ -590,8 +626,25 @@ watch(
     refreshAutoPageState()
   },
 )
+watch(
+  () => [settings.value.ttsVoice, settings.value.ttsRate],
+  () => {
+    if (speechStatus.value === 'idle') return
+    // 立即按新音色/语速重念当前段；暂停中只作废旧 utterance，继续时重念
+    cancelSpeechUtterance()
+    if (speechStatus.value === 'speaking') {
+      speechBusyRetried = false
+      speechNotAllowed = false
+      speakCurrentSegment()
+    }
+  },
+)
 watch(view, (next, prev) => {
-  if (prev === 'reader' && next !== 'reader') stopAutoPage()
+  if (prev === 'reader' && next !== 'reader') {
+    stopSpeech()
+    stopAutoPage()
+    flushReaderProgress()
+  }
 })
 const editing = ref<any>(null)
 const editingJson = ref('')
@@ -1592,6 +1645,8 @@ onUnmounted(() => {
   }
   window.removeEventListener('keydown', onReaderEscape)
   document.removeEventListener('visibilitychange', onReaderVisibilityChange)
+  window.speechSynthesis?.removeEventListener?.('voiceschanged', loadSpeechVoices)
+  stopSpeech()
   if (readerHintTimer) clearTimeout(readerHintTimer)
   releaseKeepAwake()
 })
@@ -2825,7 +2880,7 @@ async function addToShelf(): Promise<boolean> {
 async function openChapter(
   chapter: any,
   page?: number,
-  options: { afterMediaRetry?: boolean } = {},
+  options: { afterMediaRetry?: boolean; keepSpeech?: boolean } = {},
 ) {
   if (!chapter || chapter.isVolume || !chapter.url) return false
   if (!options.afterMediaRetry) {
@@ -2838,7 +2893,8 @@ async function openChapter(
   tocOpen.value = false
   bookmarksOpen.value = false
   closeReaderDict()
-  stopSpeech()
+  // 换章、换书停止朗读；自动翻页续章（keepSpeech）不打断其状态。
+  if (!options.keepSpeech) stopSpeech('', { keepAutoPage: autoPageStatus.value === 'running' })
   busy.value = true
   chrome.value = false
   chapterError.value = ''
@@ -3361,81 +3417,395 @@ function onPage(payload: { page: number; total: number }) {
   }, 600)
 }
 
-function splitSpeech(text: string) {
-  const list: Array<{ text: string; start: number }> = []
-  const pattern = /[^。！？!?…\n]+[。！？!?…]*/g
-  let match: RegExpExecArray | null
-  while ((match = pattern.exec(text))) {
-    const value = match[0].trim()
-    if (value) list.push({ text: value, start: match.index })
+const speechSupported = computed(
+  () =>
+    typeof window !== 'undefined' &&
+    'speechSynthesis' in window &&
+    typeof SpeechSynthesisUtterance !== 'undefined',
+)
+
+const chineseSpeechVoices = computed(() =>
+  speechVoices.value.filter((voice) => voice.lang?.toLowerCase().startsWith('zh')),
+)
+
+/** 入口禁用原因；音色列表尚未加载时为空，避免首屏误判 */
+const speechBlockedReason = computed(() => {
+  if (!speechSupported.value) return SPEECH_UNSUPPORTED_MESSAGE
+  if (speechVoices.value.length === 0) return ''
+  return chineseSpeechVoices.value.length === 0 ? SPEECH_NO_VOICE_MESSAGE : ''
+})
+
+/** 阅读页高亮：朗读范围优先，其次搜索命中范围 */
+const readerHighlight = computed(() => speechHighlight.value ?? highlightText.value)
+
+function loadSpeechVoices() {
+  if (!speechSupported.value) return
+  try {
+    const voices = window.speechSynthesis?.getVoices?.() ?? []
+    if (voices.length > 0) speechVoices.value = voices
+  } catch {
+    // 枚举音色失败时保持未知，朗读入口仍可尝试
   }
-  return list
 }
 
-function pickVoice(): SpeechSynthesisVoice | null {
+function pickSpeechVoice(): SpeechSynthesisVoice | null {
   const voices = window.speechSynthesis?.getVoices?.() ?? []
+  const wanted = settings.value.ttsVoice
+  if (wanted) {
+    const matched = voices.find((voice) => voice.voiceURI === wanted)
+    if (matched) return matched
+  }
   return voices.find((voice) => voice.lang?.toLowerCase().startsWith('zh')) ?? null
 }
 
-function speakNext() {
-  if (!speaking.value) return
-  if (speechIndex >= speechSegments.length) {
-    stopSpeech()
-    return
+function syncSpeechSegment() {
+  speechSegmentIndex.value = speechCursor?.index ?? 0
+  speechSegmentTotal.value = speechCursor?.total ?? 0
+}
+
+function currentSpeechRate(): number {
+  const rate = Number(settings.value.ttsRate)
+  if (!Number.isFinite(rate)) return 1
+  return Math.min(2, Math.max(0.5, rate))
+}
+
+/** 高亮越屏时静默切页（goto 会取消翻页动画），不做子串匹配 */
+function alignSpeechPage(offset: number) {
+  if (readerKind.value !== 'text' || document.hidden) return
+  const reader = readerRef.value
+  const target = reader?.pageForOffset?.(offset)
+  if (typeof target !== 'number' || target < 0) return
+  if (target === Number(reader?.page)) return
+  reader?.goto?.(target)
+}
+
+function cancelSpeechUtterance() {
+  speechToken += 1
+  try {
+    window.speechSynthesis?.cancel()
+  } catch {
+    // 取消失败不影响后续重建
   }
-  const segment = speechSegments[speechIndex]
+  speechUtterance = null
+  if (speechResumeTimer) {
+    clearTimeout(speechResumeTimer)
+    speechResumeTimer = undefined
+  }
+}
+
+/** 念当前段从游标位置开始的剩余文本；boundary 用绝对偏移，不做子串匹配 */
+function speakCurrentSegment() {
+  const cursor = speechCursor
+  if (!cursor) return
   const synth = window.speechSynthesis
-  if (!synth) {
-    stopSpeech()
-    status.value = '当前浏览器不支持朗读'
+  if (!synth || !speechSupported.value) {
+    stopSpeech(SPEECH_UNSUPPORTED_MESSAGE)
     return
   }
-  const utterance = new SpeechSynthesisUtterance(segment.text)
-  utterance.lang = 'zh-CN'
-  utterance.rate = 1
-  const voice = pickVoice()
+  const text = cursor.remainingText()
+  if (!text.trim()) {
+    advanceSpeechSegment()
+    return
+  }
+  const token = ++speechToken
+  speechUserCancel = false
+  const utterance = new SpeechSynthesisUtterance(text)
+  speechUtterance = utterance
+  const voice = pickSpeechVoice()
+  utterance.lang = voice?.lang || 'zh-CN'
+  utterance.rate = currentSpeechRate()
   if (voice) utterance.voice = voice
+  const baseOffset = cursor.charOffset
   utterance.onstart = () => {
-    highlightText.value = segment.text
-    const target = readerRef.value?.findPageFor?.(segment.text)
-    if (typeof target === 'number' && target >= 0) readerRef.value?.goto?.(target)
+    if (token !== speechToken) return
+    const range = cursor.highlightRange()
+    speechHighlight.value = range
+    if (range) alignSpeechPage(range.start)
+  }
+  utterance.onboundary = (event: SpeechSynthesisEvent) => {
+    if (token !== speechToken || speechStatus.value === 'idle') return
+    if (typeof event.charIndex !== 'number') return
+    cursor.setBoundary(baseOffset + event.charIndex)
+    const range = cursor.highlightRange()
+    speechHighlight.value = range
+    if (range) alignSpeechPage(range.start)
   }
   utterance.onend = () => {
-    if (!speaking.value) return
-    speechIndex += 1
-    speakNext()
+    if (token !== speechToken || speechStatus.value === 'idle') return
+    speechHighlight.value = null
+    advanceSpeechSegment()
   }
-  utterance.onerror = () => {
-    if (!speaking.value) return
-    speechIndex += 1
-    speakNext()
+  utterance.onerror = (event: SpeechSynthesisErrorEvent) => {
+    if (token !== speechToken || speechStatus.value === 'idle') return
+    const action = classifySpeechError(event?.error, speechUserCancel)
+    if (action === 'ignore') return
+    if (action === 'retry' && !speechBusyRetried) {
+      speechBusyRetried = true
+      cancelSpeechUtterance()
+      speakCurrentSegment()
+      return
+    }
+    if (action === 'not-allowed') {
+      speechNotAllowed = true
+      speechStatus.value = 'paused'
+      speechNotice.value = SPEECH_NOT_ALLOWED_NOTICE
+      showReaderHint(SPEECH_NOT_ALLOWED_NOTICE)
+      return
+    }
+    stopSpeech(speechErrorNotice(event?.error))
   }
   synth.speak(utterance)
 }
 
-function startSpeech() {
-  if (!('speechSynthesis' in window)) {
-    status.value = '当前浏览器不支持朗读'
+/** 当前段念完：有下一段继续，否则走章末续章/停止 */
+function advanceSpeechSegment() {
+  const cursor = speechCursor
+  if (!cursor) return
+  if (cursor.advance() === 'next') {
+    speechBusyRetried = false
+    syncSpeechSegment()
+    speakCurrentSegment()
     return
   }
-  if (!replacedContent.value.trim()) return
-  window.speechSynthesis.cancel()
-  speechSegments = splitSpeech(replacedContent.value)
-  if (speechSegments.length === 0) return
-  speechIndex = 0
-  speaking.value = true
-  speakNext()
+  void finishSpeechChapter()
 }
 
-function stopSpeech() {
-  speaking.value = false
-  highlightText.value = ''
-  if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+/** 章末：连续朗读开则加载下一章并从标题后第一段继续，否则停在章末 */
+async function finishSpeechChapter() {
+  const hasNext = chapterIndex.value >= 0 && chapterIndex.value < chapters.value.length - 1
+  if (!settings.value.ttsContinuous) {
+    stopSpeech()
+    showReaderHint('已读完本章')
+    return
+  }
+  if (!hasNext) {
+    stopSpeech('已到全书末尾')
+    return
+  }
+  const target = chapters.value[chapterIndex.value + 1]
+  if (!target) {
+    stopSpeech('已到全书末尾')
+    return
+  }
+  speechLoading.value = true
+  speechNotice.value = '正在加载下一章…'
+  const ok = await openChapter(target, 0, { keepSpeech: true })
+  speechLoading.value = false
+  if (speechStatus.value === 'idle') return
+  if (!ok) {
+    stopSpeech('下一章加载失败，朗读已停止')
+    return
+  }
+  await nextTick()
+  speechPlan = buildSpeechPlan(readerTitle.value, replacedContent.value)
+  speechCursor = new SpeechCursor(speechPlan)
+  speechChapterTitle.value = readerTitle.value
+  if (speechCursor.segment?.kind === 'title') speechCursor.setIndex(1)
+  syncSpeechSegment()
+  if (!speechCursor.segment || speechCursor.segment.kind === 'title') {
+    stopSpeech('下一章没有可朗读的正文')
+    return
+  }
+  speechNotice.value = ''
+  speechNotAllowed = false
+  speechBusyRetried = false
+  if (speechStatus.value === 'paused') {
+    speechHighlight.value = speechCursor.highlightRange()
+    return
+  }
+  speechStatus.value = 'speaking'
+  speakCurrentSegment()
 }
 
-function toggleSpeech() {
-  if (speaking.value) stopSpeech()
-  else startSpeech()
+function startSpeech() {
+  if (!speechSupported.value) {
+    showReaderHint(SPEECH_UNSUPPORTED_MESSAGE)
+    return
+  }
+  if (view.value !== 'reader' || readerKind.value !== 'text') return
+  loadSpeechVoices()
+  const reason = speechBlockedReason.value
+  if (reason) {
+    showReaderHint(reason)
+    return
+  }
+  if (!replacedContent.value.trim()) {
+    showReaderHint('本章没有可朗读的内容')
+    return
+  }
+  cancelSpeechUtterance()
+  speechBusyRetried = false
+  speechUserCancel = false
+  speechNotAllowed = false
+  speechPlan = buildSpeechPlan(readerTitle.value, replacedContent.value)
+  speechCursor = new SpeechCursor(speechPlan)
+  speechChapterTitle.value = readerTitle.value
+  if (speechPlan.segments.length === 0) {
+    stopSpeech('本章没有可朗读的内容')
+    return
+  }
+  if (autoPageStatus.value !== 'idle') {
+    autoPage.addPauseReason('tts')
+    refreshAutoPageState()
+  }
+  void ensureKeepAwake().acquire()
+  const reader = readerRef.value
+  const range = reader?.currentPageRange?.() ?? null
+  const pageStart = range && range.start >= 0 ? range.start : 0
+  if (pageStart <= 0) {
+    speechCursor.setIndex(0)
+  } else {
+    const index = segmentIndexForOffset(speechPlan, pageStart)
+    if (index >= 0) {
+      speechCursor.setIndex(index)
+      const segment = speechCursor.segment
+      if (segment && segment.kind === 'paragraph' && pageStart > segment.start) {
+        speechCursor.setBoundary(pageStart - segment.start)
+      }
+    }
+  }
+  syncSpeechSegment()
+  speechNotice.value = ''
+  speechStatus.value = 'speaking'
+  speakCurrentSegment()
+}
+
+function pauseSpeech() {
+  if (speechStatus.value !== 'speaking') return
+  const synth = window.speechSynthesis
+  if (!synth) return
+  speechUserCancel = true
+  speechStatus.value = 'paused'
+  speechNotice.value = '已暂停'
+  if (speechResumeTimer) {
+    clearTimeout(speechResumeTimer)
+    speechResumeTimer = undefined
+  }
+  try {
+    synth.pause()
+  } catch {
+    // 忽略：恢复时统一兜底
+  }
+}
+
+/** 继续：400ms 内没恢复 speaking 就取消当前 utterance，从最后 boundary 偏移重读该段 */
+function resumeSpeech() {
+  if (speechStatus.value !== 'paused') return
+  const synth = window.speechSynthesis
+  if (!synth) return
+  speechUserCancel = false
+  speechNotice.value = ''
+  if (autoPageStatus.value === 'running') {
+    autoPage.addPauseReason('tts')
+    refreshAutoPageState()
+  }
+  if (!speechUtterance || speechNotAllowed) {
+    speechNotAllowed = false
+    speechBusyRetried = false
+    cancelSpeechUtterance()
+    speechStatus.value = 'speaking'
+    speakCurrentSegment()
+    return
+  }
+  speechStatus.value = 'speaking'
+  try {
+    synth.resume()
+  } catch {
+    // 恢复失败走下面的兜底
+  }
+  if (speechResumeTimer) clearTimeout(speechResumeTimer)
+  speechResumeTimer = setTimeout(() => {
+    speechResumeTimer = undefined
+    if (speechStatus.value !== 'speaking') return
+    if (synth.speaking) return
+    cancelSpeechUtterance()
+    speakCurrentSegment()
+  }, 400)
+}
+
+function toggleSpeechPlay() {
+  if (speechStatus.value === 'idle') startSpeech()
+  else if (speechStatus.value === 'speaking') pauseSpeech()
+  else resumeSpeech()
+}
+
+/** 上一段/下一段：暂停中只移动位置，播放中立即从新段开头念 */
+function moveSpeechSegment(direction: -1 | 1) {
+  if (speechStatus.value === 'idle') {
+    showReaderHint('先点「朗读」开始')
+    return
+  }
+  const cursor = speechCursor
+  if (!cursor) return
+  if (direction > 0 && cursor.isLast) {
+    cancelSpeechUtterance()
+    void finishSpeechChapter()
+    return
+  }
+  const wasPaused = speechStatus.value === 'paused'
+  speechNotAllowed = false
+  speechBusyRetried = false
+  cancelSpeechUtterance()
+  const moved = direction > 0 ? cursor.next() : cursor.prev()
+  if (!moved) cursor.setBoundary(0)
+  syncSpeechSegment()
+  speechHighlight.value = cursor.highlightRange()
+  if (wasPaused) {
+    speechStatus.value = 'paused'
+    return
+  }
+  speechStatus.value = 'speaking'
+  speakCurrentSegment()
+}
+
+function stopSpeech(
+  notice = '',
+  options: { keepAutoPage?: boolean } = {},
+) {
+  const wasActive = speechStatus.value !== 'idle' || speechLoading.value || speechCursor !== null
+  speechUserCancel = true
+  cancelSpeechUtterance()
+  speechStatus.value = 'idle'
+  speechNotAllowed = false
+  speechLoading.value = false
+  speechHighlight.value = null
+  speechNotice.value = ''
+  speechCursor = null
+  speechPlan = null
+  speechSegmentIndex.value = 0
+  speechSegmentTotal.value = 0
+  speechChapterTitle.value = ''
+  if (!wasActive) return
+  // 只处理「因朗读而暂停」的自动翻页：先补一个暂停原因再摘掉 tts，避免摘掉后自动重启；
+  // 自动翻页本来就在跑/暂停时不因停止朗读而改变它。
+  if (autoPage.pausedReasons.includes('tts')) {
+    if (!options.keepAutoPage) autoPage.pause()
+    autoPage.removePauseReason('tts')
+    refreshAutoPageState()
+  }
+  if (autoPage.status !== 'running') releaseKeepAwake()
+  // 停止朗读立即落一次阅读进度，不等 600ms 防抖
+  flushReaderProgress()
+  if (notice) showReaderHint(notice)
+}
+
+/** 离开阅读页立即落一次进度，避免 600ms 防抖丢掉最后一次翻页 */
+function flushReaderProgress() {
+  if (pageTimer) {
+    clearTimeout(pageTimer)
+    pageTimer = undefined
+  }
+  if (!currentBook.value?.id || !currentChapter.value) return
+  if (readerKind.value === 'pdf') return
+  const raw = Number(initialPage.value)
+  const position = Number.isFinite(raw) && raw >= 0 && raw !== Number.MAX_SAFE_INTEGER ? raw : 0
+  call('saveProgress', {
+    bookId: currentBook.value.id,
+    chapterIndex: chapterIndex.value,
+    chapterTitle: currentChapter.value.title,
+    chapterUrl: currentChapter.value.url,
+    position,
+  }).catch(() => undefined)
 }
 
 function showReaderHint(text: string) {
@@ -3563,10 +3933,11 @@ async function jumpToSearchResult(item: { chapterIndex: number }) {
     return
   }
   await nextTick()
-  const target = readerRef.value?.findPageFor?.(key)
-  if (typeof target === 'number' && target >= 0) {
-    readerRef.value?.goto?.(target)
-    highlightText.value = key
+  const range = readerRef.value?.findRangeFor?.(key)
+  if (range) {
+    const target = readerRef.value?.pageForOffset?.(range.start)
+    readerRef.value?.goto?.(typeof target === 'number' ? target : 0)
+    highlightText.value = { start: range.start, end: range.end }
   } else {
     readerRef.value?.goto?.(0)
     showReaderHint('未定位到关键词')
@@ -3631,8 +4002,16 @@ function onTapAction(code: number) {
     void toggleBookmark()
     return
   }
+  if (code === 5) {
+    moveSpeechSegment(-1)
+    return
+  }
+  if (code === 6) {
+    moveSpeechSegment(1)
+    return
+  }
   if (code === 13) {
-    toggleSpeech()
+    toggleSpeechPlay()
     return
   }
   if (code === 10) {
@@ -3930,6 +4309,8 @@ function openArticle(item: any) {
 onMounted(async () => {
   window.addEventListener('keydown', onReaderEscape)
   document.addEventListener('visibilitychange', onReaderVisibilityChange)
+  loadSpeechVoices()
+  window.speechSynthesis?.addEventListener?.('voiceschanged', loadSpeechVoices)
   autoPage.setSeconds(settings.value.autoPageSeconds)
   if (!autoPageTimer) autoPageTimer = setInterval(runAutoPageTick, 250)
   try {
@@ -5126,7 +5507,7 @@ onMounted(async () => {
             :indent="settings.indent"
             :padding="settings.padding"
             :initial-page="initialPage"
-            :highlight="highlightText"
+            :highlight="readerHighlight"
             :underlines="underlineQuotes"
             :theme="theme"
             :theme-colors="activeThemeColors"
@@ -5201,6 +5582,24 @@ onMounted(async () => {
           {{ boundaryDirection > 0 ? '正在加载下一章…' : '正在加载上一章…' }}
         </p>
 
+        <p v-if="speechStatus === 'idle' && speechBlockedReason" class="mo-reader-hint" data-testid="speech-blocked">
+          {{ speechBlockedReason }}
+        </p>
+
+        <div
+          v-if="speechStatus !== 'idle'"
+          class="mo-auto-page"
+          data-testid="speech-bar"
+          :style="autoPageStatus !== 'idle' ? 'bottom: 64px' : ''"
+        >
+          <span class="mo-auto-page-label">朗读 · 第 {{ speechSegmentIndex + 1 }}/{{ speechSegmentTotal }} 段</span>
+          <span class="mo-auto-page-notice">{{ speechNotice || speechChapterTitle }}</span>
+          <button class="mo-btn tiny" data-testid="speech-prev" @click="moveSpeechSegment(-1)">上一段</button>
+          <button class="mo-btn tiny" data-testid="speech-play" @click="toggleSpeechPlay">{{ speechStatus === 'speaking' ? '暂停' : '继续' }}</button>
+          <button class="mo-btn tiny" data-testid="speech-next" @click="moveSpeechSegment(1)">下一段</button>
+          <button class="mo-btn tiny" data-testid="speech-stop" @click="stopSpeech()">关闭</button>
+        </div>
+
         <div v-if="autoPageStatus !== 'idle'" class="mo-auto-page" data-testid="auto-page-bar">
           <span class="mo-auto-page-label">{{ autoPageLabel }}</span>
           <span v-if="autoPageNotice" class="mo-auto-page-notice">{{ autoPageNotice }}</span>
@@ -5235,7 +5634,14 @@ onMounted(async () => {
             <div class="mo-chrome-bottom">
               <button v-if="settings.menuItems.includes('prev')" class="mo-chrome-btn" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
               <button v-if="settings.menuItems.includes('settings') && readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-settings" @click="openSettings($event)">Aa</button>
-              <button v-if="readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-speak" @click="toggleSpeech">{{ speaking ? '暂停' : '朗读' }}</button>
+              <button
+                v-if="readerKind === 'text'"
+                class="mo-chrome-btn"
+                data-testid="reader-speak"
+                :disabled="speechStatus === 'idle' && speechBlockedReason !== ''"
+                :title="speechBlockedReason || '朗读'"
+                @click="toggleSpeechPlay"
+              >{{ speechStatus === 'idle' ? '朗读' : speechStatus === 'speaking' ? '暂停' : '继续' }}</button>
               <button v-if="settings.menuItems.includes('toc')" class="mo-chrome-btn" @click="tocOpen = true">目录</button>
               <button
                 v-if="currentBook && currentBook.origin !== 'local'"
@@ -5655,8 +6061,17 @@ onMounted(async () => {
                 </div>
                 <label class="mo-theme-row">
                   <span>音色</span>
-                  <input v-model="settings.ttsVoice" class="mo-input" maxlength="400" placeholder="留空用系统默认" @change="persistSettings" />
+                  <select v-model="settings.ttsVoice" class="mo-select" @change="persistSettings">
+                    <option value="">系统默认</option>
+                    <option
+                      v-for="voice in (chineseSpeechVoices.length ? chineseSpeechVoices : speechVoices)"
+                      :key="voice.voiceURI"
+                      :value="voice.voiceURI"
+                    >{{ voice.name }}（{{ voice.lang }}）</option>
+                  </select>
                 </label>
+                <p v-if="speechVoices.length === 0" class="muted">音色列表加载中…</p>
+                <p v-else-if="speechBlockedReason" class="muted">{{ speechBlockedReason }}</p>
                 <label class="mo-slider">
                   <span>语速</span>
                   <input v-model.number="settings.ttsRate" type="range" min="0.5" max="2" step="0.1" @input="schedulePersistSettings" />

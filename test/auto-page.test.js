@@ -149,6 +149,20 @@ test('状态条文案带当前间隔，停止后清空', () => {
   assert.equal(controller.label, '')
 })
 
+test('朗读可挂起自动翻页，原因清空后由宿主决定是否恢复', () => {
+  const { clock, controller } = setup()
+  controller.start()
+  clock.advance(5000)
+  controller.addPauseReason('tts')
+  assert.equal(controller.status, 'paused')
+  clock.advance(60000)
+  assert.equal(controller.tick().kind, 'idle')
+  controller.removePauseReason('tts')
+  assert.equal(controller.status, 'running')
+  clock.advance(10000)
+  assert.deepEqual(controller.tick(), { kind: 'turn', page: 1 })
+})
+
 test('新建实例是空闲态，不跨刷新继承运行状态', () => {
   const first = new AutoPageController({ now: () => 0 })
   first.start()
