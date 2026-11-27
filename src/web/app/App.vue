@@ -4160,7 +4160,7 @@ async function loadSettings() {
     // 有书时始终取一次合并值，阅读页据此显示；全局作用域另取全局层供面板编辑。
     const bookStored: any = bookId ? await call('getSettings', { bookId }) : null
     const stored: any =
-      bookId && scope === 'global' ? await call('getSettings') : bookStored
+      bookId && scope === 'global' ? await call('getSettings', {}) : bookStored
     if (!stored?.settings) return
     bookOverrides.value = bookStored?.bookOverrides ?? {}
     settings.value = { ...defaultReaderSettings(), ...stored.settings } as ReaderSettings

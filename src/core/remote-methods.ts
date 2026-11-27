@@ -77,3 +77,22 @@ export const REMOTE_METHODS = Object.freeze([
   'getFont',
   'deleteFont',
 ])
+
+/**
+ * 不需要入参的远端方法：客户端桥接据此声明「零参数」，其余方法统一声明一个 args 对象。
+ * getSettings 自 #124 起接受可选的 { bookId }，所以不在其中。
+ */
+export const ARGLESS_METHODS = Object.freeze([
+  'state',
+  'listSources',
+  'listBooks',
+  'listRssSources',
+  'listExploreSources',
+  'listDictRules',
+  'exportDictRules',
+  'listFonts',
+  'getStorageUsage',
+  'clearAllMedia',
+  'clearAllCaches',
+  'clearDownloads',
+] as const)

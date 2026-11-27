@@ -1,13 +1,13 @@
 import { createElement } from 'react'
 import { z } from 'zod'
 import { PANEL_ID } from '../core/version'
-import { REMOTE_METHODS } from '../core/remote-methods'
+import { ARGLESS_METHODS, REMOTE_METHODS } from '../core/remote-methods'
 import { createReaderShell } from './shell'
 
 const jsonCodec = () => ({ mode: 'strict' as const, typeSymbol: '@local/mo-reader#Json', create: () => z.json() })
 
-/** 无参数方法；其余方法统一接收一个 args 对象。 */
-const ZERO_ARG = new Set(['state', 'listSources', 'listBooks', 'listRssSources', 'listExploreSources', 'listDictRules', 'exportDictRules', 'getSettings', 'listFonts'])
+/** 无参数方法；其余方法统一接收一个 args 对象（含可选的 getSettings({ bookId })）。 */
+const ZERO_ARG = new Set<string>(ARGLESS_METHODS)
 
 /** 与 README / service 的 REMOTE_METHODS 一一对应，宿主据此生成 ctx.remote.reader 的方法。 */
 export const readerContribution = {
