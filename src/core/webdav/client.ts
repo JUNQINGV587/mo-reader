@@ -135,6 +135,38 @@ export interface WebdavClientOptions {
   timeoutMs?: number
 }
 
+/** 请求体：字符串或上传流；流式 PUT 需要 half duplex，走 options.duplex。 */
+export interface WebdavSendOptions {
+  headers?: Record<string, string>
+  body?: string | Uint8Array | NodeJS.ReadableStream
+  /** 调用方自带的取消信号；给了就不再套默认超时（上传/下载用自己的超时计时器）。 */
+  signal?: AbortSignal
+}
+
+/** 把任意失败收敛成带 code/status 的 WebdavRequestError，避免上传下载各处重复判断。 */
+export function toWebdavRequestError(error: unknown): WebdavRequestError {
+  return error instanceof WebdavRequestError ? error : mapFetchError(error)
+}
+
+export function webdavFailureFromStatus(status: number, action = '连接'): WebdavRequestError {
+  return failureFromStatus(status, action)
+}
+
+/**
+ * 远端备份文件名：只允许单段名字，不能带路径（避免写到目标目录之外），
+ * 空名字与超长名字直接给出可读提示。
+ */
+export function assertWebdavFileName(name: string): string {
+  const trimmed = String(name ?? '').trim()
+  if (!trimmed) throw new WebdavRequestError('http', '请填写远端备份文件名')
+  if (trimmed === '.' || trimmed === '..') throw new WebdavRequestError('http', '远端文件名不能带路径')
+  if (trimmed.includes('/') || trimmed.includes('\\') || trimmed.includes('\0')) {
+    throw new WebdavRequestError('http', '远端文件名不能带路径')
+  }
+  if (trimmed.length > 255) throw new WebdavRequestError('http', '远端文件名太长，请控制在 255 个字符内')
+  return trimmed
+}
+
 export class WebdavClient {
   readonly config: WebdavConfig
   private readonly fetchImpl: WebdavFetch
@@ -146,16 +178,62 @@ export class WebdavClient {
     this.timeoutMs = Math.max(1000, Math.min(120000, options.timeoutMs ?? WEBDAV_DEFAULT_TIMEOUT_MS))
   }
 
-  /** 统一出口：Basic 认证头与超时都由这里加；#133 的 PUT/GET 直接调用它。 */
-  async send(method: string, url: string, options: { headers?: Record<string, string>; body?: string } = {}): Promise<Response> {
+  /**
+   * 统一出口：Basic 认证头与超时都由这里加；#133 的 PUT/GET 直接调用它。
+   * 调用方给了 signal（上传/下载要取消与自定义超时）就用它，否则套默认超时。
+   */
+  async send(method: string, url: string, options: WebdavSendOptions = {}): Promise<Response> {
     const headers: Record<string, string> = { ...(options.headers ?? {}) }
     const { username, password } = this.config
     if (username || password) {
       headers.Authorization = `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`
     }
-    const init: RequestInit = { method, headers, signal: AbortSignal.timeout(this.timeoutMs) }
-    if (options.body !== undefined) init.body = options.body
+    const init: RequestInit & { duplex?: 'half' } = {
+      method,
+      headers,
+      signal: options.signal ?? AbortSignal.timeout(this.timeoutMs),
+    }
+    if (options.body !== undefined) {
+      init.body = options.body as RequestInit['body']
+      // Node 的 fetch 对流式请求体要求 half duplex，声明后才能发送。
+      if (typeof options.body === 'object' && typeof (options.body as { pipe?: unknown }).pipe === 'function') {
+        init.duplex = 'half'
+      }
+    }
     return this.fetchImpl(url, init)
+  }
+
+  /**
+   * 上传/下载前的目录准备：解析地址、私网策略、PROPFIND depth 0；
+   * 目录 404 时与 #131 测试连通一致地逐级 MKCOL。只建目录，不列目录内容。
+   */
+  async prepareDirectory(): Promise<{ createdDirs: number }> {
+    const url = parseWebdavAddress(this.config.url)
+    await assertTargetAllowed(url, this.config.allowPrivate)
+    const target = webdavDirectoryHref(url)
+    const response = await this.propfindDirectory(target)
+    if (response.status === 404) {
+      const createdDirs = await this.ensureDirectory(target)
+      return { createdDirs }
+    }
+    if (!isSuccess(response.status)) throw failureFromStatus(response.status, '连接目录')
+    return { createdDirs: 0 }
+  }
+
+  /** 目标文件地址：目录地址补斜杠后拼单段文件名（编码后只写这一个文件）。 */
+  fileUrl(fileName: string): string {
+    const directory = webdavDirectoryHref(parseWebdavAddress(this.config.url))
+    return `${directory}${encodeURIComponent(assertWebdavFileName(fileName))}`
+  }
+
+  /** 覆盖前探测远端同名文件；有的服务器不支持 HEAD（405/501），由调用方按「未知」处理。 */
+  headFile(url: string): Promise<Response> {
+    return this.send('HEAD', url)
+  }
+
+  /** 取回远端备份；调用方负责超时与取消信号。 */
+  downloadFile(url: string, signal?: AbortSignal): Promise<Response> {
+    return this.send('GET', url, { signal })
   }
 
   async propfindDirectory(url: string): Promise<Response> {

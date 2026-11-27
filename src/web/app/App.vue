@@ -1188,6 +1188,12 @@ async function refreshBackupJob() {
   } catch (error) {
     backupMessage.value = errorText(error)
   }
+  if (backupJob.value?.status === 'done') {
+    latestBackup.value = backupJob.value
+    if (!webdavDownloadName.value && backupJob.value.fileName) {
+      webdavDownloadName.value = String(backupJob.value.fileName)
+    }
+  }
   if (backupJob.value?.status === 'done' && !backupDownload.value) await loadBackupDownload()
   if (backupJob.value?.status === 'failed' && backupJob.value?.error) backupMessage.value = String(backupJob.value.error)
   syncBackupTimer()
@@ -1198,8 +1204,21 @@ async function loadBackupJob() {
   backupImportJob.value = null
   backupDownload.value = null
   backupMessage.value = ''
+  latestBackup.value = null
+  webdavTransferJob.value = null
+  webdavTransferMessage.value = ''
   try {
     const result: any = await call('getBackupJob', {})
+    latestBackup.value = result?.backup ?? null
+    if (!webdavDownloadName.value && latestBackup.value?.fileName) {
+      webdavDownloadName.value = String(latestBackup.value.fileName)
+    }
+    const transfer = result?.transfer ?? null
+    if (transfer) {
+      webdavTransferJob.value = transfer
+      if (transfer.status === 'failed' && transfer.error) webdavTransferMessage.value = String(transfer.error)
+      syncWebdavTransferTimer()
+    }
     const job = result?.job ?? null
     if (job?.kind === 'backupImport') {
       // 离开「我的」页再回来时接着显示导入进度或待确认的预览。
@@ -1208,7 +1227,13 @@ async function loadBackupJob() {
       syncBackupImportTimer()
       return
     }
-    backupJob.value = job
+    if (job?.kind === 'webdavTransfer') {
+      // 传输作业在跑时，备份卡仍显示它上传的那份备份。
+      backupJob.value = latestBackup.value
+      if (job.status === 'done' && job.importJobId) await adoptWebdavImport(String(job.importJobId))
+    } else {
+      backupJob.value = job
+    }
   } catch (error) {
     backupMessage.value = errorText(error)
   }
@@ -1225,6 +1250,7 @@ async function startBackup(light = false) {
   try {
     const result: any = await call('startBackup', { light })
     backupJob.value = result?.job ?? null
+    latestBackup.value = backupJob.value
     backupMessage.value = result?.existing ? '已有备份在进行，完成后会给出下载链接' : '已开始备份'
     syncBackupTimer()
   } catch (error) {
@@ -1649,6 +1675,180 @@ function webdavTestText(result: any) {
   return parts.filter(Boolean).join(' · ')
 }
 
+// —— WebDAV 上传与下载（#133）：上传当前备份，取回后走与本地导入相同的预览 ——
+const latestBackup = ref<any>(null)
+const webdavTransferJob = ref<any>(null)
+const webdavTransferBusy = ref(false)
+const webdavTransferMessage = ref('')
+const webdavDownloadName = ref('')
+let webdavTransferTimer: ReturnType<typeof setInterval> | null = null
+
+function isWebdavTransferRunning(job: any) {
+  return job?.status === 'running' || job?.status === 'queued'
+}
+
+function webdavTransferStatusText(job: any) {
+  if (!job) return ''
+  if (job.status === 'queued') return '排队中'
+  if (job.status === 'running') return job.direction === 'upload' ? '上传中' : '取回中'
+  if (job.status === 'paused') return '待确认'
+  if (job.status === 'done') return '已完成'
+  if (job.status === 'cancelled') return '已取消'
+  return job.status === 'failed' ? '失败' : String(job.status ?? '')
+}
+
+function webdavTransferPercent(job: any) {
+  const total = Number(job?.total) || 0
+  if (!total) return 0
+  const done = Number(job?.completed) || 0
+  return Math.max(0, Math.min(100, Math.round((done / total) * 100)))
+}
+
+/** 字节进度：上传/取回都以「已传 / 总共」显示，取不回总大小时只显示已传。 */
+function webdavTransferBytesText(job: any) {
+  const done = Number(job?.completed) || 0
+  if (!done) return ''
+  const total = Number(job?.total) || 0
+  return total ? `${formatBytes(done)} / ${formatBytes(total)}` : formatBytes(done)
+}
+
+function stopWebdavTransferTimer() {
+  if (webdavTransferTimer !== null) {
+    clearInterval(webdavTransferTimer)
+    webdavTransferTimer = null
+  }
+}
+
+function syncWebdavTransferTimer() {
+  if (isWebdavTransferRunning(webdavTransferJob.value)) {
+    if (webdavTransferTimer === null) webdavTransferTimer = setInterval(refreshWebdavTransferJob, 800)
+  } else {
+    stopWebdavTransferTimer()
+  }
+}
+
+/** 取回完成后的导入作业交给导入卡与预览：校验、确认、写库全部沿用 #132 的流程。 */
+async function adoptWebdavImport(importJobId: string) {
+  try {
+    const result: any = await call('getBackupJob', { jobId: importJobId })
+    const imported = result?.job ?? null
+    if (!imported) return
+    backupImportJob.value = imported
+    if (imported.status === 'failed') {
+      backupImportMessage.value = String(imported.error || '备份无法导入')
+    } else if (imported.status === 'paused') {
+      backupImportMessage.value = '校验完成，确认后开始导入'
+    } else {
+      backupImportMessage.value = '正在校验备份'
+    }
+    syncBackupImportTimer()
+  } catch (error) {
+    webdavTransferMessage.value = errorText(error)
+  }
+}
+
+async function refreshWebdavTransferJob() {
+  const job = webdavTransferJob.value
+  if (!job?.id) return
+  try {
+    const result: any = await call('getBackupJob', { jobId: job.id })
+    webdavTransferJob.value = result?.job ?? webdavTransferJob.value
+    latestBackup.value = result?.backup ?? latestBackup.value
+  } catch (error) {
+    webdavTransferMessage.value = errorText(error)
+  }
+  const current = webdavTransferJob.value
+  if (current?.status === 'failed' && current?.error) webdavTransferMessage.value = String(current.error)
+  if (current?.status === 'done') {
+    webdavTransferMessage.value =
+      current.direction === 'upload'
+        ? `已上传：${current.fileName}`
+        : `已取回：${current.fileName}，请确认导入`
+    if (current.importJobId) await adoptWebdavImport(String(current.importJobId))
+  }
+  syncWebdavTransferTimer()
+}
+
+/** 上传前先确认当前备份可用；没备份就先提示去备份。 */
+async function startWebdavUpload() {
+  if (webdavTransferBusy.value) return
+  webdavTransferBusy.value = true
+  webdavTransferMessage.value = ''
+  try {
+    const result: any = await call('uploadBackupToWebdav', { backupJobId: latestBackup.value?.id || '' })
+    webdavTransferJob.value = result?.job ?? null
+    webdavTransferMessage.value = '正在检查远端目录'
+    syncWebdavTransferTimer()
+  } catch (error) {
+    webdavTransferMessage.value = errorText(error)
+  } finally {
+    webdavTransferBusy.value = false
+  }
+}
+
+async function confirmWebdavOverwrite() {
+  const job = webdavTransferJob.value
+  if (!job?.id || webdavTransferBusy.value) return
+  webdavTransferBusy.value = true
+  try {
+    const result: any = await call('uploadBackupToWebdav', { id: job.id })
+    webdavTransferJob.value = result?.job ?? webdavTransferJob.value
+    webdavTransferMessage.value = '正在上传'
+    syncWebdavTransferTimer()
+  } catch (error) {
+    webdavTransferMessage.value = errorText(error)
+  } finally {
+    webdavTransferBusy.value = false
+  }
+}
+
+async function cancelWebdavTransfer() {
+  const job = webdavTransferJob.value
+  if (!job?.id || webdavTransferBusy.value) return
+  webdavTransferBusy.value = true
+  try {
+    const result: any = await call('cancelBackupJob', { id: job.id })
+    webdavTransferJob.value = result?.job ?? webdavTransferJob.value
+    webdavTransferMessage.value = '已取消，临时文件已清理'
+  } catch (error) {
+    webdavTransferMessage.value = errorText(error)
+  } finally {
+    webdavTransferBusy.value = false
+    stopWebdavTransferTimer()
+  }
+}
+
+async function retryWebdavTransfer() {
+  const job = webdavTransferJob.value
+  if (job?.direction === 'download') {
+    await startWebdavDownload()
+    return
+  }
+  await startWebdavUpload()
+}
+
+/** 取回的远端文件名默认用当前备份名，也可以手填别的。 */
+async function startWebdavDownload() {
+  if (webdavTransferBusy.value) return
+  const fileName = webdavDownloadName.value.trim() || latestBackup.value?.fileName || ''
+  if (!fileName) {
+    webdavTransferMessage.value = '请填写远端备份文件名'
+    return
+  }
+  webdavTransferBusy.value = true
+  webdavTransferMessage.value = ''
+  try {
+    const result: any = await call('downloadBackupFromWebdav', { fileName })
+    webdavTransferJob.value = result?.job ?? null
+    webdavTransferMessage.value = '正在取回备份'
+    syncWebdavTransferTimer()
+  } catch (error) {
+    webdavTransferMessage.value = errorText(error)
+  } finally {
+    webdavTransferBusy.value = false
+  }
+}
+
 async function clearWebdav() {
   if (webdavSaving.value) return
   webdavSaving.value = true
@@ -1911,6 +2111,7 @@ watch(view, (next) => {
     void loadWebdavConfig()
   } else {
     stopBackupTimer()
+    stopWebdavTransferTimer()
   }
 })
 
@@ -2356,6 +2557,7 @@ onUnmounted(() => {
   stopMediaTimer()
   stopExportTimer()
   stopBackupTimer()
+  stopWebdavTransferTimer()
   if (settingsPersistTimer) clearTimeout(settingsPersistTimer)
   if (autoPageTimer) {
     clearInterval(autoPageTimer)
@@ -6424,6 +6626,81 @@ onMounted(async () => {
           </p>
           <p v-if="webdavError" class="muted" role="alert" data-testid="webdav-error">{{ webdavError }}</p>
           <p v-if="webdavMessage" class="muted" role="status" data-testid="webdav-message">{{ webdavMessage }}</p>
+
+          <div class="mo-webdav-transfer" data-testid="webdav-transfer">
+            <h4 class="mo-webdav-subtitle">备份上传与取回</h4>
+            <p class="muted">上传会把当前整包备份写到上面目录的同名文件；取回先校验和预览，确认后才写进本机。</p>
+            <div class="mo-row">
+              <button
+                class="mo-btn primary"
+                :disabled="webdavTransferBusy || isWebdavTransferRunning(webdavTransferJob) || latestBackup?.status !== 'done'"
+                data-testid="webdav-upload"
+                aria-label="上传当前备份到 WebDAV"
+                @click="startWebdavUpload"
+              >上传备份</button>
+              <span class="muted" data-testid="webdav-upload-note">
+                {{ latestBackup?.status === 'done' && latestBackup?.fileName ? `当前备份：${latestBackup.fileName}` : "先在上方做一次备份，再上传" }}
+              </span>
+            </div>
+            <div class="mo-webdav-file">
+              <label class="mo-webdav-field">
+                <span>远端文件名</span>
+                <input
+                  v-model="webdavDownloadName"
+                  class="mo-input"
+                  type="text"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="默认用当前备份的文件名"
+                  data-testid="webdav-download-name"
+                />
+              </label>
+              <button
+                class="mo-btn"
+                :disabled="webdavTransferBusy || isWebdavTransferRunning(webdavTransferJob)"
+                data-testid="webdav-download"
+                aria-label="从 WebDAV 取回备份"
+                @click="startWebdavDownload"
+              >取回备份</button>
+            </div>
+            <p class="muted">只读这个文件名对应的备份，不会列出或改动网盘上的其他文件。</p>
+
+            <div v-if="webdavTransferJob" class="mo-backup-progress" data-testid="webdav-transfer-progress">
+              <div class="mo-row">
+                <span class="mo-tag" :class="{ soft: !isWebdavTransferRunning(webdavTransferJob) }">{{ webdavTransferStatusText(webdavTransferJob) }}</span>
+                <span class="muted">{{ webdavTransferJob.direction === "upload" ? "上传到 WebDAV" : "从 WebDAV 取回" }}</span>
+                <span v-if="webdavTransferJob.stageText" class="muted">{{ webdavTransferJob.stageText }}</span>
+                <span v-if="webdavTransferBytesText(webdavTransferJob)" class="muted">{{ webdavTransferBytesText(webdavTransferJob) }}</span>
+                <span v-if="webdavTransferJob.total" class="muted">{{ webdavTransferPercent(webdavTransferJob) }}%</span>
+              </div>
+              <span v-if="webdavTransferJob.total" class="mo-download-bar">
+                <span :style="{ width: `${webdavTransferPercent(webdavTransferJob)}%` }" />
+              </span>
+              <div v-if="isWebdavTransferRunning(webdavTransferJob)" class="mo-row">
+                <button class="mo-btn danger" :disabled="webdavTransferBusy" data-testid="webdav-transfer-cancel" @click="cancelWebdavTransfer">取消</button>
+                <span class="muted">取消后临时文件会清掉，远端原有备份不受影响</span>
+              </div>
+              <div v-else-if="webdavTransferJob.status === 'paused'" class="mo-row" data-testid="webdav-transfer-confirm-row">
+                <span class="muted">远端已有 {{ webdavTransferJob.fileName }}，覆盖会替换旧备份。</span>
+                <button
+                  class="mo-btn primary"
+                  :disabled="webdavTransferBusy"
+                  data-testid="webdav-transfer-confirm"
+                  aria-label="确认覆盖远端同名备份"
+                  @click="confirmWebdavOverwrite"
+                >确认覆盖</button>
+                <button class="mo-btn" :disabled="webdavTransferBusy" data-testid="webdav-transfer-dismiss" @click="cancelWebdavTransfer">取消</button>
+              </div>
+              <div v-else-if="webdavTransferJob.status === 'failed'" class="mo-row" data-testid="webdav-transfer-error" role="alert">
+                <span class="muted">{{ webdavTransferJob.error || "上传下载失败，请重试" }}</span>
+                <button class="mo-btn" :disabled="webdavTransferBusy" data-testid="webdav-transfer-retry" @click="retryWebdavTransfer">重试</button>
+              </div>
+              <div v-else-if="webdavTransferJob.status === 'cancelled'" class="mo-row">
+                <button class="mo-btn" :disabled="webdavTransferBusy" data-testid="webdav-transfer-retry" @click="retryWebdavTransfer">重试</button>
+              </div>
+            </div>
+            <p v-if="webdavTransferMessage" class="muted" role="status" data-testid="webdav-transfer-message">{{ webdavTransferMessage }}</p>
+          </div>
         </div>
         <div class="mo-card" data-testid="profile-entries">
           <div class="mo-card-head">
@@ -9433,6 +9710,28 @@ textarea {
   font-size: 13px;
   color: var(--mo-ink-2);
 }
+/* WebDAV 上传与取回（#133）：与配置表单隔开，文件名输入与按钮同一行，窄屏折行。 */
+.mo-webdav-transfer {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--mo-line);
+}
+.mo-webdav-subtitle {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.mo-webdav-file {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+  margin: 8px 0;
+}
+.mo-webdav-file .mo-webdav-field {
+  flex: 1 1 220px;
+  min-width: 0;
+}
 @media (max-width: 720px) {
   .mo-webdav-field input {
     min-height: 44px;
@@ -9440,6 +9739,9 @@ textarea {
   }
   .mo-webdav-allow {
     min-height: 44px;
+  }
+  .mo-webdav-file .mo-btn {
+    flex: 1 1 100%;
   }
 }
 .mo-download-actions {

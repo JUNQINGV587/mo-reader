@@ -8,7 +8,7 @@
  * - 失败后可用同一文件重新 preview，不残留半份数据。
  */
 import { randomUUID } from 'node:crypto'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   assertImportArchiveSize,
@@ -163,8 +163,47 @@ export class BackupImportCoordinator {
     } catch {
       // 清理失败不影响本次导入。
     }
+    const job = this.buildJob(input.fileName)
+    this.live.set(job.id, job)
+    await this.put(job)
+    this.launchPreview(job, input)
+    return { job: { ...job } }
+  }
+
+  /**
+   * 从磁盘上的备份文件发起导入（#133 下载后走这里）：文件先移进导入自己的临时目录，
+   * 之后的校验、预览、确认与回滚和本地上传完全同一条通路。
+   */
+  async startFromFile(input: { fileName?: string; filePath: string }): Promise<{ job: BackupImportJob }> {
+    const db = this.host.db()
+    try {
+      await cleanupExpiredBackupImports(db.jobs)
+    } catch {
+      // 清理失败不影响本次导入。
+    }
+    const job = this.buildJob(input.fileName)
+    const tempDir = backupImportTempDir(job.id)
+    const target = join(tempDir, UPLOAD_FILE)
+    try {
+      await ensureExportRoot()
+      await mkdir(tempDir, { recursive: true })
+      await rename(input.filePath, target)
+      const info = await stat(target)
+      assertImportArchiveSize(info.size)
+      job.bytes = info.size
+    } catch (error) {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => undefined)
+      throw error
+    }
+    this.live.set(job.id, job)
+    await this.put(job)
+    this.launchPreview(job, { fileName: job.fileName, sourcePath: target })
+    return { job: { ...job } }
+  }
+
+  private buildJob(fileName?: string): BackupImportJob {
     const now = Date.now()
-    const job: BackupImportJob = {
+    return {
       id: randomUUID(),
       kind: BACKUP_IMPORT_KIND,
       bookId: '',
@@ -178,7 +217,7 @@ export class BackupImportCoordinator {
       skipped: 0,
       bytes: 0,
       records: 0,
-      fileName: String(input.fileName ?? '').trim() || 'backup.zip',
+      fileName: String(fileName ?? '').trim() || 'backup.zip',
       importKind: '',
       preview: null,
       warnings: [],
@@ -186,10 +225,6 @@ export class BackupImportCoordinator {
       createdAt: now,
       updatedAt: now,
     }
-    this.live.set(job.id, job)
-    await this.put(job)
-    this.launchPreview(job, input)
-    return { job: { ...job } }
   }
 
   peek(id: string): BackupImportJob | null {
@@ -306,7 +341,10 @@ export class BackupImportCoordinator {
     this.runners.clear()
   }
 
-  private launchPreview(job: BackupImportJob, input: { fileName?: string; dataBase64: string }): void {
+  private launchPreview(
+    job: BackupImportJob,
+    input: { fileName?: string; dataBase64?: string; sourcePath?: string },
+  ): void {
     const abort = new AbortController()
     const runner = this.runPreview(job, input, abort).finally(() => {
       this.runners.delete(job.id)
@@ -318,7 +356,7 @@ export class BackupImportCoordinator {
 
   private async runPreview(
     job: BackupImportJob,
-    input: { fileName?: string; dataBase64: string },
+    input: { fileName?: string; dataBase64?: string; sourcePath?: string },
     abort: AbortController,
   ): Promise<void> {
     const tempDir = backupImportTempDir(job.id)
@@ -327,11 +365,19 @@ export class BackupImportCoordinator {
       job.stage = 'inspect'
       job.stageText = '校验备份文件'
       await this.put(job)
-      const data = decodeArchive(input.dataBase64)
-      job.bytes = data.length
-      await ensureExportRoot()
-      await mkdir(tempDir, { recursive: true })
-      await writeFile(join(tempDir, UPLOAD_FILE), data)
+      let data: Buffer
+      if (input.sourcePath) {
+        // 下载通路：文件已由 startFromFile 移进临时目录，读回来走同一套解析。
+        data = await readFile(input.sourcePath)
+        assertImportArchiveSize(data.length)
+        job.bytes = data.length
+      } else {
+        data = decodeArchive(input.dataBase64 ?? '')
+        job.bytes = data.length
+        await ensureExportRoot()
+        await mkdir(tempDir, { recursive: true })
+        await writeFile(join(tempDir, UPLOAD_FILE), data)
+      }
       if (abort.signal.aborted) throw new Error('已取消')
       const backup = parseBackupImport({ data, fileName: job.fileName })
       job.importKind = backup.kind

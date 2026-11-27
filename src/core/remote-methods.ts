@@ -49,6 +49,8 @@ export const REMOTE_METHODS = Object.freeze([
   'getBackupDownload',
   'getBackupJob',
   'cancelBackupJob',
+  'uploadBackupToWebdav',
+  'downloadBackupFromWebdav',
   'getWebdavConfig',
   'saveWebdavConfig',
   'testWebdav',

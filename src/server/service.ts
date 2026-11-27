@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto'
 import { Service } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
-import { dirname } from 'node:path'
+import { stat } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { VERSION } from '../core/version.js'
 import {
   addReadingTime,
@@ -112,6 +113,14 @@ import {
   type BackupImportHost,
   type BackupImportJob,
 } from './backup-import.js'
+import {
+  WEBDAV_TRANSFER_KIND,
+  WebdavTransferCoordinator,
+  cleanupExpiredWebdavTransfers,
+  recoverInterruptedWebdavTransfers,
+  type WebdavTransferHost,
+  type WebdavTransferJob,
+} from './webdav-transfer.js'
 import { BACKUP_TOKEN_TTL_MS } from '../core/reader/backup.js'
 import {
   WEBDAV_PASSWORD_MAX,
@@ -297,6 +306,13 @@ interface SourceCheckResult {
   error: string
 }
 
+/** 取 createdAt 最新的一条；空列表返回 null。 */
+function latestOf<T extends { createdAt: number }>(jobs: Array<T | null | undefined>): T | null {
+  const list = jobs.filter((job): job is T => Boolean(job))
+  list.sort((left, right) => right.createdAt - left.createdAt)
+  return list[0] ?? null
+}
+
 function clampCheckTimeout(value: unknown): number {
   const raw =
     typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : SOURCE_CHECK_TIMEOUT_MS
@@ -350,6 +366,9 @@ export class ReaderService extends TypertRemoteService {
 
   /** 备份导入协调器（#132）：预览计划留在内存，写库复用 jobs 表。 */
   backupImportCoordinator: BackupImportCoordinator | null = null
+
+  /** WebDAV 上传下载协调器（#133）：进度与取消复用 jobs 表。 */
+  webdavTransferCoordinator: WebdavTransferCoordinator | null = null
 
   /** 媒体离线下载协调器（#112），按需创建；与文字下载共用作业表与暂停/重试语义。 */
   mediaDownloadsCoordinator: MediaDownloadCoordinator | null = null
@@ -407,6 +426,8 @@ export class ReaderService extends TypertRemoteService {
       await cleanupExpiredBackups(this.db.jobs)
       await recoverInterruptedBackupImports(this.db.jobs)
       await cleanupExpiredBackupImports(this.db.jobs)
+      await recoverInterruptedWebdavTransfers(this.db.jobs)
+      await cleanupExpiredWebdavTransfers(this.db.jobs)
     } catch {
       // 清理失败不影响启动。
     }
@@ -419,6 +440,11 @@ export class ReaderService extends TypertRemoteService {
     const ctx = this.ctx as any
     ctx.effect(
       () => async () => {
+        try {
+          await this.webdavTransferCoordinator?.shutdown()
+        } finally {
+          this.webdavTransferCoordinator = null
+        }
         try {
           await this.backupImportCoordinator?.shutdown()
         } finally {
@@ -1266,6 +1292,8 @@ export class ReaderService extends TypertRemoteService {
         throw new Error('备份不能暂停，请取消后重新导出')
       case 'backupImport':
         throw new Error('导入不能暂停，请取消后重新选择文件')
+      case 'webdav':
+        throw new Error('上传下载不能暂停，请取消后重新操作')
       case 'export':
         return this.exportManager().pause(id)
       case 'media':
@@ -1282,6 +1310,8 @@ export class ReaderService extends TypertRemoteService {
         throw new Error('备份不能继续，请重新导出')
       case 'backupImport':
         throw new Error('导入不能继续，请取消后重新选择文件')
+      case 'webdav':
+        throw new Error('上传下载不能继续，请取消后重新操作')
       case 'export':
         return this.exportManager().resume(id)
       case 'media':
@@ -1299,6 +1329,8 @@ export class ReaderService extends TypertRemoteService {
         return this.backupManager().cancel(id)
       case 'backupImport':
         return this.backupImportManager().cancel(id)
+      case 'webdav':
+        return this.webdavTransferManager().cancel(id)
       case 'export':
         return this.exportManager().cancel(id)
       case 'media':
@@ -1313,6 +1345,8 @@ export class ReaderService extends TypertRemoteService {
     switch (this.jobKindOf(id)) {
       case 'backupImport':
         throw new Error('导入失败后请重新选择同一文件')
+      case 'webdav':
+        throw new Error('上传下载失败后请重新操作')
       case 'export':
         return this.exportManager().retry(id)
       case 'media':
@@ -1328,6 +1362,8 @@ export class ReaderService extends TypertRemoteService {
     if (backup) return { job: { ...backup } }
     const backupImport = this.backupImportCoordinator?.peek(id)
     if (backupImport) return { job: { ...backupImport } }
+    const transfer = this.webdavTransferCoordinator?.peek(id)
+    if (transfer) return { job: { ...transfer } }
     const live = this.exportsCoordinator?.peek(id)
     if (live) return { job: { ...live } }
     const media = this.mediaDownloadsCoordinator?.peek(id)
@@ -1336,6 +1372,7 @@ export class ReaderService extends TypertRemoteService {
     if (record?.kind === MEDIA_DOWNLOAD_KIND) return this.mediaManager().get(id)
     if (record?.kind === BACKUP_KIND) return { job: await this.backupManager().get(id) }
     if (record?.kind === BACKUP_IMPORT_KIND) return { job: await this.backupImportManager().get(id) }
+    if (record?.kind === WEBDAV_TRANSFER_KIND) return { job: await this.webdavTransferManager().get(id) }
     return this.downloadManager().get(id)
   }
 
@@ -1352,6 +1389,7 @@ export class ReaderService extends TypertRemoteService {
     for (const job of this.exportsCoordinator?.list(filter) ?? []) merged.set(job.id, job)
     for (const job of this.backupCoordinator?.list() ?? []) merged.set(job.id, job)
     for (const job of this.backupImportCoordinator?.list() ?? []) merged.set(job.id, job)
+    for (const job of this.webdavTransferCoordinator?.list() ?? []) merged.set(job.id, job)
     return {
       jobs: [...merged.values()].sort(
         (left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0),
@@ -1382,6 +1420,11 @@ export class ReaderService extends TypertRemoteService {
   /** 测试/关停用：等待所有备份导入协程收尾。 */
   async waitForBackupImports() {
     await this.backupImportCoordinator?.waitIdle()
+  }
+
+  /** 测试/关停用：等待所有 WebDAV 上传下载协程收尾。 */
+  async waitForWebdavTransfers() {
+    await this.webdavTransferCoordinator?.waitIdle()
   }
 
   /** 按书聚合下载结果：书架/详情只调一次就能显示进度、体积与当前作业。 */
@@ -1782,26 +1825,45 @@ export class ReaderService extends TypertRemoteService {
     }
   }
 
-  /** 备份/导入作业的进度；不传 jobId 时返回最近一次，打开「我的」页就能接着看。 */
+  /**
+   * 备份/导入/上传下载作业的进度；不传 jobId 时返回最近一次，打开「我的」页就能接着看。
+   * backup/transfer 额外返回最近一次备份与传输，界面据此显示上传入口和进度。
+   */
   async getBackupJob(args: Args) {
     const jobId = typeof args?.jobId === 'string' ? args.jobId.trim() : ''
-    if (jobId) {
-      const backup = await this.backupManager().get(jobId)
-      if (backup) return { job: backup }
-      return { job: await this.backupImportManager().get(jobId) }
-    }
     const backup = await this.backupManager().get()
+    const transfer = await this.webdavTransferManager().get()
+    if (jobId) {
+      const matched = await this.backupManager().get(jobId)
+      if (matched) return { job: matched, backup, transfer }
+      const imported = await this.backupImportManager().get(jobId)
+      if (imported) return { job: imported, backup, transfer }
+      return { job: await this.webdavTransferManager().get(jobId), backup, transfer }
+    }
     const imported = await this.backupImportManager().get()
-    const candidates: Array<BackupJob | BackupImportJob> = []
-    if (backup) candidates.push(backup)
-    if (imported) candidates.push(imported)
-    candidates.sort((left, right) => right.createdAt - left.createdAt)
-    return { job: candidates[0] ?? null }
+    const job = latestOf([backup, imported, transfer])
+    return { job, backup, transfer }
+  }
+
+  /** 把当前（或指定）备份上传到 WebDAV；带 id 表示确认覆盖后继续那次上传。 */
+  async uploadBackupToWebdav(args: Args) {
+    const id = typeof args?.id === 'string' ? args.id.trim() : ''
+    if (id) return this.webdavTransferManager().confirmUpload(id)
+    const backupJobId = typeof args?.backupJobId === 'string' ? args.backupJobId.trim() : ''
+    return this.webdavTransferManager().startUpload({ backupJobId })
+  }
+
+  /** 从 WebDAV 取回备份；取回后先预览，确认前不写库。 */
+  async downloadBackupFromWebdav(args: Args) {
+    const fileName = typeof args?.fileName === 'string' ? args.fileName.trim() : ''
+    return this.webdavTransferManager().startDownload({ fileName })
   }
 
   async cancelBackupJob(args: Args) {
     const id = stringArg(args, 'id')
-    if (this.jobKindOf(id) === 'backupImport') return this.backupImportManager().cancel(id)
+    const kind = this.jobKindOf(id)
+    if (kind === 'backupImport') return this.backupImportManager().cancel(id)
+    if (kind === 'webdav') return this.webdavTransferManager().cancel(id)
     return this.backupManager().cancel(id)
   }
 
@@ -2594,6 +2656,32 @@ export class ReaderService extends TypertRemoteService {
     return { db: () => this.requireDb() }
   }
 
+  private webdavTransferManager(): WebdavTransferCoordinator {
+    if (!this.webdavTransferCoordinator) {
+      this.webdavTransferCoordinator = new WebdavTransferCoordinator(this.webdavTransferHost())
+    }
+    return this.webdavTransferCoordinator
+  }
+
+  private webdavTransferHost(): WebdavTransferHost {
+    return {
+      db: () => this.requireDb(),
+      config: () => normalizeWebdavConfig(this.requireDb().settings.get()),
+      client: (config) => this.webdavClient(config),
+      timeoutMs: () => this.webdavTimeoutMs,
+      backupArtifact: async (jobId) => {
+        const job = jobId ? await this.backupManager().get(jobId) : await this.backupManager().get()
+        if (!job) throw new Error('还没有备份，请先做一次备份')
+        if (job.status !== 'done') throw new Error('备份还没有完成，请稍后再上传')
+        if (!(await backupArtifactAvailable(job.filePath))) throw new Error('备份文件已过期，请重新备份')
+        const absolute = join(exportRoot(), job.filePath)
+        const info = await stat(absolute)
+        return { id: job.id, fileName: job.fileName, filePath: absolute, size: info.size }
+      },
+      importFromFile: (input) => this.backupImportManager().startFromFile(input),
+    }
+  }
+
   private exportManager(): ExportCoordinator {
     if (!this.exportsCoordinator) {
       this.exportsCoordinator = new ExportCoordinator(this.exportHost())
@@ -2658,14 +2746,18 @@ export class ReaderService extends TypertRemoteService {
   }
 
   /** 作业分派：活动作业先问协调器，再读 jobs 表里的 kind。 */
-  private jobKindOf(id: string): 'export' | 'media' | 'download' | 'backup' | 'backupImport' {
+  private jobKindOf(
+    id: string,
+  ): 'export' | 'media' | 'download' | 'backup' | 'backupImport' | 'webdav' {
     if (this.backupCoordinator?.peek(id)) return 'backup'
     if (this.backupImportCoordinator?.peek(id)) return 'backupImport'
+    if (this.webdavTransferCoordinator?.peek(id)) return 'webdav'
     if (this.exportsCoordinator?.peek(id)) return 'export'
     if (this.mediaDownloadsCoordinator?.peek(id)) return 'media'
     const record = this.db?.jobs?.get?.(id) as Record<string, unknown> | undefined
     if (record?.kind === BACKUP_KIND) return 'backup'
     if (record?.kind === BACKUP_IMPORT_KIND) return 'backupImport'
+    if (record?.kind === WEBDAV_TRANSFER_KIND) return 'webdav'
     if (record?.kind === EXPORT_KIND) return 'export'
     if (record?.kind === MEDIA_DOWNLOAD_KIND) return 'media'
     return 'download'
