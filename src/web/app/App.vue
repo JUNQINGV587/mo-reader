@@ -6,16 +6,29 @@ import PdfReader from '../reader/PdfReader.vue'
 import AudioReader from '../reader/AudioReader.vue'
 import VideoReader from '../reader/VideoReader.vue'
 import { simulatedChapterCount, simulatedProgress } from '../../core/reader/simulate'
+import {
+  buildSpeechPlan,
+  classifySpeechError,
+  segmentIndexForOffset,
+  speechBlockedMessage,
+  speechErrorNotice,
+  SpeechCursor,
+  SPEECH_NO_VOICE_MESSAGE,
+  SPEECH_NOT_ALLOWED_NOTICE,
+  SPEECH_UNSUPPORTED_MESSAGE,
+  type SpeechPlan,
+} from '../../core/reader/speech'
 import { chapterForPdfPage, pdfPageOfChapterTitle } from '../../core/pdf-pages'
 import {
   DEFAULT_MENU_ITEMS,
   DEFAULT_TAP_ZONES,
   MENU_ITEMS,
   READER_PRESETS,
-  TAP_ACTIONS,
   TAP_ZONE_NAMES,
   TIP_MODES,
-  tapActionLabel,
+  isHiddenTapAction,
+  sanitizeTapZones,
+  visibleTapActions,
 } from '../../core/reader/reader-config'
 import {
   BUILTIN_THEMES,
@@ -30,6 +43,17 @@ import {
   type ThemeColors,
 } from '../../core/reader/theme'
 import { exportFullShelf, exportLegadoShelf } from '../../core/reader/shelf-transfer'
+import {
+  defaultReaderSettings,
+  diffReaderSettings,
+  mergeReaderSettings,
+  presetSettingsPatch,
+  type ReaderSettings,
+  type SettingsGroupKey,
+} from '../../core/reader/settings'
+import { dualColumnAvailability } from '../../core/reader/paginate'
+import { AutoPageController } from '../../core/reader/auto-page'
+import { KeepAwake } from '../../core/reader/wake-lock'
 import { enabledDictRules, lookupAll, type DictLookupOutcome } from '../../core/dict/lookup-all'
 import { swapDictOrder } from '../../core/dict/order'
 import { filterSources, hasExplore, needsLogin, sourceHost } from '../../core/source/filter'
@@ -182,7 +206,7 @@ const readerMediaRetryChapter = ref<number | null>(null)
 let mediaFallbackBusy = false
 const replacedContent = computed(() => {
   let text = content.value
-  for (const rule of settings.value.replaceRules) {
+  for (const rule of effectiveSettings.value.replaceRules) {
     if (!rule.enabled || !rule.pattern) continue
     try {
       if (rule.regex) text = text.replace(new RegExp(rule.pattern, 'g'), rule.replacement ?? '')
@@ -229,30 +253,52 @@ async function loadBattery() {
     batteryPercent.value = null
   }
 }
-const settings = ref({
-  fontSize: 22,
-  fontId: '',
-  lineSpacing: 1.9,
-  paragraphSpacing: 6,
-  indent: 2,
-  padding: { left: 22, top: 5, right: 22, bottom: 4 },
-  theme: 'light' as string,
-  customThemes: [] as CustomTheme[],
-  pageAnimation: 'cover' as Turn,
-  headerMode: 1,
-  footerMode: 6,
-  showHeaderLine: true,
-  showFooterLine: true,
-  tapZones: [...DEFAULT_TAP_ZONES] as number[],
-  menuItems: [...DEFAULT_MENU_ITEMS] as string[],
-  replaceRules: [] as Array<{
-    id: string
-    pattern: string
-    replacement: string
-    regex: boolean
-    enabled: boolean
-  }>,
+/** 全局设置与「本书覆盖」合并后的当前生效值；面板里的控件都绑它。 */
+const settings = ref<ReaderSettings>(defaultReaderSettings())
+type SettingsScope = 'global' | 'book'
+/** 作用域是用户选择，记在本机，刷新后仍停在同一层。 */
+const SETTINGS_SCOPE_KEY = 'mo-reader-settings-scope'
+/** Chrome 的音色列表常异步到达：最多等这么久，仍为空即认定没有中文音色 */
+const SPEECH_VOICE_WAIT_MS = 1200
+function storedSettingsScope(): SettingsScope {
+  try {
+    return localStorage.getItem(SETTINGS_SCOPE_KEY) === 'book' ? 'book' : 'global'
+  } catch {
+    // 隐私模式下 localStorage 可能不可用
+    return 'global'
+  }
+}
+function storeSettingsScope(scope: SettingsScope): void {
+  try {
+    localStorage.setItem(SETTINGS_SCOPE_KEY, scope)
+  } catch {
+    // 存不了就不存，作用域只在本次会话有效
+  }
+}
+const settingsScope = ref<SettingsScope>(storedSettingsScope())
+/** 服务端返回的本书覆盖层：阅读页在全局作用域下也要叠加它。 */
+const bookOverrides = ref<Partial<ReaderSettings>>({})
+const bookOverridden = ref(false)
+/** 视口宽度，随 resize 更新，用于判断双栏是否放得下。 */
+const viewportWidth = ref(typeof window === 'undefined' ? 0 : window.innerWidth)
+const settingsError = ref('')
+/** 最近一次读取/保存后的基准值，用于算出「只提交改过的字段」。 */
+const settingsBaseline = ref<ReaderSettings>(defaultReaderSettings())
+const settingsSheetRef = ref<HTMLElement | null>(null)
+const settingsTrigger = ref<HTMLElement | null>(null)
+const canUseBookScope = computed(() => Boolean(currentBook.value?.id))
+/**
+ * 阅读页真正生效的设置：打开一本书时，始终是服务端合并后的「全局 + 本书覆盖」；
+ * 设置面板里的 settings 仍表示当前作用域那一层，用于决定改哪一层。
+ */
+const effectiveSettings = computed<ReaderSettings>(() => {
+  if (!currentBook.value?.id || settingsScope.value === 'book') return settings.value
+  return mergeReaderSettings(settings.value, bookOverrides.value)
 })
+const dualColumnAvailable = computed(() =>
+  dualColumnAvailability(viewportWidth.value, settings.value.padding),
+)
+let settingsPersistTimer: ReturnType<typeof setTimeout> | null = null
 const readerRef = ref<any>(null)
 const initialPage = ref(0)
 const tocFilter = ref('')
@@ -280,10 +326,27 @@ const noteDraft = ref('')
 const underlineOpen = ref(false)
 const underlineLines = ref<string[]>([])
 const selectedUnderlines = ref<string[]>([])
-const speaking = ref(false)
-const highlightText = ref('')
-let speechSegments: Array<{ text: string; start: number }> = []
-let speechIndex = 0
+const speechStatus = ref<'idle' | 'speaking' | 'paused'>('idle')
+const speechNotice = ref('')
+const speechLoading = ref(false)
+const speechHighlight = ref<{ start: number; end: number } | null>(null)
+const speechSegmentIndex = ref(0)
+const speechSegmentTotal = ref(0)
+const speechChapterTitle = ref('')
+const speechVoices = ref<SpeechSynthesisVoice[]>([])
+const speechVoicesLoaded = ref(false)
+let speechVoiceWaitTimer = 0
+/** 搜索高亮：关键词命中的原文绝对范围（与朗读高亮分开，朗读优先） */
+const highlightText = ref<{ start: number; end: number } | null>(null)
+let speechPlan: SpeechPlan | null = null
+let speechCursor: SpeechCursor | null = null
+let speechUtterance: SpeechSynthesisUtterance | null = null
+let speechToken = 0
+let speechResumeTimer: ReturnType<typeof setTimeout> | undefined
+let speechBusyRetried = false
+let speechUserCancel = false
+/** 上次失败是 not-allowed：只有用户手势里的 speak 才可能恢复 */
+let speechNotAllowed = false
 let pageTimer: ReturnType<typeof setTimeout> | undefined
 
 // 阅读页「书内搜索」：跨批自动推进，令牌用于停止后丢弃在途批次。
@@ -306,6 +369,314 @@ const readerHint = ref('')
 let readerSearchToken = 0
 let readerHintTimer: ReturnType<typeof setTimeout> | undefined
 
+// ---- 自动翻页（#126）：控制器、章末续章、常亮与状态条 ----
+const autoPage = new AutoPageController()
+const autoPageStatus = ref<'idle' | 'running' | 'paused'>('idle')
+const autoPageLabel = ref('')
+const autoPageNotice = ref('')
+const tapActionChoices = computed(() => visibleTapActions())
+const readerTotalPages = ref(0)
+const boundaryLoading = ref(false)
+const boundaryDirection = ref<1 | -1>(1)
+let autoPageTimer: ReturnType<typeof setInterval> | undefined
+let autoPagePendingChapter = false
+let autoPageChapterFailed = false
+let keepAwake: KeepAwake | null = null
+let tapZonesRevertedNotified = false
+
+function refreshAutoPageState() {
+  autoPageStatus.value = autoPage.status
+  autoPageLabel.value = autoPage.label
+  autoPageNotice.value = autoPage.notice
+}
+
+function autoPageHasNextChapter(): boolean {
+  return chapterIndex.value >= 0 && chapterIndex.value < chapters.value.length - 1
+}
+
+function syncAutoPagePosition(page = initialPage.value, pages = readerTotalPages.value) {
+  autoPage.setPosition({ page, pages, hasNextChapter: autoPageHasNextChapter() })
+}
+
+function ensureKeepAwake(): KeepAwake {
+  if (!keepAwake) {
+    keepAwake = new KeepAwake({
+      request: async () => {
+        const api = (navigator as Navigator & { wakeLock?: { request?: (type: 'screen') => Promise<any> } }).wakeLock
+        if (!api?.request) throw new Error('wakeLock unavailable')
+        return await api.request('screen')
+      },
+      onNotice: (message) => {
+        if (view.value === 'reader') showReaderHint(message)
+      },
+    })
+  }
+  return keepAwake
+}
+
+function releaseKeepAwake() {
+  if (!keepAwake) return
+  void keepAwake.release()
+}
+
+async function startAutoPage() {
+  if (view.value !== 'reader' || readerKind.value !== 'text') {
+    showReaderHint('仅文字阅读支持自动翻页')
+    return
+  }
+  if (settingsOpen.value) closeSettings()
+  chrome.value = false
+  // 自动翻页与朗读互斥：暂停朗读但保留游标，之后再继续。
+  if (speechStatus.value === 'speaking') pauseSpeech()
+  autoPage.setSeconds(effectiveSettings.value.autoPageSeconds)
+  syncAutoPagePosition()
+  autoPage.start()
+  autoPageChapterFailed = false
+  autoPagePendingChapter = false
+  refreshAutoPageState()
+  void ensureKeepAwake().acquire()
+}
+
+function pauseAutoPage() {
+  autoPage.pause()
+  refreshAutoPageState()
+}
+
+async function resumeAutoPage() {
+  autoPage.resume()
+  refreshAutoPageState()
+  if (autoPageChapterFailed) {
+    autoPageChapterFailed = false
+    await loadAutoPageChapter()
+    return
+  }
+  void ensureKeepAwake().acquire()
+}
+
+function stopAutoPage() {
+  autoPage.stop()
+  autoPageChapterFailed = false
+  autoPagePendingChapter = false
+  refreshAutoPageState()
+  releaseKeepAwake()
+}
+
+/** 章末续章：先加载，成功后才由 onReaderPageState 恢复计时。 */
+async function loadAutoPageChapter() {
+  if (view.value !== 'reader' || boundaryLoading.value) return
+  const target = chapters.value[chapterIndex.value + 1]
+  if (!target) {
+    autoPageChapterFailed = true
+    autoPage.failedChapter('没有下一章可续')
+    refreshAutoPageState()
+    releaseKeepAwake()
+    return
+  }
+  boundaryDirection.value = 1
+  boundaryLoading.value = true
+  try {
+    const ok = await openChapter(target, 0)
+    if (!ok) {
+      autoPageChapterFailed = true
+      autoPage.failedChapter('下一章加载失败，点「继续」重试')
+      releaseKeepAwake()
+    } else {
+      autoPagePendingChapter = true
+    }
+  } finally {
+    boundaryLoading.value = false
+    refreshAutoPageState()
+  }
+}
+
+function runAutoPageTick() {
+  if (view.value !== 'reader' || autoPage.status !== 'running') return
+  if (chrome.value || tocOpen.value || settingsOpen.value) return
+  const action = autoPage.tick()
+  if (action.kind === 'turn') {
+    readerRef.value?.goto?.(action.page)
+    refreshAutoPageState()
+    return
+  }
+  if (action.kind === 'load-chapter') {
+    refreshAutoPageState()
+    void loadAutoPageChapter()
+    return
+  }
+  if (action.kind === 'book-end') {
+    refreshAutoPageState()
+    showReaderHint(action.message)
+    releaseKeepAwake()
+  }
+}
+
+/** 翻页到章边界：先加载相邻章，成功后再落到新章首页/末页。 */
+async function onChapterBoundary(payload: { direction: 1 | -1 }) {
+  if (boundaryLoading.value || busy.value) return
+  const target = chapters.value[chapterIndex.value + payload.direction]
+  if (!target) {
+    showReaderHint(payload.direction > 0 ? '已到全书末尾' : '已是第一章')
+    return
+  }
+  boundaryDirection.value = payload.direction
+  boundaryLoading.value = true
+  autoPage.addPauseReason('loading')
+  refreshAutoPageState()
+  try {
+    const page = payload.direction > 0 ? 0 : Number.MAX_SAFE_INTEGER
+    const ok = await openChapter(target, page)
+    if (!ok) {
+      showReaderHint(payload.direction > 0 ? '下一章加载失败，请重试' : '上一章加载失败，请重试')
+      if (autoPage.status !== 'idle') {
+        autoPageChapterFailed = true
+        autoPage.failedChapter('相邻章节加载失败，点「继续」重试')
+      }
+    } else if (autoPage.status !== 'idle') {
+      autoPage.removePauseReason('loading')
+      autoPage.notifyTurn()
+    }
+  } finally {
+    boundaryLoading.value = false
+    refreshAutoPageState()
+  }
+}
+
+function onReaderTurnState(animating: boolean) {
+  if (animating) autoPage.addPauseReason('turn')
+  else autoPage.removePauseReason('turn')
+  refreshAutoPageState()
+}
+
+function onReaderPageState(payload: { page: number; total: number }) {
+  readerTotalPages.value = Math.max(0, payload.total)
+  syncAutoPagePosition(payload.page, payload.total)
+  if (autoPagePendingChapter) {
+    autoPagePendingChapter = false
+    autoPage.loadedChapter({ pages: payload.total })
+    autoPage.setPosition({ page: payload.page })
+    void ensureKeepAwake().acquire()
+  } else {
+    autoPage.notifyTurn()
+  }
+  refreshAutoPageState()
+}
+
+function setAutoPause(reason: 'menu' | 'toc' | 'settings' | 'hidden' | 'loading', active: boolean) {
+  if (active) autoPage.addPauseReason(reason)
+  else autoPage.removePauseReason(reason)
+  refreshAutoPageState()
+}
+
+function onReaderVisibilityChange() {
+  const hidden = document.hidden
+  setAutoPause('hidden', hidden)
+  if (keepAwake) void keepAwake.visibilityChanged(!hidden)
+  if (hidden) return
+  // 后台朗读可能被系统打断：回前台发现已不在 speaking 就显示「朗读已暂停」，位置保留可继续。
+  if (speechStatus.value === 'speaking' && !window.speechSynthesis?.speaking) {
+    speechStatus.value = 'paused'
+    speechNotice.value = '朗读已暂停'
+    showReaderHint('朗读已暂停')
+  }
+  if (speechHighlight.value) alignSpeechPage(speechHighlight.value.start)
+}
+
+/** Esc：依次收起设置、目录、各类面板、朗读条与菜单。 */
+function closeReaderOverlays(): boolean {
+  if (settingsOpen.value) {
+    closeSettings()
+    return true
+  }
+  if (tocOpen.value) {
+    tocOpen.value = false
+    return true
+  }
+  if (bookmarksOpen.value) {
+    bookmarksOpen.value = false
+    return true
+  }
+  if (notesOpen.value) {
+    notesOpen.value = false
+    return true
+  }
+  if (readerSearchOpen.value) {
+    readerSearchOpen.value = false
+    return true
+  }
+  if (dictPanelOpen.value) {
+    dictPanelOpen.value = false
+    return true
+  }
+  if (underlineOpen.value) {
+    underlineOpen.value = false
+    return true
+  }
+  if (speechStatus.value !== 'idle') {
+    stopSpeech()
+    return true
+  }
+  if (chrome.value) {
+    chrome.value = false
+    return true
+  }
+  return false
+}
+
+function onReaderEscape(event: KeyboardEvent) {
+  if (event.key !== 'Escape' || event.defaultPrevented) return
+  if (view.value !== 'reader') return
+  if (closeReaderOverlays()) event.preventDefault()
+}
+
+watch(
+  [chrome, bookmarksOpen, notesOpen, readerSearchOpen, dictPanelOpen, underlineOpen],
+  ([bar, bookmarks, notes, search, dict, underline]) => {
+    if (view.value === 'reader') setAutoPause('menu', Boolean(bar || bookmarks || notes || search || dict || underline))
+  },
+)
+watch(busy, (loading) => {
+  if (view.value === 'reader') setAutoPause('loading', loading)
+})
+watch(tocOpen, (open) => {
+  if (view.value === 'reader') setAutoPause('toc', open)
+})
+watch(settingsOpen, (open) => {
+  if (view.value === 'reader') setAutoPause('settings', open)
+})
+watch(
+  () => effectiveSettings.value.autoPageSeconds,
+  (value) => {
+    autoPage.setSeconds(value)
+    refreshAutoPageState()
+  },
+)
+watch(
+  () => [effectiveSettings.value.ttsVoice, effectiveSettings.value.ttsRate],
+  () => {
+    if (speechStatus.value === 'idle') return
+    // 立即按新音色/语速重念当前段；暂停中只作废旧 utterance，继续时重念
+    cancelSpeechUtterance()
+    if (speechStatus.value === 'speaking') {
+      speechBusyRetried = false
+      speechNotAllowed = false
+      speakCurrentSegment()
+    }
+  },
+)
+// 字体跟随阅读页的生效设置：切换作用域、换书或同步本书覆盖后都会重新应用。
+watch(
+  () => effectiveSettings.value.fontId,
+  (id) => {
+    void applyCustomFont(id)
+  },
+)
+watch(view, (next, prev) => {
+  if (prev === 'reader' && next !== 'reader') {
+    stopSpeech()
+    stopAutoPage()
+    flushReaderProgress()
+  }
+})
 const editing = ref<any>(null)
 const editingJson = ref('')
 const debugType = ref('search')
@@ -326,15 +697,19 @@ const underlineQuotes = computed(() =>
     .map((item) => String(item.quote ?? ''))
     .filter(Boolean),
 )
-const theme = computed<Theme>(() => {
-  const value = settings.value.theme === 'system' ? 'light' : settings.value.theme
-  return isBuiltinThemeName(value) ? value : 'light'
-})
 const activeThemeColors = computed<ThemeColors>(() =>
   resolveThemeColors(settings.value.theme, settings.value.customThemes),
 )
 const activeCustomTheme = computed<CustomTheme | undefined>(() =>
   settings.value.customThemes.find((item) => item.id === settings.value.theme),
+)
+// 阅读区跟随生效设置；主题编辑仍用面板当前作用域。
+const readerTheme = computed<Theme>(() => {
+  const value = effectiveSettings.value.theme === 'system' ? 'light' : effectiveSettings.value.theme
+  return isBuiltinThemeName(value) ? value : 'light'
+})
+const readerThemeColors = computed<ThemeColors>(() =>
+  resolveThemeColors(effectiveSettings.value.theme, effectiveSettings.value.customThemes),
 )
 const sourceGroups = computed(() =>
   [...new Set(sources.value.map((source) => source.bookSourceGroup).filter((group): group is string => typeof group === 'string' && group.length > 0))].sort((a, b) => a.localeCompare(b, 'zh')),
@@ -450,17 +825,12 @@ async function refresh() {
     sources.value = sourceResult?.sources ?? []
     shelfBooks.value = bookResult?.books ?? []
     await loadDictRules()
-    try {
-      const stored = await call('getSettings')
-      if (stored?.settings) settings.value = { ...settings.value, ...stored.settings }
-    } catch {
-      // 设置读取失败不阻塞主流程
-    }
+    // 设置读取失败只在面板里提示，不阻塞书源/书架加载。
+    await loadSettings()
     try {
       const fontResult = await call('listFonts')
       customFonts.value = fontResult?.fonts ?? []
       syncExportFont()
-      if (settings.value.fontId) await applyCustomFont(settings.value.fontId)
     } catch (error) {
       fontMessage.value = `字体加载失败：${errorText(error)}`
     }
@@ -681,7 +1051,7 @@ async function loadActiveExport() {
 /** 导出字体默认跟随阅读字体，没设过就用列表第一个；是否可嵌入由服务端开工前校验。 */
 function syncExportFont() {
   if (exportFontId.value && customFonts.value.some((font) => font.id === exportFontId.value)) return
-  const preferred = settings.value.fontId
+  const preferred = effectiveSettings.value.fontId
   exportFontId.value =
     preferred && customFonts.value.some((font) => font.id === preferred)
       ? preferred
@@ -698,7 +1068,7 @@ async function startExport(format: 'txt' | 'epub' | 'pdf' = 'txt', fontId = '') 
   try {
     const payload: Record<string, unknown> = { bookId: book.id, format }
     if (format === 'pdf') {
-      payload.fontId = fontId || exportFontId.value || settings.value.fontId || customFonts.value[0]?.id || ''
+      payload.fontId = fontId || exportFontId.value || effectiveSettings.value.fontId || customFonts.value[0]?.id || ''
     }
     const result: any = await call('startExport', payload)
     exportJob.value = result?.job ?? null
@@ -1302,6 +1672,19 @@ onUnmounted(() => {
   stopDownloadTimer()
   stopMediaTimer()
   stopExportTimer()
+  if (settingsPersistTimer) clearTimeout(settingsPersistTimer)
+  if (autoPageTimer) {
+    clearInterval(autoPageTimer)
+    autoPageTimer = undefined
+  }
+  window.removeEventListener('keydown', onReaderEscape)
+  window.removeEventListener('resize', syncViewportWidth)
+  document.removeEventListener('visibilitychange', onReaderVisibilityChange)
+  window.speechSynthesis?.removeEventListener?.('voiceschanged', loadSpeechVoices)
+  clearSpeechVoiceWait()
+  stopSpeech()
+  if (readerHintTimer) clearTimeout(readerHintTimer)
+  releaseKeepAwake()
 })
 
 const reviewOpen = ref(false)
@@ -2022,6 +2405,8 @@ async function openBook(book: any) {
   try {
     const info = await call('getBookInfo', { sourceUrl: book.origin, bookUrl: book.bookUrl })
     currentBook.value = { ...book, ...info.info, tocUrl: info.info.tocUrl || book.bookUrl }
+    // 无论面板作用域是哪层，换书都要刷新本书覆盖层。
+    await loadSettings()
     await loadToc(currentBook.value, book.bookUrl)
     await loadLocalPdfStatus(currentBook.value)
     await loadBookmarks()
@@ -2043,6 +2428,8 @@ async function openShelfBook(book: any) {
   chapterError.value = ''
   downloadSummary.value = null
   currentBook.value = { ...book }
+  // 无论面板作用域是哪层，换书都要刷新本书覆盖层。
+  await loadSettings()
   chapters.value = []
   try {
     await loadToc(currentBook.value, book.bookUrl)
@@ -2126,7 +2513,8 @@ async function applyCustomFont(id: string) {
     fontMessage.value = ''
   } catch (error) {
     activeFontFamily.value = ''
-    settings.value.fontId = ''
+    // 只清掉仍然指向这个字体的设置，避免把用户刚换的字体清掉。
+    if (settings.value.fontId === id) settings.value.fontId = ''
     fontMessage.value = `字体加载失败，已回退默认字体：${errorText(error)}`
   }
 }
@@ -2134,7 +2522,6 @@ async function applyCustomFont(id: string) {
 async function selectFont(event: Event) {
   const id = (event.target as HTMLSelectElement).value
   settings.value.fontId = id
-  await applyCustomFont(id)
   await persistSettings()
 }
 
@@ -2155,7 +2542,6 @@ async function uploadFontFile(event: Event) {
     customFonts.value = list?.fonts ?? []
     exportFontId.value = result.font.id
     settings.value.fontId = result.font.id
-    await applyCustomFont(settings.value.fontId)
     await persistSettings()
     fontMessage.value = result.created ? `已上传并应用「${result.font.name}」` : `字体已存在，直接应用「${result.font.name}」`
   } catch (error) {
@@ -2190,9 +2576,14 @@ async function deleteFont(font: { id: string; name: string }) {
 
 async function commitThemeState(themeId: string, themes: CustomTheme[], message: string) {
   try {
-    await call('saveSettings', { settings: { theme: themeId, customThemes: themes } })
+    // 主题列表只存全局；选中的主题按当前作用域写入（本书可单独换主题）。
+    if (!deepEqualValue(themes, settings.value.customThemes)) {
+      await call('saveSettings', { settings: { customThemes: themes } })
+      settings.value.customThemes = themes
+      settingsBaseline.value.customThemes = themes
+    }
     settings.value.theme = themeId
-    settings.value.customThemes = themes
+    await persistSettings()
     themeMessage.value = message
     return true
   } catch (error) {
@@ -2526,9 +2917,9 @@ async function addToShelf(): Promise<boolean> {
 async function openChapter(
   chapter: any,
   page?: number,
-  options: { afterMediaRetry?: boolean } = {},
+  options: { afterMediaRetry?: boolean; keepSpeech?: boolean } = {},
 ) {
-  if (!chapter || chapter.isVolume || !chapter.url) return
+  if (!chapter || chapter.isVolume || !chapter.url) return false
   if (!options.afterMediaRetry) {
     // 用户重新打开章节时重置「本章只重下一次」额度；重下后的自动重开不重置。
     readerMediaRetryUsed = false
@@ -2539,7 +2930,8 @@ async function openChapter(
   tocOpen.value = false
   bookmarksOpen.value = false
   closeReaderDict()
-  stopSpeech()
+  // 换章、换书停止朗读；自动翻页续章（keepSpeech）不打断其状态。
+  if (!options.keepSpeech) stopSpeech('', { keepAutoPage: autoPageStatus.value === 'running' })
   busy.value = true
   chrome.value = false
   chapterError.value = ''
@@ -2581,13 +2973,16 @@ async function openChapter(
         chapterIndex: index,
         chapterTitle: chapter.title,
         chapterUrl: chapter.url,
-        position: initialPage.value,
+        // 跳章末时是 MAX_SAFE_INTEGER，先按 0 记，等页面渲染后由 onPage 写入真实页码。
+        position: initialPage.value === Number.MAX_SAFE_INTEGER ? 0 : initialPage.value,
       }).catch(() => undefined)
     }
+    return true
   } catch (error) {
     const message = errorText(error)
     chapterError.value = `本章暂不可读：${message}。未下载的章节需要联网后阅读。`
     status.value = message
+    return false
   } finally {
     busy.value = false
   }
@@ -3043,6 +3438,7 @@ async function confirmSwitch() {
 }
 
 function onPage(payload: { page: number; total: number }) {
+  onReaderPageState(payload)
   initialPage.value = payload.page
   if (!currentBook.value?.id) return
   if (pageTimer) clearTimeout(pageTimer)
@@ -3058,81 +3454,437 @@ function onPage(payload: { page: number; total: number }) {
   }, 600)
 }
 
-function splitSpeech(text: string) {
-  const list: Array<{ text: string; start: number }> = []
-  const pattern = /[^。！？!?…\n]+[。！？!?…]*/g
-  let match: RegExpExecArray | null
-  while ((match = pattern.exec(text))) {
-    const value = match[0].trim()
-    if (value) list.push({ text: value, start: match.index })
+const speechSupported = computed(
+  () =>
+    typeof window !== 'undefined' &&
+    'speechSynthesis' in window &&
+    typeof SpeechSynthesisUtterance !== 'undefined',
+)
+
+const chineseSpeechVoices = computed(() =>
+  speechVoices.value.filter((voice) => voice.lang?.toLowerCase().startsWith('zh')),
+)
+
+/** 入口禁用原因；音色列表还没结论时为空，避免首屏误判，等过一次 voiceschanged 仍为空则禁用 */
+const speechBlockedReason = computed(() =>
+  speechBlockedMessage({
+    supported: speechSupported.value,
+    loaded: speechVoicesLoaded.value,
+    voiceLangs: speechVoices.value.map((voice) => voice.lang),
+  }),
+)
+
+/** 进入阅读页时用一次提示说明朗读为什么不可用，不常驻挡住正文 */
+let speechBlockedNotified = false
+watch([view, readerKind, speechBlockedReason], ([current, kind, reason]) => {
+  if (current !== 'reader') {
+    speechBlockedNotified = false
+    return
   }
-  return list
+  if (kind !== 'text' || !reason || speechBlockedNotified) return
+  speechBlockedNotified = true
+  showReaderHint(reason)
+})
+
+/** 阅读页高亮：朗读范围优先，其次搜索命中范围 */
+const readerHighlight = computed(() => speechHighlight.value ?? highlightText.value)
+
+function clearSpeechVoiceWait() {
+  if (speechVoiceWaitTimer) {
+    window.clearTimeout(speechVoiceWaitTimer)
+    speechVoiceWaitTimer = 0
+  }
 }
 
-function pickVoice(): SpeechSynthesisVoice | null {
+/**
+ * 读取音色列表：一次拿不到（Chrome 常见）就等 voiceschanged；
+ * 等待窗口结束仍为空即认定为「没有中文音色」，禁用朗读入口并说明原因。
+ */
+function loadSpeechVoices() {
+  if (!speechSupported.value) return
+  let voices: SpeechSynthesisVoice[] = []
+  try {
+    voices = window.speechSynthesis?.getVoices?.() ?? []
+  } catch {
+    voices = []
+  }
+  if (voices.length > 0) {
+    speechVoices.value = voices
+    speechVoicesLoaded.value = true
+    clearSpeechVoiceWait()
+    return
+  }
+  if (speechVoicesLoaded.value || speechVoiceWaitTimer) return
+  speechVoiceWaitTimer = window.setTimeout(() => {
+    speechVoiceWaitTimer = 0
+    speechVoicesLoaded.value = true
+  }, SPEECH_VOICE_WAIT_MS)
+}
+
+function pickSpeechVoice(): SpeechSynthesisVoice | null {
   const voices = window.speechSynthesis?.getVoices?.() ?? []
+  const wanted = effectiveSettings.value.ttsVoice
+  if (wanted) {
+    const matched = voices.find((voice) => voice.voiceURI === wanted)
+    if (matched) return matched
+  }
   return voices.find((voice) => voice.lang?.toLowerCase().startsWith('zh')) ?? null
 }
 
-function speakNext() {
-  if (!speaking.value) return
-  if (speechIndex >= speechSegments.length) {
-    stopSpeech()
-    return
+function syncSpeechSegment() {
+  speechSegmentIndex.value = speechCursor?.index ?? 0
+  speechSegmentTotal.value = speechCursor?.total ?? 0
+}
+
+function currentSpeechRate(): number {
+  const rate = Number(effectiveSettings.value.ttsRate)
+  if (!Number.isFinite(rate)) return 1
+  return Math.min(2, Math.max(0.5, rate))
+}
+
+/** 高亮越屏时静默切页（goto 会取消翻页动画），不做子串匹配 */
+function alignSpeechPage(offset: number) {
+  if (readerKind.value !== 'text' || document.hidden) return
+  const reader = readerRef.value
+  const target = reader?.pageForOffset?.(offset)
+  if (typeof target !== 'number' || target < 0) return
+  if (target === Number(reader?.page)) return
+  reader?.goto?.(target)
+}
+
+function cancelSpeechUtterance() {
+  speechToken += 1
+  try {
+    window.speechSynthesis?.cancel()
+  } catch {
+    // 取消失败不影响后续重建
   }
-  const segment = speechSegments[speechIndex]
+  speechUtterance = null
+  if (speechResumeTimer) {
+    clearTimeout(speechResumeTimer)
+    speechResumeTimer = undefined
+  }
+}
+
+/** 念当前段从游标位置开始的剩余文本；boundary 用绝对偏移，不做子串匹配 */
+function speakCurrentSegment() {
+  const cursor = speechCursor
+  if (!cursor) return
   const synth = window.speechSynthesis
-  if (!synth) {
-    stopSpeech()
-    status.value = '当前浏览器不支持朗读'
+  if (!synth || !speechSupported.value) {
+    stopSpeech(SPEECH_UNSUPPORTED_MESSAGE)
     return
   }
-  const utterance = new SpeechSynthesisUtterance(segment.text)
-  utterance.lang = 'zh-CN'
-  utterance.rate = 1
-  const voice = pickVoice()
+  const text = cursor.remainingText()
+  if (!text.trim()) {
+    advanceSpeechSegment()
+    return
+  }
+  const token = ++speechToken
+  speechUserCancel = false
+  const utterance = new SpeechSynthesisUtterance(text)
+  speechUtterance = utterance
+  const voice = pickSpeechVoice()
+  utterance.lang = voice?.lang || 'zh-CN'
+  utterance.rate = currentSpeechRate()
   if (voice) utterance.voice = voice
+  const baseOffset = cursor.charOffset
   utterance.onstart = () => {
-    highlightText.value = segment.text
-    const target = readerRef.value?.findPageFor?.(segment.text)
-    if (typeof target === 'number' && target >= 0) readerRef.value?.goto?.(target)
+    if (token !== speechToken) return
+    const range = cursor.highlightRange()
+    speechHighlight.value = range
+    if (range) alignSpeechPage(range.start)
+  }
+  utterance.onboundary = (event: SpeechSynthesisEvent) => {
+    if (token !== speechToken || speechStatus.value === 'idle') return
+    if (typeof event.charIndex !== 'number') return
+    cursor.setBoundary(baseOffset + event.charIndex)
+    const range = cursor.highlightRange()
+    speechHighlight.value = range
+    if (range) alignSpeechPage(range.start)
   }
   utterance.onend = () => {
-    if (!speaking.value) return
-    speechIndex += 1
-    speakNext()
+    if (token !== speechToken || speechStatus.value === 'idle') return
+    speechHighlight.value = null
+    advanceSpeechSegment()
   }
-  utterance.onerror = () => {
-    if (!speaking.value) return
-    speechIndex += 1
-    speakNext()
+  utterance.onerror = (event: SpeechSynthesisErrorEvent) => {
+    if (token !== speechToken || speechStatus.value === 'idle') return
+    const action = classifySpeechError(event?.error, speechUserCancel)
+    if (action === 'ignore') return
+    if (action === 'retry' && !speechBusyRetried) {
+      speechBusyRetried = true
+      cancelSpeechUtterance()
+      speakCurrentSegment()
+      return
+    }
+    if (action === 'not-allowed') {
+      speechNotAllowed = true
+      speechStatus.value = 'paused'
+      speechNotice.value = SPEECH_NOT_ALLOWED_NOTICE
+      showReaderHint(SPEECH_NOT_ALLOWED_NOTICE)
+      return
+    }
+    stopSpeech(speechErrorNotice(event?.error))
   }
   synth.speak(utterance)
 }
 
-function startSpeech() {
-  if (!('speechSynthesis' in window)) {
-    status.value = '当前浏览器不支持朗读'
+/** 当前段念完：有下一段继续，否则走章末续章/停止 */
+function advanceSpeechSegment() {
+  const cursor = speechCursor
+  if (!cursor) return
+  if (cursor.advance() === 'next') {
+    speechBusyRetried = false
+    syncSpeechSegment()
+    speakCurrentSegment()
     return
   }
-  if (!replacedContent.value.trim()) return
-  window.speechSynthesis.cancel()
-  speechSegments = splitSpeech(replacedContent.value)
-  if (speechSegments.length === 0) return
-  speechIndex = 0
-  speaking.value = true
-  speakNext()
+  void finishSpeechChapter()
 }
 
-function stopSpeech() {
-  speaking.value = false
-  highlightText.value = ''
-  if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+/** 章末：连续朗读开则加载下一章并从标题后第一段继续，否则停在章末 */
+async function finishSpeechChapter() {
+  const hasNext = chapterIndex.value >= 0 && chapterIndex.value < chapters.value.length - 1
+  if (!effectiveSettings.value.ttsContinuous) {
+    stopSpeech()
+    showReaderHint('已读完本章')
+    return
+  }
+  if (!hasNext) {
+    stopSpeech('已到全书末尾')
+    return
+  }
+  const target = chapters.value[chapterIndex.value + 1]
+  if (!target) {
+    stopSpeech('已到全书末尾')
+    return
+  }
+  speechLoading.value = true
+  speechNotice.value = '正在加载下一章…'
+  const ok = await openChapter(target, 0, { keepSpeech: true })
+  speechLoading.value = false
+  if (speechStatus.value === 'idle') return
+  if (!ok) {
+    stopSpeech('下一章加载失败，朗读已停止')
+    return
+  }
+  await nextTick()
+  speechPlan = buildSpeechPlan(readerTitle.value, replacedContent.value)
+  speechCursor = new SpeechCursor(speechPlan)
+  speechChapterTitle.value = readerTitle.value
+  if (speechCursor.segment?.kind === 'title') speechCursor.setIndex(1)
+  syncSpeechSegment()
+  if (!speechCursor.segment || speechCursor.segment.kind === 'title') {
+    stopSpeech('下一章没有可朗读的正文')
+    return
+  }
+  speechNotice.value = ''
+  speechNotAllowed = false
+  speechBusyRetried = false
+  if (speechStatus.value === 'paused') {
+    speechHighlight.value = speechCursor.highlightRange()
+    return
+  }
+  speechStatus.value = 'speaking'
+  speakCurrentSegment()
 }
 
-function toggleSpeech() {
-  if (speaking.value) stopSpeech()
-  else startSpeech()
+function startSpeech() {
+  if (!speechSupported.value) {
+    showReaderHint(SPEECH_UNSUPPORTED_MESSAGE)
+    return
+  }
+  if (view.value !== 'reader' || readerKind.value !== 'text') return
+  loadSpeechVoices()
+  const reason = speechBlockedReason.value
+  if (reason) {
+    speechVoicesLoaded.value = true
+    showReaderHint(reason)
+    return
+  }
+  if (!pickSpeechVoice()) {
+    speechVoicesLoaded.value = true
+    showReaderHint(SPEECH_NO_VOICE_MESSAGE)
+    return
+  }
+  if (!replacedContent.value.trim()) {
+    showReaderHint('本章没有可朗读的内容')
+    return
+  }
+  cancelSpeechUtterance()
+  speechBusyRetried = false
+  speechUserCancel = false
+  speechNotAllowed = false
+  speechPlan = buildSpeechPlan(readerTitle.value, replacedContent.value)
+  speechCursor = new SpeechCursor(speechPlan)
+  speechChapterTitle.value = readerTitle.value
+  if (speechPlan.segments.length === 0) {
+    stopSpeech('本章没有可朗读的内容')
+    return
+  }
+  if (autoPageStatus.value !== 'idle') {
+    autoPage.addPauseReason('tts')
+    refreshAutoPageState()
+  }
+  void ensureKeepAwake().acquire()
+  const reader = readerRef.value
+  const range = reader?.currentPageRange?.() ?? null
+  const pageStart = range && range.start >= 0 ? range.start : 0
+  if (pageStart <= 0) {
+    speechCursor.setIndex(0)
+  } else {
+    const index = segmentIndexForOffset(speechPlan, pageStart)
+    if (index >= 0) {
+      speechCursor.setIndex(index)
+      const segment = speechCursor.segment
+      if (segment && segment.kind === 'paragraph' && pageStart > segment.start) {
+        speechCursor.setBoundary(pageStart - segment.start)
+      }
+    }
+  }
+  syncSpeechSegment()
+  speechNotice.value = ''
+  speechStatus.value = 'speaking'
+  speakCurrentSegment()
+}
+
+function pauseSpeech() {
+  if (speechStatus.value !== 'speaking') return
+  const synth = window.speechSynthesis
+  if (!synth) return
+  speechUserCancel = true
+  speechStatus.value = 'paused'
+  speechNotice.value = '已暂停'
+  if (speechResumeTimer) {
+    clearTimeout(speechResumeTimer)
+    speechResumeTimer = undefined
+  }
+  try {
+    synth.pause()
+  } catch {
+    // 忽略：恢复时统一兜底
+  }
+}
+
+/** 继续：400ms 内没恢复 speaking 就取消当前 utterance，从最后 boundary 偏移重读该段 */
+function resumeSpeech() {
+  if (speechStatus.value !== 'paused') return
+  const synth = window.speechSynthesis
+  if (!synth) return
+  speechUserCancel = false
+  speechNotice.value = ''
+  if (autoPageStatus.value === 'running') {
+    autoPage.addPauseReason('tts')
+    refreshAutoPageState()
+  }
+  if (!speechUtterance || speechNotAllowed) {
+    speechNotAllowed = false
+    speechBusyRetried = false
+    cancelSpeechUtterance()
+    speechStatus.value = 'speaking'
+    speakCurrentSegment()
+    return
+  }
+  speechStatus.value = 'speaking'
+  try {
+    synth.resume()
+  } catch {
+    // 恢复失败走下面的兜底
+  }
+  if (speechResumeTimer) clearTimeout(speechResumeTimer)
+  speechResumeTimer = setTimeout(() => {
+    speechResumeTimer = undefined
+    if (speechStatus.value !== 'speaking') return
+    if (synth.speaking) return
+    cancelSpeechUtterance()
+    speakCurrentSegment()
+  }, 400)
+}
+
+function toggleSpeechPlay() {
+  if (speechStatus.value === 'idle') startSpeech()
+  else if (speechStatus.value === 'speaking') pauseSpeech()
+  else resumeSpeech()
+}
+
+/** 上一段/下一段：暂停中只移动位置，播放中立即从新段开头念 */
+function moveSpeechSegment(direction: -1 | 1) {
+  if (speechStatus.value === 'idle') {
+    showReaderHint('先点「朗读」开始')
+    return
+  }
+  const cursor = speechCursor
+  if (!cursor) return
+  if (direction > 0 && cursor.isLast) {
+    cancelSpeechUtterance()
+    void finishSpeechChapter()
+    return
+  }
+  const wasPaused = speechStatus.value === 'paused'
+  speechNotAllowed = false
+  speechBusyRetried = false
+  cancelSpeechUtterance()
+  const moved = direction > 0 ? cursor.next() : cursor.prev()
+  if (!moved) cursor.setBoundary(0)
+  syncSpeechSegment()
+  speechHighlight.value = cursor.highlightRange()
+  if (wasPaused) {
+    speechStatus.value = 'paused'
+    return
+  }
+  speechStatus.value = 'speaking'
+  speakCurrentSegment()
+}
+
+function stopSpeech(
+  notice = '',
+  options: { keepAutoPage?: boolean } = {},
+) {
+  const wasActive = speechStatus.value !== 'idle' || speechLoading.value || speechCursor !== null
+  speechUserCancel = true
+  cancelSpeechUtterance()
+  speechStatus.value = 'idle'
+  speechNotAllowed = false
+  speechLoading.value = false
+  speechHighlight.value = null
+  speechNotice.value = ''
+  speechCursor = null
+  speechPlan = null
+  speechSegmentIndex.value = 0
+  speechSegmentTotal.value = 0
+  speechChapterTitle.value = ''
+  if (!wasActive) return
+  // 只处理「因朗读而暂停」的自动翻页：先补一个暂停原因再摘掉 tts，避免摘掉后自动重启；
+  // 自动翻页本来就在跑/暂停时不因停止朗读而改变它。
+  if (autoPage.pausedReasons.includes('tts')) {
+    if (!options.keepAutoPage) autoPage.pause()
+    autoPage.removePauseReason('tts')
+    refreshAutoPageState()
+  }
+  if (autoPage.status !== 'running') releaseKeepAwake()
+  // 停止朗读立即落一次阅读进度，不等 600ms 防抖
+  flushReaderProgress()
+  if (notice) showReaderHint(notice)
+}
+
+/** 离开阅读页立即落一次进度，避免 600ms 防抖丢掉最后一次翻页 */
+function flushReaderProgress() {
+  if (pageTimer) {
+    clearTimeout(pageTimer)
+    pageTimer = undefined
+  }
+  if (!currentBook.value?.id || !currentChapter.value) return
+  if (readerKind.value === 'pdf') return
+  const raw = Number(initialPage.value)
+  const position = Number.isFinite(raw) && raw >= 0 && raw !== Number.MAX_SAFE_INTEGER ? raw : 0
+  call('saveProgress', {
+    bookId: currentBook.value.id,
+    chapterIndex: chapterIndex.value,
+    chapterTitle: currentChapter.value.title,
+    chapterUrl: currentChapter.value.url,
+    position,
+  }).catch(() => undefined)
 }
 
 function showReaderHint(text: string) {
@@ -3260,10 +4012,11 @@ async function jumpToSearchResult(item: { chapterIndex: number }) {
     return
   }
   await nextTick()
-  const target = readerRef.value?.findPageFor?.(key)
-  if (typeof target === 'number' && target >= 0) {
-    readerRef.value?.goto?.(target)
-    highlightText.value = key
+  const range = readerRef.value?.findRangeFor?.(key)
+  if (range) {
+    const target = readerRef.value?.pageForOffset?.(range.start)
+    readerRef.value?.goto?.(typeof target === 'number' ? target : 0)
+    highlightText.value = { start: range.start, end: range.end }
   } else {
     readerRef.value?.goto?.(0)
     showReaderHint('未定位到关键词')
@@ -3303,7 +4056,8 @@ function onMediaProgress(seconds: number) {
 }
 
 function onTapAction(code: number) {
-  if (code === -1) return
+  // 无动作与尚未开放的隐藏动作都按「什么都不做」处理。
+  if (code === -1 || isHiddenTapAction(code)) return
   if (code === 0) {
     chrome.value = !chrome.value
     return
@@ -3328,23 +4082,25 @@ function onTapAction(code: number) {
     void toggleBookmark()
     return
   }
+  if (code === 5) {
+    moveSpeechSegment(-1)
+    return
+  }
+  if (code === 6) {
+    moveSpeechSegment(1)
+    return
+  }
   if (code === 13) {
-    toggleSpeech()
+    toggleSpeechPlay()
     return
   }
   if (code === 10) {
     tocOpen.value = true
-    return
   }
-  status.value = `「${tapActionLabel(code)}」暂未开放`
 }
 
 function applyPreset(preset: (typeof READER_PRESETS)[number]) {
-  settings.value.fontSize = preset.fontSize
-  settings.value.lineSpacing = preset.lineSpacing
-  settings.value.paragraphSpacing = preset.paragraphSpacing
-  settings.value.indent = preset.indent
-  settings.value.padding = { ...preset.padding }
+  Object.assign(settings.value, presetSettingsPatch(preset))
   persistSettings()
 }
 
@@ -3371,29 +4127,182 @@ function toggleMenuItem(key: string) {
   persistSettings()
 }
 
-async function persistSettings() {
+/** 滑杆连续拖动时合并保存，避免每移动一格就写一次。 */
+function schedulePersistSettings() {
+  if (settingsPersistTimer) clearTimeout(settingsPersistTimer)
+  settingsPersistTimer = setTimeout(() => {
+    settingsPersistTimer = null
+    void persistSettings()
+  }, 120)
+}
+
+const deepEqualValue = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right)
+
+/** 只提交与基准不同的字段；自定义主题与媒体配额属全局层，不随面板保存。 */
+function settingsDiff(base: ReaderSettings, current: ReaderSettings): Record<string, unknown> {
+  const patch = diffReaderSettings(base, current) as Record<string, unknown>
+  delete patch.customThemes
+  delete patch.mediaQuotaBytes
+  return patch
+}
+
+const cloneSettings = (value: ReaderSettings): ReaderSettings => JSON.parse(JSON.stringify(value)) as ReaderSettings
+
+/** 读取当前作用域的设置：无书写全局，有书读合并值并带上「本书是否覆盖」。 */
+async function loadSettings() {
+  await settingsSaveChain
+  const bookId = currentBook.value?.id ?? ''
+  // 打开一本书时恢复用户上次选的作用域；没有书就只能是全局。
+  if (bookId) settingsScope.value = storedSettingsScope()
+  const scope: SettingsScope = bookId ? settingsScope.value : 'global'
+  if (!bookId) settingsScope.value = 'global'
   try {
-    await call('saveSettings', {
-      settings: {
-        fontSize: settings.value.fontSize,
-        fontId: settings.value.fontId,
-        lineSpacing: settings.value.lineSpacing,
-        paragraphSpacing: settings.value.paragraphSpacing,
-        indent: settings.value.indent,
-        padding: settings.value.padding,
-        theme: settings.value.theme,
-        customThemes: settings.value.customThemes,
-        pageAnimation: settings.value.pageAnimation,
-        headerMode: settings.value.headerMode,
-        footerMode: settings.value.footerMode,
-        showHeaderLine: settings.value.showHeaderLine,
-        showFooterLine: settings.value.showFooterLine,
-        tapZones: settings.value.tapZones,
-        menuItems: settings.value.menuItems,
-      },
-    })
+    // 有书时始终取一次合并值，阅读页据此显示；全局作用域另取全局层供面板编辑。
+    const bookStored: any = bookId ? await call('getSettings', { bookId }) : null
+    const stored: any =
+      bookId && scope === 'global' ? await call('getSettings', {}) : bookStored
+    if (!stored?.settings) return
+    bookOverrides.value = bookStored?.bookOverrides ?? {}
+    settings.value = { ...defaultReaderSettings(), ...stored.settings } as ReaderSettings
+    // 旧配置里可能存着已隐藏的点击动作（8/9/11/12）：回退为无动作并保存一次。
+    const sanitizedZones = sanitizeTapZones(settings.value.tapZones)
+    if (sanitizedZones.changed) {
+      settings.value.tapZones = sanitizedZones.zones
+      if (!tapZonesRevertedNotified) {
+        tapZonesRevertedNotified = true
+        const message = '部分点击区域的功能未开放，已改为无动作'
+        if (view.value === 'reader') showReaderHint(message)
+        else status.value = message
+      }
+      void persistSettings()
+    }
+    settingsBaseline.value = cloneSettings(settings.value)
+    bookOverridden.value = bookId ? Boolean(bookStored?.bookOverridden) : false
+    settingsError.value = ''
   } catch (error) {
-    status.value = errorText(error)
+    settingsError.value = `设置读取失败：${errorText(error)}`
+  }
+}
+
+/** 串行保存队列：先发后到的响应不能把后来的改动覆盖掉。 */
+let settingsSaveChain: Promise<void> = Promise.resolve()
+
+/**
+ * 保存设置：只提交本次改动字段，按当前作用域写到全局或本书。
+ * 失败时保留用户当前值，在面板内提示原因，可重试。
+ */
+function persistSettings(): Promise<void> {
+  if (settingsPersistTimer) {
+    clearTimeout(settingsPersistTimer)
+    settingsPersistTimer = null
+  }
+  const run = () => runPersistSettings()
+  settingsSaveChain = settingsSaveChain.then(run, run)
+  return settingsSaveChain
+}
+
+async function runPersistSettings() {
+  const bookId = settingsScope.value === 'book' ? currentBook.value?.id ?? '' : ''
+  const patch = settingsDiff(settingsBaseline.value, settings.value)
+  if (Object.keys(patch).length === 0) return
+  const sent = JSON.parse(JSON.stringify(patch)) as Record<string, unknown>
+  try {
+    const args: Record<string, unknown> = { settings: patch }
+    if (bookId) args.bookId = bookId
+    const result = await call('saveSettings', args)
+    if (result?.settings) {
+      const normalized = { ...defaultReaderSettings(), ...result.settings } as ReaderSettings
+      const merged = cloneSettings(normalized)
+      for (const key of Object.keys(sent)) {
+        const local = (settings.value as unknown as Record<string, unknown>)[key]
+        // 保存途中用户又改过这个字段：保留本地新值，等下一轮再提交。
+        if (!deepEqualValue(local, sent[key])) (merged as unknown as Record<string, unknown>)[key] = local
+      }
+      settings.value = merged
+      settingsBaseline.value = cloneSettings(normalized)
+    } else {
+      settingsBaseline.value = cloneSettings(settings.value)
+    }
+    bookOverridden.value = bookId ? Boolean(result?.bookOverridden ?? true) : false
+    if (bookId && result?.bookOverrides) bookOverrides.value = result.bookOverrides
+    settingsError.value = ''
+    status.value = bookId ? '已保存到本书' : '已保存全局设置'
+  } catch (error) {
+    settingsError.value = `保存失败：${errorText(error)}`
+  }
+}
+
+function openSettings(event?: Event) {
+  settingsTrigger.value = (event?.currentTarget as HTMLElement | null) ?? (document.activeElement as HTMLElement | null)
+  settingsOpen.value = true
+  settingsError.value = ''
+  void loadSettings()
+  nextTick(() => {
+    settingsSheetRef.value?.querySelector<HTMLElement>('button, select, input, summary')?.focus()
+  })
+}
+
+function closeSettings() {
+  settingsOpen.value = false
+  const trigger = settingsTrigger.value
+  settingsTrigger.value = null
+  nextTick(() => trigger?.focus())
+}
+
+async function switchSettingsScope(scope: SettingsScope) {
+  if (scope === 'book' && !canUseBookScope.value) return
+  if (scope === settingsScope.value) return
+  settingsScope.value = scope
+  storeSettingsScope(scope)
+  await loadSettings()
+}
+
+/** 恢复全局：清掉本书覆盖层，面板立即显示继承后的值。 */
+async function restoreGlobalSettings() {
+  const bookId = currentBook.value?.id
+  if (!bookId) return
+  await settingsSaveChain
+  try {
+    await call('resetBookSettings', { bookId })
+    bookOverridden.value = false
+    await loadSettings()
+    status.value = '已恢复全局设置'
+  } catch (error) {
+    settingsError.value = `恢复失败：${errorText(error)}`
+  }
+}
+
+/** 恢复本节默认：全局层回默认值，本书层删掉该分区覆盖、改为跟随全局。 */
+async function resetSettingsSection(group: SettingsGroupKey) {
+  const bookId = settingsScope.value === 'book' ? currentBook.value?.id ?? '' : ''
+  await settingsSaveChain
+  try {
+    const args: Record<string, unknown> = { group }
+    if (bookId) args.bookId = bookId
+    await call('resetSettingsGroup', args)
+    await loadSettings()
+    status.value = bookId ? '已恢复本节，改为跟随全局' : '已恢复本节默认'
+  } catch (error) {
+    settingsError.value = `恢复失败：${errorText(error)}`
+  }
+}
+
+/** 面板内 Tab 循环，焦点不跑到后面的阅读页。 */
+function trapSettingsFocus(event: KeyboardEvent) {
+  const root = settingsSheetRef.value
+  if (!root) return
+  const focusable = Array.from(
+    root.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, summary, [tabindex]:not([tabindex="-1"])'),
+  ).filter((node) => !node.hasAttribute('disabled') && node.offsetParent !== null)
+  if (focusable.length === 0) return
+  const first = focusable[0]
+  const last = focusable[focusable.length - 1]
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first.focus()
   }
 }
 
@@ -3473,7 +4382,19 @@ function openArticle(item: any) {
   article.value = item
 }
 
+function syncViewportWidth() {
+  viewportWidth.value = window.innerWidth
+}
+
 onMounted(async () => {
+  window.addEventListener('keydown', onReaderEscape)
+  window.addEventListener('resize', syncViewportWidth)
+  syncViewportWidth()
+  document.addEventListener('visibilitychange', onReaderVisibilityChange)
+  loadSpeechVoices()
+  window.speechSynthesis?.addEventListener?.('voiceschanged', loadSpeechVoices)
+  autoPage.setSeconds(effectiveSettings.value.autoPageSeconds)
+  if (!autoPageTimer) autoPageTimer = setInterval(runAutoPageTick, 250)
   try {
     const raw = localStorage.getItem(SEARCH_HISTORY_KEY)
     if (raw) {
@@ -4652,28 +5573,40 @@ onMounted(async () => {
             :text="replacedContent"
             :title="readerTitle"
             :book-name="currentBook?.name || ''"
-            :font-size="settings.fontSize"
+            :font-size="effectiveSettings.fontSize"
             :font-family="activeFontFamily"
-            :line-height="settings.lineSpacing"
-            :paragraph-spacing="settings.paragraphSpacing"
-            :indent="settings.indent"
-            :padding="settings.padding"
+            :line-height="effectiveSettings.lineSpacing"
+            :paragraph-spacing="effectiveSettings.paragraphSpacing"
+            :letter-spacing="effectiveSettings.letterSpacing"
+            :bold="effectiveSettings.bold"
+            :title-mode="effectiveSettings.titleMode"
+            :title-size="effectiveSettings.titleSize"
+            :align="effectiveSettings.align"
+            :compress-punctuation="effectiveSettings.compressPunctuation"
+            :kinsoku="effectiveSettings.kinsoku"
+            :dual-column="effectiveSettings.dualColumn"
+            :ink-mode="effectiveSettings.inkMode"
+            :indent="effectiveSettings.indent"
+            :padding="effectiveSettings.padding"
             :initial-page="initialPage"
-            :highlight="highlightText"
+            :highlight="readerHighlight"
             :underlines="underlineQuotes"
-            :theme="theme"
-            :theme-colors="activeThemeColors"
-            :animation="settings.pageAnimation"
-            :header-mode="settings.headerMode"
-            :footer-mode="settings.footerMode"
-            :show-header-line="settings.showHeaderLine"
-            :show-footer-line="settings.showFooterLine"
-            :tap-zones="settings.tapZones"
+            :theme="readerTheme"
+            :theme-colors="readerThemeColors"
+            :animation="effectiveSettings.pageAnimation"
+            :keys-enabled="!settingsOpen && !tocOpen && !bookmarksOpen && !notesOpen && !readerSearchOpen && !dictPanelOpen && !underlineOpen"
+            :header-mode="effectiveSettings.headerMode"
+            :footer-mode="effectiveSettings.footerMode"
+            :show-header-line="effectiveSettings.showHeaderLine"
+            :show-footer-line="effectiveSettings.showFooterLine"
+            :tap-zones="effectiveSettings.tapZones"
             :book-percent="bookPercent"
             :battery-percent="batteryPercent"
             @page="onPage"
             @tap-action="onTapAction"
             @select="onReaderSelect"
+            @chapter-boundary="onChapterBoundary"
+            @turn-state="onReaderTurnState"
           />
           <PdfReader
             v-else-if="readerKind === 'pdf' && pdfOriginalUrl && !pdfError"
@@ -4727,6 +5660,32 @@ onMounted(async () => {
           <p v-else class="muted mo-reader-loading">{{ chapterError || (busy ? '加载中…' : '（空章节）') }}</p>
         </div>
 
+        <p v-if="boundaryLoading" class="mo-reader-hint" data-testid="chapter-boundary-loading">
+          {{ boundaryDirection > 0 ? '正在加载下一章…' : '正在加载上一章…' }}
+        </p>
+
+        <div
+          v-if="speechStatus !== 'idle'"
+          class="mo-auto-page"
+          data-testid="speech-bar"
+          :style="autoPageStatus !== 'idle' ? 'bottom: 64px' : ''"
+        >
+          <span class="mo-auto-page-label">朗读 · 第 {{ speechSegmentIndex + 1 }}/{{ speechSegmentTotal }} 段</span>
+          <span class="mo-auto-page-notice">{{ speechNotice || speechChapterTitle }}</span>
+          <button class="mo-btn tiny" data-testid="speech-prev" @click="moveSpeechSegment(-1)">上一段</button>
+          <button class="mo-btn tiny" data-testid="speech-play" @click="toggleSpeechPlay">{{ speechStatus === 'speaking' ? '暂停' : '继续' }}</button>
+          <button class="mo-btn tiny" data-testid="speech-next" @click="moveSpeechSegment(1)">下一段</button>
+          <button class="mo-btn tiny" data-testid="speech-stop" @click="stopSpeech()">关闭</button>
+        </div>
+
+        <div v-if="autoPageStatus !== 'idle'" class="mo-auto-page" data-testid="auto-page-bar">
+          <span class="mo-auto-page-label">{{ autoPageLabel }}</span>
+          <span v-if="autoPageNotice" class="mo-auto-page-notice">{{ autoPageNotice }}</span>
+          <button v-if="autoPageStatus === 'running'" class="mo-btn tiny" data-testid="auto-page-pause" @click="pauseAutoPage">暂停</button>
+          <button v-else class="mo-btn tiny" data-testid="auto-page-resume" @click="resumeAutoPage">继续</button>
+          <button class="mo-btn tiny" data-testid="auto-page-stop" @click="stopAutoPage">停止</button>
+        </div>
+
         <transition name="mo-fade">
           <div v-if="chrome" class="mo-chrome">
             <div class="mo-chrome-top">
@@ -4752,8 +5711,15 @@ onMounted(async () => {
             </div>
             <div class="mo-chrome-bottom">
               <button v-if="settings.menuItems.includes('prev')" class="mo-chrome-btn" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
-              <button v-if="settings.menuItems.includes('settings') && readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-settings" @click="settingsOpen = true">Aa</button>
-              <button v-if="readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-speak" @click="toggleSpeech">{{ speaking ? '暂停' : '朗读' }}</button>
+              <button v-if="settings.menuItems.includes('settings') && readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-settings" @click="openSettings($event)">Aa</button>
+              <button
+                v-if="readerKind === 'text'"
+                class="mo-chrome-btn"
+                data-testid="reader-speak"
+                :disabled="speechStatus === 'idle' && speechBlockedReason !== ''"
+                :title="speechBlockedReason || '朗读'"
+                @click="toggleSpeechPlay"
+              >{{ speechStatus === 'idle' ? '朗读' : speechStatus === 'speaking' ? '暂停' : '继续' }}</button>
               <button v-if="settings.menuItems.includes('toc')" class="mo-chrome-btn" @click="tocOpen = true">目录</button>
               <button
                 v-if="currentBook && currentBook.origin !== 'local'"
@@ -4893,147 +5859,325 @@ onMounted(async () => {
           </div>
         </transition>
 
-        <transition name="mo-fade">
-          <div v-if="settingsOpen" class="mo-sheet-mask" @click.self="settingsOpen = false">
-            <div class="mo-sheet mo-sheet-scroll">
+                <transition name="mo-fade">
+          <div
+            v-if="settingsOpen"
+            class="mo-sheet-mask mo-settings-mask"
+            data-testid="settings-mask"
+            @click.self="closeSettings"
+          >
+            <div
+              ref="settingsSheetRef"
+              class="mo-sheet mo-sheet-scroll mo-settings-sheet"
+              data-testid="settings-panel"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="mo-settings-title"
+              tabindex="-1"
+              @pointerdown.stop
+              @click.stop
+              @keydown.esc="closeSettings"
+              @keydown.tab="trapSettingsFocus"
+            >
               <div class="mo-sheet-head">
-                <strong>阅读设置</strong>
-                <button class="mo-icon-btn" @click="settingsOpen = false">✕</button>
+                <strong id="mo-settings-title">阅读设置</strong>
+                <button class="mo-icon-btn" data-testid="settings-close" title="关闭" @click="closeSettings">✕</button>
               </div>
+              
+              <div class="mo-scope-row">
+                <div class="mo-scope-tabs" role="tablist" aria-label="设置作用范围">
+                  <button
+                    class="mo-scope-tab"
+                    :class="{ on: settingsScope === 'global' }"
+                    role="tab"
+                    :aria-selected="settingsScope === 'global'"
+                    data-testid="settings-scope-global"
+                    @click="switchSettingsScope('global')"
+                  >全局</button>
+                  <button
+                    class="mo-scope-tab"
+                    :class="{ on: settingsScope === 'book' }"
+                    role="tab"
+                    :aria-selected="settingsScope === 'book'"
+                    :disabled="!canUseBookScope"
+                    data-testid="settings-scope-book"
+                    @click="switchSettingsScope('book')"
+                  >本书</button>
+                </div>
+                <span v-if="settingsScope === 'book' && bookOverridden" class="mo-scope-badge" data-testid="settings-book-overridden">本书已自定义</span>
+                <button
+                  v-if="settingsScope === 'book' && bookOverridden"
+                  class="mo-btn tiny"
+                  data-testid="settings-restore-global"
+                  @click="restoreGlobalSettings"
+                >恢复全局</button>
+              </div>
+              <p v-if="settingsScope === 'book' && !bookOverridden" class="mo-settings-tip">本书跟随全局设置</p>
+              <p v-else-if="!canUseBookScope" class="mo-settings-tip">打开一本书后可单独设置本书</p>
+              
+              <div v-if="settingsError" class="mo-settings-error" role="status" data-testid="settings-error">
+                <span>{{ settingsError }}</span>
+                <button class="mo-btn tiny" data-testid="settings-retry" @click="persistSettings">重试</button>
+                <button class="mo-btn tiny" data-testid="settings-reload" @click="loadSettings">还原</button>
+              </div>
+              
               <div class="mo-theme-row">
                 <span>预设</span>
                 <button v-for="preset in READER_PRESETS" :key="preset.key" @click="applyPreset(preset)">{{ preset.name }}</button>
               </div>
-              <label class="mo-slider">
-                <span>字号</span>
-                <input v-model.number="settings.fontSize" type="range" min="14" max="34" step="1" @change="persistSettings" />
-                <b>{{ settings.fontSize }}</b>
-              </label>
-              <div class="mo-theme-row">
-                <span>字体</span>
-                <select class="mo-select" data-testid="font-select" :value="settings.fontId" @change="selectFont">
-                  <option value="">默认宋体</option>
-                  <option v-for="font in customFonts" :key="font.id" :value="font.id">{{ font.name }}</option>
-                </select>
-                <label class="mo-font-upload" data-testid="font-upload">
-                  上传
-                  <input type="file" accept=".ttf,.otf,.woff,.woff2" @change="uploadFontFile" />
+              
+              <details class="mo-settings-group" open>
+                <summary>排版</summary>
+                <div class="mo-group-bar">
+                  <span class="muted">字号、行距与文字样式</span>
+                  <button class="mo-btn tiny" data-testid="settings-reset-layout" @click="resetSettingsSection('layout')">恢复本节默认</button>
+                </div>
+                <label class="mo-slider">
+                  <span>字号</span>
+                  <input v-model.number="settings.fontSize" type="range" min="12" max="48" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.fontSize }}</b>
                 </label>
-              </div>
-              <div v-if="customFonts.length" class="mo-font-list" data-testid="font-list">
-                <div v-for="font in customFonts" :key="font.id" class="mo-font-item">
-                  <span>{{ font.name }}</span>
-                  <small>{{ (font.size / 1024 / 1024).toFixed(1) }} MB</small>
-                  <button class="mo-icon-btn" data-testid="font-delete" title="删除字体" @click="deleteFont(font)">✕</button>
+                <div class="mo-theme-row">
+                  <span>字体</span>
+                  <select class="mo-select" data-testid="font-select" :value="settings.fontId" @change="selectFont">
+                    <option value="">默认宋体</option>
+                    <option v-for="font in customFonts" :key="font.id" :value="font.id">{{ font.name }}</option>
+                  </select>
+                  <label class="mo-font-upload" data-testid="font-upload">
+                    上传
+                    <input type="file" accept=".ttf,.otf,.woff,.woff2" @change="uploadFontFile" />
+                  </label>
                 </div>
-              </div>
-              <p v-if="fontMessage" class="mo-font-status" data-testid="font-status">{{ fontMessage }}</p>
-              <label class="mo-slider">
-                <span>行距</span>
-                <input v-model.number="settings.lineSpacing" type="range" min="1.2" max="2.6" step="0.1" @change="persistSettings" />
-                <b>{{ settings.lineSpacing.toFixed(1) }}</b>
-              </label>
-              <label class="mo-slider">
-                <span>段距</span>
-                <input v-model.number="settings.paragraphSpacing" type="range" min="0" max="20" step="1" @change="persistSettings" />
-                <b>{{ settings.paragraphSpacing }}</b>
-              </label>
-              <div class="mo-theme-row">
-                <span>缩进</span>
-                <button :class="{ on: settings.indent === 2 }" @click="settings.indent = 2; persistSettings()">两字</button>
-                <button :class="{ on: settings.indent === 0 }" @click="settings.indent = 0; persistSettings()">无</button>
-              </div>
-              <div class="mo-theme-row">
-                <span>主题</span>
-                <button v-for="item in [{ value: 'light', label: '纸白' }, { value: 'sepia', label: '米黄' }, { value: 'dark', label: '夜读' }]" :key="item.value" :class="{ on: settings.theme === item.value }" @click="selectTheme(item.value)">{{ item.label }}</button>
-              </div>
-              <div v-if="settings.customThemes.length" class="mo-theme-row mo-theme-wrap">
-                <span>自定义</span>
-                <button v-for="item in settings.customThemes" :key="item.id" data-testid="theme-custom" :class="{ on: settings.theme === item.id }" @click="selectTheme(item.id)">{{ item.name }}</button>
-              </div>
-              <div class="mo-theme-row">
-                <span>管理</span>
-                <button data-testid="theme-new" @click="startThemeCreate">新建</button>
-                <button v-if="activeCustomTheme" data-testid="theme-edit" @click="startThemeEdit">编辑</button>
-                <button v-if="activeCustomTheme" data-testid="theme-delete" @click="deleteActiveTheme">删除</button>
-              </div>
-              <div class="mo-theme-row">
-                <span>迁移</span>
-                <label class="mo-font-upload" data-testid="theme-import">
-                  导入
-                  <input type="file" accept=".json,application/json" @change="importThemeFile" />
+                <div v-if="customFonts.length" class="mo-font-list" data-testid="font-list">
+                  <div v-for="font in customFonts" :key="font.id" class="mo-font-item">
+                    <span>{{ font.name }}</span>
+                    <small>{{ (font.size / 1024 / 1024).toFixed(1) }} MB</small>
+                    <button class="mo-icon-btn" data-testid="font-delete" title="删除字体" @click="deleteFont(font)">✕</button>
+                  </div>
+                </div>
+                <p v-if="fontMessage" class="mo-font-status" data-testid="font-status">{{ fontMessage }}</p>
+                <label class="mo-slider">
+                  <span>行距</span>
+                  <input v-model.number="settings.lineSpacing" type="range" min="1.2" max="2.6" step="0.1" @input="schedulePersistSettings" />
+                  <b>{{ settings.lineSpacing.toFixed(1) }}</b>
                 </label>
-                <button data-testid="theme-export-legado" @click="exportThemes('legado')">兼容版</button>
-                <button data-testid="theme-export-full" @click="exportThemes('full')">全量版</button>
-              </div>
-              <p v-if="themeMessage" class="mo-font-status" data-testid="theme-status">{{ themeMessage }}</p>
-              <div v-if="themeDraft" class="mo-theme-editor" data-testid="theme-editor">
-                <div class="mo-theme-editor-head">
-                  <strong>{{ themeDraft.id ? '编辑主题' : '新建主题' }}</strong>
-                  <button class="mo-icon-btn" data-testid="theme-cancel" title="取消" @click="themeDraft = null">✕</button>
-                </div>
-                <label class="mo-theme-field">
-                  <span>名称</span>
-                  <input v-model="themeDraft.name" class="mo-input" data-testid="theme-name" maxlength="32" placeholder="主题名称" />
+                <label class="mo-slider">
+                  <span>段距</span>
+                  <input v-model.number="settings.paragraphSpacing" type="range" min="0" max="24" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.paragraphSpacing }}</b>
                 </label>
-                <div class="mo-color-grid">
-                  <label class="mo-color-field"><span>背景</span><input v-model="themeDraft.bg" type="color" data-testid="theme-bg" /></label>
-                  <label class="mo-color-field"><span>正文</span><input v-model="themeDraft.text" type="color" data-testid="theme-text" /></label>
-                  <label class="mo-color-field"><span>辅助</span><input v-model="themeDraft.muted" type="color" data-testid="theme-muted" /></label>
-                  <label class="mo-color-field"><span>分隔</span><input v-model="themeDraft.line" type="color" data-testid="theme-line" /></label>
+                <label class="mo-slider">
+                  <span>字距</span>
+                  <input v-model.number="settings.letterSpacing" type="range" min="0" max="4" step="0.5" @input="schedulePersistSettings" />
+                  <b>{{ settings.letterSpacing.toFixed(1) }}</b>
+                </label>
+                <div class="mo-theme-row">
+                  <span>缩进</span>
+                  <button :class="{ on: settings.indent === 2 }" @click="settings.indent = 2; persistSettings()">两字</button>
+                  <button :class="{ on: settings.indent === 0 }" @click="settings.indent = 0; persistSettings()">无</button>
                 </div>
-                <div class="mo-theme-editor-actions">
-                  <button class="mo-btn primary" data-testid="theme-save" @click="saveThemeDraft">保存</button>
-                  <button class="mo-btn" @click="themeDraft = null">取消</button>
+                <label class="mo-switch"><input v-model="settings.bold" type="checkbox" @change="persistSettings" />加粗正文</label>
+                <div class="mo-theme-row">
+                  <span>标题位置</span>
+                  <button
+                    v-for="mode in [{ value: 0, label: '靠左' }, { value: 1, label: '居中' }, { value: 2, label: '隐藏' }, { value: 3, label: '靠右' }]"
+                    :key="mode.value"
+                    :class="{ on: settings.titleMode === mode.value }"
+                    @click="settings.titleMode = mode.value; persistSettings()"
+                  >{{ mode.label }}</button>
                 </div>
-              </div>
-              <div class="mo-theme-row">
-                <span>翻页</span>
-                <button v-for="item in [{ value: 'cover', label: '覆盖' }, { value: 'slide', label: '平移' }, { value: 'simulate', label: '仿真' }, { value: 'scroll', label: '滚动' }, { value: 'none', label: '无动画' }]" :key="item.value" :class="{ on: settings.pageAnimation === item.value }" @click="settings.pageAnimation = item.value as any; persistSettings()">{{ item.label }}</button>
-              </div>
-              <div class="mo-theme-row">
-                <span>页眉</span>
-                <select v-model.number="settings.headerMode" class="mo-select" @change="persistSettings">
-                  <option v-for="mode in TIP_MODES" :key="mode.code" :value="mode.code">{{ mode.label }}</option>
-                </select>
-              </div>
-              <div class="mo-theme-row">
-                <span>页脚</span>
-                <select v-model.number="settings.footerMode" class="mo-select" @change="persistSettings">
-                  <option v-for="mode in TIP_MODES" :key="mode.code" :value="mode.code">{{ mode.label }}</option>
-                </select>
-              </div>
-              <div class="mo-theme-row">
-                <span>分隔线</span>
-                <label class="mo-switch"><input v-model="settings.showHeaderLine" type="checkbox" @change="persistSettings" />页眉</label>
-                <label class="mo-switch"><input v-model="settings.showFooterLine" type="checkbox" @change="persistSettings" />页脚</label>
-              </div>
-              <div class="mo-zone-grid">
-                <div v-for="(zone, index) in settings.tapZones" :key="index" class="mo-zone-cell">
-                  <span>{{ TAP_ZONE_NAMES[index] }}</span>
-                  <select :value="zone" class="mo-select" @change="setTapZone(index, $event)">
-                    <option v-for="action in TAP_ACTIONS" :key="action.code" :value="action.code">{{ action.label }}{{ action.available ? '' : '（未开放）' }}</option>
+                <label class="mo-slider">
+                  <span>标题字号</span>
+                  <input v-model.number="settings.titleSize" type="range" min="0" max="8" step="1" @input="schedulePersistSettings" />
+                  <b>+{{ settings.titleSize * 2 }}px</b>
+                </label>
+                <div class="mo-theme-row">
+                  <span>对齐</span>
+                  <button :class="{ on: settings.align === 'left' }" @click="settings.align = 'left'; persistSettings()">左齐</button>
+                  <button :class="{ on: settings.align === 'justify' }" @click="settings.align = 'justify'; persistSettings()">两端</button>
+                </div>
+                <label class="mo-switch"><input v-model="settings.compressPunctuation" type="checkbox" @change="persistSettings" />标点压缩</label>
+                <label class="mo-switch"><input v-model="settings.kinsoku" type="checkbox" @change="persistSettings" />避头尾</label>
+              </details>
+              
+              <details class="mo-settings-group">
+                <summary>页面</summary>
+                <div class="mo-group-bar">
+                  <span class="muted">主题、边距与页眉页脚</span>
+                  <button class="mo-btn tiny" data-testid="settings-reset-page" @click="resetSettingsSection('page')">恢复本节默认</button>
+                </div>
+                <div class="mo-theme-row">
+                  <span>主题</span>
+                  <button v-for="item in [{ value: 'light', label: '纸白' }, { value: 'sepia', label: '米黄' }, { value: 'dark', label: '夜读' }]" :key="item.value" :class="{ on: settings.theme === item.value }" @click="selectTheme(item.value)">{{ item.label }}</button>
+                </div>
+                <div v-if="settings.customThemes.length" class="mo-theme-row mo-theme-wrap">
+                  <span>自定义</span>
+                  <button v-for="item in settings.customThemes" :key="item.id" data-testid="theme-custom" :class="{ on: settings.theme === item.id }" @click="selectTheme(item.id)">{{ item.name }}</button>
+                </div>
+                <div class="mo-theme-row">
+                  <span>管理</span>
+                  <button data-testid="theme-new" @click="startThemeCreate">新建</button>
+                  <button v-if="activeCustomTheme" data-testid="theme-edit" @click="startThemeEdit">编辑</button>
+                  <button v-if="activeCustomTheme" data-testid="theme-delete" @click="deleteActiveTheme">删除</button>
+                </div>
+                <div class="mo-theme-row">
+                  <span>迁移</span>
+                  <label class="mo-font-upload" data-testid="theme-import">
+                    导入
+                    <input type="file" accept=".json,application/json" @change="importThemeFile" />
+                  </label>
+                  <button data-testid="theme-export-legado" @click="exportThemes('legado')">兼容版</button>
+                  <button data-testid="theme-export-full" @click="exportThemes('full')">全量版</button>
+                </div>
+                <p v-if="themeMessage" class="mo-font-status" data-testid="theme-status">{{ themeMessage }}</p>
+                <div v-if="themeDraft" class="mo-theme-editor" data-testid="theme-editor">
+                  <div class="mo-theme-editor-head">
+                    <strong>{{ themeDraft.id ? '编辑主题' : '新建主题' }}</strong>
+                    <button class="mo-icon-btn" data-testid="theme-cancel" title="取消" @click="themeDraft = null">✕</button>
+                  </div>
+                  <label class="mo-theme-field">
+                    <span>名称</span>
+                    <input v-model="themeDraft.name" class="mo-input" data-testid="theme-name" maxlength="32" placeholder="主题名称" />
+                  </label>
+                  <div class="mo-color-grid">
+                    <label class="mo-color-field"><span>背景</span><input v-model="themeDraft.bg" type="color" data-testid="theme-bg" /></label>
+                    <label class="mo-color-field"><span>正文</span><input v-model="themeDraft.text" type="color" data-testid="theme-text" /></label>
+                    <label class="mo-color-field"><span>辅助</span><input v-model="themeDraft.muted" type="color" data-testid="theme-muted" /></label>
+                    <label class="mo-color-field"><span>分隔</span><input v-model="themeDraft.line" type="color" data-testid="theme-line" /></label>
+                  </div>
+                  <div class="mo-theme-editor-actions">
+                    <button class="mo-btn primary" data-testid="theme-save" @click="saveThemeDraft">保存</button>
+                    <button class="mo-btn" @click="themeDraft = null">取消</button>
+                  </div>
+                </div>
+                <label class="mo-slider">
+                  <span>左距</span>
+                  <input v-model.number="settings.padding.left" type="range" min="8" max="48" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.padding.left }}</b>
+                </label>
+                <label class="mo-slider">
+                  <span>右距</span>
+                  <input v-model.number="settings.padding.right" type="range" min="8" max="48" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.padding.right }}</b>
+                </label>
+                <label class="mo-slider">
+                  <span>上距</span>
+                  <input v-model.number="settings.padding.top" type="range" min="0" max="32" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.padding.top }}</b>
+                </label>
+                <label class="mo-slider">
+                  <span>下距</span>
+                  <input v-model.number="settings.padding.bottom" type="range" min="0" max="32" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.padding.bottom }}</b>
+                </label>
+                <div class="mo-theme-row">
+                  <span>翻页</span>
+                  <button v-for="item in [{ value: 'cover', label: '覆盖' }, { value: 'slide', label: '平移' }, { value: 'simulate', label: '仿真' }, { value: 'scroll', label: '滚动' }, { value: 'none', label: '无动画' }]" :key="item.value" :class="{ on: settings.pageAnimation === item.value }" @click="settings.pageAnimation = item.value as any; persistSettings()">{{ item.label }}</button>
+                </div>
+                <div class="mo-theme-row">
+                  <span>页眉</span>
+                  <select v-model.number="settings.headerMode" class="mo-select" @change="persistSettings">
+                    <option v-for="mode in TIP_MODES" :key="mode.code" :value="mode.code">{{ mode.label }}</option>
                   </select>
                 </div>
-              </div>
-              <div class="mo-theme-row">
-                <span>底栏</span>
-                <label v-for="item in MENU_ITEMS" :key="item.key" class="mo-switch">
-                  <input type="checkbox" :checked="settings.menuItems.includes(item.key)" @change="toggleMenuItem(item.key)" />{{ item.label }}
+                <div class="mo-theme-row">
+                  <span>页脚</span>
+                  <select v-model.number="settings.footerMode" class="mo-select" @change="persistSettings">
+                    <option v-for="mode in TIP_MODES" :key="mode.code" :value="mode.code">{{ mode.label }}</option>
+                  </select>
+                </div>
+                <div class="mo-theme-row">
+                  <span>分隔线</span>
+                  <label class="mo-switch"><input v-model="settings.showHeaderLine" type="checkbox" @change="persistSettings" />页眉</label>
+                  <label class="mo-switch"><input v-model="settings.showFooterLine" type="checkbox" @change="persistSettings" />页脚</label>
+                </div>
+                <div class="mo-theme-row">
+                  <label class="mo-switch"><input v-model="settings.dualColumn" type="checkbox" :disabled="!dualColumnAvailable" @change="persistSettings" />双栏</label>
+                  <span v-if="!dualColumnAvailable" class="muted" data-testid="dual-column-hint">屏幕太窄</span>
+                  <label class="mo-switch"><input v-model="settings.inkMode" type="checkbox" @change="persistSettings" />墨水屏</label>
+                </div>
+                <p class="muted" style="font-size: 12px; line-height: 1.6; margin: 4px 0 0">
+                  双栏在屏幕可用宽度不足 480px 时不可开启（会改单栏），滚动翻页只支持单栏。墨水屏下自动关掉翻页动画，退出后恢复原来的选择。
+                </p>
+              </details>
+              
+              <details class="mo-settings-group">
+                <summary>操作</summary>
+                <div class="mo-group-bar">
+                  <span class="muted">点击区域与底栏</span>
+                  <button class="mo-btn tiny" data-testid="settings-reset-operate" @click="resetSettingsSection('operate')">恢复本节默认</button>
+                </div>
+                <div class="mo-zone-grid">
+                  <div v-for="(zone, index) in settings.tapZones" :key="index" class="mo-zone-cell">
+                    <span>{{ TAP_ZONE_NAMES[index] }}</span>
+                    <select :value="zone" class="mo-select" @change="setTapZone(index, $event)">
+                      <option v-for="action in tapActionChoices" :key="action.code" :value="action.code">{{ action.label }}</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="mo-theme-row">
+                  <span>底栏</span>
+                  <label v-for="item in MENU_ITEMS" :key="item.key" class="mo-switch">
+                    <input type="checkbox" :checked="settings.menuItems.includes(item.key)" @change="toggleMenuItem(item.key)" />{{ item.label }}
+                  </label>
+                </div>
+                <label class="mo-slider">
+                  <span>自动翻页</span>
+                  <input v-model.number="settings.autoPageSeconds" type="range" min="1" max="60" step="1" @input="schedulePersistSettings" />
+                  <b>{{ settings.autoPageSeconds }} 秒</b>
                 </label>
-              </div>
-              <div class="mo-theme-row">
-                <span>替换</span>
-                <button class="mo-btn" data-testid="replace-add" @click="addReplaceRule">加规则</button>
-                <span class="muted">按顺序作用于正文</span>
-              </div>
-              <div v-for="rule in settings.replaceRules" :key="rule.id" class="mo-replace-rule">
-                <input v-model="rule.pattern" class="mo-input" placeholder="查找内容" @change="persistSettings" />
-                <input v-model="rule.replacement" class="mo-input" placeholder="替换为" @change="persistSettings" />
-                <label class="mo-switch"><input v-model="rule.regex" type="checkbox" @change="persistSettings" />正则</label>
-                <label class="mo-switch"><input v-model="rule.enabled" type="checkbox" @change="persistSettings" />启用</label>
-                <button class="mo-icon-btn" @click="removeReplaceRule(rule)">✕</button>
-              </div>
+                <div class="mo-theme-row">
+                  <span>自动翻页</span>
+                  <button class="mo-btn tiny" data-testid="auto-page-start" :disabled="view !== 'reader' || readerKind !== 'text'" @click="startAutoPage">
+                    {{ autoPageStatus === 'idle' ? '开始' : autoPageStatus === 'running' ? '重新计时' : '继续' }}
+                  </button>
+                </div>
+              </details>
+              
+              <details class="mo-settings-group">
+                <summary>朗读</summary>
+                <div class="mo-group-bar">
+                  <span class="muted">音色与语速</span>
+                  <button class="mo-btn tiny" data-testid="settings-reset-speak" @click="resetSettingsSection('speak')">恢复本节默认</button>
+                </div>
+                <label class="mo-theme-row">
+                  <span>音色</span>
+                  <select v-model="settings.ttsVoice" class="mo-select" @change="persistSettings">
+                    <option value="">系统默认</option>
+                    <option
+                      v-for="voice in (chineseSpeechVoices.length ? chineseSpeechVoices : speechVoices)"
+                      :key="voice.voiceURI"
+                      :value="voice.voiceURI"
+                    >{{ voice.name }}（{{ voice.lang }}）</option>
+                  </select>
+                </label>
+                <p v-if="speechVoices.length === 0" class="muted">音色列表加载中…</p>
+                <p v-else-if="speechBlockedReason" class="muted">{{ speechBlockedReason }}</p>
+                <label class="mo-slider">
+                  <span>语速</span>
+                  <input v-model.number="settings.ttsRate" type="range" min="0.5" max="2" step="0.1" @input="schedulePersistSettings" />
+                  <b>{{ settings.ttsRate.toFixed(1) }}×</b>
+                </label>
+                <label class="mo-switch"><input v-model="settings.ttsContinuous" type="checkbox" @change="persistSettings" />连续朗读</label>
+              </details>
+              
+              <details class="mo-settings-group">
+                <summary>替换</summary>
+                <div class="mo-group-bar">
+                  <span class="muted">按顺序作用于正文</span>
+                  <button class="mo-btn tiny" data-testid="settings-reset-replace" @click="resetSettingsSection('replace')">恢复本节默认</button>
+                </div>
+                <div class="mo-theme-row">
+                  <button class="mo-btn" data-testid="replace-add" @click="addReplaceRule">加规则</button>
+                </div>
+                <div v-for="rule in settings.replaceRules" :key="rule.id" class="mo-replace-rule">
+                  <input v-model="rule.pattern" class="mo-input" placeholder="查找内容" @change="persistSettings" />
+                  <input v-model="rule.replacement" class="mo-input" placeholder="替换为" @change="persistSettings" />
+                  <label class="mo-switch"><input v-model="rule.regex" type="checkbox" @change="persistSettings" />正则</label>
+                  <label class="mo-switch"><input v-model="rule.enabled" type="checkbox" @change="persistSettings" />启用</label>
+                  <button class="mo-icon-btn" @click="removeReplaceRule(rule)">✕</button>
+                </div>
+              </details>
             </div>
           </div>
         </transition>
@@ -6288,6 +7432,32 @@ textarea {
   z-index: 5;
   pointer-events: none;
 }
+.mo-auto-page {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(20, 21, 24, 0.86);
+  color: #d8d4c8;
+  font-size: 12px;
+  z-index: 6;
+}
+.mo-auto-page-notice {
+  max-width: 42vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #e6a23c;
+}
+.mo-auto-page .mo-btn.tiny {
+  padding: 2px 8px;
+  font-size: 12px;
+}
 
 /* 阅读页 */
 .mo-reading-mode {
@@ -6401,6 +7571,142 @@ textarea {
 .mo-sheet-scroll {
   max-height: 78vh;
   overflow-y: auto;
+}
+/* 设置面板：移动端底部、桌面右侧；分区可折叠 */
+.mo-settings-mask {
+  z-index: 5;
+}
+.mo-settings-sheet {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-bottom: calc(26px + env(safe-area-inset-bottom));
+}
+.mo-settings-sheet:focus-visible {
+  outline: 2px solid var(--mo-accent);
+  outline-offset: -2px;
+}
+.mo-settings-group {
+  border-top: 1px solid var(--mo-line);
+  padding: 4px 0;
+}
+.mo-settings-group > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 6px 0;
+  font-size: 14px;
+  font-weight: 600;
+  list-style: none;
+  cursor: pointer;
+}
+.mo-settings-group > summary::-webkit-details-marker {
+  display: none;
+}
+.mo-settings-group > summary::before {
+  content: '▸';
+  color: var(--mo-muted);
+  font-size: 12px;
+}
+.mo-settings-group[open] > summary::before {
+  content: '▾';
+}
+.mo-group-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.mo-group-bar .muted,
+.mo-settings-tip {
+  font-size: 12px;
+}
+.mo-settings-tip {
+  margin: 0 0 6px;
+}
+.mo-scope-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 10px;
+}
+.mo-scope-tabs {
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid var(--mo-line);
+  border-radius: 999px;
+}
+.mo-scope-tab {
+  min-height: 36px;
+  padding: 8px 16px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.mo-scope-tab.on {
+  background: var(--mo-accent);
+  color: #fff;
+}
+.mo-scope-tab:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.mo-scope-badge {
+  padding: 2px 8px;
+  border: 1px solid var(--mo-accent);
+  border-radius: 999px;
+  color: var(--mo-accent);
+  font-size: 12px;
+}
+.mo-settings-error {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid #d9534f;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.mo-settings-sheet .mo-slider,
+.mo-settings-sheet .mo-theme-row,
+.mo-settings-sheet .mo-switch {
+  min-height: 44px;
+}
+@media (min-width: 721px) {
+  .mo-settings-mask {
+    justify-content: flex-end;
+    align-items: stretch;
+  }
+  .mo-settings-sheet {
+    width: 420px;
+    max-width: 92vw;
+    height: 100%;
+    max-height: none;
+    border-radius: 14px 0 0 14px;
+    padding-bottom: 26px;
+  }
+}
+@media (max-width: 720px) {
+  .mo-settings-sheet {
+    max-height: 82vh;
+  }
+  .mo-settings-sheet .mo-slider input,
+  .mo-settings-sheet .mo-theme-row button,
+  .mo-settings-sheet .mo-theme-row select,
+  .mo-settings-sheet .mo-input {
+    min-height: 44px;
+  }
+  .mo-settings-sheet .mo-input {
+    font-size: 16px;
+  }
 }
 .mo-switch-body {
   display: grid;

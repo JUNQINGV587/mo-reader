@@ -1,6 +1,40 @@
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
-import { DEFAULT_MENU_ITEMS, DEFAULT_TAP_ZONES } from '../core/reader/reader-config.js'
+import { DEFAULT_MENU_ITEMS, DEFAULT_TAP_ZONES, MENU_ITEMS } from '../core/reader/reader-config.js'
+import { READER_ALIGNS, READER_PAGE_ANIMATIONS } from '../core/reader/settings.js'
+
+/** 旧记录里的越界数字读时先夹到合法范围；类型不对则交给 zod 默认值。 */
+const clampNumber = (min: number, max: number, integer = false) => (value: unknown): number | undefined => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  const next = Math.min(max, Math.max(min, value))
+  return integer ? Math.round(next) : next
+}
+
+const pickBoolean = (value: unknown): boolean | undefined => (typeof value === 'boolean' ? value : undefined)
+
+const pickIndent = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) ? (value >= 1 ? 2 : 0) : undefined
+
+/** 不在允许表里的枚举值回落默认，避免旧记录整条校验失败。 */
+const pickEnum = <T extends string>(allowed: readonly T[], fallback: T) => (value: unknown): T =>
+  typeof value === 'string' && (allowed as readonly string[]).includes(value) ? (value as T) : fallback
+
+/** 点击区必须是 9 项；缺项/坏项按九宫格默认值补齐，越界项夹到 -1..13。 */
+const pickTapZones = (value: unknown): number[] => {
+  if (!Array.isArray(value) || value.length !== 9) return DEFAULT_TAP_ZONES
+  return value.map((item, index) => {
+    if (typeof item !== 'number' || !Number.isFinite(item)) return DEFAULT_TAP_ZONES[index]
+    return Math.min(13, Math.max(-1, Math.round(item)))
+  })
+}
+
+/** 底栏按钮只保留已知项；一个都不认识时回落默认四项。 */
+const pickMenuItems = (value: unknown): string[] => {
+  const known = MENU_ITEMS.map((item) => item.key)
+  if (!Array.isArray(value)) return DEFAULT_MENU_ITEMS
+  const filtered = [...new Set(value.filter((item): item is string => typeof item === 'string' && known.includes(item)))]
+  return filtered.length > 0 ? filtered : DEFAULT_MENU_ITEMS
+}
 
 const identified = z.object({ id: z.string().min(1).max(4096) }).passthrough()
 
@@ -105,26 +139,42 @@ export const ReaderDomain = defineDomain({
           )
           .max(100)
           .default([]),
-        fontSize: z.number().int().min(12).max(48).default(24),
         fontId: z.string().max(80).default(''),
-        lineSpacing: z.number().min(1).max(3).default(1.8),
-        paragraphSpacing: z.number().int().min(0).max(40).default(6),
-        indent: z.number().int().min(0).max(2).default(2),
+        fontFamily: z.string().max(200).default(''),
+        fontSize: z.preprocess(clampNumber(12, 48, true), z.number().int().min(12).max(48).default(24)),
+        letterSpacing: z.preprocess(clampNumber(0, 4), z.number().min(0).max(4).default(0)),
+        lineSpacing: z.preprocess(clampNumber(1.2, 2.6), z.number().min(1.2).max(2.6).default(1.8)),
+        paragraphSpacing: z.preprocess(clampNumber(0, 24, true), z.number().int().min(0).max(24).default(6)),
+        indent: z.preprocess(pickIndent, z.number().int().min(0).max(2).default(2)),
+        bold: z.preprocess(pickBoolean, z.boolean().default(false)),
+        titleMode: z.preprocess(clampNumber(0, 3, true), z.number().int().min(0).max(3).default(0)),
+        titleSize: z.preprocess(clampNumber(0, 8, true), z.number().int().min(0).max(8).default(4)),
+        align: z.preprocess(pickEnum(READER_ALIGNS, 'left'), z.enum(['left', 'justify']).default('left')),
+        compressPunctuation: z.preprocess(pickBoolean, z.boolean().default(true)),
+        kinsoku: z.preprocess(pickBoolean, z.boolean().default(true)),
         padding: z
           .object({
-            left: z.number().int().min(0).max(80).default(22),
-            top: z.number().int().min(0).max(80).default(5),
-            right: z.number().int().min(0).max(80).default(22),
-            bottom: z.number().int().min(0).max(80).default(4),
+            left: z.preprocess(clampNumber(8, 48, true), z.number().int().min(8).max(48).default(22)),
+            top: z.preprocess(clampNumber(0, 32, true), z.number().int().min(0).max(32).default(5)),
+            right: z.preprocess(clampNumber(8, 48, true), z.number().int().min(8).max(48).default(22)),
+            bottom: z.preprocess(clampNumber(0, 32, true), z.number().int().min(0).max(32).default(4)),
           })
           .default({ left: 22, top: 5, right: 22, bottom: 4 }),
-        pageAnimation: z.enum(['none', 'cover', 'slide', 'simulate', 'scroll']).default('cover'),
-        headerMode: z.number().int().min(0).max(11).default(1),
-        footerMode: z.number().int().min(0).max(11).default(6),
-        showHeaderLine: z.boolean().default(true),
-        showFooterLine: z.boolean().default(true),
-        tapZones: z.array(z.number().int().min(-1).max(13)).length(9).default(DEFAULT_TAP_ZONES),
-        menuItems: z.array(z.string()).default(DEFAULT_MENU_ITEMS),
+        pageAnimation: z.preprocess(
+          pickEnum(READER_PAGE_ANIMATIONS, 'cover'),
+          z.enum(['none', 'cover', 'slide', 'simulate', 'scroll']).default('cover'),
+        ),
+        headerMode: z.preprocess(clampNumber(0, 11, true), z.number().int().min(0).max(11).default(1)),
+        footerMode: z.preprocess(clampNumber(0, 11, true), z.number().int().min(0).max(11).default(6)),
+        showHeaderLine: z.preprocess(pickBoolean, z.boolean().default(true)),
+        showFooterLine: z.preprocess(pickBoolean, z.boolean().default(true)),
+        dualColumn: z.preprocess(pickBoolean, z.boolean().default(false)),
+        inkMode: z.preprocess(pickBoolean, z.boolean().default(false)),
+        tapZones: z.preprocess(
+          pickTapZones,
+          z.array(z.number().int().min(-1).max(13)).length(9).default(DEFAULT_TAP_ZONES),
+        ),
+        menuItems: z.preprocess(pickMenuItems, z.array(z.string()).default(DEFAULT_MENU_ITEMS)),
         replaceRules: z
           .array(
             z
@@ -138,26 +188,47 @@ export const ReaderDomain = defineDomain({
               .passthrough(),
           )
           .default([]),
+        autoPageSeconds: z.preprocess(clampNumber(1, 60, true), z.number().int().min(1).max(60).default(10)),
+        ttsVoice: z.string().max(400).default(''),
+        ttsRate: z.preprocess(clampNumber(0.5, 2), z.number().min(0.5).max(2).default(1)),
+        ttsContinuous: z.preprocess(pickBoolean, z.boolean().default(true)),
         /** 媒体缓存配额（字节）；0 表示跟随环境变量或默认 50GB。 */
-        mediaQuotaBytes: z.number().int().min(0).default(0),
+        mediaQuotaBytes: z.preprocess(
+          clampNumber(0, Number.MAX_SAFE_INTEGER, true),
+          z.number().int().min(0).default(0),
+        ),
       })
       .passthrough(),
     initial: {
       theme: 'light',
       customThemes: [],
-      fontSize: 22,
       fontId: '',
-      lineSpacing: 1.9,
+      fontFamily: '',
+      fontSize: 24,
+      letterSpacing: 0,
+      lineSpacing: 1.8,
       paragraphSpacing: 6,
       indent: 2,
+      bold: false,
+      titleMode: 0,
+      titleSize: 4,
+      align: 'left',
+      compressPunctuation: true,
+      kinsoku: true,
       padding: { left: 22, top: 5, right: 22, bottom: 4 },
       pageAnimation: 'cover',
       headerMode: 1,
       footerMode: 6,
       showHeaderLine: true,
       showFooterLine: true,
+      dualColumn: false,
+      inkMode: false,
       tapZones: DEFAULT_TAP_ZONES,
       menuItems: DEFAULT_MENU_ITEMS,
+      autoPageSeconds: 10,
+      ttsVoice: '',
+      ttsRate: 1,
+      ttsContinuous: true,
       replaceRules: [],
       mediaQuotaBytes: 0,
     },
@@ -173,6 +244,10 @@ export const ReaderDomain = defineDomain({
     notes: domainTable(identified),
     bookmarks: domainTable(identified),
     read_records: domainTable(identified),
+    /** 每本书的设置覆盖层：只存本书改过的字段，读取时与全局设置深合并。 */
+    read_configs: domainTable(
+      z.object({ id: z.string().min(1).max(4096), bookId: z.string().min(1).max(4096) }).passthrough(),
+    ),
     jobs: domainTable(jobRecord),
     download_entries: domainTable(downloadEntry),
     media_entries: domainTable(mediaEntry),
@@ -192,6 +267,7 @@ export async function openReaderStorage(ctx: any) {
     notes: domain.table('notes'),
     bookmarks: domain.table('bookmarks'),
     readRecords: domain.table('read_records'),
+    readConfigs: domain.table('read_configs'),
     jobs: domain.table('jobs'),
     downloadEntries: domain.table('download_entries'),
     mediaEntries: domain.table('media_entries'),

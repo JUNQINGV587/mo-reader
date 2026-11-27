@@ -29,6 +29,8 @@ export interface TapAction {
   code: number
   label: string
   available: boolean
+  /** 选择器里不展示；旧配置落到它时回退为「无动作」 */
+  hidden?: boolean
 }
 
 export const TAP_ACTIONS: TapAction[] = [
@@ -38,14 +40,14 @@ export const TAP_ACTIONS: TapAction[] = [
   { code: 2, label: '上一页', available: true },
   { code: 3, label: '下一章', available: true },
   { code: 4, label: '上一章', available: true },
-  { code: 5, label: '朗读上段', available: false },
-  { code: 6, label: '朗读下段', available: false },
+  { code: 5, label: '朗读上段', available: true },
+  { code: 6, label: '朗读下段', available: true },
   { code: 7, label: '加书签', available: true },
-  { code: 8, label: '正文编辑', available: false },
-  { code: 9, label: '替换开关', available: false },
+  { code: 8, label: '正文编辑', available: false, hidden: true },
+  { code: 9, label: '替换开关', available: false, hidden: true },
   { code: 10, label: '目录', available: true },
-  { code: 11, label: '全文搜索', available: false },
-  { code: 12, label: '同步进度', available: false },
+  { code: 11, label: '全文搜索', available: false, hidden: true },
+  { code: 12, label: '同步进度', available: false, hidden: true },
   { code: 13, label: '朗读暂停', available: true },
 ]
 
@@ -54,6 +56,40 @@ export const tapActionLabel = (code: number): string =>
 
 /** 九宫格默认：TL2 TC2 TR1 / ML2 MC0 MR1 / BL2 BC1 BR2（阅读 AppConfig 默认）。 */
 export const DEFAULT_TAP_ZONES: number[] = [2, 2, 1, 2, 0, 1, 2, 1, 2]
+
+/**
+ * 本切片暂不实现的动作：正文编辑、替换开关、全文搜索、同步进度。
+ * 朗读上段/下段/暂停（5/6/13）属于朗读切片，不在这里隐藏。
+ */
+export const HIDDEN_TAP_ACTION_CODES: readonly number[] = [8, 9, 11, 12]
+
+export const isHiddenTapAction = (code: number): boolean => HIDDEN_TAP_ACTION_CODES.includes(code)
+
+/** 九宫格动作选择器可选项：隐藏动作不出现在列表里。 */
+export function visibleTapActions(): TapAction[] {
+  return TAP_ACTIONS.filter((action) => action.hidden !== true)
+}
+
+export interface TapZoneSanitizeResult {
+  zones: number[]
+  /** 被回退成「无动作」的格子序号（0~8） */
+  resetZones: number[]
+  changed: boolean
+}
+
+/**
+ * 把九宫格里的动作收敛到本切片支持的集合：隐藏动作回退为 -1（无动作）。
+ * 只在读取旧配置时调用；返回 resetZones 供界面提示一次。
+ */
+export function sanitizeTapZones(input: unknown): TapZoneSanitizeResult {
+  const zones: unknown[] = Array.isArray(input) && input.length === 9 ? input : DEFAULT_TAP_ZONES
+  const next = zones.map((zone) => {
+    if (typeof zone !== 'number' || !Number.isInteger(zone) || zone < -1 || zone > 13) return -1
+    return isHiddenTapAction(zone) ? -1 : zone
+  })
+  const resetZones = next.map((zone, index) => (zones[index] === zone ? -1 : index)).filter((index) => index >= 0)
+  return { zones: next, resetZones, changed: resetZones.length > 0 }
+}
 
 export const TAP_ZONE_NAMES = ['左上', '上中', '右上', '左中', '中间', '右中', '左下', '下中', '右下']
 
