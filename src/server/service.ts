@@ -1,7 +1,14 @@
 import { createHash } from 'node:crypto'
 import { Service } from '@deepseek-ai/cordis'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { dirname } from 'node:path'
 import { VERSION } from '../core/version.js'
+import {
+  addReadingTime,
+  aggregateReadingStats,
+  normalizeReadingTime,
+  type AggregatableBook,
+} from '../core/reader/stats.js'
 import { parseSource, type BookSource } from '../core/model/source.js'
 import { dictRuleKey, parseDictRule, type DictRule } from '../core/model/dict.js'
 import { AnalyzeRule } from '../core/rules/analyze-rule.js'
@@ -368,6 +375,7 @@ export class ReaderService extends TypertRemoteService {
       ok: true,
       version: VERSION,
       methods: REMOTE_METHODS,
+      dataDir: dirname(mediaRoot()),
     }
   }
 
@@ -1897,7 +1905,13 @@ export class ReaderService extends TypertRemoteService {
         throw new Error(`删除《${name}》失败：${reason}；缓存未清完的书仍留在书架，可再次删除`)
       }
       await db.books.delete(id)
-      await db.readRecords.delete(id)
+      const progress = db.readRecords.get(id) as Record<string, unknown> | undefined
+      // 删书但保留阅读统计：记一条墓碑，「我的」页还能看到这本书用了多少时间。
+      if (normalizeReadingTime(progress).readMs > 0) {
+        await db.readRecords.put(id, { ...progress, id, bookId: id, bookName: name, deleted: true })
+      } else {
+        await db.readRecords.delete(id)
+      }
       if (book?.origin === 'local') await removeLocalBook(id).catch(() => undefined)
       if (book) deleted += 1
     }
@@ -1934,6 +1948,8 @@ export class ReaderService extends TypertRemoteService {
       if (Number.isFinite(zoom)) record.pdfZoom = Math.min(300, Math.max(50, Math.round(zoom)))
     }
     if (typeof args?.pdfFitWidth === 'boolean') record.pdfFitWidth = args.pdfFitWidth
+    // 重新加入或重新打开一本书时，旧的「已删除」标记不能挡住进度保存。
+    delete record.deleted
     record.updatedAt = new Date().toISOString()
     await this.requireDb().readRecords.put(bookId, record)
     const book = this.requireDb().books.get(bookId) as Record<string, unknown> | undefined
@@ -1946,6 +1962,61 @@ export class ReaderService extends TypertRemoteService {
   async getProgress(args: Args) {
     const bookId = stringArg(args, 'bookId')
     return { progress: this.requireDb().readRecords.get(bookId) ?? null }
+  }
+
+  /**
+   * 阅读计时落盘：把这次累计的本地日桶并进阅读记录，不动章节进度。
+   * 日桶超过 400 天会折进 archiveMs，由纯函数负责，服务端只做校验与合并。
+   */
+  async saveReadingTime(args: Args) {
+    const bookId = stringArg(args, 'bookId')
+    const db = this.requireDb()
+    const existing = (db.readRecords.get(bookId) ?? {}) as Record<string, unknown>
+    const daily = args?.daily && typeof args.daily === 'object' && !Array.isArray(args.daily)
+      ? (args.daily as Record<string, number>)
+      : {}
+    const at = typeof args?.at === 'string' && !Number.isNaN(Date.parse(args.at))
+      ? new Date(args.at)
+      : new Date()
+    const record: Record<string, unknown> = {
+      ...existing,
+      id: bookId,
+      bookId,
+      ...addReadingTime(existing, daily, at),
+    }
+    if (db.books.get(bookId)) delete record.deleted
+    await db.readRecords.put(bookId, record)
+    return { readMs: record.readMs, dailyMs: record.dailyMs, updatedAt: record.updatedAt }
+  }
+
+  /** 「我的」页的阅读统计；记录里已删除的书保留在排行里。 */
+  async getReadingStats() {
+    const db = this.requireDb()
+    const records: unknown[] = []
+    for (const [, value] of db.readRecords.entries()) records.push(value)
+    const books: AggregatableBook[] = []
+    for (const [, value] of db.books.entries()) books.push(value as AggregatableBook)
+    return aggregateReadingStats(records, books)
+  }
+
+  /** 清空阅读统计：只清时长，保留章节进度、书签与「最后阅读」。 */
+  async clearReadingStats() {
+    const db = this.requireDb()
+    let cleared = 0
+    const keys = Array.from(db.readRecords.keys()) as string[]
+    for (const key of keys) {
+      const record = { ...((db.readRecords.get(key) ?? {}) as Record<string, unknown>) }
+      const hasProgress = ['chapterIndex', 'chapterUrl', 'chapterTitle', 'position', 'pdfPage', 'pdfZoom', 'pdfFitWidth']
+        .some((field) => record[field] !== undefined && record[field] !== '')
+      if (record.deleted === true && !hasProgress) {
+        await db.readRecords.delete(key)
+        cleared += 1
+        continue
+      }
+      await db.readRecords.put(key, { ...record, readMs: 0, dailyMs: {}, archiveMs: {} })
+      cleared += 1
+    }
+    return { cleared }
   }
 
   async listBookmarks(args: Args) {

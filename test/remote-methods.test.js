@@ -13,13 +13,31 @@ test('无参方法都在远端清单里，且没有重复', () => {
 })
 
 test('不接收入参的方法必须声明成零参数（否则参数个数会校验失败）', () => {
-  for (const method of ['state', 'listBooks', 'listFonts', 'getStorageUsage', 'clearAllMedia', 'clearAllCaches', 'clearDownloads']) {
+  for (const method of [
+    'state',
+    'listBooks',
+    'listFonts',
+    'getStorageUsage',
+    'getReadingStats',
+    'clearReadingStats',
+    'clearAllMedia',
+    'clearAllCaches',
+    'clearDownloads',
+  ]) {
     assert.ok(ARGLESS_METHODS.includes(method), `${method} 应当零参数`)
   }
 })
 
 test('接受入参的方法不能声明成零参数（否则客户端调用直接报参数个数不符）', () => {
-  for (const method of ['getSettings', 'saveSettings', 'resetBookSettings', 'resetSettingsGroup', 'getProgress', 'getContent']) {
+  for (const method of [
+    'getSettings',
+    'saveSettings',
+    'resetBookSettings',
+    'resetSettingsGroup',
+    'getProgress',
+    'getContent',
+    'saveReadingTime',
+  ]) {
     assert.ok(!ARGLESS_METHODS.includes(method), `${method} 需要接收 args 对象`)
   }
 })

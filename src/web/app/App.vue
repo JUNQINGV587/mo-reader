@@ -32,6 +32,7 @@ import {
 } from '../../core/reader/reader-config'
 import {
   BUILTIN_THEMES,
+  BUILTIN_THEME_NAMES,
   createCustomTheme,
   exportFullThemes,
   exportLegadoThemes,
@@ -53,6 +54,7 @@ import {
 } from '../../core/reader/settings'
 import { dualColumnAvailability } from '../../core/reader/paginate'
 import { AutoPageController } from '../../core/reader/auto-page'
+import { ReadingTimer, formatReadingDuration, localDateKey, shouldCountReading, type ReadingStats } from '../../core/reader/stats'
 import { KeepAwake } from '../../core/reader/wake-lock'
 import { enabledDictRules, lookupAll, type DictLookupOutcome } from '../../core/dict/lookup-all'
 import { swapDictOrder } from '../../core/dict/order'
@@ -61,7 +63,7 @@ import { groupExploreBySourceGroup } from '../../core/source/group'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
-type View = 'shelf' | 'sources' | 'search' | 'explore' | 'detail' | 'reader' | 'storage'
+type View = 'shelf' | 'sources' | 'search' | 'explore' | 'detail' | 'reader' | 'storage' | 'profile'
 type Theme = 'light' | 'sepia' | 'dark'
 type Turn = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
 type DictResult = DictLookupOutcome
@@ -87,6 +89,7 @@ function plainText(input?: string | null): string {
 
 const view = ref<View>('shelf')
 const version = ref('')
+const dataDir = ref('')
 const status = ref('')
 const busy = ref(false)
 const cacheBusy = ref(false)
@@ -569,6 +572,7 @@ function setAutoPause(reason: 'menu' | 'toc' | 'settings' | 'hidden' | 'loading'
 
 function onReaderVisibilityChange() {
   const hidden = document.hidden
+  syncReadingTimer()
   setAutoPause('hidden', hidden)
   if (keepAwake) void keepAwake.visibilityChanged(!hidden)
   if (hidden) return
@@ -821,6 +825,7 @@ async function refresh() {
   try {
     const state = await call('state')
     version.value = state?.version ?? ''
+    dataDir.value = state?.dataDir ?? ''
     const [sourceResult, bookResult] = await Promise.all([call('listSources'), call('listBooks')])
     sources.value = sourceResult?.sources ?? []
     shelfBooks.value = bookResult?.books ?? []
@@ -1233,6 +1238,114 @@ async function clearAllCachesStorage() {
 // 切到存储页时刷新一次，配额或清理改动后也会再刷。
 watch(view, (next) => {
   if (next === 'storage') void loadStorageUsage()
+})
+// 阅读统计与「我的」页：只在阅读页、标签页可见、窗口聚焦时计时，5 秒落盘，离开或失焦立即落盘。
+const stats = ref<ReadingStats | null>(null)
+const statsBusy = ref(false)
+const statsError = ref('')
+const statsClearOpen = ref(false)
+const statsClearBusy = ref(false)
+const statsExpanded = ref(false)
+const todayReadingMs = ref(0)
+const PROFILE_RANK_LIMIT = 50
+
+const statsBooks = computed(() => stats.value?.books ?? [])
+const visibleStatsBooks = computed(() =>
+  statsExpanded.value ? statsBooks.value : statsBooks.value.slice(0, PROFILE_RANK_LIMIT),
+)
+const last7MaxMs = computed(() => {
+  const days = stats.value?.last7Days ?? []
+  return Math.max(1, ...days.map((day) => day.ms))
+})
+const last7TotalMs = computed(() =>
+  (stats.value?.last7Days ?? []).reduce((sum, day) => sum + day.ms, 0),
+)
+
+function statsBarHeight(ms: number) {
+  const ratio = Math.max(0, Number(ms) || 0) / last7MaxMs.value
+  return `${Math.round(ratio * 100)}%`
+}
+
+function formatStatDate(value: string) {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '—'
+  const now = new Date()
+  const prefix = date.getFullYear() === now.getFullYear() ? '' : `${date.getFullYear()}年`
+  return `${prefix}${date.getMonth() + 1}月${date.getDate()}日`
+}
+
+async function loadReadingStats() {
+  statsBusy.value = true
+  statsError.value = ''
+  try {
+    const result = await call('getReadingStats')
+    stats.value = result as ReadingStats
+    todayReadingMs.value = Number(result?.todayMs ?? 0)
+  } catch (error) {
+    statsError.value = `统计读取失败：${errorText(error)}`
+  } finally {
+    statsBusy.value = false
+  }
+}
+
+let readingTimer: ReadingTimer | null = null
+let statsFlushChain: Promise<void> = Promise.resolve()
+
+function queueReadingTime(bookId: string, daily: Record<string, number>) {
+  const todayKey = localDateKey(new Date())
+  todayReadingMs.value += Number(daily[todayKey] ?? 0)
+  const at = new Date().toISOString()
+  statsFlushChain = statsFlushChain
+    .then(() => call('saveReadingTime', { bookId, daily, at }))
+    .then(() => undefined)
+    .catch(() => undefined)
+}
+
+function syncReadingTimer() {
+  if (!readingTimer) {
+    readingTimer = new ReadingTimer({
+      flush: (payload) => queueReadingTime(payload.bookId, payload.daily),
+    })
+  }
+  const bookId = String(currentBook.value?.id ?? '')
+  if (bookId) readingTimer.setBook(bookId)
+  const timing = shouldCountReading({
+    readingPage: view.value === 'reader',
+    bookId,
+    hidden: document.hidden,
+    focused: document.hasFocus(),
+  })
+  readingTimer.setActive(timing)
+}
+
+function flushReadingTimer() {
+  readingTimer?.flush()
+}
+
+async function clearReadingStats() {
+  statsClearBusy.value = true
+  statsError.value = ''
+  try {
+    await statsFlushChain
+    await call('clearReadingStats')
+    todayReadingMs.value = 0
+    statsClearOpen.value = false
+    await loadReadingStats()
+  } catch (error) {
+    statsError.value = `清空失败：${errorText(error)}`
+  } finally {
+    statsClearBusy.value = false
+  }
+}
+
+watch([view, () => currentBook.value?.id, readerKind], () => syncReadingTimer())
+
+watch(view, (next) => {
+  if (next === 'profile') {
+    statsClearOpen.value = false
+    void loadReadingStats()
+  }
 })
 
 function isDownloadRunning(job: any) {
@@ -1669,6 +1782,10 @@ watch(view, (next) => {
 })
 
 onUnmounted(() => {
+  window.removeEventListener('focus', syncReadingTimer)
+  window.removeEventListener('blur', syncReadingTimer)
+  window.removeEventListener('pagehide', flushReadingTimer)
+  readingTimer?.stop()
   stopDownloadTimer()
   stopMediaTimer()
   stopExportTimer()
@@ -4391,6 +4508,9 @@ onMounted(async () => {
   window.addEventListener('resize', syncViewportWidth)
   syncViewportWidth()
   document.addEventListener('visibilitychange', onReaderVisibilityChange)
+  window.addEventListener('focus', syncReadingTimer)
+  window.addEventListener('blur', syncReadingTimer)
+  window.addEventListener('pagehide', flushReadingTimer)
   loadSpeechVoices()
   window.speechSynthesis?.addEventListener?.('voiceschanged', loadSpeechVoices)
   autoPage.setSeconds(effectiveSettings.value.autoPageSeconds)
@@ -4408,6 +4528,8 @@ onMounted(async () => {
   }
   void loadBattery()
   await refresh()
+  void loadReadingStats()
+  syncReadingTimer()
   void loadRssSources()
 })
 </script>
@@ -4430,6 +4552,7 @@ onMounted(async () => {
         <button :class="{ on: view === 'explore' }" data-testid="nav-explore" @click="openExplore">发现</button>
         <button :class="{ on: view === 'sources' }" data-testid="nav-sources" @click="view = 'sources'">书源</button>
         <button :class="{ on: view === 'rss' }" data-testid="nav-rss" @click="view = 'rss'">订阅</button>
+        <button :class="{ on: view === 'profile' }" data-testid="nav-profile" @click="view = 'profile'">我的</button>
         <button :class="{ on: view === 'storage' }" data-testid="nav-storage" @click="view = 'storage'">存储</button>
         <span class="mo-version">v{{ version }}</span>
       </nav>
@@ -5416,6 +5539,117 @@ onMounted(async () => {
         </transition>
       </section>
 
+      <section v-if="view === 'profile'" class="mo-pane mo-profile" data-testid="profile-pane">
+        <div class="mo-section-head">
+          <h2>我的</h2>
+          <span class="muted">阅读统计 · 设置入口</span>
+          <button class="mo-btn" :disabled="statsBusy" data-testid="stats-refresh" @click="loadReadingStats">刷新</button>
+        </div>
+
+        <div class="mo-card mo-stat-summary" data-testid="stats-summary">
+          <div class="mo-stat-big">
+            <span class="muted">今日</span>
+            <strong data-testid="stats-today">{{ formatReadingDuration(todayReadingMs) }}</strong>
+          </div>
+          <div class="mo-stat-big">
+            <span class="muted">累计</span>
+            <strong data-testid="stats-total">{{ formatReadingDuration(stats?.totalMs || 0) }}</strong>
+          </div>
+        </div>
+
+        <p v-if="statsBusy && !stats" class="muted" role="status">统计加载中…</p>
+        <div v-else-if="statsError" class="mo-card mo-stats-error" role="alert">
+          <p class="muted">{{ statsError }}</p>
+          <button class="mo-btn" data-testid="stats-retry" @click="loadReadingStats">重试</button>
+        </div>
+        <template v-else-if="stats">
+          <div class="mo-card" data-testid="stats-week">
+            <div class="mo-card-head">
+              <h3 class="mo-card-title">近 7 天</h3>
+              <span class="muted">近 30 天 {{ formatReadingDuration(stats.last30Ms) }}</span>
+            </div>
+            <div
+              class="mo-bars"
+              role="img"
+              :aria-label="`近 7 天阅读 ${formatReadingDuration(last7TotalMs)}`"
+            >
+              <div v-for="day in stats.last7Days" :key="day.date" class="mo-bar-col">
+                <span class="mo-bar-value">{{ day.ms ? formatReadingDuration(day.ms) : '' }}</span>
+                <div class="mo-bar-track" :title="`${day.date} ${formatReadingDuration(day.ms)}`">
+                  <div class="mo-bar" :style="{ height: statsBarHeight(day.ms) }"></div>
+                </div>
+                <span class="mo-bar-label">{{ day.label }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="mo-card" data-testid="stats-books">
+            <div class="mo-card-head">
+              <h3 class="mo-card-title">按书排行</h3>
+              <span class="muted">{{ statsBooks.length }} 本</span>
+            </div>
+            <p v-if="statsBooks.length === 0" class="muted">还没有阅读时长，去书架挑一本吧。</p>
+            <ol v-else class="mo-rank">
+              <li v-for="book in visibleStatsBooks" :key="book.bookId" class="mo-rank-item">
+                <div class="mo-rank-head">
+                  <span class="mo-rank-name">
+                    {{ book.name }}
+                    <span v-if="book.deleted" class="mo-tag soft" data-testid="stats-deleted">已删除</span>
+                  </span>
+                  <strong>{{ formatReadingDuration(book.readMs) }}</strong>
+                </div>
+                <div class="mo-rank-meta">
+                  <span>{{ book.percent }}% · {{ book.chapterTitle || `第 ${book.chapterIndex + 1} 章` }}</span>
+                  <span>最后阅读 {{ formatStatDate(book.lastReadAt) }}</span>
+                </div>
+              </li>
+            </ol>
+            <button
+              v-if="statsBooks.length > PROFILE_RANK_LIMIT"
+              class="mo-btn mo-rank-more"
+              data-testid="stats-more"
+              :aria-label="statsExpanded ? '收起其余书目' : `展开其余 ${statsBooks.length - PROFILE_RANK_LIMIT} 本`"
+              @click="statsExpanded = !statsExpanded"
+            >{{ statsExpanded ? '收起' : '展开' }}</button>
+          </div>
+        </template>
+
+        <div class="mo-card" data-testid="stats-clear">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">清空统计</h3>
+            <span class="muted">保留进度和书签</span>
+          </div>
+          <div v-if="statsClearOpen" class="mo-row">
+            <span class="muted">只清空阅读时长，进度和书签都会保留。</span>
+            <button class="mo-btn danger" :disabled="statsClearBusy" data-testid="stats-clear-confirm" @click="clearReadingStats">
+              {{ statsClearBusy ? '清空中…' : '确认清空' }}
+            </button>
+            <button class="mo-btn" :disabled="statsClearBusy" @click="statsClearOpen = false">取消</button>
+          </div>
+          <button v-else class="mo-btn danger" data-testid="stats-clear-open" @click="statsClearOpen = true">清空统计</button>
+        </div>
+
+        <div class="mo-card" data-testid="profile-entries">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">设置</h3>
+            <span class="muted">存储 · 主题 · 关于</span>
+          </div>
+          <div class="mo-row">
+            <button class="mo-btn" data-testid="profile-storage" @click="view = 'storage'">存储</button>
+            <button
+              v-for="themeName in BUILTIN_THEME_NAMES"
+              :key="themeName"
+              class="mo-btn"
+              :class="{ primary: settings.theme === themeName }"
+              :aria-pressed="settings.theme === themeName"
+              :data-testid="`profile-theme-${themeName}`"
+              @click="selectTheme(themeName)"
+            >{{ BUILTIN_THEMES[themeName].name }}</button>
+          </div>
+          <p class="muted mo-about" data-testid="profile-about">墨读 v{{ version }} · GPL-3.0 · 数据目录 {{ dataDir || '—' }}</p>
+        </div>
+      </section>
+
       <section v-if="view === 'storage'" class="mo-pane" data-testid="storage-pane">
         <div class="mo-section-head">
           <h2>存储</h2>
@@ -5710,6 +5944,7 @@ onMounted(async () => {
               </button>
             </div>
             <div class="mo-chrome-bottom">
+              <span class="mo-chrome-today" :aria-label="`今日阅读 ${formatReadingDuration(todayReadingMs)}`">今日 {{ formatReadingDuration(todayReadingMs) }}</span>
               <button v-if="settings.menuItems.includes('prev')" class="mo-chrome-btn" :disabled="chapterIndex <= 0" @click="openAdjacent(-1)">上一章</button>
               <button v-if="settings.menuItems.includes('settings') && readerKind === 'text'" class="mo-chrome-btn" data-testid="reader-settings" @click="openSettings($event)">Aa</button>
               <button
@@ -5883,6 +6118,7 @@ onMounted(async () => {
                 <strong id="mo-settings-title">阅读设置</strong>
                 <button class="mo-icon-btn" data-testid="settings-close" title="关闭" @click="closeSettings">✕</button>
               </div>
+              <p class="muted mo-settings-today" data-testid="settings-today">今日阅读 {{ formatReadingDuration(todayReadingMs) }}</p>
               
               <div class="mo-scope-row">
                 <div class="mo-scope-tabs" role="tablist" aria-label="设置作用范围">
@@ -6455,8 +6691,9 @@ onMounted(async () => {
 }
 .mo-nav {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 22px;
+  gap: 6px 14px;
   padding: 0 22px;
   border-bottom: 1px solid var(--mo-line);
 }
@@ -6481,6 +6718,13 @@ onMounted(async () => {
   bottom: -1px;
   height: 2px;
   background: var(--mo-accent);
+}
+.mo-nav button:focus-visible,
+.mo-btn:focus-visible,
+.mo-icon-btn:focus-visible,
+.mo-chrome-btn:focus-visible {
+  outline: 2px solid var(--mo-accent);
+  outline-offset: 2px;
 }
 .mo-version {
   margin-left: auto;
@@ -7074,6 +7318,105 @@ onMounted(async () => {
 .mo-card-head .mo-filter {
   margin-left: auto;
 }
+/* 「我的」：统计大数、7 天柱状（原生 div 手绘，不引图表库）与按书排行。 */
+.mo-stat-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 14px;
+}
+.mo-stat-big {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.mo-stat-big strong {
+  font: 700 24px/1.25 'Songti SC', 'Noto Serif SC', serif;
+  overflow-wrap: anywhere;
+}
+.mo-bars {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 6px;
+}
+.mo-bar-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.mo-bar-value {
+  max-width: 100%;
+  font-size: 11px;
+  color: var(--mo-ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mo-bar-track {
+  display: flex;
+  align-items: flex-end;
+  width: 100%;
+  max-width: 34px;
+  height: 90px;
+  border-radius: 4px;
+  background: var(--mo-line);
+}
+.mo-bar {
+  width: 100%;
+  border-radius: 4px;
+  background: var(--mo-accent);
+}
+.mo-bar-label {
+  font-size: 11px;
+  color: var(--mo-ink-3);
+  white-space: nowrap;
+}
+.mo-rank {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.mo-rank-item {
+  padding: 8px 0;
+  border-top: 1px solid var(--mo-line);
+}
+.mo-rank-item:first-child {
+  border-top: 0;
+}
+.mo-rank-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.mo-rank-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+.mo-rank-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--mo-ink-3);
+}
+.mo-rank-more {
+  margin-top: 10px;
+}
+.mo-about {
+  margin: 10px 0 0;
+  overflow-wrap: anywhere;
+}
+.mo-stats-error p {
+  margin: 0 0 8px;
+}
 .mo-source-tools {
   display: flex;
   flex-wrap: wrap;
@@ -7534,8 +7877,14 @@ textarea {
   text-overflow: ellipsis;
 }
 .mo-chrome-bottom {
+  flex-wrap: wrap;
   justify-content: space-around;
   padding: 12px 14px;
+}
+.mo-chrome-today {
+  font-size: 12px;
+  color: rgba(216, 212, 200, 0.75);
+  white-space: nowrap;
 }
 .mo-chrome-btn {
   border: 0;
@@ -7585,6 +7934,9 @@ textarea {
 .mo-settings-sheet:focus-visible {
   outline: 2px solid var(--mo-accent);
   outline-offset: -2px;
+}
+.mo-settings-today {
+  margin: -4px 0 8px;
 }
 .mo-settings-group {
   border-top: 1px solid var(--mo-line);
@@ -7706,6 +8058,25 @@ textarea {
   }
   .mo-settings-sheet .mo-input {
     font-size: 16px;
+  }
+  .mo-nav {
+    padding: 0 14px;
+  }
+  .mo-nav button {
+    font-size: 13px;
+  }
+  .mo-profile .mo-section-head {
+    flex-wrap: wrap;
+  }
+  .mo-bar-track {
+    height: 70px;
+  }
+  .mo-bar-value {
+    display: none;
+  }
+  .mo-chrome-today {
+    width: 100%;
+    text-align: center;
   }
 }
 .mo-switch-body {
