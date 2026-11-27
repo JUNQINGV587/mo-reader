@@ -140,7 +140,7 @@ export const ReaderDomain = defineDomain({
           .max(100)
           .default([]),
         fontId: z.string().max(80).default(''),
-        fontFamily: z.string().max(120).default(''),
+        fontFamily: z.string().max(200).default(''),
         fontSize: z.preprocess(clampNumber(12, 48, true), z.number().int().min(12).max(48).default(24)),
         letterSpacing: z.preprocess(clampNumber(0, 4), z.number().min(0).max(4).default(0)),
         lineSpacing: z.preprocess(clampNumber(1.2, 2.6), z.number().min(1.2).max(2.6).default(1.8)),

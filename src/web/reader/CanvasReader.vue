@@ -6,6 +6,9 @@ import {
   isPunctuationChar,
   paginate,
   pageIndexForOffset,
+  punctuationCompressionWidth,
+  titleFontSizeOf,
+  titleLineHeightOf,
   type PaginateLine,
   type PaginatePage,
   type PaginateResult,
@@ -198,7 +201,7 @@ function bodyFont(): string {
 }
 
 function titleFontSize(): number {
-  return props.fontSize + Math.max(0, props.titleSize) * 2
+  return titleFontSizeOf(props.fontSize, props.titleSize)
 }
 
 function titleFont(): string {
@@ -210,7 +213,7 @@ function lineHeightPx(): number {
 }
 
 function titleLineHeight(): number {
-  return lineHeightPx() * (titleFontSize() / props.fontSize)
+  return titleLineHeightOf(props.fontSize, lineHeightPx(), props.titleSize)
 }
 
 function headerHeight(): number {
@@ -406,7 +409,7 @@ function gapBefore(line: PaginateLine, index: number, previous: string, char: st
   if (index === 0) return 0
   let gap = props.letterSpacing
   if (props.compressPunctuation && isPunctuationChar(previous) && isPunctuationChar(char)) {
-    gap -= props.fontSize * 0.5
+    gap -= punctuationCompressionWidth(props.fontSize)
   }
   if (line.justifyPx > 0 && index > line.indentChars) gap += line.justifyPx
   return gap

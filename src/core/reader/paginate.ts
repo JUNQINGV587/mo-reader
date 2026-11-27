@@ -108,7 +108,7 @@ const INDENT = '　　'
 const CLOSING = '。，、；：？！…—～·”’）》」』】〕〉》,.;:!?)]}'
 const OPENING = '（《「『【〔〈“‘([{'
 const PUNCTUATION = CLOSING + OPENING
-const DUAL_COLUMN_MIN_WIDTH = 480
+export const DUAL_COLUMN_MIN_WIDTH = 480
 const DEFAULT_COLUMN_GAP = 24
 const MAX_JUSTIFY_EM = 0.5
 const EPS = 1e-6
@@ -128,6 +128,36 @@ function isPunctuation(char: string): boolean {
 /** 供渲染层判断标点压缩的边界（只给出是否标点）。 */
 export function isPunctuationChar(char: string): boolean {
   return isPunctuation(char)
+}
+
+/** 相邻标点压缩掉的宽度：半个字宽。排版与渲染共用，避免两边各写一份。 */
+export function punctuationCompressionWidth(fontSize: number): number {
+  return fontSize * 0.5
+}
+
+/** 标题字号 = 正文字号 + 档位 * 2px。 */
+export function titleFontSizeOf(fontSize: number, titleSize?: number): number {
+  return fontSize + Math.max(0, titleSize ?? 0) * 2
+}
+
+/** 标题行高 = 正文行高 *（标题字号 / 正文字号）。 */
+export function titleLineHeightOf(fontSize: number, lineHeight: number, titleSize?: number): number {
+  return fontSize > 0 ? lineHeight * (titleFontSizeOf(fontSize, titleSize) / fontSize) : lineHeight
+}
+
+/** 正文可用宽度是否够放双栏。 */
+export function dualColumnFitsContent(contentWidth: number): boolean {
+  return contentWidth >= DUAL_COLUMN_MIN_WIDTH
+}
+
+/** 按视口宽度与左右留白判断双栏是否可用；窗口尺寸变化时由界面重新计算。 */
+export function dualColumnAvailability(
+  viewportWidth: number,
+  padding: { left: number; right: number },
+): boolean {
+  const left = Number.isFinite(padding.left) ? padding.left : 0
+  const right = Number.isFinite(padding.right) ? padding.right : 0
+  return dualColumnFitsContent(viewportWidth - left - right)
 }
 
 interface Item {
@@ -165,7 +195,7 @@ function lineWidthOf(items: Item[], letterSpacing: number, compress: boolean, fo
     if (index > 0) {
       width += letterSpacing
       if (compress && isPunctuation(items[index - 1].char) && isPunctuation(items[index].char)) {
-        width -= fontSize * 0.5
+        width -= punctuationCompressionWidth(fontSize)
       }
     }
   }
@@ -217,7 +247,7 @@ function wrapItems(options: WrapOptions): RawLine[] {
       const item = items[cursor]
       const spacing = line.length > 0 ? letterSpacing : 0
       const compression = line.length > 0 && compress && isPunctuation(line[line.length - 1].char) && isPunctuation(item.char)
-        ? fontSize * 0.5
+        ? punctuationCompressionWidth(fontSize)
         : 0
       const advance = item.width + spacing - compression
       if (line.length > 0 && width + advance > maxWidth + EPS) {
@@ -407,8 +437,8 @@ export function paginate(text: string, options: PaginateOptions): PaginateResult
   const lineHeight = options.lineHeight
   const letterSpacing = options.letterSpacing ?? 0
   const titleSize = Math.max(0, options.titleSize ?? 0)
-  const titleFontSize = fontSize + titleSize * 2
-  const titleLineHeight = lineHeight * (titleFontSize / fontSize)
+  const titleFontSize = titleFontSizeOf(fontSize, titleSize)
+  const titleLineHeight = titleLineHeightOf(fontSize, lineHeight, titleSize)
   const paragraphSpacing = Math.max(0, options.paragraphSpacing ?? 0)
   const align: PaginateTextAlign = options.align === 'justify' ? 'justify' : 'left'
   const compressPunctuation = options.compressPunctuation === true
@@ -439,7 +469,7 @@ export function paginate(text: string, options: PaginateOptions): PaginateResult
   const dualColumnDisabledReason: PaginateDualColumnDisabledReason | null = requestedDualColumn
     ? scrollMode
       ? 'scroll'
-      : maxWidth < DUAL_COLUMN_MIN_WIDTH
+      : !dualColumnFitsContent(maxWidth)
         ? 'narrow'
         : null
     : null

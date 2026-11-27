@@ -178,6 +178,34 @@ test('本书保存忽略全局专属字段，主题按全局主题表校验', as
   await assert.rejects(service.saveSettings({ bookId: 'b1', settings: { theme: 'nope' } }), /主题不存在/)
 })
 
+test('保存九宫格拒绝已隐藏动作与越界值，旧值保留', async () => {
+  const { service, getStored } = await makeService({ theme: 'system', tapZones: [2, 2, 1, 2, 0, 1, 2, 1, 2] })
+  const before = [...getStored().tapZones]
+  const hidden = await service.saveSettings({
+    settings: { fontSize: 26, tapZones: [8, 2, 1, 2, 0, 1, 2, 1, 2] },
+  })
+  assert.deepEqual(hidden.settings.tapZones, before)
+  assert.equal(hidden.settings.fontSize, 26)
+  const outOfRange = await service.saveSettings({
+    settings: { tapZones: [99, 2, 1, 2, 0, 1, 2, 1, 2] },
+  })
+  assert.deepEqual(outOfRange.settings.tapZones, before)
+})
+
+test('fontFamily 上限两端一致为 200', async () => {
+  const { normalizeReaderSettings } = await import('../dist/core/reader/settings.js')
+  const { ReaderDomain } = await import('../dist/server/storage.js')
+  const long = 'A'.repeat(260)
+  assert.equal(normalizeReaderSettings({ fontFamily: long }).fontFamily.length, 200)
+  const schema = ReaderDomain.global.schema
+  assert.equal(schema.parse({ fontFamily: 'A'.repeat(200) }).fontFamily.length, 200)
+  assert.throws(() => schema.parse({ fontFamily: 'A'.repeat(201) }))
+  const { service, getStored } = await makeService({ theme: 'system' })
+  const { settings } = await service.saveSettings({ settings: { fontFamily: long } })
+  assert.equal(settings.fontFamily.length, 200)
+  assert.equal(getStored().fontFamily.length, 200)
+})
+
 test('恢复未知分组报错，不写任何设置', async () => {
   const { service, writeCount } = await makeService({ theme: 'system', fontSize: 24 })
   await assert.rejects(service.resetSettingsGroup({ group: 'nope' }), /未知设置分组/)

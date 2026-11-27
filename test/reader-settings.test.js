@@ -8,6 +8,7 @@ import test from 'node:test'
 const {
   defaultReaderSettings,
   normalizeReaderSettings,
+  normalizeReaderSettingsPatch,
   normalizeBookOverrides,
   mergeReaderSettings,
   diffReaderSettings,
@@ -164,6 +165,35 @@ test('tapZones 不是 9 项回落默认，越界项钳制', () => {
   assert.deepEqual(normalizeReaderSettings({ tapZones: [2, 2, 1] }).tapZones, defaultReaderSettings().tapZones)
   const clamped = normalizeReaderSettings({ tapZones: [99, -9, 3, 7, 0, 1, 2, 13, -1] }).tapZones
   assert.deepEqual(clamped, [13, -1, 3, 7, 0, 1, 2, 13, -1])
+})
+
+test('保存九宫格拒绝已隐藏动作与越界值，其他字段照常写入', () => {
+  const valid = [2, 2, 1, 2, 0, 1, 2, 1, 2]
+  assert.deepEqual(normalizeReaderSettingsPatch({ fontSize: 26, tapZones: valid }), {
+    fontSize: 26,
+    tapZones: valid,
+  })
+  assert.deepEqual(normalizeReaderSettingsPatch({ fontSize: 26, tapZones: [8, 2, 1, 2, 0, 1, 2, 1, 2] }), {
+    fontSize: 26,
+  })
+  assert.deepEqual(normalizeReaderSettingsPatch({ tapZones: [99, 2, 1, 2, 0, 1, 2, 1, 2] }), {})
+  assert.deepEqual(normalizeReaderSettingsPatch({ tapZones: [9, 11, 12, 2, 0, 1, 2, 1, 2] }), {})
+})
+
+test('旧本书覆盖里的隐藏九宫格读取时收敛为无动作', () => {
+  const overrides = normalizeBookOverrides({
+    id: 'b1',
+    bookId: 'b1',
+    fontSize: 26,
+    tapZones: [8, 2, 1, 2, 0, 1, 2, 1, 2],
+  })
+  assert.deepEqual(overrides.tapZones, [-1, 2, 1, 2, 0, 1, 2, 1, 2])
+  assert.equal(overrides.fontSize, 26)
+})
+
+test('fontFamily 超长按 200 截断', () => {
+  const settings = normalizeReaderSettings({ fontFamily: 'A'.repeat(260) })
+  assert.equal(settings.fontFamily.length, 200)
 })
 
 test('menuItems 只保留已知项，全未知时回落默认', () => {
