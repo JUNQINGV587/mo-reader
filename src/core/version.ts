@@ -1,2 +1,2 @@
-export const VERSION = '0.2.0-m0'
+export const VERSION = '0.3.0-m6'
 export const PANEL_ID = 'reader'
