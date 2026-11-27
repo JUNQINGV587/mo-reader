@@ -3443,6 +3443,18 @@ const speechBlockedReason = computed(() =>
   }),
 )
 
+/** 进入阅读页时用一次提示说明朗读为什么不可用，不常驻挡住正文 */
+let speechBlockedNotified = false
+watch([view, readerKind, speechBlockedReason], ([current, kind, reason]) => {
+  if (current !== 'reader') {
+    speechBlockedNotified = false
+    return
+  }
+  if (kind !== 'text' || !reason || speechBlockedNotified) return
+  speechBlockedNotified = true
+  showReaderHint(reason)
+})
+
 /** 阅读页高亮：朗读范围优先，其次搜索命中范围 */
 const readerHighlight = computed(() => speechHighlight.value ?? highlightText.value)
 
@@ -5616,10 +5628,6 @@ onMounted(async () => {
 
         <p v-if="boundaryLoading" class="mo-reader-hint" data-testid="chapter-boundary-loading">
           {{ boundaryDirection > 0 ? '正在加载下一章…' : '正在加载上一章…' }}
-        </p>
-
-        <p v-if="speechStatus === 'idle' && speechBlockedReason" class="mo-reader-hint" data-testid="speech-blocked">
-          {{ speechBlockedReason }}
         </p>
 
         <div
