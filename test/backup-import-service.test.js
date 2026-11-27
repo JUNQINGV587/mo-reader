@@ -253,6 +253,21 @@ test('分块上传乱序、坏字符、超量、缺字节都报可读错误（#1
   )
 })
 
+test('分块上传拒绝超长分块与超过整包上限的文件（#137）', async () => {
+  const service = makeService(makeDb())
+  const started = await service.beginBackupImportUpload({ fileName: 'a.zip', size: 10 * 1024 * 1024 })
+  const oversized = Buffer.alloc(4 * 1024 * 1024 + 1024, 1).toString('base64')
+  await assert.rejects(
+    service.appendBackupImportUpload({ jobId: started.job.id, index: 0, dataBase64: oversized }),
+    /上传分块过大/,
+  )
+  await service.cancelBackupJob({ id: started.job.id })
+  await assert.rejects(
+    service.beginBackupImportUpload({ fileName: 'big.zip', size: 257 * 1024 * 1024 }),
+    /备份文件过大/,
+  )
+})
+
 test('分块上传中取消：作业已取消、临时文件删除、后续分块被拒绝（#137）', async () => {
   const db = makeDb()
   const service = makeService(db)

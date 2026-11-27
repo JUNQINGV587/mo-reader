@@ -44,6 +44,7 @@ import {
   type ThemeColors,
 } from '../../core/reader/theme'
 import { exportFullShelf, exportLegadoShelf } from '../../core/reader/shelf-transfer'
+import { IMPORT_UPLOAD_CHUNK_BYTES } from '../../core/reader/backup-constants'
 import {
   defaultReaderSettings,
   diffReaderSettings,
@@ -1290,7 +1291,7 @@ const backupImportInput = ref<HTMLInputElement | null>(null)
 const backupImportJob = ref<any>(null)
 const backupImportBusy = ref(false)
 const backupImportUploading = ref(false)
-const backupImportCancel = ref(false)
+const backupImportCancelRequested = ref(false)
 const backupImportMessage = ref('')
 const backupImportFile = ref<File | null>(null)
 let backupImportTimer: ReturnType<typeof setInterval> | null = null
@@ -1408,26 +1409,25 @@ function backupImportSettingLabels(job: any) {
   return keys.map((key) => backupImportSettingLabel(key))
 }
 
-/** 单块 4 MB：base64 后约 5.3 MB，远低于 RPC 与内存上限；整包不再一次性读入（#137）。 */
-const BACKUP_IMPORT_CHUNK_BYTES = 4 * 1024 * 1024
-
 async function previewBackupImportFile(file: File) {
   backupImportBusy.value = true
   backupImportUploading.value = false
-  backupImportCancel.value = false
+  backupImportCancelRequested.value = false
   backupImportMessage.value = ''
+  let startedJobId = ''
   try {
     if (!file.size) throw new Error('没有选择备份文件')
     const started: any = await call('beginBackupImportUpload', { fileName: file.name, size: file.size })
     const jobId = String(started?.job?.id ?? '')
+    startedJobId = jobId
     if (!jobId) throw new Error('上传没有开始，请重新选择文件')
     backupImportJob.value = started.job
     backupImportUploading.value = true
     let index = 0
     let sent = 0
     while (sent < file.size) {
-      if (backupImportCancel.value) throw new Error('已取消导入')
-      const slice = file.slice(sent, Math.min(file.size, sent + BACKUP_IMPORT_CHUNK_BYTES))
+      if (backupImportCancelRequested.value) throw new Error('已取消导入')
+      const slice = file.slice(sent, Math.min(file.size, sent + IMPORT_UPLOAD_CHUNK_BYTES))
       const bytes = new Uint8Array(await slice.arrayBuffer())
       const result: any = await call('appendBackupImportUpload', {
         jobId,
@@ -1440,13 +1440,20 @@ async function previewBackupImportFile(file: File) {
       backupImportMessage.value = `正在上传 ${Math.round((sent / file.size) * 100)}%`
     }
     backupImportUploading.value = false
-    if (backupImportCancel.value) throw new Error('已取消导入')
+    if (backupImportCancelRequested.value) throw new Error('已取消导入')
     const finished: any = await call('finishBackupImportUpload', { jobId })
     backupImportJob.value = finished?.job ?? backupImportJob.value
     backupImportMessage.value = '正在校验备份，完成后确认导入'
   } catch (error) {
     backupImportUploading.value = false
-    const cancelled = backupImportCancel.value
+    const cancelled = backupImportCancelRequested.value
+    if (!cancelled && startedJobId) {
+      try {
+        await call('cancelBackupJob', { id: startedJobId })
+      } catch {
+        // 服务端可能已清理，忽略。
+      }
+    }
     if (backupImportJob.value?.id) {
       try {
         await refreshBackupImportJob()
@@ -1502,6 +1509,9 @@ async function refreshBackupImportJob() {
   }
   const current = backupImportJob.value
   if (current?.status === 'failed' && current?.error) backupImportMessage.value = String(current.error)
+  if (current?.status === 'paused' && current?.preview && !backupImportUploading.value) {
+    backupImportMessage.value = '校验完成，确认后开始导入'
+  }
   if (current?.status === 'done') {
     backupImportMessage.value = backupImportResultText(current)
     backupImportJob.value = null
@@ -1560,7 +1570,7 @@ async function cancelBackupImport() {
   }
   // 上传中取消：置标记让分块循环退出，同时通知服务端删除临时文件。
   if (backupImportUploading.value) {
-    backupImportCancel.value = true
+    backupImportCancelRequested.value = true
     backupImportMessage.value = '正在取消上传'
     try {
       await call('cancelBackupJob', { id: job.id })

@@ -10,6 +10,7 @@
 import { randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { IMPORT_UPLOAD_CHUNK_BYTES } from '../core/reader/backup-constants.js'
 import {
   assertImportArchiveSize,
   mergeBackupImport,
@@ -31,8 +32,8 @@ export const BACKUP_IMPORT_TEMP_SUFFIX = '.import.parts'
 export const BACKUP_IMPORT_JOB_TTL_MS = 24 * 60 * 60 * 1000
 const BACKUP_IMPORT_FLUSH_MS = 500
 const UPLOAD_FILE = 'upload.bin'
-/** 分块上传的单块上限（#137）：客户端按它切文件，服务端按它校验，避免整包 base64 进内存。 */
-export const BACKUP_IMPORT_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+/** 分块上传的单块上限（#137）：与客户端共用同一个常量，避免两端漂移。 */
+const BACKUP_IMPORT_UPLOAD_CHUNK_BYTES = IMPORT_UPLOAD_CHUNK_BYTES
 /** 单块 base64 字符数上限，留 3 字节对齐的余量。 */
 const BACKUP_IMPORT_UPLOAD_CHUNK_CHARS = Math.ceil(BACKUP_IMPORT_UPLOAD_CHUNK_BYTES / 3) * 4 + 4
 /** 上传会话闲置多久算中断：只在下一次开始导入时顺手清理，不影响进行中的上传。 */
@@ -48,7 +49,7 @@ export interface BackupImportJob {
   bookId: string
   bookName: string
   status: JobStatus
-  /** 机器可读阶段：receive/inspect/preview/apply/done/failed/cancelled。 */
+  /** 机器可读阶段：upload/receive/inspect/preview/apply/done/failed/cancelled。 */
   stage: string
   stageText: string
   total: number
@@ -78,7 +79,6 @@ interface ImportSession {
 /** 分块上传会话：只保留落盘进度，不持有整包内容（#137）。 */
 interface UploadSession {
   filePath: string
-  fileName: string
   expectedBytes: number
   received: number
   nextIndex: number
@@ -214,6 +214,7 @@ export class BackupImportCoordinator {
     } catch {
       // 清理失败不影响本次导入。
     }
+    await this.dropStaleUploads()
     const job = this.buildJob(input.fileName)
     this.live.set(job.id, job)
     await this.put(job)
@@ -232,6 +233,7 @@ export class BackupImportCoordinator {
     } catch {
       // 清理失败不影响本次导入。
     }
+    await this.dropStaleUploads()
     const job = this.buildJob(input.fileName)
     const tempDir = backupImportTempDir(job.id)
     const target = join(tempDir, UPLOAD_FILE)
@@ -279,7 +281,6 @@ export class BackupImportCoordinator {
     await writeFile(target, Buffer.alloc(0))
     this.uploads.set(job.id, {
       filePath: target,
-      fileName: job.fileName,
       expectedBytes: size,
       received: 0,
       nextIndex: 0,
@@ -294,19 +295,24 @@ export class BackupImportCoordinator {
     const cutoff = Date.now() - BACKUP_IMPORT_UPLOAD_STALE_MS
     for (const [id, job] of [...this.live]) {
       if (job.stage !== 'upload' || !isActiveStatus(job.status) || job.updatedAt >= cutoff) continue
-      this.uploads.delete(id)
-      this.live.delete(id)
-      job.status = 'failed'
-      job.stage = 'failed'
-      job.stageText = '已中断'
-      job.error = '上传中断，请重新选择文件'
-      await rm(backupImportTempDir(id), { recursive: true, force: true }).catch(() => undefined)
-      try {
-        await this.put(job)
-      } catch {
-        // 记账失败不影响新上传。
-      }
+      await this.failUpload(id, job, '上传中断，请重新选择文件', '已中断')
     }
+  }
+
+  /** 上传失败收尾：清会话与半成品，记账失败不抛。 */
+  private async failUpload(jobId: string, job: BackupImportJob, message: string, stageText: string): Promise<void> {
+    this.uploads.delete(jobId)
+    job.status = 'failed'
+    job.stage = 'failed'
+    job.stageText = stageText
+    job.error = message
+    await rm(backupImportTempDir(jobId), { recursive: true, force: true }).catch(() => undefined)
+    try {
+      await this.put(job)
+    } catch {
+      // 失败记账不再抛。
+    }
+    this.live.delete(jobId)
   }
 
   /** 分块上传：按 index 顺序追加，单块受 4 MB 上限约束，总量不得超过声明大小。 */
@@ -347,19 +353,9 @@ export class BackupImportCoordinator {
     const job = this.live.get(jobId) ?? (await this.requireJob(jobId))
     if (job.status === 'cancelled') throw new Error('已取消导入')
     if (upload.received !== upload.expectedBytes) {
-      this.uploads.delete(jobId)
-      job.status = 'failed'
-      job.stage = 'failed'
-      job.stageText = '导入失败'
-      job.error = `备份文件上传不完整（已收到 ${formatUploadSize(upload.received)}，应为 ${formatUploadSize(upload.expectedBytes)}），请重新选择`
-      this.live.delete(jobId)
-      await rm(backupImportTempDir(jobId), { recursive: true, force: true }).catch(() => undefined)
-      try {
-        await this.put(job)
-      } catch {
-        // 失败记账不再抛。
-      }
-      throw new Error(job.error)
+      const message = `备份文件上传不完整（已收到 ${formatUploadSize(upload.received)}，应为 ${formatUploadSize(upload.expectedBytes)}），请重新选择`
+      await this.failUpload(jobId, job, message, '导入失败')
+      throw new Error(message)
     }
     this.uploads.delete(jobId)
     job.bytes = upload.received
