@@ -1,12 +1,21 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { hitTest } from '../../core/reader/hit-test'
-import { paginate } from '../../core/reader/paginate'
+import { createLayoutJob, LayoutCache, layoutCacheKey, type LayoutJob } from '../../core/reader/layout-cache'
+import {
+  isPunctuationChar,
+  paginate,
+  pageIndexForOffset,
+  type PaginateLine,
+  type PaginatePage,
+  type PaginateResult,
+} from '../../core/reader/paginate'
 import { DEFAULT_TAP_ZONES, tapZoneIndex, tipText } from '../../core/reader/reader-config'
 import { isDarkColor, type ThemeColors } from '../../core/reader/theme'
 
 type Theme = 'light' | 'sepia' | 'dark'
 type Turn = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
+type TextAlign = 'left' | 'justify'
 
 const props = withDefaults(
   defineProps<{
@@ -31,7 +40,19 @@ const props = withDefaults(
     bookPercent?: number
     batteryPercent?: number | null
     highlight?: string
-  underlines?: string[]
+    underlines?: string[]
+    /** 字距（px），加在相邻两个字之间 */
+    letterSpacing?: number
+    bold?: boolean
+    /** 0 左对齐、1 居中、2 隐藏、3 右对齐 */
+    titleMode?: number
+    /** 标题字号增量：标题字号 = fontSize + titleSize * 2 */
+    titleSize?: number
+    align?: TextAlign
+    compressPunctuation?: boolean
+    kinsoku?: boolean
+    dualColumn?: boolean
+    inkMode?: boolean
   }>(),
   {
     title: '',
@@ -55,23 +76,27 @@ const props = withDefaults(
     batteryPercent: null,
     highlight: '',
     underlines: () => [],
+    letterSpacing: 0,
+    bold: false,
+    titleMode: 0,
+    titleSize: 0,
+    align: 'left',
+    compressPunctuation: false,
+    kinsoku: false,
+    dualColumn: false,
+    inkMode: false,
   },
 )
 
 /** 长按选中的结果：正文文本 + 画布/视口坐标，供查词面板使用。 */
 interface ReaderSelection {
-  /** 选中的词；定位不到词时是整行回退文本。 */
   text: string
-  /** 选中所在行的文本（已去掉首尾空白）。 */
   line: string
-  /** true 表示没有定位到词，text 是整行回退。 */
   fallback: boolean
   lineIndex: number
   charIndex: number
-  /** 画布内的 CSS 坐标（左上角为 0）。 */
   x: number
   y: number
-  /** 视口坐标，浮层定位用。 */
   clientX: number
   clientY: number
 }
@@ -83,9 +108,11 @@ const emit = defineEmits<{
 }>()
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
-const pages = ref<string[][]>([['']])
+const result = ref<PaginateResult | null>(null)
 const page = ref(0)
-const total = computed(() => pages.value.length)
+const total = computed(() => result.value?.layout.length ?? 1)
+const loading = ref(false)
+const anchorOffset = ref(-1)
 
 let ctx: CanvasRenderingContext2D | null = null
 let observer: ResizeObserver | null = null
@@ -94,7 +121,13 @@ let width = 0
 let height = 0
 let animating = false
 
-/** 长按判定：按住 500ms、位移不超过 10px。 */
+const layoutCache = new LayoutCache<PaginateResult>(6)
+let layoutJob: LayoutJob<PaginateResult> | null = null
+let layoutToken = 0
+let layoutFrame = 0
+let settingsTimer = 0
+const SETTINGS_DEBOUNCE_MS = 120
+
 const LONG_PRESS_MS = 500
 const LONG_PRESS_TOLERANCE = 10
 
@@ -108,13 +141,17 @@ interface PressState {
 }
 
 let press: PressState | null = null
-/** 长按已经触发时，吞掉随后的合成 click，避免误翻页/弹菜单。 */
 let swallowClick = false
 
 const SERIF = "'Noto Serif SC', 'Songti SC', 'Noto Sans SC', serif"
 const ACCENT = '#3d6b53'
 
-const palette = computed(() => {
+const effectiveAnimation = computed<Turn>(() => (props.inkMode ? 'none' : props.animation))
+
+const palette = computed<ThemeColors>(() => {
+  if (props.inkMode) {
+    return { bg: '#ffffff', text: '#000000', muted: '#3f3f3f', line: 'rgba(0,0,0,0.45)' }
+  }
   if (props.themeColors) return props.themeColors
   if (props.theme === 'dark') {
     return { bg: '#141518', text: '#d8d4c8', muted: '#8f897b', line: 'rgba(255,255,255,0.14)' }
@@ -125,28 +162,95 @@ const palette = computed(() => {
   return { bg: '#f6f1e7', text: '#2b2a26', muted: '#7c7567', line: 'rgba(43,42,38,0.14)' }
 })
 
-const fontStack = computed(() => props.fontFamily ? `'${props.fontFamily.replace(/'/g, '')}', ${SERIF}` : SERIF)
+const dualHint = computed(() => {
+  if (!props.dualColumn) return ''
+  const reason = result.value?.dualColumnDisabledReason
+  if (reason === 'narrow') return '屏幕太窄，已改为单栏'
+  if (reason === 'scroll') return '滚动模式只支持单栏'
+  return ''
+})
+
+const fontStack = computed(() => (props.fontFamily ? `'${props.fontFamily.replace(/'/g, '')}', ${SERIF}` : SERIF))
 const darkTheme = computed(() =>
-  props.themeColors ? isDarkColor(props.themeColors.bg) : props.theme === 'dark',
+  props.inkMode ? false : props.themeColors ? isDarkColor(props.themeColors.bg) : props.theme === 'dark',
 )
 
-function measureFont() {
-  return `${props.fontSize}px ${fontStack.value}`
+function bodyFont(): string {
+  return `${props.bold ? 'bold ' : ''}${props.fontSize}px ${fontStack.value}`
 }
 
-function lineHeightPx() {
+function titleFontSize(): number {
+  return props.fontSize + Math.max(0, props.titleSize) * 2
+}
+
+function titleFont(): string {
+  return `${props.bold ? 'bold ' : ''}${titleFontSize()}px ${fontStack.value}`
+}
+
+function lineHeightPx(): number {
   return props.fontSize * props.lineHeight
 }
 
-function headerHeight() {
+function titleLineHeight(): number {
+  return lineHeightPx() * (titleFontSize() / props.fontSize)
+}
+
+function headerHeight(): number {
   return props.headerMode === 0 && !props.showHeaderLine ? 18 : 48
 }
 
-function footerHeight() {
+function footerHeight(): number {
   return props.footerMode === 0 && !props.showFooterLine ? 18 : 44
 }
 
-function layout() {
+/** 正文可用区域：页眉页脚横跨全宽，正文左右留白也在这里扣掉。 */
+function contentBox() {
+  const pad = props.padding
+  return {
+    left: pad.left,
+    top: headerHeight() + pad.top,
+    width: Math.max(80, width - pad.left - pad.right),
+    height: Math.max(1, height - headerHeight() - footerHeight() - pad.top - pad.bottom),
+  }
+}
+
+function layoutSettings() {
+  return {
+    fontSize: props.fontSize,
+    fontFamily: props.fontFamily,
+    lineHeight: props.lineHeight,
+    paragraphSpacing: props.paragraphSpacing,
+    indent: props.indent,
+    padding: props.padding,
+    letterSpacing: props.letterSpacing,
+    bold: props.bold,
+    title: props.title,
+    titleMode: props.titleMode,
+    titleSize: props.titleSize,
+    align: props.align,
+    compressPunctuation: props.compressPunctuation,
+    kinsoku: props.kinsoku,
+    dualColumn: props.dualColumn,
+    animation: effectiveAnimation.value,
+  }
+}
+
+function applyLayout(next: PaginateResult, keepOffset: boolean) {
+  const previousAnchor = anchorOffset.value
+  const lastPage = Math.max(0, next.layout.length - 1)
+  result.value = next
+  if (keepOffset && previousAnchor >= 0) {
+    page.value = Math.min(lastPage, pageIndexForOffset(next.layout, previousAnchor))
+  } else if (!keepOffset) {
+    page.value = Math.min(Math.max(0, props.initialPage), lastPage)
+  } else {
+    page.value = Math.min(page.value, lastPage)
+  }
+  syncAnchor()
+  render()
+}
+
+function layout(keepOffset = true) {
   const canvas = canvasRef.value
   const host = canvas?.parentElement
   if (!canvas || !host || !ctx) return
@@ -161,21 +265,85 @@ function layout() {
   canvas.style.width = `${rect.width}px`
   canvas.style.height = `${rect.height}px`
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-  ctx.font = measureFont()
+  ctx.font = bodyFont()
 
-  const pad = props.padding
-  const result = paginate(props.text, {
-    width: rect.width - pad.left - pad.right,
-    height: rect.height - headerHeight() - footerHeight() - pad.top - pad.bottom,
-    fontSize: props.fontSize,
-    lineHeight: lineHeightPx(),
-    indent: props.indent !== 0,
-    paragraphSpacing: props.paragraphSpacing,
-    measure: (value) => ctx?.measureText(value).width ?? 0,
+  const box = contentBox()
+  const key = layoutCacheKey({
+    text: props.text,
+    settings: layoutSettings(),
+    viewport: { width: box.width, height: box.height },
   })
-  pages.value = result.pages
-  page.value = Math.min(page.value, result.pages.length - 1)
-  render()
+
+  layoutToken += 1
+  const token = layoutToken
+  layoutJob?.cancel()
+  layoutJob = null
+  cancelAnimationFrame(layoutFrame)
+
+  const cached = layoutCache.get(key)
+  if (cached) {
+    loading.value = false
+    applyLayout(cached, keepOffset)
+    return
+  }
+
+  // 大章节先让加载态画出来，再排版
+  loading.value = props.text.length > 15000
+  const startLayout = () => {
+    if (token !== layoutToken) return
+    const job = createLayoutJob(() =>
+      paginate(props.text, {
+        width: box.width,
+        height: box.height,
+        fontSize: props.fontSize,
+        lineHeight: lineHeightPx(),
+        padding: 0,
+        headerHeight: 0,
+        footerHeight: 0,
+        indent: props.indent !== 0,
+        paragraphSpacing: props.paragraphSpacing,
+        letterSpacing: props.letterSpacing,
+        title: props.title,
+        titleMode: props.titleMode,
+        titleSize: props.titleSize,
+        align: props.align,
+        compressPunctuation: props.compressPunctuation,
+        kinsoku: props.kinsoku,
+        dualColumn: props.dualColumn,
+        scrollMode: effectiveAnimation.value === 'scroll',
+        measure: (value) => {
+          if (!ctx) return 0
+          ctx.font = bodyFont()
+          return ctx.measureText(value).width
+        },
+        measureTitle: (value) => {
+          if (!ctx) return 0
+          ctx.font = titleFont()
+          return ctx.measureText(value).width
+        },
+      }),
+    )
+    layoutJob = job
+    job.promise
+      .then((next) => {
+        if (token !== layoutToken) return
+        layoutCache.set(key, next)
+        applyLayout(next, keepOffset)
+      })
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.name === 'LayoutCancelledError') return
+        console.error('[reader] 排版失败', error)
+      })
+      .finally(() => {
+        if (token === layoutToken) loading.value = false
+      })
+  }
+  if (loading.value) {
+    // 先让「排版中…」画一帧，再跑同步排版
+    layoutFrame = requestAnimationFrame(startLayout)
+  } else {
+    startLayout()
+  }
 }
 
 function fillBackground() {
@@ -191,11 +359,79 @@ function tipContext() {
     bookName: props.bookName,
     chapterTitle: props.title,
     page: page.value + 1,
-    totalPages: pages.value.length,
+    totalPages: total.value,
     bookPercent: props.bookPercent,
     batteryPercent: props.batteryPercent ?? undefined,
     time: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
   }
+}
+
+let widthCacheFont = ''
+const widthCache = new Map<string, number>()
+
+function charWidth(char: string): number {
+  const font = ctx?.font ?? ''
+  if (font !== widthCacheFont) {
+    widthCacheFont = font
+    widthCache.clear()
+  }
+  const cached = widthCache.get(char)
+  if (cached !== undefined) return cached
+  const value = ctx?.measureText(char).width ?? 0
+  widthCache.set(char, value)
+  return value
+}
+
+/** 相邻字符之间额外的距离：字距、标点压缩、两端对齐补白。 */
+function gapBefore(line: PaginateLine, index: number, previous: string, char: string): number {
+  if (index === 0) return 0
+  let gap = props.letterSpacing
+  if (props.compressPunctuation && isPunctuationChar(previous) && isPunctuationChar(char)) {
+    gap -= props.fontSize * 0.5
+  }
+  if (line.justifyPx > 0 && index > line.indentChars) gap += line.justifyPx
+  return gap
+}
+
+/** 画一行（逐字画，才能带上字距、压缩与对齐）；返回行宽。 */
+function drawLine(line: PaginateLine, left: number, top: number): number {
+  if (!ctx || !line.text) return 0
+  const chars = Array.from(line.text)
+  let x = left
+  let previous = ''
+  for (let index = 0; index < chars.length; index += 1) {
+    x += gapBefore(line, index, previous, chars[index])
+    ctx.fillText(chars[index], x, top)
+    x += charWidth(chars[index])
+    previous = chars[index]
+  }
+  return x - left
+}
+
+/** 行内前 count 个字符的宽度（含字距、压缩、对齐补白）。 */
+function prefixWidth(line: PaginateLine, count: number): number {
+  const chars = Array.from(line.text)
+  let width = 0
+  let previous = ''
+  for (let index = 0; index < count && index < chars.length; index += 1) {
+    width += gapBefore(line, index, previous, chars[index])
+    width += charWidth(chars[index])
+    previous = chars[index]
+  }
+  return width
+}
+
+function pageLinesOf(pageData: PaginatePage): PaginateLine[] {
+  return [...pageData.titleLines, ...pageData.columns.flatMap((column) => column.lines)]
+}
+
+function highlightRange(): { start: number; end: number } | null {
+  const quote = props.highlight?.trim()
+  if (!quote) return null
+  const haystack = result.value?.text ?? props.text.replace(/\r\n?/g, '\n')
+  const index = haystack.indexOf(quote)
+  if (index < 0) return null
+  return { start: index, end: index + quote.length }
 }
 
 function render() {
@@ -208,7 +444,7 @@ function render() {
   const headerText = tipText(props.headerMode, tipContext())
   const footerText = tipText(props.footerMode, tipContext())
 
-  // 页眉
+  // 页眉横跨全宽
   if (headerText) {
     ctx.fillStyle = muted
     ctx.font = `${Math.max(11, props.fontSize - 9)}px ${fontStack.value}`
@@ -225,63 +461,97 @@ function render() {
     ctx.stroke()
   }
 
-  // 正文
-  ctx.textAlign = 'left'
-  ctx.textBaseline = 'top'
-  ctx.font = measureFont()
-  const lines = pages.value[page.value] ?? []
-  const baseY = 44 + pad.top + 8
+  const pageData = result.value?.layout[page.value]
+  if (!pageData) {
+    emit('page', { page: page.value, total: total.value })
+    return
+  }
+  const box = contentBox()
+  const titleHeight = pageData.titleLines.length * titleLineHeight()
+  const dualTitle = (result.value?.columnCount ?? 1) === 2 && pageData.titleLines.length > 0
+  const highlight = highlightRange()
 
-  // 朗读高亮：在当前页里按字符区间画底色
-  if (props.highlight) {
-    const pageText = lines.join('\n')
-    const index = pageText.indexOf(props.highlight)
-    if (index >= 0) {
-      ctx.save()
-      ctx.fillStyle = darkTheme.value ? 'rgba(214,193,148,0.24)' : 'rgba(61,107,83,0.18)'
-      let offset = 0
-      lines.forEach((line, lineIndex) => {
-        const start = offset
-        const end = offset + line.length
-        offset = end + 1
-        const from = Math.max(index, start)
-        const to = Math.min(index + (props.highlight ?? '').length, end)
-        if (to > from && line) {
-          const before = line.slice(0, from - start)
-          const hit = line.slice(from - start, to - start)
-          const x1 = ctx!.measureText(before).width
-          const x2 = x1 + ctx!.measureText(hit).width
-          ctx!.fillRect(pad.left + x1, baseY + lineIndex * lineHeight - 2, x2 - x1, lineHeight - 2)
-        }
-      })
-      ctx.restore()
+  // 标题：单栏跨全宽，双栏只占第一栏顶部；按左/中/右对齐
+  if (pageData.titleLines.length > 0) {
+    ctx.font = titleFont()
+    ctx.textAlign = 'left'
+    ctx.textBaseline = 'top'
+    ctx.fillStyle = color
+    const titleWidth = dualTitle ? pageData.columns[0]?.width ?? box.width : box.width
+    for (const titleLine of pageData.titleLines) {
+      const align = result.value?.titleAlign ?? 'left'
+      const lineWidth = prefixWidth(titleLine, Array.from(titleLine.text).length)
+      const left =
+        align === 'center'
+          ? box.left + Math.max(0, (titleWidth - lineWidth) / 2)
+          : align === 'right'
+            ? box.left + Math.max(0, titleWidth - lineWidth)
+            : box.left
+      drawLine(titleLine, left, box.top + titleLine.top)
     }
   }
 
-  ctx.fillStyle = color
-  lines.forEach((value, lineIndex) => {
-    if (value) ctx!.fillText(value, pad.left, baseY + lineIndex * lineHeight)
-  })
+  ctx.font = bodyFont()
+  ctx.textAlign = 'left'
+  ctx.textBaseline = 'top'
 
-  // 划线：按行文本匹配
-  if (props.underlines?.length) {
+  for (let columnIndex = 0; columnIndex < pageData.columns.length; columnIndex += 1) {
+    const column = pageData.columns[columnIndex]
+    if (column.lines.length === 0) continue
+    const left = box.left + column.x
+    const topOffset = columnIndex === 0 ? titleHeight : 0
+    const top = box.top + topOffset
     ctx.save()
-    ctx.strokeStyle = darkTheme.value ? 'rgba(214,193,148,0.55)' : 'rgba(61,107,83,0.45)'
-    ctx.lineWidth = 2
-    lines.forEach((value, lineIndex) => {
-      if (!value) return
-      if (!props.underlines!.some((quote) => quote && value.includes(quote))) return
-      const textWidth = ctx!.measureText(value).width
-      const y = baseY + lineIndex * lineHeight + lineHeight - 5
-      ctx!.beginPath()
-      ctx!.moveTo(pad.left, y)
-      ctx!.lineTo(pad.left + textWidth, y)
-      ctx!.stroke()
-    })
+    ctx.beginPath()
+    ctx.rect(left - props.fontSize, top - 2, column.width + props.fontSize * 2, box.height - topOffset + props.fontSize)
+    ctx.clip()
+
+    for (const bodyLine of column.lines) {
+      const lineTop = top + bodyLine.top
+      if (highlight && bodyLine.start >= 0) {
+        const from = Math.max(highlight.start, bodyLine.start)
+        const to = Math.min(highlight.end, bodyLine.end)
+        if (to > from) {
+          const startIndex = bodyLine.indentChars + (from - bodyLine.start)
+          const endIndex = bodyLine.indentChars + (to - bodyLine.start)
+          const x1 = prefixWidth(bodyLine, startIndex)
+          const x2 = prefixWidth(bodyLine, endIndex)
+          ctx.save()
+          ctx.fillStyle = props.inkMode
+            ? 'rgba(0,0,0,0.12)'
+            : darkTheme.value
+              ? 'rgba(214,193,148,0.24)'
+              : 'rgba(61,107,83,0.18)'
+          ctx.fillRect(left + x1, lineTop - 2, x2 - x1, lineHeight - 2)
+          ctx.restore()
+        }
+      }
+      ctx.fillStyle = color
+      if (bodyLine.text) drawLine(bodyLine, left, lineTop)
+
+      if (props.underlines?.length && bodyLine.text) {
+        if (props.underlines.some((quote) => quote && bodyLine.text.includes(quote))) {
+          const textWidth = prefixWidth(bodyLine, Array.from(bodyLine.text).length)
+          ctx.save()
+          ctx.strokeStyle = props.inkMode
+            ? 'rgba(0,0,0,0.55)'
+            : darkTheme.value
+              ? 'rgba(214,193,148,0.55)'
+              : 'rgba(61,107,83,0.45)'
+          ctx.lineWidth = 2
+          const underlineY = lineTop + lineHeight - 5
+          ctx.beginPath()
+          ctx.moveTo(left, underlineY)
+          ctx.lineTo(left + textWidth, underlineY)
+          ctx.stroke()
+          ctx.restore()
+        }
+      }
+    }
     ctx.restore()
   }
 
-  // 页脚
+  // 页脚横跨全宽
   if (footerText) {
     ctx.fillStyle = muted
     ctx.font = `${Math.max(10, props.fontSize - 10)}px ${fontStack.value}`
@@ -292,12 +562,30 @@ function render() {
   if (props.showFooterLine) {
     ctx.fillStyle = line
     ctx.fillRect(pad.left, height - 12 - pad.bottom, width - pad.left - pad.right, 1)
-    const ratio = pages.value.length <= 1 ? 1 : (page.value + 1) / pages.value.length
-    ctx.fillStyle = ACCENT
+    const ratio = total.value <= 1 ? 1 : (page.value + 1) / total.value
+    ctx.fillStyle = props.inkMode ? color : ACCENT
     ctx.fillRect(pad.left, height - 12 - pad.bottom, (width - pad.left - pad.right) * ratio, 1)
   }
 
-  emit('page', { page: page.value, total: pages.value.length })
+  emit('page', { page: page.value, total: total.value })
+}
+
+function pageAnchor(): number {
+  const layoutPages = result.value?.layout ?? []
+  const current = layoutPages[page.value]
+  if (!current) return -1
+  if (current.start >= 0) return current.start
+  for (let index = page.value + 1; index < layoutPages.length; index += 1) {
+    if (layoutPages[index].start >= 0) return layoutPages[index].start
+  }
+  for (let index = page.value - 1; index >= 0; index -= 1) {
+    if (layoutPages[index].end >= 0) return layoutPages[index].end
+  }
+  return -1
+}
+
+function syncAnchor() {
+  anchorOffset.value = pageAnchor()
 }
 
 function snapshot(): HTMLCanvasElement | null {
@@ -381,10 +669,11 @@ function animate(mode: Turn, direction: 1 | -1, before: HTMLCanvasElement, after
 function turn(direction: 1 | -1) {
   if (animating) return
   const nextPage = page.value + direction
-  if (nextPage < 0 || nextPage >= pages.value.length) return
+  if (nextPage < 0 || nextPage >= total.value) return
 
-  if (props.animation === 'none' || !canvasRef.value) {
+  if (effectiveAnimation.value === 'none' || !canvasRef.value) {
     page.value = nextPage
+    syncAnchor()
     render()
     return
   }
@@ -392,11 +681,12 @@ function turn(direction: 1 | -1) {
   const before = snapshot()
   if (!before) return
   page.value = nextPage
+  syncAnchor()
   render()
   const after = snapshot()
   if (!after) return
   animating = true
-  animate(props.animation, direction, before, after)
+  animate(effectiveAnimation.value, direction, before, after)
 }
 
 function next() {
@@ -422,37 +712,55 @@ function onCanvasClick(event: MouseEvent) {
   emit('tapAction', zones[index] ?? 0)
 }
 
-/** 长按落点换算成词；拿不到可读文本返回 null。 */
+/** 点按落点换算成词；双栏时先定位到栏，再在该行里选词。 */
 function selectionAt(clientX: number, clientY: number): ReaderSelection | null {
   const canvas = canvasRef.value
-  if (!canvas || !ctx) return null
+  const pageData = result.value?.layout[page.value]
+  if (!canvas || !ctx || !pageData) return null
   const rect = canvas.getBoundingClientRect()
   if (!rect.width || !rect.height) return null
-  const pad = props.padding
-  // render 末尾可能把 ctx.font 切到页脚字体，测量前必须恢复正文字体。
-  ctx.font = measureFont()
-  const hit = hitTest(
-    pages.value[page.value] ?? [],
-    { x: clientX - rect.left, y: clientY - rect.top },
-    {
-      left: pad.left,
-      top: 44 + pad.top + 8,
-      lineHeight: lineHeightPx(),
-      measure: (value) => ctx?.measureText(value).width ?? 0,
-    },
-  )
-  if (!hit || !hit.word) return null
-  return {
-    text: hit.word,
-    line: hit.line.trim(),
-    fallback: hit.fallback,
-    lineIndex: hit.lineIndex,
-    charIndex: hit.charIndex,
-    x: clientX - rect.left,
-    y: clientY - rect.top,
-    clientX,
-    clientY,
+  const box = contentBox()
+  const x = clientX - rect.left
+  const y = clientY - rect.top
+  const titleHeight = pageData.titleLines.length * titleLineHeight()
+  if (y < box.top || y > box.top + box.height) return null
+
+  for (let columnIndex = 0; columnIndex < pageData.columns.length; columnIndex += 1) {
+    const column = pageData.columns[columnIndex]
+    const columnLeft = box.left + column.x
+    if (x < columnLeft - props.fontSize || x > columnLeft + column.width + props.fontSize) continue
+    const columnTop = box.top + (columnIndex === 0 ? titleHeight : 0)
+    for (const line of column.lines) {
+      if (!line.text) continue
+      const lineTop = columnTop + line.top
+      if (y < lineTop || y > lineTop + lineHeightPx()) continue
+      ctx.font = bodyFont()
+      const measure = (value: string) => {
+        const chars = Array.from(value).length
+        return ctx!.measureText(value).width + props.letterSpacing * Math.max(0, chars - 1)
+      }
+      const hit = hitTest([line.text], { x: x - columnLeft, y: 0 }, {
+        left: 0,
+        top: 0,
+        lineHeight: lineHeightPx(),
+        measure,
+      })
+      if (!hit || !hit.word) return null
+      const flat = pageLinesOf(pageData)
+      return {
+        text: hit.word,
+        line: hit.line.trim(),
+        fallback: hit.fallback,
+        lineIndex: Math.max(0, flat.indexOf(line)),
+        charIndex: hit.charIndex,
+        x,
+        y,
+        clientX,
+        clientY,
+      }
+    }
   }
+  return null
 }
 
 function clearPress() {
@@ -464,7 +772,6 @@ function finishLongPress() {
   const active = press
   if (!active) return
   clearPress()
-  // 长按即使没命中文字也不翻页；命中时把选中的词抛给查词面板。
   swallowClick = true
   const selection = selectionAt(active.x, active.y)
   if (selection) emit('select', selection)
@@ -501,7 +808,6 @@ function onWindowPointerEnd(event: PointerEvent) {
 }
 
 function onCanvasContextMenu(event: MouseEvent) {
-  // 长按/右键都不弹浏览器菜单，避免打断选词。
   event.preventDefault()
 }
 
@@ -521,12 +827,10 @@ onMounted(() => {
   const canvas = canvasRef.value
   if (!canvas) return
   ctx = canvas.getContext('2d')
-  layout()
-  if (props.initialPage > 0) {
-    page.value = Math.min(props.initialPage, Math.max(0, pages.value.length - 1))
-    layout()
-  }
-  observer = new ResizeObserver(() => layout())
+  anchorOffset.value = -1
+  page.value = Math.max(0, props.initialPage)
+  layout(false)
+  observer = new ResizeObserver(() => layout(true))
   if (canvas.parentElement) observer.observe(canvas.parentElement)
   window.addEventListener('keydown', onKey)
   window.addEventListener('pointermove', onWindowPointerMove)
@@ -536,6 +840,9 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   observer?.disconnect()
+  layoutJob?.cancel()
+  cancelAnimationFrame(layoutFrame)
+  window.clearTimeout(settingsTimer)
   clearPress()
   window.removeEventListener('keydown', onKey)
   window.removeEventListener('pointermove', onWindowPointerMove)
@@ -546,19 +853,20 @@ onBeforeUnmount(() => {
 watch(
   () => props.text,
   () => {
-    page.value = Math.min(props.initialPage, Math.max(0, pages.value.length - 1))
-    layout()
+    window.clearTimeout(settingsTimer)
+    anchorOffset.value = -1
+    page.value = Math.max(0, props.initialPage)
+    layout(false)
   },
 )
 
 watch(
   () => props.initialPage,
   (value) => {
-    const target = Math.min(value, Math.max(0, pages.value.length - 1))
-    if (target !== page.value) {
-      page.value = target
-      layout()
-    }
+    window.clearTimeout(settingsTimer)
+    anchorOffset.value = -1
+    page.value = Math.max(0, value)
+    layout(false)
   },
 )
 
@@ -571,15 +879,33 @@ watch(
     props.lineHeight,
     props.paragraphSpacing,
     props.indent,
-    props.theme,
-    props.themeColors,
+    props.padding,
+    props.letterSpacing,
+    props.bold,
+    props.titleMode,
+    props.titleSize,
+    props.align,
+    props.compressPunctuation,
+    props.kinsoku,
+    props.dualColumn,
+    props.animation,
+    props.inkMode,
     props.headerMode,
     props.footerMode,
     props.showHeaderLine,
     props.showFooterLine,
-    props.padding,
   ],
-  () => layout(),
+  () => {
+    // 滑杆连续输入时合帧：120ms 内只重排最后一步，且按字符偏移留在原处
+    window.clearTimeout(settingsTimer)
+    settingsTimer = window.setTimeout(() => layout(true), SETTINGS_DEBOUNCE_MS)
+  },
+  { deep: true },
+)
+
+watch(
+  () => [props.theme, props.themeColors],
+  () => render(),
   { deep: true },
 )
 
@@ -590,13 +916,14 @@ function goto(target: number) {
     return
   }
   page.value = nextPage
+  syncAnchor()
   render()
-  emit('page', { page: nextPage, total: total.value })
 }
 
 function findPageFor(text: string): number {
   if (!text) return -1
-  return pages.value.findIndex((lines) => lines.join('\n').includes(text))
+  const layoutPages = result.value?.layout ?? []
+  return layoutPages.findIndex((pageData) => pageLinesOf(pageData).map((line) => line.text).join('\n').includes(text))
 }
 
 watch(
@@ -611,7 +938,9 @@ watch(
 )
 
 function currentPageLines() {
-  return (pages.value[page.value] ?? []).filter(Boolean)
+  const pageData = result.value?.layout[page.value]
+  if (!pageData) return []
+  return pageLinesOf(pageData).map((line) => line.text).filter(Boolean)
 }
 
 defineExpose({ next, prev, total, page, goto, findPageFor, currentPageLines })
@@ -626,6 +955,21 @@ defineExpose({ next, prev, total, page, goto, findPageFor, currentPageLines })
       @pointerdown="onCanvasPointerDown"
       @contextmenu="onCanvasContextMenu"
     />
+    <div
+      v-if="loading"
+      class="mo-reader-loading"
+      data-testid="reader-loading"
+      :style="{ color: palette.muted, background: palette.bg }"
+    >
+      排版中…
+    </div>
+    <div
+      v-if="dualHint"
+      class="mo-reader-hint"
+      :style="{ color: palette.muted, borderColor: palette.line, background: palette.bg }"
+    >
+      {{ dualHint }}
+    </div>
   </div>
 </template>
 
@@ -645,5 +989,28 @@ defineExpose({ next, prev, total, page, goto, findPageFor, currentPageLines })
   -webkit-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;
+}
+.mo-reader-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  opacity: 0.8;
+}
+.mo-reader-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 64px;
+  transform: translateX(-50%);
+  padding: 2px 10px;
+  border: 1px solid;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+  opacity: 0.85;
+  pointer-events: none;
 }
 </style>

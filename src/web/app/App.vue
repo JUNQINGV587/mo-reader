@@ -4809,6 +4809,15 @@ onMounted(async () => {
             :font-family="activeFontFamily"
             :line-height="settings.lineSpacing"
             :paragraph-spacing="settings.paragraphSpacing"
+            :letter-spacing="settings.letterSpacing"
+            :bold="settings.bold"
+            :title-mode="settings.titleMode"
+            :title-size="settings.titleSize"
+            :align="settings.align"
+            :compress-punctuation="settings.compressPunctuation"
+            :kinsoku="settings.kinsoku"
+            :dual-column="settings.dualColumn"
+            :ink-mode="settings.inkMode"
             :indent="settings.indent"
             :padding="settings.padding"
             :initial-page="initialPage"
@@ -5280,6 +5289,9 @@ onMounted(async () => {
                 </div>
                 <label class="mo-switch"><input v-model="settings.dualColumn" type="checkbox" @change="persistSettings" />双栏</label>
                 <label class="mo-switch"><input v-model="settings.inkMode" type="checkbox" @change="persistSettings" />墨水屏</label>
+                <p class="muted" style="font-size: 12px; line-height: 1.6; margin: 4px 0 0">
+                  双栏在屏幕可用宽度不足 480px 时自动改单栏，滚动翻页只支持单栏。墨水屏下自动关掉翻页动画，退出后恢复原来的选择。
+                </p>
               </details>
               
               <details class="mo-settings-group">
