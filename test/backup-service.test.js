@@ -108,6 +108,10 @@ async function makeService(overrides = {}) {
         replaceRules: [{ id: 'rule-1', pattern: 'a', replacement: 'b', regex: false, enabled: true }],
         fontSize: 30,
         unknownSetting: 'keep',
+        webdavUrl: 'https://dav.example/dav/墨读/',
+        webdavUsername: 'nas-user',
+        webdavPassword: 'nas-secret-should-not-export',
+        webdavAllowPrivate: true,
       }),
       set: async () => undefined,
     },
@@ -198,6 +202,12 @@ test('整包备份：zip 含 manifest 与全部数据文件、封面按约定命
   const settings = JSON.parse(await zip.file('settings.json').async('string'))
   assert.equal(settings[0].unknownSetting, 'keep')
   assert.equal(settings[0].fontSize, 30)
+  // WebDAV 凭据脱敏：密码不进备份包，地址/账号/私网开关保留便于恢复后重填。
+  assert.equal('webdavPassword' in settings[0], false)
+  assert.equal(JSON.stringify(settings).includes('nas-secret-should-not-export'), false)
+  assert.equal(settings[0].webdavUrl, 'https://dav.example/dav/墨读/')
+  assert.equal(settings[0].webdavUsername, 'nas-user')
+  assert.equal(settings[0].webdavAllowPrivate, true)
   const themes = JSON.parse(await zip.file('themeConfig.json').async('string'))
   assert.equal(themes[0].theme, 'dark')
   assert.equal(themes[0].customThemes[0].name, '夜读')

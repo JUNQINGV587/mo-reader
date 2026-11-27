@@ -105,6 +105,17 @@ import {
 } from './backup.js'
 import { BACKUP_TOKEN_TTL_MS } from '../core/reader/backup.js'
 import {
+  WEBDAV_PASSWORD_MAX,
+  WEBDAV_SETTING_KEYS,
+  isPrivateWebdavHost,
+  normalizeWebdavConfig,
+  parseWebdavAddress,
+  publicWebdavConfig,
+  withoutWebdavSettings,
+  type WebdavConfig,
+} from '../core/webdav/config.js'
+import { WebdavClient, type WebdavFetch } from '../core/webdav/client.js'
+import {
   EXPORT_KIND,
   ExportCoordinator,
   cleanupExpiredExports,
@@ -217,6 +228,23 @@ function stringArg(args: Args, name: string): string {
   return value.trim()
 }
 
+/**
+ * 连接测试的配置草稿：按「字段是否出现」区分「没改」与「改成空」。
+ * 密码草稿是空串时沿用已存密码——页面拿不到原密码，只能这样保留。
+ */
+function webdavDraftFromArgs(args: Args | undefined, stored: WebdavConfig): WebdavConfig {
+  if (!args || typeof args !== 'object') return stored
+  const has = (name: string) => Object.prototype.hasOwnProperty.call(args, name)
+  return {
+    url: has('url') && typeof args.url === 'string' ? args.url.trim() : stored.url,
+    username: has('username') && typeof args.username === 'string' ? args.username.trim() : stored.username,
+    password: has('password') && typeof args.password === 'string' && args.password !== ''
+      ? args.password
+      : stored.password,
+    allowPrivate: typeof args.allowPrivate === 'boolean' ? args.allowPrivate : stored.allowPrivate,
+  }
+}
+
 const SAFE_KEY = /^[a-z][a-z0-9_-]+$/
 
 function sameRequest(a: RequestSpec, b: RequestSpec): boolean {
@@ -321,6 +349,12 @@ export class ReaderService extends TypertRemoteService {
   mediaStreamOpener: ((url: string, options: MediaStreamOptions) => Promise<MediaStreamResult>) | null = null
 
   downloadRetryBaseMs = DEFAULT_RETRY_BASE_MS
+
+  /** WebDAV 请求实现（#131），默认用 Node 内置 fetch；测试注入假实现即可不联网。 */
+  webdavFetch: WebdavFetch | null = null
+
+  /** WebDAV 连通测试超时（毫秒）。 */
+  webdavTimeoutMs = 15000
 
   /** 配额读改串行：并发章节发布会同时触发淘汰，排队执行避免重复删同一本书。 */
   storageLock: Promise<unknown> | null = null
@@ -1488,7 +1522,7 @@ export class ReaderService extends TypertRemoteService {
     // 与 saveSettings 同样整条合并：只改配额，别的设置原样保留。
     const next = { ...db.settings.get(), mediaQuotaBytes: raw }
     await db.settings.set(next)
-    return { settings: next }
+    return { settings: withoutWebdavSettings(next) }
   }
 
   /** 按书清理文字与媒体缓存：取消该书活动作业并等在途收尾，索引与占用同步更新。 */
@@ -1708,6 +1742,72 @@ export class ReaderService extends TypertRemoteService {
   async cancelBackupJob(args: Args) {
     const id = stringArg(args, 'id')
     return this.backupManager().cancel(id)
+  }
+
+  /** 读 WebDAV 配置（#131）：密码只回「是否已设置」，原值永不出服务端。 */
+  async getWebdavConfig() {
+    const db = this.requireDb()
+    const config = normalizeWebdavConfig(db.settings.get())
+    return { config: publicWebdavConfig(config), configured: config.url.length > 0 }
+  }
+
+  /**
+   * 保存 WebDAV 配置：url/username 传空串表示清空，password 传空串表示「不改」，
+   * allowPrivate 缺省沿用旧值；clear=true 一键清空（地址、账号、密码、私网开关一起复位）。
+   * 地址先校验再落库，坏地址不会把设置写坏。
+   */
+  async saveWebdavConfig(args: Args) {
+    const db = this.requireDb()
+    const current = normalizeWebdavConfig(db.settings.get())
+    if (args?.clear === true) {
+      const cleared: WebdavConfig = { url: '', username: '', password: '', allowPrivate: false }
+      await this.writeWebdavConfig(db, cleared)
+      return { config: publicWebdavConfig(cleared), warning: '', cleared: true }
+    }
+    const url = typeof args?.url === 'string' ? args.url.trim() : current.url
+    const username = typeof args?.username === 'string' ? args.username.trim() : current.username
+    // 空串是「保留原密码」的约定，不能当成把密码清空（清空走 clear）。
+    const password = typeof args?.password === 'string' && args.password !== '' ? args.password : current.password
+    const allowPrivate = typeof args?.allowPrivate === 'boolean' ? args.allowPrivate : current.allowPrivate
+    if (password.length > WEBDAV_PASSWORD_MAX) throw new Error(`密码不能超过 ${WEBDAV_PASSWORD_MAX} 个字符`)
+    // 清空只能走 clear：保存时地址必填且必须是合法的 http(s) 目录地址。
+    const hostname = parseWebdavAddress(url).hostname
+    const next: WebdavConfig = { url, username, password, allowPrivate }
+    await this.writeWebdavConfig(db, next)
+    const warning = hostname && !allowPrivate && isPrivateWebdavHost(hostname)
+      ? '这是内网地址，测试连通前需打开「允许私网」'
+      : ''
+    return { config: publicWebdavConfig(next), warning, cleared: false }
+  }
+
+  /**
+   * 测试 WebDAV 连通：带参数按表单草稿试（不写库），不带参数用已存配置。
+   * PROPFIND depth 0 打招呼，目录 404 时逐级 MKCOL；错误已映射成可读文案。
+   */
+  async testWebdav(args?: Args) {
+    const db = this.requireDb()
+    const stored = normalizeWebdavConfig(db.settings.get())
+    const draft = webdavDraftFromArgs(args, stored)
+    return this.webdavClient(draft).testConnection()
+  }
+
+  private webdavClient(config: WebdavConfig) {
+    return new WebdavClient(config, {
+      fetchImpl: this.webdavFetch ?? undefined,
+      timeoutMs: this.webdavTimeoutMs,
+    })
+  }
+
+  /** 把 WebDAV 四字段整组并进设置表；其它设置原样保留。 */
+  private async writeWebdavConfig(db: any, config: WebdavConfig) {
+    const next = normalizeReaderSettings({
+      ...db.settings.get(),
+      webdavUrl: config.url,
+      webdavUsername: config.username,
+      webdavPassword: config.password,
+      webdavAllowPrivate: config.allowPrivate,
+    })
+    await db.settings.set(next)
   }
 
   async getReviewSummary(args: Args) {
@@ -2254,12 +2354,13 @@ export class ReaderService extends TypertRemoteService {
     const db = this.requireDb()
     const global = normalizeReaderSettings(db.settings.get())
     const bookId = typeof args?.bookId === 'string' ? args.bookId.trim() : ''
-    if (!bookId) return { settings: global }
+    // WebDAV 凭据只在服务端流转，任何下发给页面的设置都整组剔除。
+    if (!bookId) return { settings: withoutWebdavSettings(global) }
     const bookOverrides = normalizeBookOverrides(db.readConfigs?.get(bookId), {
       knownThemeIds: global.customThemes.map((theme) => theme.id),
     })
     return {
-      settings: mergeReaderSettings(global, bookOverrides),
+      settings: withoutWebdavSettings(mergeReaderSettings(global, bookOverrides)),
       bookOverridden: Object.keys(bookOverrides).length > 0,
       bookOverrides,
     }
@@ -2276,6 +2377,8 @@ export class ReaderService extends TypertRemoteService {
     const bookId = typeof args?.bookId === 'string' ? args.bookId.trim() : ''
     const current = normalizeReaderSettings(db.settings.get())
     const patchRecord = patch as Record<string, unknown>
+    // WebDAV 凭据只走 saveWebdavConfig；设置补丁里出现该组字段一律忽略。
+    for (const key of WEBDAV_SETTING_KEYS) delete patchRecord[key]
     const changedFont = typeof patchRecord.fontId === 'string' && patchRecord.fontId !== current.fontId
     if (changedFont && patchRecord.fontId) {
       const fonts = await listCustomFonts()
@@ -2301,7 +2404,7 @@ export class ReaderService extends TypertRemoteService {
         ...(requestedTheme === undefined ? {} : { theme: requestedTheme }),
       })
       await db.settings.set(next)
-      return { settings: next }
+      return { settings: withoutWebdavSettings(next) }
     }
 
     const overrides: Record<string, unknown> = { ...normalizeBookOverrides(db.readConfigs?.get(bookId), { knownThemeIds }) }
@@ -2310,7 +2413,7 @@ export class ReaderService extends TypertRemoteService {
       overrides[field] = (normalizedPatch as Record<string, unknown>)[field]
     }
     if (Object.keys(overrides).length === 0) {
-      return { settings: mergeReaderSettings(current, overrides), bookOverridden: false, bookOverrides: {} }
+      return { settings: withoutWebdavSettings(mergeReaderSettings(current, overrides)), bookOverridden: false, bookOverrides: {} }
     }
     const now = new Date().toISOString()
     const existing = db.readConfigs?.get(bookId) as Record<string, unknown> | undefined
@@ -2322,7 +2425,7 @@ export class ReaderService extends TypertRemoteService {
       updatedAt: now,
     })
     return {
-      settings: mergeReaderSettings(current, overrides),
+      settings: withoutWebdavSettings(mergeReaderSettings(current, overrides)),
       bookOverridden: true,
       bookOverrides: overrides,
     }
@@ -2333,7 +2436,7 @@ export class ReaderService extends TypertRemoteService {
     const bookId = stringArg(args, 'bookId')
     const db = this.requireDb()
     await db.readConfigs.delete(bookId)
-    return { settings: normalizeReaderSettings(db.settings.get()), bookOverridden: false, bookOverrides: {} }
+    return { settings: withoutWebdavSettings(normalizeReaderSettings(db.settings.get())), bookOverridden: false, bookOverrides: {} }
   }
 
   /** 恢复本节默认：全局层回到默认值，本书层删掉该分区的覆盖并继承全局。 */
@@ -2347,7 +2450,7 @@ export class ReaderService extends TypertRemoteService {
     if (!bookId) {
       const next = normalizeReaderSettings({ ...global, ...defaultGroupSettings(definition.key) })
       await db.settings.set(next)
-      return { settings: next }
+      return { settings: withoutWebdavSettings(next) }
     }
     const overrides = {
       ...normalizeBookOverrides(db.readConfigs?.get(bookId), {
@@ -2369,7 +2472,7 @@ export class ReaderService extends TypertRemoteService {
       })
     }
     return {
-      settings: mergeReaderSettings(global, overrides),
+      settings: withoutWebdavSettings(mergeReaderSettings(global, overrides)),
       bookOverridden: Object.keys(overrides).length > 0,
       bookOverrides: overrides,
     }

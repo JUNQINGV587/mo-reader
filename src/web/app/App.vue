@@ -1294,6 +1294,120 @@ function backupCoverNote(job: any) {
   if (!skipped) return ''
   return `有 ${skipped} 张封面因超过 2MB 或取不到未打包`
 }
+/**
+ * WebDAV 配置（#131）：密码只在服务端，页面只拿「是否已设置」；
+ * 表单是内存草稿，切到别的页面再回来还在，离开浏览器即丢。
+ */
+const webdavConfig = ref<{ url: string; username: string; hasPassword: boolean; allowPrivate: boolean } | null>(null)
+const webdavDraft = ref({ url: '', username: '', password: '', allowPrivate: false })
+const webdavDraftTouched = ref(false)
+const webdavBusy = ref(false)
+const webdavSaving = ref(false)
+const webdavMessage = ref('')
+const webdavError = ref('')
+const webdavClearOpen = ref(false)
+const webdavTest = ref<{ ok: boolean; code: string; status: number | null; elapsedMs: number; message: string } | null>(null)
+
+/** 用服务端配置重置草稿；密码框永远从空开始，留空即「不改」。 */
+function resetWebdavDraft(config: any) {
+  webdavDraft.value = {
+    url: String(config?.url ?? ''),
+    username: String(config?.username ?? ''),
+    password: '',
+    allowPrivate: !!config?.allowPrivate,
+  }
+  webdavDraftTouched.value = false
+}
+
+async function loadWebdavConfig() {
+  try {
+    const result: any = await call('getWebdavConfig')
+    webdavConfig.value = result?.config ?? null
+    // 用户改过草稿就保留，避免每次回页面把刚填的内容冲掉。
+    if (!webdavDraftTouched.value) resetWebdavDraft(webdavConfig.value)
+  } catch (error) {
+    webdavError.value = `配置读取失败：${errorText(error)}`
+  }
+}
+
+function webdavDraftArgs() {
+  return {
+    url: webdavDraft.value.url,
+    username: webdavDraft.value.username,
+    password: webdavDraft.value.password,
+    allowPrivate: webdavDraft.value.allowPrivate,
+  }
+}
+
+/** 输入即算改过草稿，之后回页面不再用已存配置覆盖。 */
+function markWebdavTouched() {
+  webdavDraftTouched.value = true
+}
+
+async function saveWebdav() {
+  if (webdavSaving.value) return
+  webdavSaving.value = true
+  webdavError.value = ''
+  webdavMessage.value = ''
+  webdavTest.value = null
+  try {
+    const result: any = await call('saveWebdavConfig', webdavDraftArgs())
+    webdavConfig.value = result?.config ?? null
+    resetWebdavDraft(webdavConfig.value)
+    const warning = String(result?.warning ?? '')
+    webdavMessage.value = warning ? `已保存。${warning}` : '已保存'
+  } catch (error) {
+    webdavError.value = `保存失败：${errorText(error)}`
+  } finally {
+    webdavSaving.value = false
+  }
+}
+
+/** 测试的是表单里的草稿，不写库；密码留空时服务端沿用已存密码。 */
+async function testWebdav() {
+  if (webdavBusy.value) return
+  webdavBusy.value = true
+  webdavError.value = ''
+  webdavMessage.value = ''
+  webdavTest.value = null
+  try {
+    const result: any = await call('testWebdav', webdavDraftArgs())
+    webdavTest.value = result ?? null
+  } catch (error) {
+    webdavError.value = `测试失败：${errorText(error)}`
+  } finally {
+    webdavBusy.value = false
+  }
+}
+
+/** 结果一行：原因 + 状态码 + 耗时；失败时也走 role=alert 让读屏念出来。 */
+function webdavTestText(result: any) {
+  if (!result) return ''
+  const parts = [String(result.message ?? '')]
+  if (result.status) parts.push(`HTTP ${result.status}`)
+  parts.push(`${Number(result.elapsedMs) || 0} ms`)
+  return parts.filter(Boolean).join(' · ')
+}
+
+async function clearWebdav() {
+  if (webdavSaving.value) return
+  webdavSaving.value = true
+  webdavError.value = ''
+  webdavMessage.value = ''
+  webdavTest.value = null
+  try {
+    const result: any = await call('saveWebdavConfig', { clear: true })
+    webdavConfig.value = result?.config ?? null
+    resetWebdavDraft(webdavConfig.value)
+    webdavClearOpen.value = false
+    webdavMessage.value = '已清空 WebDAV 配置'
+  } catch (error) {
+    webdavError.value = `清空失败：${errorText(error)}`
+  } finally {
+    webdavSaving.value = false
+  }
+}
+
 
 type DownloadScope = 'rest' | 'all' | 'range'
 const downloadScope = ref<DownloadScope>('rest')
@@ -1531,8 +1645,10 @@ watch([view, () => currentBook.value?.id, readerKind], () => syncReadingTimer())
 watch(view, (next) => {
   if (next === 'profile') {
     statsClearOpen.value = false
+    webdavClearOpen.value = false
     void loadReadingStats()
     void loadBackupJob()
+    void loadWebdavConfig()
   } else {
     stopBackupTimer()
   }
@@ -5881,6 +5997,100 @@ onMounted(async () => {
           </template>
         </div>
 
+        <div class="mo-card" data-testid="webdav-card">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">WebDAV</h3>
+            <span class="muted">{{ webdavConfig?.url ? "已配置" : "未配置" }}</span>
+          </div>
+          <p class="muted">地址填网盘上的目录，例如 Nextcloud 的 /remote.php/dav/files/账号/墨读/；只支持 http 和 https。</p>
+          <div class="mo-webdav-form">
+            <label class="mo-webdav-field">
+              <span>地址</span>
+              <input
+                v-model="webdavDraft.url"
+                class="mo-input"
+                type="url"
+                inputmode="url"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="https://网盘地址/目录/"
+                data-testid="webdav-url"
+                @input="markWebdavTouched"
+              />
+            </label>
+            <label class="mo-webdav-field">
+              <span>账号</span>
+              <input
+                v-model="webdavDraft.username"
+                class="mo-input"
+                type="text"
+                autocomplete="username"
+                spellcheck="false"
+                placeholder="网盘账号"
+                data-testid="webdav-username"
+                @input="markWebdavTouched"
+              />
+            </label>
+            <label class="mo-webdav-field">
+              <span>密码</span>
+              <input
+                v-model="webdavDraft.password"
+                class="mo-input"
+                type="password"
+                autocomplete="new-password"
+                :placeholder="webdavConfig?.hasPassword ? '已设置，留空不改' : '网盘密码'"
+                data-testid="webdav-password"
+                @input="markWebdavTouched"
+              />
+            </label>
+          </div>
+          <label class="mo-webdav-allow">
+            <input
+              v-model="webdavDraft.allowPrivate"
+              type="checkbox"
+              data-testid="webdav-allow-private"
+              @change="markWebdavTouched"
+            />
+            <span>允许私网</span>
+          </label>
+          <p class="muted">只有自己的 NAS、内网网盘才需要打开；打开后允许访问本机和内网地址，公网地址不用开。</p>
+          <div class="mo-row">
+            <button class="mo-btn primary" :disabled="webdavSaving" data-testid="webdav-save" @click="saveWebdav">
+              {{ webdavSaving ? "保存中…" : "保存" }}
+            </button>
+            <button
+              class="mo-btn"
+              :disabled="webdavBusy || !webdavDraft.url"
+              data-testid="webdav-test"
+              @click="testWebdav"
+            >{{ webdavBusy ? "测试中…" : "测试连通" }}</button>
+            <button
+              v-if="!webdavClearOpen"
+              class="mo-btn danger"
+              :disabled="webdavSaving"
+              data-testid="webdav-clear-open"
+              @click="webdavClearOpen = true"
+            >清空配置</button>
+          </div>
+          <div v-if="webdavClearOpen" class="mo-row">
+            <span class="muted">清空会删掉地址、账号、密码和私网开关。</span>
+            <button class="mo-btn danger" :disabled="webdavSaving" data-testid="webdav-clear-confirm" @click="clearWebdav">
+              确认清空
+            </button>
+            <button class="mo-btn" @click="webdavClearOpen = false">取消</button>
+          </div>
+          <p
+            v-if="webdavTest"
+            class="mo-webdav-result"
+            :role="webdavTest.ok ? 'status' : 'alert'"
+            data-testid="webdav-test-result"
+          >
+            <span class="mo-tag" :class="{ soft: !webdavTest.ok }">{{ webdavTest.ok ? "可用" : "不可用" }}</span>
+            <span>{{ webdavTestText(webdavTest) }}</span>
+          </p>
+          <p v-if="webdavError" class="muted" role="alert" data-testid="webdav-error">{{ webdavError }}</p>
+          <p v-if="webdavMessage" class="muted" role="status" data-testid="webdav-message">{{ webdavMessage }}</p>
+        </div>
         <div class="mo-card" data-testid="profile-entries">
           <div class="mo-card-head">
             <h3 class="mo-card-title">设置</h3>
@@ -8832,6 +9042,52 @@ textarea {
 }
 @media (max-width: 720px) {
   .mo-profile .mo-card .mo-btn {
+    min-height: 44px;
+  }
+}
+/* WebDAV 卡片（#131）：表单单列栅格，窄屏按钮自动折行，输入框保持 44px 点击高度。 */
+.mo-webdav-form {
+  display: grid;
+  gap: 10px;
+  margin: 10px 0;
+}
+.mo-webdav-field {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--mo-ink-2);
+}
+.mo-webdav-field input {
+  width: 100%;
+  min-width: 0;
+}
+.mo-webdav-allow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  font-size: 13px;
+  color: var(--mo-ink-2);
+  cursor: pointer;
+}
+.mo-webdav-allow input {
+  accent-color: var(--mo-accent);
+}
+.mo-webdav-result {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--mo-ink-2);
+}
+@media (max-width: 720px) {
+  .mo-webdav-field input {
+    min-height: 44px;
+    font-size: 16px;
+  }
+  .mo-webdav-allow {
     min-height: 44px;
   }
 }

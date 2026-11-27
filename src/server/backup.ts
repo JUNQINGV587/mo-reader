@@ -511,7 +511,13 @@ export class BackupCoordinator {
       note: () => recordsOf(db.notes),
       readRecord: () => recordsOf(db.readRecords),
       readConfig: () => recordsOf(db.readConfigs),
-      settings: async () => [settings()],
+      settings: async () => {
+        // 备份包会被拷走、上传网盘或转发，WebDAV 密码不能跟着走；
+        // 地址、账号与私网开关保留，恢复后只需重填密码。
+        const snapshot: Record<string, any> = { ...settings() }
+        delete snapshot.webdavPassword
+        return [snapshot]
+      },
       themeConfig: async () => {
         const current = settings()
         return [{ theme: current.theme, customThemes: current.customThemes ?? [] }]

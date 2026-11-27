@@ -47,6 +47,9 @@ export const REMOTE_METHODS = Object.freeze([
   'getBackupDownload',
   'getBackupJob',
   'cancelBackupJob',
+  'getWebdavConfig',
+  'saveWebdavConfig',
+  'testWebdav',
   'debugSource',
   'addBook',
   'importLocalBook',
@@ -104,4 +107,6 @@ export const ARGLESS_METHODS = Object.freeze([
   'clearAllMedia',
   'clearAllCaches',
   'clearDownloads',
+  // WebDAV 配置读取无参；保存与连通测试都要带 args，所以只有它进零参数清单。
+  'getWebdavConfig',
 ] as const)
