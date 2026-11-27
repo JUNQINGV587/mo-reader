@@ -22,7 +22,10 @@ test('隐藏的动作就是 8/9/11/12', () => {
 test('选择器只列未隐藏的动作', () => {
   const codes = visibleTapActions().map((action) => action.code)
   assert.deepEqual(codes, [-1, 0, 1, 2, 3, 4, 5, 6, 7, 10, 13])
-  for (const code of [5, 6, 13]) assert.ok(codes.includes(code), `朗读动作 ${code} 不应被隐藏`)
+  for (const code of [5, 6, 13]) {
+    assert.ok(codes.includes(code), `朗读动作 ${code} 不应被隐藏`)
+    assert.equal(TAP_ACTIONS.find((action) => action.code === code)?.available, true, `朗读动作 ${code} 应可用`)
+  }
   for (const code of HIDDEN_TAP_ACTION_CODES) assert.equal(isHiddenTapAction(code), true)
   assert.equal(isHiddenTapAction(1), false)
 })

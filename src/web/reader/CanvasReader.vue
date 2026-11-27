@@ -42,7 +42,8 @@ const props = withDefaults(
     tapZones?: number[]
     bookPercent?: number
     batteryPercent?: number | null
-    highlight?: string
+    /** 朗读/搜索高亮：原文绝对字符范围（#127 起不再用子串匹配） */
+    highlight?: { start: number; end: number } | null
     underlines?: string[]
     /** 字距（px），加在相邻两个字之间 */
     letterSpacing?: number
@@ -79,7 +80,7 @@ const props = withDefaults(
     tapZones: () => DEFAULT_TAP_ZONES,
     bookPercent: 0,
     batteryPercent: null,
-    highlight: '',
+    highlight: null,
     underlines: () => [],
     letterSpacing: 0,
     bold: false,
@@ -444,12 +445,34 @@ function pageLinesOf(pageData: PaginatePage): PaginateLine[] {
 }
 
 function highlightRange(): { start: number; end: number } | null {
-  const quote = props.highlight?.trim()
+  const range = props.highlight
+  if (!range || !Number.isFinite(range.start) || !Number.isFinite(range.end)) return null
+  const start = Math.max(0, Math.trunc(range.start))
+  const end = Math.max(0, Math.trunc(range.end))
+  if (end <= start) return null
+  return { start, end }
+}
+
+/** 关键词 → 原文绝对范围，供搜索跳转高亮（只用于搜索，朗读只用偏移） */
+function findRangeFor(text: string): { start: number; end: number } | null {
+  const quote = text?.trim()
   if (!quote) return null
   const haystack = result.value?.text ?? props.text.replace(/\r\n?/g, '\n')
   const index = haystack.indexOf(quote)
   if (index < 0) return null
   return { start: index, end: index + quote.length }
+}
+
+/** 正文绝对偏移 → 页号（越界取最近页） */
+function pageForOffset(offset: number): number {
+  return pageIndexForOffset(result.value?.layout ?? [], offset)
+}
+
+/** 当前页覆盖的原文范围；纯标题页/空页返回 null */
+function currentPageRange(): { start: number; end: number } | null {
+  const pageData = result.value?.layout[page.value]
+  if (!pageData || pageData.start < 0 || pageData.end < 0) return null
+  return { start: pageData.start, end: pageData.end }
 }
 
 function render() {
@@ -1042,7 +1065,19 @@ function currentPageLines() {
   return pageLinesOf(pageData).map((line) => line.text).filter(Boolean)
 }
 
-defineExpose({ next, prev, total, page, goto, findPageFor, currentPageLines, isAnimating: () => animating })
+defineExpose({
+  next,
+  prev,
+  total,
+  page,
+  goto,
+  findPageFor,
+  findRangeFor,
+  pageForOffset,
+  currentPageRange,
+  currentPageLines,
+  isAnimating: () => animating,
+})
 </script>
 
 <template>
