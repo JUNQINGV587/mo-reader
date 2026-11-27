@@ -237,7 +237,24 @@ async function loadBattery() {
 /** 全局设置与「本书覆盖」合并后的当前生效值；面板里的控件都绑它。 */
 const settings = ref<ReaderSettings>(defaultReaderSettings())
 type SettingsScope = 'global' | 'book'
-const settingsScope = ref<SettingsScope>('global')
+/** 作用域是用户选择，记在本机，刷新后仍停在同一层。 */
+const SETTINGS_SCOPE_KEY = 'mo-reader-settings-scope'
+function storedSettingsScope(): SettingsScope {
+  try {
+    return localStorage.getItem(SETTINGS_SCOPE_KEY) === 'book' ? 'book' : 'global'
+  } catch {
+    // 隐私模式下 localStorage 可能不可用
+    return 'global'
+  }
+}
+function storeSettingsScope(scope: SettingsScope): void {
+  try {
+    localStorage.setItem(SETTINGS_SCOPE_KEY, scope)
+  } catch {
+    // 存不了就不存，作用域只在本次会话有效
+  }
+}
+const settingsScope = ref<SettingsScope>(storedSettingsScope())
 const bookOverridden = ref(false)
 const settingsError = ref('')
 /** 最近一次读取/保存后的基准值，用于算出「只提交改过的字段」。 */
@@ -3396,6 +3413,8 @@ const cloneSettings = (value: ReaderSettings): ReaderSettings => JSON.parse(JSON
 async function loadSettings() {
   await settingsSaveChain
   const bookId = currentBook.value?.id ?? ''
+  // 打开一本书时恢复用户上次选的作用域；没有书就只能是全局。
+  if (bookId) settingsScope.value = storedSettingsScope()
   const scope: SettingsScope = bookId ? settingsScope.value : 'global'
   if (!bookId) settingsScope.value = 'global'
   try {
@@ -3478,6 +3497,7 @@ async function switchSettingsScope(scope: SettingsScope) {
   if (scope === 'book' && !canUseBookScope.value) return
   if (scope === settingsScope.value) return
   settingsScope.value = scope
+  storeSettingsScope(scope)
   await loadSettings()
 }
 
