@@ -1107,6 +1107,193 @@ async function cancelExport() {
   }
 }
 
+const backupJob = ref<any>(null)
+const backupBusy = ref(false)
+const backupMessage = ref('')
+const backupDownload = ref<{ url: string; fileName: string; expiresAt: number } | null>(null)
+let backupTimer: ReturnType<typeof setInterval> | null = null
+
+function isBackupRunning(job: any) {
+  return job?.status === 'running' || job?.status === 'queued'
+}
+
+function backupStatusText(job: any) {
+  if (!job) return ''
+  if (job.status === 'queued') return '排队中'
+  if (job.status === 'running') return '备份中'
+  if (job.status === 'done') return '已完成'
+  if (job.status === 'cancelled') return '已取消'
+  return job.status === 'failed' ? '失败' : String(job.status ?? '')
+}
+
+/** 阶段文案优先用服务端给的 stageText，缺了就按 stage 兜底。 */
+function backupStageText(job: any) {
+  if (!job) return ''
+  if (job.stageText) return String(job.stageText)
+  const stage = String(job.stage ?? '')
+  if (stage === 'collecting') return '整理数据'
+  if (stage === 'covers') return '打包封面'
+  if (stage === 'manifest') return '写入清单'
+  if (stage === 'packing') return '压缩文件'
+  return ''
+}
+
+function backupPercent(job: any) {
+  const total = Number(job?.total) || 0
+  if (!total) return 0
+  const done = Number(job.completed) || 0
+  return Math.max(0, Math.min(100, Math.round((done / total) * 100)))
+}
+
+function stopBackupTimer() {
+  if (backupTimer !== null) {
+    clearInterval(backupTimer)
+    backupTimer = null
+  }
+}
+
+function syncBackupTimer() {
+  if (isBackupRunning(backupJob.value)) {
+    if (backupTimer === null) backupTimer = setInterval(refreshBackupJob, 800)
+  } else {
+    stopBackupTimer()
+  }
+}
+
+async function loadBackupDownload() {
+  const job = backupJob.value
+  if (!job?.id || job.status !== 'done') {
+    backupDownload.value = null
+    return
+  }
+  try {
+    const result: any = await call('getBackupDownload', { jobId: job.id })
+    backupDownload.value = {
+      url: String(result?.url ?? ''),
+      fileName: String(result?.fileName ?? ''),
+      expiresAt: Number(result?.expiresAt) || 0,
+    }
+  } catch (error) {
+    backupDownload.value = null
+    backupMessage.value = errorText(error)
+  }
+}
+
+async function refreshBackupJob() {
+  const job = backupJob.value
+  if (!job?.id) return
+  try {
+    const result: any = await call('getBackupJob', { jobId: job.id })
+    backupJob.value = result?.job ?? backupJob.value
+  } catch (error) {
+    backupMessage.value = errorText(error)
+  }
+  if (backupJob.value?.status === 'done' && !backupDownload.value) await loadBackupDownload()
+  if (backupJob.value?.status === 'failed' && backupJob.value?.error) backupMessage.value = String(backupJob.value.error)
+  syncBackupTimer()
+}
+
+async function loadBackupJob() {
+  backupJob.value = null
+  backupDownload.value = null
+  backupMessage.value = ''
+  try {
+    const result: any = await call('getBackupJob', {})
+    backupJob.value = result?.job ?? null
+  } catch (error) {
+    backupMessage.value = errorText(error)
+  }
+  if (backupJob.value?.status === 'done') await loadBackupDownload()
+  if (backupJob.value?.status === 'failed' && backupJob.value?.error) backupMessage.value = String(backupJob.value.error)
+  syncBackupTimer()
+}
+
+async function startBackup(light = false) {
+  if (backupBusy.value) return
+  backupBusy.value = true
+  backupMessage.value = ''
+  backupDownload.value = null
+  try {
+    const result: any = await call('startBackup', { light })
+    backupJob.value = result?.job ?? null
+    backupMessage.value = result?.existing ? '已有备份在进行，完成后会给出下载链接' : '已开始备份'
+    syncBackupTimer()
+  } catch (error) {
+    backupMessage.value = errorText(error)
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+async function cancelBackup() {
+  const job = backupJob.value
+  if (!job?.id) return
+  backupBusy.value = true
+  try {
+    const result: any = await call('cancelBackupJob', { id: job.id })
+    backupJob.value = result?.job ?? backupJob.value
+    backupDownload.value = null
+    backupMessage.value = '已取消备份，临时文件已清理'
+  } catch (error) {
+    backupMessage.value = errorText(error)
+  } finally {
+    backupBusy.value = false
+    syncBackupTimer()
+  }
+}
+
+/** 重新签发一次性链接；旧链接（含已用过的）随之作废。 */
+async function regenerateBackupLink() {
+  backupBusy.value = true
+  try {
+    await loadBackupDownload()
+    if (backupDownload.value) backupMessage.value = '已生成新的下载链接，10 分钟内有效'
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+async function downloadBackup() {
+  const link = backupDownload.value
+  if (!link?.url) return
+  backupBusy.value = true
+  try {
+    const response = await fetch(link.url, { credentials: 'same-origin' })
+    if (!response.ok) {
+      let message = `下载链接不可用（${response.status}）`
+      try {
+        const payload: any = await response.json()
+        if (payload?.error) message = String(payload.error)
+      } catch {
+        // 响应不是 JSON 时保留状态码文案。
+      }
+      backupMessage.value = message
+      backupDownload.value = null
+      return
+    }
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = link.fileName || 'mo-reader-backup.zip'
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    backupMessage.value = '已开始下载；链接只能用一次，需要再下请重新生成'
+    backupDownload.value = null
+  } catch (error) {
+    backupMessage.value = errorText(error)
+  } finally {
+    backupBusy.value = false
+  }
+}
+
+function backupCoverNote(job: any) {
+  const skipped = Number(job?.skippedCovers) || 0
+  if (!skipped) return ''
+  return `有 ${skipped} 张封面因超过 2MB 或取不到未打包`
+}
 
 type DownloadScope = 'rest' | 'all' | 'range'
 const downloadScope = ref<DownloadScope>('rest')
@@ -1345,6 +1532,9 @@ watch(view, (next) => {
   if (next === 'profile') {
     statsClearOpen.value = false
     void loadReadingStats()
+    void loadBackupJob()
+  } else {
+    stopBackupTimer()
   }
 })
 
@@ -1789,6 +1979,7 @@ onUnmounted(() => {
   stopDownloadTimer()
   stopMediaTimer()
   stopExportTimer()
+  stopBackupTimer()
   if (settingsPersistTimer) clearTimeout(settingsPersistTimer)
   if (autoPageTimer) {
     clearInterval(autoPageTimer)
@@ -5629,6 +5820,67 @@ onMounted(async () => {
           <button v-else class="mo-btn danger" data-testid="stats-clear-open" @click="statsClearOpen = true">清空统计</button>
         </div>
 
+        <div class="mo-card" data-testid="backup-card">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">备份</h3>
+            <span class="muted">整包导出 · 一次性下载</span>
+          </div>
+          <p class="muted" data-testid="backup-note">
+            打包书目、阅读进度、书签、笔记、书源、订阅、分组、设置、主题、替换规则、字典规则和封面，不含正文、缓存与字体。
+          </p>
+          <p class="muted">备份生成后提供一次性下载链接，10 分钟内有效，只能下载一次。</p>
+          <div class="mo-row">
+            <button class="mo-btn primary" :disabled="backupBusy || isBackupRunning(backupJob)" data-testid="backup-start-full" @click="startBackup(false)">
+              {{ backupBusy ? '处理中…' : '完整备份' }}
+            </button>
+            <button class="mo-btn" :disabled="backupBusy || isBackupRunning(backupJob)" data-testid="backup-start-light" @click="startBackup(true)">
+              轻量备份
+            </button>
+            <span class="muted">轻量备份只含书目与阅读进度</span>
+          </div>
+
+          <p v-if="backupMessage" class="muted" data-testid="backup-message" role="status">{{ backupMessage }}</p>
+
+          <template v-if="backupJob">
+            <div class="mo-backup-progress" data-testid="backup-progress">
+              <div class="mo-row">
+                <span class="mo-tag" :class="{ soft: !isBackupRunning(backupJob) }">{{ backupStatusText(backupJob) }}</span>
+                <span class="muted">{{ backupJob.light ? '轻量备份' : '完整备份' }}</span>
+                <span v-if="backupStageText(backupJob)" class="muted" data-testid="backup-stage">{{ backupStageText(backupJob) }}</span>
+                <span class="muted">{{ backupPercent(backupJob) }}%</span>
+              </div>
+              <span class="mo-download-bar">
+                <span :style="{ width: `${backupPercent(backupJob)}%` }" />
+              </span>
+              <p v-if="backupCoverNote(backupJob)" class="muted" data-testid="backup-skipped-covers">{{ backupCoverNote(backupJob) }}</p>
+            </div>
+
+            <div v-if="backupJob.status === 'failed'" class="mo-row" data-testid="backup-error" role="alert">
+              <span class="muted">{{ backupJob.error || '备份失败，请重试' }}</span>
+              <button class="mo-btn" :disabled="backupBusy" data-testid="backup-retry" @click="startBackup(backupJob.light)">重试</button>
+            </div>
+            <div v-else-if="backupJob.status === 'cancelled'" class="mo-row">
+              <button class="mo-btn" :disabled="backupBusy" data-testid="backup-retry" @click="startBackup(backupJob.light)">重试</button>
+            </div>
+            <div v-else-if="isBackupRunning(backupJob)" class="mo-row">
+              <button class="mo-btn danger" :disabled="backupBusy" data-testid="backup-cancel" @click="cancelBackup">取消</button>
+            </div>
+            <div v-else-if="backupJob.status === 'done'" class="mo-row">
+              <button
+                v-if="backupDownload"
+                class="mo-btn primary"
+                :disabled="backupBusy"
+                data-testid="backup-download"
+                @click="downloadBackup"
+              >下载备份</button>
+              <button v-else class="mo-btn" :disabled="backupBusy" data-testid="backup-download-retry" @click="regenerateBackupLink">
+                重新生成下载链接
+              </button>
+              <span class="muted">{{ backupJob.fileName }}</span>
+            </div>
+          </template>
+        </div>
+
         <div class="mo-card" data-testid="profile-entries">
           <div class="mo-card-head">
             <h3 class="mo-card-title">设置</h3>
@@ -8563,6 +8815,25 @@ textarea {
   height: 100%;
   border-radius: inherit;
   background: var(--mo-accent);
+}
+/* 备份卡片：元信息一行、进度条独占一行，窄屏也不会挤在一起。 */
+.mo-backup-progress {
+  margin: 10px 0 0;
+  font-size: 13px;
+}
+.mo-backup-progress .mo-download-bar {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+}
+.mo-profile .mo-card p.muted {
+  margin: 6px 0;
+  line-height: 1.6;
+}
+@media (max-width: 720px) {
+  .mo-profile .mo-card .mo-btn {
+    min-height: 44px;
+  }
 }
 .mo-download-actions {
   display: flex;

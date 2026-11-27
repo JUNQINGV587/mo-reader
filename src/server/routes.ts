@@ -12,6 +12,8 @@ export const EXPORT_FAILED_ROUTE_PATH = '/reader/exports-failed'
 export const LOCAL_PDF_ROUTE_PATH = '/reader/local-pdf'
 /** 本地媒体文件路由（#112）：URL 里是 24 位十六进制文件摘要，路径由索引反查。 */
 export const LOCAL_MEDIA_ROUTE_PATH = '/reader/media-local'
+/** 整包备份的一次性下载路由（#130）：URL 里是只能用一次的随机 token，不是作业 id。 */
+export const BACKUP_ROUTE_PATH = '/reader/backups'
 /** 导出作业 id 的默认白名单：单段、字母数字开头、允许短横线。 */
 const DEFAULT_ARTIFACT_ID_PATTERN = /^[0-9a-zA-Z][0-9a-zA-Z-]{7,63}$/
 /** 私有产物只让浏览器本地缓存，不进共享缓存。 */
@@ -23,6 +25,22 @@ export interface ArtifactDescriptor {
   /** 浏览器下载时展示的文件名。 */
   fileName: string
   contentType: string
+}
+
+/**
+ * 定位失败但需要给出明确原因的响应（如一次性链接已用/已过期）。
+ * 返回它时按 status + JSON error 响应，而不是统一的 404。
+ */
+export interface ArtifactRefusal {
+  status: number
+  message: string
+}
+
+export type ArtifactLookupResult = ArtifactDescriptor | ArtifactRefusal | null
+
+/** 区分「产物描述」与「带原因的拒绝」。 */
+export function isArtifactRefusal(value: ArtifactLookupResult): value is ArtifactRefusal {
+  return !!value && typeof (value as ArtifactRefusal).status === 'number' && typeof (value as ArtifactRefusal).message === 'string'
 }
 
 /** 只依赖 Peer 的身份字段，避免把宿主插件类型带进本服务。 */
@@ -37,12 +55,14 @@ export interface ArtifactRouteOptions {
   auth?: 'required' | 'anonymous' | 'deny'
   /** 产物根目录；每次取用时求值，便于测试改环境变量。 */
   root(): string
-  /** 由作业 id 定位产物；返回 null 表示没有可下载的产物（404）。 */
-  locate(jobId: string): Promise<ArtifactDescriptor | null> | ArtifactDescriptor | null
+  /** 由作业 id / token 定位产物；返回 null 表示没有可下载的产物（404）。 */
+  locate(jobId: string): Promise<ArtifactLookupResult> | ArtifactLookupResult
   /** 身份校验，默认只放行 Host 属主；不满足返回 403。 */
   allow?(peer: ArtifactPeer | undefined): boolean
   /** 是否要求已登录；默认 true（未登录 401）。 */
   requirePeer?: boolean
+  /** id/token 白名单；默认作业 id 规则，备份 token 用它放宽到 64 位十六进制。 */
+  idPattern?: RegExp
 }
 
 export interface ArtifactRoute {
@@ -85,14 +105,15 @@ export function createArtifactResource(
     }
     if (requirePeer && !peer) return refuse(401)
     if (!allow(peer)) return refuse(403)
-    const jobId = artifactIdOf(request, routePath)
+    const jobId = singleSegmentIdOf(request, routePath, options.idPattern ?? DEFAULT_ARTIFACT_ID_PATTERN)
     if (!jobId) return refuse(404)
-    let descriptor: ArtifactDescriptor | null = null
+    let descriptor: ArtifactLookupResult = null
     try {
       descriptor = await options.locate(jobId)
     } catch {
       return refuse(404)
     }
+    if (isArtifactRefusal(descriptor)) return refuseWithMessage(descriptor.status, descriptor.message)
     if (!descriptor) return refuse(404)
     const absolute = resolveArtifactPath(options.root(), descriptor.filePath)
     if (!absolute) return refuse(404)
@@ -395,4 +416,12 @@ function resolveResourcePath(root: string, filePath: string): string | null {
 
 function refuse(status: number, extra: Record<string, string> = {}): Response {
   return new Response(null, { status, headers: { 'Cache-Control': 'no-store', ...extra } })
+}
+
+/** 带明确文案的拒绝：一次性下载链接过期/已用时，界面能直接展示原因。 */
+function refuseWithMessage(status: number, message: string): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json; charset=utf-8' },
+  })
 }

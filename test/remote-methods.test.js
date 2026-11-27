@@ -28,6 +28,13 @@ test('不接收入参的方法必须声明成零参数（否则参数个数会�
   }
 })
 
+test('备份导出方法注册给客户端，且都接收 args 对象', () => {
+  for (const method of ['startBackup', 'getBackupDownload', 'getBackupJob', 'cancelBackupJob']) {
+    assert.ok(REMOTE_METHODS.includes(method), `${method} 不在 REMOTE_METHODS`)
+    assert.ok(!ARGLESS_METHODS.includes(method), `${method} 需要接收 args 对象`)
+  }
+})
+
 test('接受入参的方法不能声明成零参数（否则客户端调用直接报参数个数不符）', () => {
   for (const method of [
     'getSettings',

@@ -96,6 +96,15 @@ import { buildEpub } from './epub-export.js'
 import { assertEmbeddableFont } from './pdf-export.js'
 import { loadCoverImage } from './export-cover.js'
 import {
+  BACKUP_KIND,
+  BackupCoordinator,
+  backupArtifactAvailable,
+  cleanupExpiredBackups,
+  recoverInterruptedBackups,
+  type BackupHost,
+} from './backup.js'
+import { BACKUP_TOKEN_TTL_MS } from '../core/reader/backup.js'
+import {
   EXPORT_KIND,
   ExportCoordinator,
   cleanupExpiredExports,
@@ -107,13 +116,16 @@ import {
   type ExportHost,
 } from './exports.js'
 import {
+  BACKUP_ROUTE_PATH,
   EXPORT_FAILED_ROUTE_PATH,
   EXPORT_ROUTE_PATH,
   LOCAL_MEDIA_ROUTE_PATH,
   LOCAL_PDF_ROUTE_PATH,
+  isArtifactRefusal,
   registerArtifactRoute,
   registerProtectedFileRoute,
   type ArtifactDescriptor,
+  type ArtifactLookupResult,
   type FileArtifactDescriptor,
 } from './routes.js'
 import { registerPdfjsAssetRoute } from './pdfjs-assets.js'
@@ -296,6 +308,9 @@ export class ReaderService extends TypertRemoteService {
   /** 导出作业协调器，按需创建；产物落导出目录并由受保护路由下发。 */
   exportsCoordinator: ExportCoordinator | null = null
 
+  /** 整包备份协调器（#130），按需创建；产物同样落导出目录，但只走一次性 token。 */
+  backupCoordinator: BackupCoordinator | null = null
+
   /** 媒体离线下载协调器（#112），按需创建；与文字下载共用作业表与暂停/重试语义。 */
   mediaDownloadsCoordinator: MediaDownloadCoordinator | null = null
 
@@ -340,7 +355,15 @@ export class ReaderService extends TypertRemoteService {
     } catch {
       // 清理失败不影响启动。
     }
+    // 备份作业与半成品同样要在启动时收口，避免重启后留下假的「进行中」。
+    try {
+      await recoverInterruptedBackups(this.db.jobs)
+      await cleanupExpiredBackups(this.db.jobs)
+    } catch {
+      // 清理失败不影响启动。
+    }
     this.registerExportRoute()
+    this.registerBackupRoute()
     this.registerLocalPdfRoute()
     this.registerPdfjsAssetRoute()
     this.registerMediaRoute()
@@ -348,6 +371,11 @@ export class ReaderService extends TypertRemoteService {
     const ctx = this.ctx as any
     ctx.effect(
       () => async () => {
+        try {
+          await this.backupCoordinator?.shutdown()
+        } finally {
+          this.backupCoordinator = null
+        }
         try {
           await this.exportsCoordinator?.shutdown()
         } finally {
@@ -1181,6 +1209,8 @@ export class ReaderService extends TypertRemoteService {
   async pauseJob(args: Args) {
     const id = stringArg(args, 'id')
     switch (this.jobKindOf(id)) {
+      case 'backup':
+        throw new Error('备份不能暂停，请取消后重新导出')
       case 'export':
         return this.exportManager().pause(id)
       case 'media':
@@ -1193,6 +1223,8 @@ export class ReaderService extends TypertRemoteService {
   async resumeJob(args: Args) {
     const id = stringArg(args, 'id')
     switch (this.jobKindOf(id)) {
+      case 'backup':
+        throw new Error('备份不能继续，请重新导出')
       case 'export':
         return this.exportManager().resume(id)
       case 'media':
@@ -1202,10 +1234,12 @@ export class ReaderService extends TypertRemoteService {
     }
   }
 
-  /** 取消对文字下载、媒体下载、导出三种作业通用：按 jobs 表里的 kind 分派。 */
+  /** 取消对文字下载、媒体下载、导出、备份四种作业通用：按 jobs 表里的 kind 分派。 */
   async cancelJob(args: Args) {
     const id = stringArg(args, 'id')
     switch (this.jobKindOf(id)) {
+      case 'backup':
+        return this.backupManager().cancel(id)
       case 'export':
         return this.exportManager().cancel(id)
       case 'media':
@@ -1229,12 +1263,15 @@ export class ReaderService extends TypertRemoteService {
 
   async getJob(args: Args) {
     const id = stringArg(args, 'id')
+    const backup = this.backupCoordinator?.peek(id)
+    if (backup) return { job: { ...backup } }
     const live = this.exportsCoordinator?.peek(id)
     if (live) return { job: { ...live } }
     const media = this.mediaDownloadsCoordinator?.peek(id)
     if (media) return { job: { ...media } }
     const record = this.db?.jobs?.get?.(id) as Record<string, unknown> | undefined
     if (record?.kind === MEDIA_DOWNLOAD_KIND) return this.mediaManager().get(id)
+    if (record?.kind === BACKUP_KIND) return { job: await this.backupManager().get(id) }
     return this.downloadManager().get(id)
   }
 
@@ -1249,6 +1286,7 @@ export class ReaderService extends TypertRemoteService {
     for (const job of this.downloadManager().list(filter)) merged.set(job.id, job)
     for (const job of this.mediaManager().list(filter)) merged.set(job.id, job)
     for (const job of this.exportsCoordinator?.list(filter) ?? []) merged.set(job.id, job)
+    for (const job of this.backupCoordinator?.list() ?? []) merged.set(job.id, job)
     return {
       jobs: [...merged.values()].sort(
         (left, right) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0),
@@ -1269,6 +1307,11 @@ export class ReaderService extends TypertRemoteService {
   /** 测试/关停用：等待所有导出协程收尾。 */
   async waitForExports() {
     await this.exportsCoordinator?.waitIdle()
+  }
+
+  /** 测试/关停用：等待所有备份协程收尾。 */
+  async waitForBackups() {
+    await this.backupCoordinator?.waitIdle()
   }
 
   /** 按书聚合下载结果：书架/详情只调一次就能显示进度、体积与当前作业。 */
@@ -1627,6 +1670,44 @@ export class ReaderService extends TypertRemoteService {
     if (!(await exportArtifactExists(name))) throw new Error('失败清单已过期')
     // 下载名给书名，别把作业 id 甩给用户；磁盘路径仍是 id 命名的单段文件名。
     return { url: this.exportFailedUrl(jobId), fileName: exportFailedDisplayName(String(record.bookName ?? '')) }
+  }
+
+  /** 发起整包备份；light=true 只导书目与进度。已有进行中的备份时返回 existing。 */
+  async startBackup(args: Args) {
+    return this.backupManager().start({ light: args?.light === true })
+  }
+
+  /**
+   * 备份完成后签发一次性下载链接：10 分钟有效，第一次取用后立即失效。
+   * URL 里是随机 token，不含作业 id，不能靠猜作业 id 拿到别人的备份。
+   */
+  async getBackupDownload(args: Args) {
+    const jobId = stringArg(args, 'jobId')
+    const job = await this.backupManager().get(jobId)
+    if (!job) throw new Error('作业不存在')
+    if (job.status !== 'done') throw new Error('备份还没有完成')
+    if (!(await backupArtifactAvailable(job.filePath))) throw new Error('备份文件不存在，请重新导出')
+    const ticket = this.backupManager().tickets.issue(job)
+    if (!ticket) throw new Error('备份文件不存在，请重新导出')
+    return {
+      url: `${this.webOrigin()}${BACKUP_ROUTE_PATH}/${ticket.token}`,
+      fileName: job.fileName,
+      expiresAt: ticket.expiresAt,
+      ttlMs: BACKUP_TOKEN_TTL_MS,
+      singleUse: true,
+    }
+  }
+
+  /** 备份进度；不传 jobId 时返回最近一次，打开「我的」页就能接着看。 */
+  async getBackupJob(args: Args) {
+    const jobId = typeof args?.jobId === 'string' ? args.jobId.trim() : ''
+    const job = await this.backupManager().get(jobId || undefined)
+    return { job }
+  }
+
+  async cancelBackupJob(args: Args) {
+    const id = stringArg(args, 'id')
+    return this.backupManager().cancel(id)
   }
 
   async getReviewSummary(args: Args) {
@@ -2324,6 +2405,20 @@ export class ReaderService extends TypertRemoteService {
     return result
   }
 
+  private backupManager(): BackupCoordinator {
+    if (!this.backupCoordinator) {
+      this.backupCoordinator = new BackupCoordinator(this.backupHost())
+    }
+    return this.backupCoordinator
+  }
+
+  private backupHost(): BackupHost {
+    return {
+      db: () => this.requireDb(),
+      loadCover: (book) => this.fetchExportCover(book),
+    }
+  }
+
   private exportManager(): ExportCoordinator {
     if (!this.exportsCoordinator) {
       this.exportsCoordinator = new ExportCoordinator(this.exportHost())
@@ -2388,10 +2483,12 @@ export class ReaderService extends TypertRemoteService {
   }
 
   /** 作业分派：活动作业先问协调器，再读 jobs 表里的 kind。 */
-  private jobKindOf(id: string): 'export' | 'media' | 'download' {
+  private jobKindOf(id: string): 'export' | 'media' | 'download' | 'backup' {
+    if (this.backupCoordinator?.peek(id)) return 'backup'
     if (this.exportsCoordinator?.peek(id)) return 'export'
     if (this.mediaDownloadsCoordinator?.peek(id)) return 'media'
     const record = this.db?.jobs?.get?.(id) as Record<string, unknown> | undefined
+    if (record?.kind === BACKUP_KIND) return 'backup'
     if (record?.kind === EXPORT_KIND) return 'export'
     if (record?.kind === MEDIA_DOWNLOAD_KIND) return 'media'
     return 'download'
@@ -2496,6 +2593,62 @@ export class ReaderService extends TypertRemoteService {
           }
         },
         'reader: export download route',
+      )
+    })
+  }
+
+  /**
+   * 一次性下载路由：auth 匿名，但 URL 里带 64 位随机 token，只有 token 有效时才定位到文件。
+   * 过期/已用返回 410 与可读文案，token 不存在返回 404。
+   */
+  private async locateBackupTicket(token: string): Promise<ArtifactLookupResult> {
+    const manager = this.backupCoordinator
+    if (!manager) return null
+    const result = manager.tickets.consume(token)
+    if ('error' in result) return { status: result.error.status, message: result.error.message }
+    if (!(await backupArtifactAvailable(result.descriptor.filePath))) {
+      return { status: 404, message: '备份文件不存在，请重新导出' }
+    }
+    return result.descriptor
+  }
+
+  /** 备份下载路由：按 token 取产物，与登录态无关，因此不能复用 /reader/exports 的作业 id 直链。 */
+  private registerBackupRoute(): void {
+    const ctx = this.ctx as any
+    if (typeof ctx?.inject !== 'function') return
+    ctx.inject(['webServer'], (webCtx: any) => {
+      const webServer = webCtx?.webServer
+      if (!webServer || typeof webServer.register !== 'function') return
+      if (typeof webCtx.effect !== 'function') return
+      webCtx.effect(
+        () => {
+          const disposers: Array<() => void> = []
+          try {
+            disposers.push(
+              registerArtifactRoute(webServer, {
+                path: BACKUP_ROUTE_PATH,
+                auth: 'anonymous',
+                root: () => exportRoot(),
+                idPattern: /^[0-9a-f]{64}$/,
+                requirePeer: false,
+                allow: () => true,
+                locate: (token: string) => this.locateBackupTicket(token),
+              }),
+            )
+          } catch {
+            // 同路径已注册时不重复注册，也不让启动失败。
+          }
+          return () => {
+            for (const dispose of disposers) {
+              try {
+                dispose()
+              } catch {
+                // 释放失败不影响其它路由。
+              }
+            }
+          }
+        },
+        'reader: backup download route',
       )
     })
   }
