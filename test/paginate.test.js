@@ -194,6 +194,31 @@ test('排版：标题过长折行且整块处理，不单独留在页底', async
   assert.equal(firstPageLast.text, '正文正文正文正文正文')
 })
 
+test('排版：双栏标题只在第一栏顶部，不重复也不占第二栏高度', async () => {
+  const { paginate } = await import('../dist/core/reader/paginate.js')
+  const result = paginate('一'.repeat(300), {
+    ...LAYOUT_BASE,
+    width: 500,
+    height: 120,
+    lineHeight: 20,
+    dualColumn: true,
+    title: '第一章',
+  })
+  const first = result.layout[0]
+  assert.equal(first.titleLines.length, 1)
+  assert.equal(first.titleLines[0].text, '第一章')
+  assert.equal(first.columns[0].x, 0)
+  assert.equal(first.columns[1].x, first.columns[0].width + 24)
+  assert.equal(first.columns[0].width, first.columns[1].width)
+  // 第一栏让出一行标题高度：100/20 = 5 行；第二栏仍是整页高度：120/20 = 6 行
+  assert.equal(first.columns[0].lines.length, 5)
+  assert.equal(first.columns[1].lines.length, 6)
+  assert.equal(first.start, 0)
+  assert.equal(first.end, first.columns[1].lines.at(-1).end)
+  assert.equal(result.layout[1].start, first.end)
+  assert.equal(result.lines.filter((line) => line === '第一章').length, 1)
+})
+
 test('排版：避头尾，行首不出现收尾标点、行尾不出现起首标点', async () => {
   const { paginate } = await import('../dist/core/reader/paginate.js')
   const closing = paginate('一二三四五。六七八九十', {
@@ -246,6 +271,18 @@ test('排版：两端对齐只作用于非末行，最多补 0.5em，补不过�
   const shortLine = capped.layout[0].columns[0].lines[0]
   assert.equal(shortLine.text, '一二')
   assert.equal(shortLine.justifyPx, 0)
+
+  // 每个字距只差半像素，但整行要补 6px（超过 0.5em），仍应回退左对齐
+  const overBudget = paginate('一'.repeat(20), {
+    ...LAYOUT_BASE,
+    width: 100,
+    lineHeight: 20,
+    align: 'justify',
+    measure: (value) => value.length * 9.4,
+  })
+  const overLine = overBudget.layout[0].columns[0].lines[0]
+  assert.equal(overLine.text, '一'.repeat(10))
+  assert.equal(overLine.justifyPx, 0)
 })
 
 test('排版：标点压缩不丢字，只让行更紧', async () => {

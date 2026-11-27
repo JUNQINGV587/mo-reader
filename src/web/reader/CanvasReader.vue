@@ -124,6 +124,9 @@ let animating = false
 const layoutCache = new LayoutCache<PaginateResult>(6)
 let layoutJob: LayoutJob<PaginateResult> | null = null
 let layoutToken = 0
+let layoutFrame = 0
+let settingsTimer = 0
+const SETTINGS_DEBOUNCE_MS = 120
 
 const LONG_PRESS_MS = 500
 const LONG_PRESS_TOLERANCE = 10
@@ -275,6 +278,7 @@ function layout(keepOffset = true) {
   const token = layoutToken
   layoutJob?.cancel()
   layoutJob = null
+  cancelAnimationFrame(layoutFrame)
 
   const cached = layoutCache.get(key)
   if (cached) {
@@ -285,52 +289,61 @@ function layout(keepOffset = true) {
 
   // 大章节先让加载态画出来，再排版
   loading.value = props.text.length > 15000
-  const job = createLayoutJob(() =>
-    paginate(props.text, {
-      width: box.width,
-      height: box.height,
-      fontSize: props.fontSize,
-      lineHeight: lineHeightPx(),
-      padding: 0,
-      headerHeight: 0,
-      footerHeight: 0,
-      indent: props.indent !== 0,
-      paragraphSpacing: props.paragraphSpacing,
-      letterSpacing: props.letterSpacing,
-      title: props.title,
-      titleMode: props.titleMode,
-      titleSize: props.titleSize,
-      align: props.align,
-      compressPunctuation: props.compressPunctuation,
-      kinsoku: props.kinsoku,
-      dualColumn: props.dualColumn,
-      scrollMode: effectiveAnimation.value === 'scroll',
-      measure: (value) => {
-        if (!ctx) return 0
-        ctx.font = bodyFont()
-        return ctx.measureText(value).width
-      },
-      measureTitle: (value) => {
-        if (!ctx) return 0
-        ctx.font = titleFont()
-        return ctx.measureText(value).width
-      },
-    }),
-  )
-  layoutJob = job
-  job.promise
-    .then((next) => {
-      if (token !== layoutToken) return
-      layoutCache.set(key, next)
-      applyLayout(next, keepOffset)
-    })
-    .catch((error: unknown) => {
-      if (error instanceof Error && error.name === 'LayoutCancelledError') return
-      console.error('[reader] 排版失败', error)
-    })
-    .finally(() => {
-      if (token === layoutToken) loading.value = false
-    })
+  const startLayout = () => {
+    if (token !== layoutToken) return
+    const job = createLayoutJob(() =>
+      paginate(props.text, {
+        width: box.width,
+        height: box.height,
+        fontSize: props.fontSize,
+        lineHeight: lineHeightPx(),
+        padding: 0,
+        headerHeight: 0,
+        footerHeight: 0,
+        indent: props.indent !== 0,
+        paragraphSpacing: props.paragraphSpacing,
+        letterSpacing: props.letterSpacing,
+        title: props.title,
+        titleMode: props.titleMode,
+        titleSize: props.titleSize,
+        align: props.align,
+        compressPunctuation: props.compressPunctuation,
+        kinsoku: props.kinsoku,
+        dualColumn: props.dualColumn,
+        scrollMode: effectiveAnimation.value === 'scroll',
+        measure: (value) => {
+          if (!ctx) return 0
+          ctx.font = bodyFont()
+          return ctx.measureText(value).width
+        },
+        measureTitle: (value) => {
+          if (!ctx) return 0
+          ctx.font = titleFont()
+          return ctx.measureText(value).width
+        },
+      }),
+    )
+    layoutJob = job
+    job.promise
+      .then((next) => {
+        if (token !== layoutToken) return
+        layoutCache.set(key, next)
+        applyLayout(next, keepOffset)
+      })
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.name === 'LayoutCancelledError') return
+        console.error('[reader] 排版失败', error)
+      })
+      .finally(() => {
+        if (token === layoutToken) loading.value = false
+      })
+  }
+  if (loading.value) {
+    // 先让「排版中…」画一帧，再跑同步排版
+    layoutFrame = requestAnimationFrame(startLayout)
+  } else {
+    startLayout()
+  }
 }
 
 function fillBackground() {
@@ -455,25 +468,26 @@ function render() {
   }
   const box = contentBox()
   const titleHeight = pageData.titleLines.length * titleLineHeight()
-  const bodyTop = box.top + titleHeight
+  const dualTitle = (result.value?.columnCount ?? 1) === 2 && pageData.titleLines.length > 0
   const highlight = highlightRange()
 
-  // 标题：跨全宽，按左/中/右对齐
+  // 标题：单栏跨全宽，双栏只占第一栏顶部；按左/中/右对齐
   if (pageData.titleLines.length > 0) {
     ctx.font = titleFont()
     ctx.textAlign = 'left'
     ctx.textBaseline = 'top'
     ctx.fillStyle = color
+    const titleWidth = dualTitle ? pageData.columns[0]?.width ?? box.width : box.width
     for (const titleLine of pageData.titleLines) {
       const align = result.value?.titleAlign ?? 'left'
       const lineWidth = prefixWidth(titleLine, Array.from(titleLine.text).length)
       const left =
         align === 'center'
-          ? box.left + Math.max(0, (box.width - lineWidth) / 2)
+          ? box.left + Math.max(0, (titleWidth - lineWidth) / 2)
           : align === 'right'
-            ? box.left + Math.max(0, box.width - lineWidth)
+            ? box.left + Math.max(0, titleWidth - lineWidth)
             : box.left
-      drawLine(titleLine, left, bodyTop + titleLine.top)
+      drawLine(titleLine, left, box.top + titleLine.top)
     }
   }
 
@@ -481,13 +495,15 @@ function render() {
   ctx.textAlign = 'left'
   ctx.textBaseline = 'top'
 
-  for (const column of pageData.columns) {
+  for (let columnIndex = 0; columnIndex < pageData.columns.length; columnIndex += 1) {
+    const column = pageData.columns[columnIndex]
     if (column.lines.length === 0) continue
     const left = box.left + column.x
-    const top = bodyTop
+    const topOffset = columnIndex === 0 ? titleHeight : 0
+    const top = box.top + topOffset
     ctx.save()
     ctx.beginPath()
-    ctx.rect(left - props.fontSize, top - 2, column.width + props.fontSize * 2, box.height - titleHeight + props.fontSize)
+    ctx.rect(left - props.fontSize, top - 2, column.width + props.fontSize * 2, box.height - topOffset + props.fontSize)
     ctx.clip()
 
     for (const bodyLine of column.lines) {
@@ -707,14 +723,16 @@ function selectionAt(clientX: number, clientY: number): ReaderSelection | null {
   const x = clientX - rect.left
   const y = clientY - rect.top
   const titleHeight = pageData.titleLines.length * titleLineHeight()
-  if (y < box.top + titleHeight || y > box.top + box.height) return null
+  if (y < box.top || y > box.top + box.height) return null
 
-  for (const column of pageData.columns) {
+  for (let columnIndex = 0; columnIndex < pageData.columns.length; columnIndex += 1) {
+    const column = pageData.columns[columnIndex]
     const columnLeft = box.left + column.x
     if (x < columnLeft - props.fontSize || x > columnLeft + column.width + props.fontSize) continue
+    const columnTop = box.top + (columnIndex === 0 ? titleHeight : 0)
     for (const line of column.lines) {
       if (!line.text) continue
-      const lineTop = box.top + titleHeight + line.top
+      const lineTop = columnTop + line.top
       if (y < lineTop || y > lineTop + lineHeightPx()) continue
       ctx.font = bodyFont()
       const measure = (value: string) => {
@@ -823,6 +841,8 @@ onMounted(() => {
 onBeforeUnmount(() => {
   observer?.disconnect()
   layoutJob?.cancel()
+  cancelAnimationFrame(layoutFrame)
+  window.clearTimeout(settingsTimer)
   clearPress()
   window.removeEventListener('keydown', onKey)
   window.removeEventListener('pointermove', onWindowPointerMove)
@@ -833,6 +853,7 @@ onBeforeUnmount(() => {
 watch(
   () => props.text,
   () => {
+    window.clearTimeout(settingsTimer)
     anchorOffset.value = -1
     page.value = Math.max(0, props.initialPage)
     layout(false)
@@ -842,6 +863,7 @@ watch(
 watch(
   () => props.initialPage,
   (value) => {
+    window.clearTimeout(settingsTimer)
     anchorOffset.value = -1
     page.value = Math.max(0, value)
     layout(false)
@@ -873,7 +895,11 @@ watch(
     props.showHeaderLine,
     props.showFooterLine,
   ],
-  () => layout(true),
+  () => {
+    // 滑杆连续输入时合帧：120ms 内只重排最后一步，且按字符偏移留在原处
+    window.clearTimeout(settingsTimer)
+    settingsTimer = window.setTimeout(() => layout(true), SETTINGS_DEBOUNCE_MS)
+  },
   { deep: true },
 )
 

@@ -32,7 +32,7 @@ export interface PaginateOptions {
   titleSize?: number
   /** 两端对齐只作用于段落的非末行 */
   align?: PaginateTextAlign
-  /** 标点压缩：相邻两个标点各让出半个字宽 */
+  /** 标点压缩：相邻两个标点之间让出半个字宽 */
   compressPunctuation?: boolean
   /** 避头尾：行首不出现收尾标点，行尾不出现起首标点 */
   kinsoku?: boolean
@@ -80,7 +80,7 @@ export interface PaginateColumn {
 }
 
 export interface PaginatePage {
-  /** 跨全宽显示的标题行，只在第一页 */
+  /** 标题行，只在第一页；单栏跨全宽，双栏时位于第一栏顶部 */
   titleLines: PaginateLine[]
   columns: PaginateColumn[]
   /** 本页正文的起始偏移；纯标题页为 -1 */
@@ -341,8 +341,9 @@ function buildBodyLines(
         line.justifyPx = 0
         continue
       }
-      const extra = (maxWidth - line.width) / (contentChars - 1)
-      line.justifyPx = extra > 0 && extra <= fontSize * MAX_JUSTIFY_EM ? extra : 0
+      // 单行补白最多 0.5em，超出宁可行尾留白也不把字距拉大
+      const extra = maxWidth - line.width
+      line.justifyPx = extra > EPS && extra <= fontSize * MAX_JUSTIFY_EM ? extra / (contentChars - 1) : 0
     }
   }
   return lines
@@ -463,7 +464,15 @@ export function paginate(text: string, options: PaginateOptions): PaginateResult
   const bodyAlreadyStartsWithTitle = rawTitle !== '' && normalized.trimStart().startsWith(rawTitle)
   const shouldShowTitle = rawTitle !== '' && titleAlign !== null && !bodyAlreadyStartsWithTitle
   const titleLines = shouldShowTitle
-    ? buildTitleLines(rawTitle, { maxWidth, fontSize, titleFontSize, titleLineHeight, letterSpacing, charWidth: titleCharWidth })
+    ? buildTitleLines(rawTitle, {
+        // 双栏时标题只占第一栏，按栏宽换行，不跨栏
+        maxWidth: columnCount === 2 ? columnWidth : maxWidth,
+        fontSize,
+        titleFontSize,
+        titleLineHeight,
+        letterSpacing,
+        charWidth: titleCharWidth,
+      })
     : []
 
   if (bodyLines.length === 0 && titleLines.length === 0) {
@@ -490,11 +499,18 @@ export function paginate(text: string, options: PaginateOptions): PaginateResult
     const isFirstPage = pageNo === 0
     const pageTitleLines = isFirstPage ? titleLines : []
     const titleHeight = pageTitleLines.length * titleLineHeight
-    const capacity = Math.max(0, maxHeight - titleHeight)
+    // 双栏时标题只占第一栏的高度，第二栏从栏顶开始
+    const columnCapacity = (index: number): number =>
+      index === 0 ? Math.max(0, maxHeight - titleHeight) : maxHeight
     const columns: PaginateColumn[] = []
-    const canPlaceBody = capacity >= lineHeight - EPS
-    if (bodyIndex < bodyLines.length && canPlaceBody) {
+    const canPlaceBody =
+      bodyIndex < bodyLines.length &&
+      Array.from({ length: columnCount }, (_, index) => columnCapacity(index)).some(
+        (capacity) => capacity >= lineHeight - EPS,
+      )
+    if (canPlaceBody) {
       for (let columnIndex = 0; columnIndex < columnCount; columnIndex += 1) {
+        const capacity = columnCapacity(columnIndex)
         const columnLines: PaginateLine[] = []
         let cursorY = 0
         while (bodyIndex < bodyLines.length) {
