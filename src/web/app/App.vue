@@ -26,8 +26,8 @@ import {
   READER_PRESETS,
   TAP_ZONE_NAMES,
   TIP_MODES,
+  isHiddenTapAction,
   sanitizeTapZones,
-  tapActionLabel,
   visibleTapActions,
 } from '../../core/reader/reader-config'
 import {
@@ -45,9 +45,13 @@ import {
 import { exportFullShelf, exportLegadoShelf } from '../../core/reader/shelf-transfer'
 import {
   defaultReaderSettings,
+  diffReaderSettings,
+  mergeReaderSettings,
+  presetSettingsPatch,
   type ReaderSettings,
   type SettingsGroupKey,
 } from '../../core/reader/settings'
+import { dualColumnAvailability } from '../../core/reader/paginate'
 import { AutoPageController } from '../../core/reader/auto-page'
 import { KeepAwake } from '../../core/reader/wake-lock'
 import { enabledDictRules, lookupAll, type DictLookupOutcome } from '../../core/dict/lookup-all'
@@ -202,7 +206,7 @@ const readerMediaRetryChapter = ref<number | null>(null)
 let mediaFallbackBusy = false
 const replacedContent = computed(() => {
   let text = content.value
-  for (const rule of settings.value.replaceRules) {
+  for (const rule of effectiveSettings.value.replaceRules) {
     if (!rule.enabled || !rule.pattern) continue
     try {
       if (rule.regex) text = text.replace(new RegExp(rule.pattern, 'g'), rule.replacement ?? '')
@@ -272,13 +276,28 @@ function storeSettingsScope(scope: SettingsScope): void {
   }
 }
 const settingsScope = ref<SettingsScope>(storedSettingsScope())
+/** 服务端返回的本书覆盖层：阅读页在全局作用域下也要叠加它。 */
+const bookOverrides = ref<Partial<ReaderSettings>>({})
 const bookOverridden = ref(false)
+/** 视口宽度，随 resize 更新，用于判断双栏是否放得下。 */
+const viewportWidth = ref(typeof window === 'undefined' ? 0 : window.innerWidth)
 const settingsError = ref('')
 /** 最近一次读取/保存后的基准值，用于算出「只提交改过的字段」。 */
 const settingsBaseline = ref<ReaderSettings>(defaultReaderSettings())
 const settingsSheetRef = ref<HTMLElement | null>(null)
 const settingsTrigger = ref<HTMLElement | null>(null)
 const canUseBookScope = computed(() => Boolean(currentBook.value?.id))
+/**
+ * 阅读页真正生效的设置：打开一本书时，始终是服务端合并后的「全局 + 本书覆盖」；
+ * 设置面板里的 settings 仍表示当前作用域那一层，用于决定改哪一层。
+ */
+const effectiveSettings = computed<ReaderSettings>(() => {
+  if (!currentBook.value?.id || settingsScope.value === 'book') return settings.value
+  return mergeReaderSettings(settings.value, bookOverrides.value)
+})
+const dualColumnAvailable = computed(() =>
+  dualColumnAvailability(viewportWidth.value, settings.value.padding),
+)
 let settingsPersistTimer: ReturnType<typeof setTimeout> | null = null
 const readerRef = ref<any>(null)
 const initialPage = ref(0)
@@ -409,7 +428,7 @@ async function startAutoPage() {
   chrome.value = false
   // 自动翻页与朗读互斥：暂停朗读但保留游标，之后再继续。
   if (speechStatus.value === 'speaking') pauseSpeech()
-  autoPage.setSeconds(settings.value.autoPageSeconds)
+  autoPage.setSeconds(effectiveSettings.value.autoPageSeconds)
   syncAutoPagePosition()
   autoPage.start()
   autoPageChapterFailed = false
@@ -625,14 +644,14 @@ watch(settingsOpen, (open) => {
   if (view.value === 'reader') setAutoPause('settings', open)
 })
 watch(
-  () => settings.value.autoPageSeconds,
+  () => effectiveSettings.value.autoPageSeconds,
   (value) => {
     autoPage.setSeconds(value)
     refreshAutoPageState()
   },
 )
 watch(
-  () => [settings.value.ttsVoice, settings.value.ttsRate],
+  () => [effectiveSettings.value.ttsVoice, effectiveSettings.value.ttsRate],
   () => {
     if (speechStatus.value === 'idle') return
     // 立即按新音色/语速重念当前段；暂停中只作废旧 utterance，继续时重念
@@ -642,6 +661,13 @@ watch(
       speechNotAllowed = false
       speakCurrentSegment()
     }
+  },
+)
+// 字体跟随阅读页的生效设置：切换作用域、换书或同步本书覆盖后都会重新应用。
+watch(
+  () => effectiveSettings.value.fontId,
+  (id) => {
+    void applyCustomFont(id)
   },
 )
 watch(view, (next, prev) => {
@@ -671,15 +697,19 @@ const underlineQuotes = computed(() =>
     .map((item) => String(item.quote ?? ''))
     .filter(Boolean),
 )
-const theme = computed<Theme>(() => {
-  const value = settings.value.theme === 'system' ? 'light' : settings.value.theme
-  return isBuiltinThemeName(value) ? value : 'light'
-})
 const activeThemeColors = computed<ThemeColors>(() =>
   resolveThemeColors(settings.value.theme, settings.value.customThemes),
 )
 const activeCustomTheme = computed<CustomTheme | undefined>(() =>
   settings.value.customThemes.find((item) => item.id === settings.value.theme),
+)
+// 阅读区跟随生效设置；主题编辑仍用面板当前作用域。
+const readerTheme = computed<Theme>(() => {
+  const value = effectiveSettings.value.theme === 'system' ? 'light' : effectiveSettings.value.theme
+  return isBuiltinThemeName(value) ? value : 'light'
+})
+const readerThemeColors = computed<ThemeColors>(() =>
+  resolveThemeColors(effectiveSettings.value.theme, effectiveSettings.value.customThemes),
 )
 const sourceGroups = computed(() =>
   [...new Set(sources.value.map((source) => source.bookSourceGroup).filter((group): group is string => typeof group === 'string' && group.length > 0))].sort((a, b) => a.localeCompare(b, 'zh')),
@@ -801,7 +831,6 @@ async function refresh() {
       const fontResult = await call('listFonts')
       customFonts.value = fontResult?.fonts ?? []
       syncExportFont()
-      if (settings.value.fontId) await applyCustomFont(settings.value.fontId)
     } catch (error) {
       fontMessage.value = `字体加载失败：${errorText(error)}`
     }
@@ -1022,7 +1051,7 @@ async function loadActiveExport() {
 /** 导出字体默认跟随阅读字体，没设过就用列表第一个；是否可嵌入由服务端开工前校验。 */
 function syncExportFont() {
   if (exportFontId.value && customFonts.value.some((font) => font.id === exportFontId.value)) return
-  const preferred = settings.value.fontId
+  const preferred = effectiveSettings.value.fontId
   exportFontId.value =
     preferred && customFonts.value.some((font) => font.id === preferred)
       ? preferred
@@ -1039,7 +1068,7 @@ async function startExport(format: 'txt' | 'epub' | 'pdf' = 'txt', fontId = '') 
   try {
     const payload: Record<string, unknown> = { bookId: book.id, format }
     if (format === 'pdf') {
-      payload.fontId = fontId || exportFontId.value || settings.value.fontId || customFonts.value[0]?.id || ''
+      payload.fontId = fontId || exportFontId.value || effectiveSettings.value.fontId || customFonts.value[0]?.id || ''
     }
     const result: any = await call('startExport', payload)
     exportJob.value = result?.job ?? null
@@ -1649,6 +1678,7 @@ onUnmounted(() => {
     autoPageTimer = undefined
   }
   window.removeEventListener('keydown', onReaderEscape)
+  window.removeEventListener('resize', syncViewportWidth)
   document.removeEventListener('visibilitychange', onReaderVisibilityChange)
   window.speechSynthesis?.removeEventListener?.('voiceschanged', loadSpeechVoices)
   clearSpeechVoiceWait()
@@ -2375,7 +2405,8 @@ async function openBook(book: any) {
   try {
     const info = await call('getBookInfo', { sourceUrl: book.origin, bookUrl: book.bookUrl })
     currentBook.value = { ...book, ...info.info, tocUrl: info.info.tocUrl || book.bookUrl }
-    if (settingsScope.value === 'book') await loadSettings()
+    // 无论面板作用域是哪层，换书都要刷新本书覆盖层。
+    await loadSettings()
     await loadToc(currentBook.value, book.bookUrl)
     await loadLocalPdfStatus(currentBook.value)
     await loadBookmarks()
@@ -2397,7 +2428,8 @@ async function openShelfBook(book: any) {
   chapterError.value = ''
   downloadSummary.value = null
   currentBook.value = { ...book }
-  if (settingsScope.value === 'book') await loadSettings()
+  // 无论面板作用域是哪层，换书都要刷新本书覆盖层。
+  await loadSettings()
   chapters.value = []
   try {
     await loadToc(currentBook.value, book.bookUrl)
@@ -2481,7 +2513,8 @@ async function applyCustomFont(id: string) {
     fontMessage.value = ''
   } catch (error) {
     activeFontFamily.value = ''
-    settings.value.fontId = ''
+    // 只清掉仍然指向这个字体的设置，避免把用户刚换的字体清掉。
+    if (settings.value.fontId === id) settings.value.fontId = ''
     fontMessage.value = `字体加载失败，已回退默认字体：${errorText(error)}`
   }
 }
@@ -2489,7 +2522,6 @@ async function applyCustomFont(id: string) {
 async function selectFont(event: Event) {
   const id = (event.target as HTMLSelectElement).value
   settings.value.fontId = id
-  await applyCustomFont(id)
   await persistSettings()
 }
 
@@ -2510,7 +2542,6 @@ async function uploadFontFile(event: Event) {
     customFonts.value = list?.fonts ?? []
     exportFontId.value = result.font.id
     settings.value.fontId = result.font.id
-    await applyCustomFont(settings.value.fontId)
     await persistSettings()
     fontMessage.value = result.created ? `已上传并应用「${result.font.name}」` : `字体已存在，直接应用「${result.font.name}」`
   } catch (error) {
@@ -3492,7 +3523,7 @@ function loadSpeechVoices() {
 
 function pickSpeechVoice(): SpeechSynthesisVoice | null {
   const voices = window.speechSynthesis?.getVoices?.() ?? []
-  const wanted = settings.value.ttsVoice
+  const wanted = effectiveSettings.value.ttsVoice
   if (wanted) {
     const matched = voices.find((voice) => voice.voiceURI === wanted)
     if (matched) return matched
@@ -3506,7 +3537,7 @@ function syncSpeechSegment() {
 }
 
 function currentSpeechRate(): number {
-  const rate = Number(settings.value.ttsRate)
+  const rate = Number(effectiveSettings.value.ttsRate)
   if (!Number.isFinite(rate)) return 1
   return Math.min(2, Math.max(0.5, rate))
 }
@@ -3615,7 +3646,7 @@ function advanceSpeechSegment() {
 /** 章末：连续朗读开则加载下一章并从标题后第一段继续，否则停在章末 */
 async function finishSpeechChapter() {
   const hasNext = chapterIndex.value >= 0 && chapterIndex.value < chapters.value.length - 1
-  if (!settings.value.ttsContinuous) {
+  if (!effectiveSettings.value.ttsContinuous) {
     stopSpeech()
     showReaderHint('已读完本章')
     return
@@ -4025,7 +4056,8 @@ function onMediaProgress(seconds: number) {
 }
 
 function onTapAction(code: number) {
-  if (code === -1) return
+  // 无动作与尚未开放的隐藏动作都按「什么都不做」处理。
+  if (code === -1 || isHiddenTapAction(code)) return
   if (code === 0) {
     chrome.value = !chrome.value
     return
@@ -4064,17 +4096,11 @@ function onTapAction(code: number) {
   }
   if (code === 10) {
     tocOpen.value = true
-    return
   }
-  status.value = `「${tapActionLabel(code)}」暂未开放`
 }
 
 function applyPreset(preset: (typeof READER_PRESETS)[number]) {
-  settings.value.fontSize = preset.fontSize
-  settings.value.lineSpacing = preset.lineSpacing
-  settings.value.paragraphSpacing = preset.paragraphSpacing
-  settings.value.indent = preset.indent
-  settings.value.padding = { ...preset.padding }
+  Object.assign(settings.value, presetSettingsPatch(preset))
   persistSettings()
 }
 
@@ -4114,10 +4140,7 @@ const deepEqualValue = (left: unknown, right: unknown): boolean => JSON.stringif
 
 /** 只提交与基准不同的字段；自定义主题与媒体配额属全局层，不随面板保存。 */
 function settingsDiff(base: ReaderSettings, current: ReaderSettings): Record<string, unknown> {
-  const patch: Record<string, unknown> = {}
-  for (const key of Object.keys(current) as Array<keyof ReaderSettings>) {
-    if (!deepEqualValue(current[key], base[key])) patch[key] = current[key]
-  }
+  const patch = diffReaderSettings(base, current) as Record<string, unknown>
   delete patch.customThemes
   delete patch.mediaQuotaBytes
   return patch
@@ -4134,8 +4157,12 @@ async function loadSettings() {
   const scope: SettingsScope = bookId ? settingsScope.value : 'global'
   if (!bookId) settingsScope.value = 'global'
   try {
-    const stored = scope === 'book' ? await call('getSettings', { bookId }) : await call('getSettings')
+    // 有书时始终取一次合并值，阅读页据此显示；全局作用域另取全局层供面板编辑。
+    const bookStored: any = bookId ? await call('getSettings', { bookId }) : null
+    const stored: any =
+      bookId && scope === 'global' ? await call('getSettings') : bookStored
     if (!stored?.settings) return
+    bookOverrides.value = bookStored?.bookOverrides ?? {}
     settings.value = { ...defaultReaderSettings(), ...stored.settings } as ReaderSettings
     // 旧配置里可能存着已隐藏的点击动作（8/9/11/12）：回退为无动作并保存一次。
     const sanitizedZones = sanitizeTapZones(settings.value.tapZones)
@@ -4150,7 +4177,7 @@ async function loadSettings() {
       void persistSettings()
     }
     settingsBaseline.value = cloneSettings(settings.value)
-    bookOverridden.value = scope === 'book' ? Boolean(stored.bookOverridden) : false
+    bookOverridden.value = bookId ? Boolean(bookStored?.bookOverridden) : false
     settingsError.value = ''
   } catch (error) {
     settingsError.value = `设置读取失败：${errorText(error)}`
@@ -4197,6 +4224,7 @@ async function runPersistSettings() {
       settingsBaseline.value = cloneSettings(settings.value)
     }
     bookOverridden.value = bookId ? Boolean(result?.bookOverridden ?? true) : false
+    if (bookId && result?.bookOverrides) bookOverrides.value = result.bookOverrides
     settingsError.value = ''
     status.value = bookId ? '已保存到本书' : '已保存全局设置'
   } catch (error) {
@@ -4354,12 +4382,18 @@ function openArticle(item: any) {
   article.value = item
 }
 
+function syncViewportWidth() {
+  viewportWidth.value = window.innerWidth
+}
+
 onMounted(async () => {
   window.addEventListener('keydown', onReaderEscape)
+  window.addEventListener('resize', syncViewportWidth)
+  syncViewportWidth()
   document.addEventListener('visibilitychange', onReaderVisibilityChange)
   loadSpeechVoices()
   window.speechSynthesis?.addEventListener?.('voiceschanged', loadSpeechVoices)
-  autoPage.setSeconds(settings.value.autoPageSeconds)
+  autoPage.setSeconds(effectiveSettings.value.autoPageSeconds)
   if (!autoPageTimer) autoPageTimer = setInterval(runAutoPageTick, 250)
   try {
     const raw = localStorage.getItem(SEARCH_HISTORY_KEY)
@@ -5539,33 +5573,33 @@ onMounted(async () => {
             :text="replacedContent"
             :title="readerTitle"
             :book-name="currentBook?.name || ''"
-            :font-size="settings.fontSize"
+            :font-size="effectiveSettings.fontSize"
             :font-family="activeFontFamily"
-            :line-height="settings.lineSpacing"
-            :paragraph-spacing="settings.paragraphSpacing"
-            :letter-spacing="settings.letterSpacing"
-            :bold="settings.bold"
-            :title-mode="settings.titleMode"
-            :title-size="settings.titleSize"
-            :align="settings.align"
-            :compress-punctuation="settings.compressPunctuation"
-            :kinsoku="settings.kinsoku"
-            :dual-column="settings.dualColumn"
-            :ink-mode="settings.inkMode"
-            :indent="settings.indent"
-            :padding="settings.padding"
+            :line-height="effectiveSettings.lineSpacing"
+            :paragraph-spacing="effectiveSettings.paragraphSpacing"
+            :letter-spacing="effectiveSettings.letterSpacing"
+            :bold="effectiveSettings.bold"
+            :title-mode="effectiveSettings.titleMode"
+            :title-size="effectiveSettings.titleSize"
+            :align="effectiveSettings.align"
+            :compress-punctuation="effectiveSettings.compressPunctuation"
+            :kinsoku="effectiveSettings.kinsoku"
+            :dual-column="effectiveSettings.dualColumn"
+            :ink-mode="effectiveSettings.inkMode"
+            :indent="effectiveSettings.indent"
+            :padding="effectiveSettings.padding"
             :initial-page="initialPage"
             :highlight="readerHighlight"
             :underlines="underlineQuotes"
-            :theme="theme"
-            :theme-colors="activeThemeColors"
-            :animation="settings.pageAnimation"
+            :theme="readerTheme"
+            :theme-colors="readerThemeColors"
+            :animation="effectiveSettings.pageAnimation"
             :keys-enabled="!settingsOpen && !tocOpen && !bookmarksOpen && !notesOpen && !readerSearchOpen && !dictPanelOpen && !underlineOpen"
-            :header-mode="settings.headerMode"
-            :footer-mode="settings.footerMode"
-            :show-header-line="settings.showHeaderLine"
-            :show-footer-line="settings.showFooterLine"
-            :tap-zones="settings.tapZones"
+            :header-mode="effectiveSettings.headerMode"
+            :footer-mode="effectiveSettings.footerMode"
+            :show-header-line="effectiveSettings.showHeaderLine"
+            :show-footer-line="effectiveSettings.showFooterLine"
+            :tap-zones="effectiveSettings.tapZones"
             :book-percent="bookPercent"
             :battery-percent="batteryPercent"
             @page="onPage"
@@ -6057,10 +6091,13 @@ onMounted(async () => {
                   <label class="mo-switch"><input v-model="settings.showHeaderLine" type="checkbox" @change="persistSettings" />页眉</label>
                   <label class="mo-switch"><input v-model="settings.showFooterLine" type="checkbox" @change="persistSettings" />页脚</label>
                 </div>
-                <label class="mo-switch"><input v-model="settings.dualColumn" type="checkbox" @change="persistSettings" />双栏</label>
-                <label class="mo-switch"><input v-model="settings.inkMode" type="checkbox" @change="persistSettings" />墨水屏</label>
+                <div class="mo-theme-row">
+                  <label class="mo-switch"><input v-model="settings.dualColumn" type="checkbox" :disabled="!dualColumnAvailable" @change="persistSettings" />双栏</label>
+                  <span v-if="!dualColumnAvailable" class="muted" data-testid="dual-column-hint">屏幕太窄</span>
+                  <label class="mo-switch"><input v-model="settings.inkMode" type="checkbox" @change="persistSettings" />墨水屏</label>
+                </div>
                 <p class="muted" style="font-size: 12px; line-height: 1.6; margin: 4px 0 0">
-                  双栏在屏幕可用宽度不足 480px 时自动改单栏，滚动翻页只支持单栏。墨水屏下自动关掉翻页动画，退出后恢复原来的选择。
+                  双栏在屏幕可用宽度不足 480px 时不可开启（会改单栏），滚动翻页只支持单栏。墨水屏下自动关掉翻页动画，退出后恢复原来的选择。
                 </p>
               </details>
               

@@ -9,6 +9,7 @@ import {
   DEFAULT_TAP_ZONES,
   MENU_ITEMS,
   READER_PRESETS,
+  sanitizeTapZones,
   type ReaderPreset,
 } from './reader-config.js'
 import { createCustomTheme, isKnownTheme, type CustomTheme } from './theme.js'
@@ -366,7 +367,8 @@ const canNormalizePatchField = (
     return typeof value === 'string' && (ENUM_SETTING_FIELDS[key] as readonly string[]).includes(value)
   }
   if (key === 'padding') return isPlainObject(value)
-  if (key === 'tapZones') return Array.isArray(value) && value.length === 9
+  // 九宫格只接受本切片支持的动作；隐藏动作与越界值一律不写入，旧值保留。
+  if (key === 'tapZones') return Array.isArray(value) && value.length === 9 && !sanitizeTapZones(value).changed
   if (key === 'menuItems') {
     return Array.isArray(value) && value.some((item) => typeof item === 'string' && MENU_KEYS.has(item))
   }
@@ -415,6 +417,10 @@ export function normalizeBookOverrides(
     if (!BOOK_RECORD_META.has(key)) patchSource[key] = value
   }
   const patch = normalizeReaderSettingsPatch(patchSource, options)
+  // 旧覆盖记录里的九宫格可能含已隐藏动作：读取时收敛为「无动作」，避免意外翻页。
+  if (Array.isArray(patchSource.tapZones) && patchSource.tapZones.length === 9) {
+    patch.tapZones = sanitizeTapZones(patchSource.tapZones).zones
+  }
   // 自定义主题列表与媒体配额只存在全局层，旧覆盖记录里出现的也丢弃
   delete (patch as Record<string, unknown>).customThemes
   delete (patch as Record<string, unknown>).mediaQuotaBytes
