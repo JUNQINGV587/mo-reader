@@ -63,6 +63,7 @@ import { enabledDictRules, lookupAll, type DictLookupOutcome } from '../../core/
 import { swapDictOrder } from '../../core/dict/order'
 import { filterSources, hasExplore, needsLogin, sourceHost } from '../../core/source/filter'
 import { groupExploreBySourceGroup } from '../../core/source/group'
+import { dedupeSearchResults } from '../../core/source/search-results'
 
 const props = defineProps<{ remote?: any; layout?: any }>()
 
@@ -174,6 +175,10 @@ let longPressFired = false
 
 const searchKey = ref('')
 const searching = ref(false)
+/** 当前这次搜索的 token：响应回来时用它判断是否已被取消或被新搜索取代。 */
+let activeSearchToken = ''
+/** 已点取消的 token：即便结果迟到也不再改「已取消搜索」提示。 */
+let cancelledSearchToken = ''
 const books = ref<any[]>([])
 const searchErrors = ref<any[]>([])
 const searchScope = ref('')
@@ -3227,26 +3232,66 @@ async function runDebug() {
   }
 }
 
+function newSearchToken(): string {
+  try {
+    return crypto.randomUUID()
+  } catch {
+    // 老 WebView 没有 randomUUID，退回时间戳 + 随机数。
+    return `search-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  }
+}
+
+/** 结果按「书名 + 作者」合并；服务端已合并时这里幂等兜底，老服务端也不重复。 */
+function mergeSearchList(list: any[]): any[] {
+  if (!Array.isArray(list) || !list.length) return []
+  return dedupeSearchResults(list) as any[]
+}
+
 async function search() {
   const key = searchKey.value.trim()
   if (!key) return
+  const token = newSearchToken()
+  activeSearchToken = token
+  cancelledSearchToken = ''
   searching.value = true
   books.value = []
   searchErrors.value = []
   try {
-    const args: any = { key, page: 1 }
+    const args: any = { key, page: 1, token }
     if (scopedSourceUrls.value) args.sourceUrls = scopedSourceUrls.value
     const result = await call('searchBooks', args)
-    let list = result.books ?? []
+    // 已被新搜索取代：丢弃这次响应。
+    if (activeSearchToken !== token) return
+    let list = mergeSearchList(result.books ?? [])
     if (searchExact.value) list = list.filter((book: any) => String(book.name ?? '').trim() === key.trim())
     books.value = list
     searchErrors.value = result.errors ?? []
+    if (cancelledSearchToken === token || result.cancelled === true) {
+      // 保留取消前已抓到的结果，但不覆盖「已取消搜索」提示。
+      status.value = '已取消搜索'
+      return
+    }
     rememberSearch(key)
     status.value = `搜索到 ${books.value.length} 本，失败 ${searchErrors.value.length} 个源`
   } catch (error) {
-    status.value = errorText(error)
+    if (activeSearchToken !== token) return
+    status.value = cancelledSearchToken === token ? '已取消搜索' : errorText(error)
   } finally {
-    searching.value = false
+    if (activeSearchToken === token) searching.value = false
+  }
+}
+
+/** 取消搜索：先让界面回空闲态，再通知服务端中断在途请求、停掉未开始的书源。 */
+async function cancelSearch() {
+  if (!searching.value) return
+  const token = activeSearchToken
+  cancelledSearchToken = token
+  searching.value = false
+  status.value = '已取消搜索'
+  try {
+    await call('cancelSearch', { token })
+  } catch {
+    // 服务端不可达时也不该卡在「搜索中」，界面已经回到空闲态。
   }
 }
 
@@ -5581,6 +5626,7 @@ onMounted(async () => {
           <button class="mo-btn primary" :disabled="searching || !searchKey.trim()" data-testid="search" @click="search">
             {{ searching ? '搜索中…' : '搜索' }}
           </button>
+          <button v-if="searching" class="mo-btn" data-testid="search-cancel" @click="cancelSearch">取消</button>
         </div>
         <div class="mo-search-scope">
           <select v-model="searchScope" class="mo-select" aria-label="搜索范围">
@@ -5611,7 +5657,9 @@ onMounted(async () => {
             <span class="mo-result-main">
               <span class="mo-result-name">{{ book.name }}</span>
               <span class="muted">{{ book.author || '未知作者' }} · {{ book.kind || '小说' }}</span>
-              <span class="muted">{{ book.originName || book.origin }}</span>
+              <span class="muted">
+                <template v-if="(book.sourceCount || 1) > 1">{{ book.sourceCount }} 个来源 · </template>{{ book.originName || book.origin }}
+              </span>
             </span>
             <span class="mo-result-arrow">›</span>
           </button>

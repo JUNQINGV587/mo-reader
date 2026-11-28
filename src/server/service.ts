@@ -44,6 +44,7 @@ import {
   htmlToText,
 } from '../core/source/analyze.js'
 import { buildReviewSummaryRequest, parseReviewSummary, reviewRule, summaryIsConfigured } from '../core/source/review.js'
+import { dedupeSearchResults } from '../core/source/search-results.js'
 import { mapSwitchProgress, matchBookName, sameAuthorName } from '../core/source/switch.js'
 import { openReaderStorage } from './storage.js'
 import { clearAllChapterCache, clearChapterCache, readCachedChapter, writeCachedChapter } from './cache.js'
@@ -247,6 +248,11 @@ function stringArg(args: Args, name: string): string {
   return value.trim()
 }
 
+/** 取消搜索会中断 fetch，不同运行时抛出的中止错误统一按 AbortError 识别。 */
+function isAbortError(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && (error as { name?: unknown }).name === 'AbortError')
+}
+
 /**
  * 连接测试的配置草稿：按「字段是否出现」区分「没改」与「改成空」。
  * 密码草稿是空串时沿用已存密码——页面拿不到原密码，只能这样保留。
@@ -283,6 +289,12 @@ class HlsMediaDetected extends Error {
 
 /** 在线检查并发上限与超时范围：一次只打 8 个源，单请求 0.5–30 秒。 */
 const SOURCE_CHECK_CONCURRENCY = 8
+
+/** 搜索抓取并发上限（#145）：一次最多打 8 个书源，其余排队，取消时未开始的不再请求。 */
+const SEARCH_CONCURRENCY = 8
+
+/** 先到取消标记的保留时长（#145）：避免 cancelSearch 先于 searchBooks 到达时丢失取消。 */
+const SEARCH_CANCEL_TTL_MS = 60_000
 const SOURCE_CHECK_TIMEOUT_MS = 5000
 const SOURCE_CHECK_TIMEOUT_MIN_MS = 500
 const SOURCE_CHECK_TIMEOUT_MAX_MS = 30_000
@@ -378,6 +390,12 @@ export class ReaderService extends TypertRemoteService {
 
   /** 配额读改串行：并发章节发布会同时触发淘汰，排队执行避免重复删同一本书。 */
   storageLock: Promise<unknown> | null = null
+
+  /** 搜索取消控制器（#145）：token → controller，搜索作业结束即清理，避免泄漏。 */
+  searchCancellations = new Map<string, AbortController>()
+
+  /** 先到的取消（#145）：cancelSearch 可能先于 searchBooks 处理，拿到的 token 在有效期内立即取消。 */
+  cancelledSearchTokens = new Map<string, number>()
 
   constructor(ctx: any, _options: any = {}) {
     super(ctx, 'reader')
@@ -721,9 +739,18 @@ export class ReaderService extends TypertRemoteService {
     return { name: record.name, text: htmlToText(extracted), url: raw.url }
   }
 
+  /**
+   * 搜索全部启用书源（#145）。
+   * - 有界并发：最多 8 个源同时抓取，其余排队；
+   * - 可选 token 取消：cancelSearch 置标记后未开始的批次不再请求、在途请求尽量中断；
+   * - 结果按「书名 + 作者」合并（换源候选传 dedupe:false 保留每个来源）。
+   * 旧调用（无 token）仍返回 { books, errors }，不新增字段。
+   */
   async searchBooks(args: Args) {
     const key = stringArg(args, 'key')
     const page = typeof args?.page === 'number' && args.page > 0 ? Math.floor(args.page) : 1
+    const dedupe = args?.dedupe !== false
+    const token = typeof args?.token === 'string' && args.token.trim() ? args.token.trim() : ''
     const wanted = Array.isArray(args?.sourceUrls)
       ? new Set(args!.sourceUrls.filter((url): url is string => typeof url === 'string'))
       : null
@@ -736,29 +763,104 @@ export class ReaderService extends TypertRemoteService {
       sources.push(source)
     }
 
-    const settled = await Promise.allSettled(
-      sources.map(async (source) => {
-        const request = buildSearchRequest(source, key, page)
-        if (!request) throw new Error('书源没有搜索地址')
-        const raw = await this.fetch(request, source)
-        return analyzeSearch(raw.text, source, raw.url)
-      }),
-    )
+    const controller = token ? this.beginSearch(token) : null
+    const signal = controller?.signal
+    const bookSlots: Array<ReturnType<typeof analyzeSearch>> = new Array(sources.length)
+    const errorSlots: Array<{ sourceUrl: string; message: string }> = new Array(sources.length)
+    let cancelled = false
+    let cursor = 0
+    const worker = async () => {
+      for (;;) {
+        // 每取一个源之前检查取消：未开始的源不再发请求。
+        if (signal?.aborted) {
+          cancelled = true
+          return
+        }
+        const index = cursor
+        cursor += 1
+        if (index >= sources.length) return
+        const source = sources[index]!
+        try {
+          const request = buildSearchRequest(source, key, page)
+          if (!request) throw new Error('书源没有搜索地址')
+          const raw = await this.fetch(request, source, signal)
+          bookSlots[index] = analyzeSearch(raw.text, source, raw.url)
+        } catch (error) {
+          // 取消导致的中止不算书源错误，不计入 errors。
+          if (signal?.aborted || isAbortError(error)) {
+            cancelled = true
+            return
+          }
+          errorSlots[index] = {
+            sourceUrl: source.bookSourceUrl,
+            message: error instanceof Error ? error.message : String(error),
+          }
+        }
+      }
+    }
 
+    try {
+      if (sources.length > 0) {
+        await Promise.all(
+          Array.from({ length: Math.min(SEARCH_CONCURRENCY, sources.length) }, () => worker()),
+        )
+      }
+    } finally {
+      if (token && controller) this.finishSearch(token, controller)
+    }
+
+    if (signal?.aborted) cancelled = true
     const books: ReturnType<typeof analyzeSearch> = []
     const errors: Array<{ sourceUrl: string; message: string }> = []
-    settled.forEach((result, index) => {
-      const source = sources[index]!
-      if (result.status === 'fulfilled') {
-        books.push(...result.value)
-      } else {
-        errors.push({
-          sourceUrl: source.bookSourceUrl,
-          message: result.reason instanceof Error ? result.reason.message : String(result.reason),
-        })
-      }
+    bookSlots.forEach((slot) => {
+      if (slot) books.push(...slot)
     })
-    return { books, errors }
+    errorSlots.forEach((slot) => {
+      if (slot) errors.push(slot)
+    })
+    const merged = dedupe ? dedupeSearchResults(books) : books
+    return token ? { books: merged, errors, cancelled } : { books: merged, errors }
+  }
+
+  /** 取消进行中的搜索（#145）：标记 token、中断在途抓取；未开始的书源不会再请求。 */
+  async cancelSearch(args: Args) {
+    const token = stringArg(args, 'token')
+    const controller = this.searchCancellations.get(token)
+    if (controller) {
+      // 已有在途搜索：直接中断即可，不留下取消标记。
+      controller.abort()
+    } else {
+      // 取消早于 searchBooks 到达：记标记，等搜索开始时立刻中止（60 秒内有效）。
+      this.cancelledSearchTokens.set(token, Date.now())
+      this.sweepCancelledSearches()
+    }
+    return { cancelled: true }
+  }
+
+  /** 登记一次带 token 的搜索：若取消已先到，控制器直接处于中止态。 */
+  private beginSearch(token: string): AbortController {
+    const early = this.cancelledSearchTokens.get(token)
+    this.cancelledSearchTokens.delete(token)
+    // 同一 token 重复发起时让旧请求先结束，避免结果互相覆盖。
+    this.searchCancellations.get(token)?.abort()
+    const controller = new AbortController()
+    this.searchCancellations.set(token, controller)
+    if (early !== undefined) controller.abort()
+    return controller
+  }
+
+  /** 搜索结束清理 token；只删属于自己的控制器，避免误清同 token 的新搜索。 */
+  private finishSearch(token: string, controller: AbortController): void {
+    if (this.searchCancellations.get(token) === controller) this.searchCancellations.delete(token)
+    this.sweepCancelledSearches()
+  }
+
+  /** 先到取消标记最多保留 60 秒；没有对应搜索的孤儿标记不能无限增长。 */
+  private sweepCancelledSearches(): void {
+    const now = Date.now()
+    for (const [token, at] of this.cancelledSearchTokens) {
+      if (now - at > SEARCH_CANCEL_TTL_MS) this.cancelledSearchTokens.delete(token)
+    }
   }
 
   async listExploreSources() {
@@ -840,7 +942,8 @@ export class ReaderService extends TypertRemoteService {
     }
     if (sourceUrls.length === 0) return { candidates: [], errors: [] }
 
-    const found = (await this.searchBooks({ key: bookName, sourceUrls })) as {
+    // 换源要看到每个来源的候选，不能按书名+作者合并掉其他来源。
+    const found = (await this.searchBooks({ key: bookName, sourceUrls, dedupe: false })) as {
       books: ReturnType<typeof analyzeSearch>
       errors: Array<{ sourceUrl: string; message: string }>
     }
@@ -3821,13 +3924,14 @@ export class ReaderService extends TypertRemoteService {
     throw new Error(`书源不存在：${url}`)
   }
 
-  private async fetch(request: RequestSpec, source: BookSource) {
+  private async fetch(request: RequestSpec, source: BookSource, signal?: AbortSignal) {
     // URL 自带 `,{...}` 选项（目录/正文常见，且可能 percent-encode）优先。
     const inline = splitUrlOptions(request.url)
     return fetchText(inline.url, {
       method: inline.method !== 'GET' ? inline.method : request.method,
       body: inline.body ?? request.body,
       headers: { ...parseHeaders(source.header), ...inline.headers, ...request.headers },
+      signal,
     })
   }
 }

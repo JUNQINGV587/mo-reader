@@ -15,6 +15,8 @@ export interface FetchOptions {
   headers?: Record<string, string>;
   body?: string;
   timeoutMs?: number;
+  /** 调用方取消（如搜索取消）：与单跳超时取先到者。 */
+  signal?: AbortSignal;
 }
 
 export interface FetchResult {
@@ -74,12 +76,13 @@ export async function fetchText(rawUrl: string, options: FetchOptions = {}): Pro
   };
 
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
+    const timeoutSignal = AbortSignal.timeout(options.timeoutMs ?? 20_000);
     const response = await fetch(url, {
       method,
       headers,
       body: method === 'GET' ? undefined : options.body,
       redirect: 'manual',
-      signal: AbortSignal.timeout(options.timeoutMs ?? 20_000),
+      signal: options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal,
     });
 
     if (response.status >= 300 && response.status < 400) {

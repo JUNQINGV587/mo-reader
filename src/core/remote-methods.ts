@@ -21,6 +21,7 @@ export const REMOTE_METHODS = Object.freeze([
   'previewSourceCandidate',
   'switchBookSource',
   'searchBooks',
+  'cancelSearch',
   'getBookInfo',
   'getToc',
   'getContent',
