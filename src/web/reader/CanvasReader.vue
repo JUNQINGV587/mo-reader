@@ -245,6 +245,10 @@ function contentBox() {
   }
 }
 
+/**
+ * 影响排版的全部设置：任一变化都必须重排。
+ * 主题只改颜色、不改变字形宽度，故意不进缓存键；切主题不触发 20000 字章节重排。
+ */
 function layoutSettings() {
   return {
     fontSize: props.fontSize,
