@@ -8661,6 +8661,15 @@ onMounted(async () => {
   text-align: left;
   cursor: pointer;
   color: inherit;
+  /* 千本书架：离屏卡片跳过布局与绘制；auto 记住首次渲染后的真实高度。 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 314px;
+}
+@media (min-width: 721px) {
+  /* 桌面卡片比手机略矮，减少 content-visibility 的占位误差。 */
+  .mo-shelf:not(.mo-shelf-list) .mo-cover-card {
+    contain-intrinsic-size: auto 290px;
+  }
 }
 .mo-cover {
   position: relative;
@@ -8809,6 +8818,7 @@ onMounted(async () => {
   min-width: 0;
   padding: 10px 6px;
   border-bottom: 1px solid var(--mo-line);
+  contain-intrinsic-size: auto 96px;
 }
 .mo-shelf-list .mo-cover {
   grid-column: 1;
