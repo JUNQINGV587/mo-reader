@@ -183,10 +183,36 @@ let searchPollTimer: ReturnType<typeof setInterval> | null = null
 const SEARCH_JOB_KEY = 'mo-reader-search-job'
 const books = ref<any[]>([])
 const searchErrors = ref<any[]>([])
+/** 失败源清单是否展开；收起时只显示「N 个书源检索失败」。 */
+const searchFailuresOpen = ref(false)
+/** 重试范围内已停用/已删除、本次被跳过的书源。 */
+const searchSkipped = ref<any[]>([])
+/** 重试模式：新作业的书目并入已有结果，而不是覆盖列表。 */
+const searchMergeMode = ref(false)
+/** 重试开始前已展示的书目；合并时保留，保证已有结果不会丢。 */
+const searchMergeBase = ref<any[]>([])
+/** 重试开始前的失败清单；取消重试时保住还没轮到的失败源，之后仍可再重试。 */
+const searchBaseFailures = ref<any[]>([])
 const searchScope = ref('')
 const searchExact = ref(false)
 const searchHistory = ref<string[]>([])
 const SEARCH_HISTORY_KEY = 'mo-reader-search-history'
+
+/** 失败清单里还有 bookSourceUrl 的源才可重试；没有 URL 的条目只展示。 */
+const retryableSourceUrls = computed<string[]>(() => {
+  const urls: string[] = []
+  for (const item of searchErrors.value) {
+    const url = String(item?.bookSourceUrl ?? '').trim()
+    if (url && !urls.includes(url)) urls.push(url)
+  }
+  return urls
+})
+const searchSkippedText = computed(() =>
+  searchSkipped.value
+    .map((item: any) => String(item?.sourceName || item?.bookSourceUrl || '').trim())
+    .filter(Boolean)
+    .join('、'),
+)
 
 const exploreSources = ref<any[]>([])
 const exploreGroups = ref<Array<{ source: any; categories: any[]; error: string }>>([])
@@ -3325,14 +3351,42 @@ function mergeSearchList(list: any[]): any[] {
   return dedupeSearchResults(list) as any[]
 }
 
+/** 失败项去重键：优先用书源 URL，缺 URL 时退回源名 + 错误文案。 */
+function failureKey(item: any): string {
+  const url = String(item?.bookSourceUrl ?? '').trim()
+  if (url) return url
+  return `${String(item?.sourceName ?? '').trim()}\u0000${String(item?.error ?? item?.message ?? '').trim()}`
+}
+
+/** 合并两份失败清单：按书源去重，新错误覆盖旧错误，顺序沿用原清单。 */
+function mergeFailureLists(base: any[], incoming: any[]): any[] {
+  const result: any[] = []
+  const indexByKey = new Map<string, number>()
+  for (const item of [...base, ...incoming]) {
+    const key = failureKey(item)
+    const index = indexByKey.get(key)
+    if (index === undefined) {
+      indexByKey.set(key, result.length)
+      result.push(item)
+    } else {
+      result[index] = item
+    }
+  }
+  return result
+}
+
 /** 轮询文案固定为「已搜 N/M 源、已得 K 本、失败 S 源」，K 取当前展示的去重书目数。 */
 function searchProgressText(job: any): string {
   const done = Number(job?.doneSources) || 0
   const total = Number(job?.totalSources) || 0
   const failed = Array.isArray(job?.failures) ? job.failures.length : 0
-  // 「已得」取服务端去重后的书目数，与整批搜索结果一致；精确书名只影响列表展示。
+  // 「已得」普通搜索取服务端去重后的书目数；重试作业只含失败源，取并入后展示的书目数。
   const found = Number(job?.bookCount)
-  const count = Number.isFinite(found) ? found : books.value.length
+  const count = searchMergeMode.value
+    ? books.value.length
+    : Number.isFinite(found)
+      ? found
+      : books.value.length
   return `已搜 ${done}/${total} 源、已得 ${count} 本、失败 ${failed} 源`
 }
 
@@ -3377,15 +3431,22 @@ function syncSearchTimer() {
   if (!searchPollTimer) searchPollTimer = setInterval(() => void refreshSearchJob(), 500)
 }
 
-/** 用服务端快照覆盖界面（不累加）；精确书名过滤只影响展示的列表。 */
+/** 用服务端快照更新界面：普通搜索覆盖书目；重试时把失败源的新结果并入已有书目。 */
 function applySearchSnapshot(snapshot: any) {
   if (!snapshot) return
   searchJob.value = snapshot
   const key = String(snapshot.key ?? searchKey.value ?? '').trim()
-  let list = mergeSearchList(snapshot.books ?? [])
+  const incoming = mergeSearchList(snapshot.books ?? [])
+  let list = searchMergeMode.value ? mergeSearchList([...searchMergeBase.value, ...incoming]) : incoming
   if (searchExact.value) list = list.filter((book: any) => String(book.name ?? '').trim() === key)
   books.value = list
-  searchErrors.value = Array.isArray(snapshot.failures) ? snapshot.failures : []
+  const failures = Array.isArray(snapshot.failures) ? snapshot.failures : []
+  // 取消重试时还没轮到的失败源不在快照里；并入重试前的清单，之后仍可再点重试。
+  searchErrors.value =
+    searchMergeMode.value && snapshot.status === 'cancelled'
+      ? mergeFailureLists(searchBaseFailures.value, failures)
+      : failures
+  searchSkipped.value = Array.isArray(snapshot.skipped) ? snapshot.skipped : []
   searching.value = snapshot.status === 'running'
   if (snapshot.status === 'running') {
     status.value = searchProgressText(snapshot)
@@ -3393,7 +3454,7 @@ function applySearchSnapshot(snapshot: any) {
   }
   stopSearchTimer()
   if (snapshot.status === 'cancelled' || snapshot.cancelled === true) {
-    status.value = '已取消搜索'
+    status.value = searchMergeMode.value ? '已取消重试' : '已取消搜索'
     forgetSearchJob()
     return
   }
@@ -3450,6 +3511,12 @@ async function search() {
   searching.value = true
   books.value = []
   searchErrors.value = []
+  // 新的一次普通搜索回到覆盖模式：不保留上一次重试的合并基数与展开状态。
+  searchMergeMode.value = false
+  searchMergeBase.value = []
+  searchBaseFailures.value = []
+  searchFailuresOpen.value = false
+  searchSkipped.value = []
   status.value = '搜索中…'
   try {
     const args: any = { key }
@@ -3467,13 +3534,57 @@ async function search() {
   }
 }
 
+/** 重试失败源：只把失败清单里还有 bookSourceUrl 的源重新起一个作业，结果去重并入当前列表。 */
+async function retryFailedSources() {
+  if (searching.value) return
+  const urls = [...retryableSourceUrls.value]
+  if (!urls.length) return
+  const key = String(searchJob.value?.key ?? searchKey.value ?? '').trim()
+  if (!key) return
+  stopSearchTimer()
+  // 上一次作业仍在跑就先取消，避免新旧作业同时占用书源。
+  if (searchJobId.value && searchJob.value?.status === 'running') {
+    try {
+      await call('cancelSearchJob', { jobId: searchJobId.value })
+    } catch {
+      // 取消失败不阻塞重试
+    }
+  }
+  searchMergeMode.value = true
+  searchMergeBase.value = books.value.slice()
+  searchBaseFailures.value = searchErrors.value.slice()
+  searchFailuresOpen.value = true
+  searchSkipped.value = []
+  searchJobId.value = ''
+  searchJob.value = null
+  searching.value = true
+  searchErrors.value = []
+  status.value = `重试 ${urls.length} 个失败源…`
+  try {
+    const started: any = await call('startSearch', { key, sourceUrls: urls })
+    const jobId = String(started?.jobId || '')
+    if (!jobId) throw new Error('搜索作业没有返回作业号')
+    searchJobId.value = jobId
+    rememberSearchJob(jobId)
+    await refreshSearchJob(jobId)
+    syncSearchTimer()
+  } catch (error) {
+    searching.value = false
+    searchMergeMode.value = false
+    searchMergeBase.value = []
+    searchErrors.value = searchBaseFailures.value.slice()
+    searchFailuresOpen.value = true
+    status.value = errorText(error)
+  }
+}
+
 /** 取消搜索：中断在途请求、停掉未开始的源，并保留已得书目。 */
 async function cancelSearch() {
   const jobId = searchJobId.value
   if (!jobId || !searching.value) return
   stopSearchTimer()
   searching.value = false
-  status.value = '已取消搜索'
+  status.value = searchMergeMode.value ? '已取消重试' : '已取消搜索'
   try {
     const snapshot: any = await call('cancelSearchJob', { jobId })
     if (searchJobId.value !== jobId) return
@@ -5932,10 +6043,35 @@ onMounted(async () => {
           </button>
         </div>
 
-        <div v-if="searchErrors.length" class="mo-errors">
-          <p class="muted">{{ searchErrors.length }} 个书源检索失败</p>
-          <p v-for="error in searchErrors.slice(0, 5)" :key="error.bookSourceUrl || error.sourceUrl || error.sourceName" class="muted">
-            {{ error.sourceName || error.bookSourceUrl || error.sourceUrl }}：{{ error.error || error.message }}
+        <div v-if="searchErrors.length || searchSkipped.length" class="mo-errors">
+          <template v-if="searchErrors.length">
+            <div class="mo-failure-head">
+              <p class="muted" data-testid="search-failure-count">{{ searchErrors.length }} 个书源检索失败</p>
+              <button class="mo-btn" data-testid="search-failures-toggle" @click="searchFailuresOpen = !searchFailuresOpen">
+                {{ searchFailuresOpen ? '收起' : '展开' }}
+              </button>
+              <button
+                v-if="!searching && retryableSourceUrls.length"
+                class="mo-btn"
+                data-testid="search-retry"
+                @click="retryFailedSources"
+              >
+                重试失败源
+              </button>
+            </div>
+            <ul v-if="searchFailuresOpen" class="mo-failure-list">
+              <li
+                v-for="(error, index) in searchErrors"
+                :key="error.bookSourceUrl || error.sourceUrl || error.sourceName || index"
+                class="muted"
+                data-testid="search-failure"
+              >
+                {{ error.sourceName || error.bookSourceUrl || error.sourceUrl }}：{{ error.error || error.message || '未知错误' }}
+              </li>
+            </ul>
+          </template>
+          <p v-if="searchSkipped.length" class="muted" data-testid="search-skipped">
+            已跳过 {{ searchSkipped.length }} 个不可用书源：{{ searchSkippedText }}
           </p>
         </div>
       </section>
@@ -8779,6 +8915,26 @@ onMounted(async () => {
   margin-top: 14px;
   padding-top: 10px;
   border-top: 1px dashed var(--mo-line);
+}
+.mo-failure-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.mo-failure-head p {
+  margin: 0;
+}
+.mo-errors p {
+  overflow-wrap: anywhere;
+}
+.mo-failure-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0 0;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
 }
 .mo-explore-section {
   padding-top: 14px;

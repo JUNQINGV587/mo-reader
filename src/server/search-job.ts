@@ -22,9 +22,19 @@ const SEARCH_JOB_FLUSH_MS = 500
 const SEARCH_JOB_CONCURRENCY = 8
 
 export interface SearchJobFailure {
+  /** 源在本次搜索里的下标；按它升序展示，失败顺序不随完成时序跳。旧快照可能没有该字段。 */
+  sourceIndex?: number
   sourceName: string
   bookSourceUrl: string
   error: string
+}
+
+/** 范围内已停用或已删除、本次没有参与抓取的书源。 */
+export interface SearchJobSkipped {
+  bookSourceUrl: string
+  /** 书源已不存在时用 URL 兜底。 */
+  sourceName: string
+  reason: string
 }
 
 export interface SearchJob {
@@ -43,6 +53,7 @@ export interface SearchJob {
   bookCount: number
   books: MergedSearchBook[]
   failures: SearchJobFailure[]
+  skipped: SearchJobSkipped[]
   cancelled: boolean
   error: string
   createdAt: number
@@ -61,6 +72,8 @@ export interface SearchJobSnapshot {
   bookCount: number
   books: MergedSearchBook[]
   failures: SearchJobFailure[]
+  /** 范围里已停用或已删除、本次没有参与抓取的书源。 */
+  skipped: SearchJobSkipped[]
   cancelled: boolean
   error: string
   createdAt: number
@@ -104,7 +117,11 @@ function snapshotOf(job: SearchJob): SearchJobSnapshot {
     totalSources: job.totalSources,
     bookCount: job.bookCount,
     books: job.books.map((book) => ({ ...book, sources: book.sources.map((source) => ({ ...source })) })),
-    failures: job.failures.map((failure) => ({ ...failure })),
+    // 按源下标升序：失败顺序固定为搜索源顺序，不随完成时序跳；旧快照缺下标时按原顺序稳定展示。
+    failures: [...job.failures]
+      .sort((left, right) => (left.sourceIndex ?? 0) - (right.sourceIndex ?? 0))
+      .map((failure) => ({ ...failure })),
+    skipped: (job.skipped ?? []).map((item) => ({ ...item })),
     cancelled: job.cancelled,
     error: job.error,
     createdAt: job.createdAt,
@@ -138,7 +155,8 @@ export class SearchJobCoordinator {
       // 清理失败不影响本次搜索。
     }
     await this.dropFinished(db.jobs)
-    const scope = input.scope ?? null
+    // 去重后再比：范围里同一个 URL 出现多次不算多个书源。
+    const scope = input.scope ? [...new Set(input.scope)] : null
     const sources = this.host.listSources(scope)
     const now = Date.now()
     const job: SearchJob = {
@@ -156,6 +174,7 @@ export class SearchJobCoordinator {
       bookCount: 0,
       books: [],
       failures: [],
+      skipped: this.skippedSources(scope, sources),
       cancelled: false,
       error: '',
       createdAt: now,
@@ -280,6 +299,7 @@ export class SearchJobCoordinator {
           }
           slots[index] = []
           job.failures.push({
+            sourceIndex: index,
             sourceName: source.bookSourceName || source.bookSourceUrl,
             bookSourceUrl: source.bookSourceUrl,
             error: errorMessage(error),
@@ -339,6 +359,18 @@ export class SearchJobCoordinator {
     }
     job.books = dedupeSearchResults(books)
     job.bookCount = job.books.length
+  }
+
+  /** 范围里已停用或已删除的书源：只记入 skipped 提示，不参与抓取也不计入总源数。 */
+  private skippedSources(scope: string[] | null, sources: BookSource[]): SearchJobSkipped[] {
+    if (!scope) return []
+    const available = new Set(sources.map((source) => source.bookSourceUrl))
+    const skipped: SearchJobSkipped[] = []
+    for (const url of scope) {
+      if (!url || available.has(url)) continue
+      skipped.push({ bookSourceUrl: url, sourceName: url, reason: '书源已停用或已删除' })
+    }
+    return skipped
   }
 
   private async dropFinished(jobs: any): Promise<void> {
