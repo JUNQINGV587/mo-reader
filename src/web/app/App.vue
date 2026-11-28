@@ -98,7 +98,21 @@ const view = ref<View>('shelf')
 const version = ref('')
 const dataDir = ref('')
 const status = ref('')
+/** 最近一次错误状态；非空时顶栏改用 alert 播报，普通状态仍走 polite。 */
+const statusAlert = ref('')
 const busy = ref(false)
+
+function setErrorStatus(text: string) {
+  const message = String(text ?? '').trim()
+  if (!message) return
+  status.value = message
+  statusAlert.value = message
+}
+
+watch(status, (value) => {
+  // 成功/普通状态覆盖了错误文案时，同步退回 polite；setErrorStatus 同时写两者，不会误清。
+  if (value !== statusAlert.value) statusAlert.value = ''
+})
 const cacheBusy = ref(false)
 const exportBusy = ref(false)
 
@@ -244,6 +258,13 @@ const searchEmpty = computed(
 const searchAllFailed = computed(
   () => searchFinished.value && !searching.value && books.value.length === 0 && searchErrors.value.length > 0,
 )
+/** 页面里已经有 role=alert 的错误面板时，顶栏不再重复播报同一句话。 */
+const inlineErrorVisible = computed(() => {
+  if (view.value === 'shelf') return Boolean(shelfError.value)
+  if (view.value === 'search' || view.value === 'detail') return Boolean(searchFailure.value)
+  if (view.value === 'explore') return Boolean(exploreError.value)
+  return false
+})
 
 const exploreSources = ref<any[]>([])
 const exploreGroups = ref<Array<{ source: any; categories: any[]; error: string }>>([])
@@ -454,6 +475,8 @@ const readerSearchResults = ref<
 const readerSearchErrors = ref<Array<{ chapterIndex: number; chapterTitle: string; message: string }>>([])
 const readerSearchHint = ref('')
 const readerHint = ref('')
+/** 读屏用：视觉提示 4 秒后消失，这条保留到下一次提示，避免播报被截断。 */
+const readerHintLive = ref('')
 let readerSearchToken = 0
 let readerHintTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -961,7 +984,7 @@ async function refresh() {
     status.value = `书源 ${sources.value.length} 个（启用 ${enabledCount.value}） · 书架 ${shelfBooks.value.length} 本`
   } catch (error) {
     if (!shelfLoaded) shelfError.value = shelfLoadErrorMessage(errorText(error))
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     busy.value = false
   }
@@ -1025,7 +1048,7 @@ async function saveSimulate() {
     status.value = patch.simulateEnabled ? `模拟阅读已开启，当前模拟至第 ${simulatedChapterCount(currentBook.value as any)} 章` : '模拟阅读已关闭'
     await refresh()
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   }
 }
 
@@ -1037,7 +1060,7 @@ async function cacheBookChapters() {
     const result: any = await call('cacheBook', { bookId: book.id, limit: 20 })
     status.value = result?.message || `已缓存 ${result?.cached ?? 0} 章，失败 ${result?.failed ?? 0} 章`
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     cacheBusy.value = false
   }
@@ -1131,7 +1154,7 @@ async function loadExportDownload() {
       exportDownload.value = { url: String(result?.url ?? ''), fileName: String(result?.fileName ?? '') }
     } catch (error) {
       exportDownload.value = null
-      status.value = errorText(error)
+      setErrorStatus(errorText(error))
     }
   } else {
     // 整本失败没有主产物，但失败清单照样值得给：它就是定位「哪几章没导出」的材料。
@@ -1162,7 +1185,7 @@ async function refreshExportJob() {
     const result: any = await call('getJob', { id: job.id })
     exportJob.value = result?.job ?? exportJob.value
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   }
   if (isExportFinished(exportJob.value)) await loadExportDownload()
   syncExportTimer()
@@ -1237,7 +1260,7 @@ async function cancelExport() {
     exportFailedDownload.value = null
     status.value = '已取消导出'
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     exportBusy.value = false
     syncExportTimer()
@@ -2398,7 +2421,7 @@ async function refreshDownloadJob() {
     const result: any = await call('getJob', { id: job.id })
     downloadJob.value = result?.job ?? downloadJob.value
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   }
   // 下载中每 5 秒刷新一次聚合（索引随完成章增长）；结束/暂停时立即刷新。
   if (!isDownloadRunning(downloadJob.value) || Date.now() - downloadSummaryAt > 5000) {
@@ -2461,7 +2484,7 @@ async function deleteDownloaded() {
     status.value = `已删除 ${result?.removed ?? 0} 章的下载`
     await loadActiveDownload()
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     downloadDeleting.value = false
   }
@@ -2490,7 +2513,7 @@ async function startDownload() {
     void refreshDownloadSummary()
     syncDownloadTimer()
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     downloadBusy.value = false
   }
@@ -2505,7 +2528,7 @@ async function controlDownload(method: string, message: string) {
     downloadJob.value = result?.job ?? downloadJob.value
     status.value = message
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     downloadBusy.value = false
     void refreshDownloadSummary()
@@ -2569,7 +2592,7 @@ async function refreshMediaJob() {
     const result: any = await call('getJob', { id: job.id })
     mediaJob.value = result?.job ?? mediaJob.value
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   }
   if (!isDownloadRunning(mediaJob.value) || Date.now() - mediaSummaryAt > 5000) {
     void refreshMediaSummary()
@@ -2649,7 +2672,7 @@ async function startMediaDownload() {
     void refreshMediaSummary()
     syncMediaTimer()
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     mediaBusy.value = false
   }
@@ -2664,7 +2687,7 @@ async function controlMediaDownload(method: string, message: string) {
     mediaJob.value = result?.job ?? mediaJob.value
     status.value = message
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     mediaBusy.value = false
     void refreshMediaSummary()
@@ -2726,7 +2749,7 @@ async function retryReaderMedia() {
     readerMediaRetryUsed = false
     readerMediaRetryAvailable.value = true
     readerMediaNotice.value = `重新下载第 ${index + 1} 章失败：${errorText(error)}`
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     readerMediaRetryBusy.value = false
   }
@@ -2770,7 +2793,7 @@ async function deleteMediaDownloaded() {
     status.value = `已删除 ${result?.removed ?? 0} ${mediaUnit()}离线媒体`
     await loadActiveMedia()
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     mediaDeleting.value = false
   }
@@ -3194,7 +3217,7 @@ async function toggleSource(source: any) {
     })
     Object.assign(source, result.source)
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   }
 }
 
@@ -3236,7 +3259,7 @@ async function batchSetEnabled(enabled: boolean) {
     await refresh()
     status.value = `已${enabled ? '启用' : '禁用'} ${result.updated} 个书源`
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     busy.value = false
   }
@@ -3356,7 +3379,7 @@ async function saveEditing() {
     await refresh()
     status.value = '书源已保存'
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   }
 }
 
@@ -3515,7 +3538,7 @@ function applySearchSnapshot(snapshot: any) {
   if (snapshot.status === 'failed') {
     searchFinished.value = false
     searchFailure.value = snapshot.error || snapshot.stageText || '搜索已中断'
-    status.value = searchFailure.value
+    setErrorStatus(searchFailure.value)
     forgetSearchJob()
     return
   }
@@ -3549,7 +3572,7 @@ async function refreshSearchJob(jobId = searchJobId.value) {
     stopSearchTimer()
     searching.value = false
     searchFailure.value = readableNetworkError(errorText(error))
-    status.value = searchFailure.value
+    setErrorStatus(searchFailure.value)
   }
 }
 
@@ -3592,7 +3615,7 @@ async function search() {
   } catch (error) {
     searching.value = false
     searchFailure.value = readableNetworkError(errorText(error))
-    status.value = searchFailure.value
+    setErrorStatus(searchFailure.value)
   }
 }
 
@@ -3639,7 +3662,7 @@ async function retryFailedSources() {
     searchErrors.value = searchBaseFailures.value.slice()
     searchFailuresOpen.value = true
     searchFailure.value = readableNetworkError(errorText(error))
-    status.value = searchFailure.value
+    setErrorStatus(searchFailure.value)
   }
 }
 
@@ -3739,7 +3762,7 @@ async function loadExploreGroups(force = false) {
   } catch (error) {
     exploreGroups.value = []
     exploreError.value = readableNetworkError(errorText(error))
-    status.value = exploreError.value
+    setErrorStatus(exploreError.value)
   } finally {
     exploreLoading.value = false
   }
@@ -3798,7 +3821,7 @@ async function loadExplorePage(page: number, replace: boolean) {
   } catch (error) {
     exploreError.value = readableNetworkError(errorText(error))
     exploreHasMore.value = false
-    status.value = exploreError.value
+    setErrorStatus(exploreError.value)
   } finally {
     exploreBusy.value = false
   }
@@ -3847,7 +3870,7 @@ async function openBook(book: any) {
     view.value = 'detail'
     status.value = `${currentBook.value.name} · ${chapters.value.length} 章`
   } catch (error) {
-    status.value = readableNetworkError(errorText(error))
+    setErrorStatus(readableNetworkError(errorText(error)))
   } finally {
     busy.value = false
   }
@@ -3876,7 +3899,7 @@ async function openShelfBook(book: any) {
     view.value = 'detail'
     status.value = `${book.name} · ${chapters.value.length} 章`
   } catch (error) {
-    status.value = readableNetworkError(errorText(error))
+    setErrorStatus(readableNetworkError(errorText(error)))
   } finally {
     busy.value = false
   }
@@ -3899,7 +3922,7 @@ async function applyGroupToSelected() {
     exitShelfSelect()
     await refresh()
   } catch (error: any) {
-    status.value = `分组失败：${error?.message ?? error}`
+    setErrorStatus(`分组失败：${error?.message ?? error}`)
   } finally {
     busy.value = false
   }
@@ -4157,7 +4180,7 @@ async function importLocalFile(event: Event) {
     status.value = `已导入《${result.book?.name ?? file.name}》${result.chapters} 章`
     if (result.book) await openShelfBook(result.book)
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     busy.value = false
   }
@@ -4279,7 +4302,7 @@ async function updateSelected(patch: (book: any) => Record<string, unknown>, mes
     await refresh()
     status.value = message
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     busy.value = false
   }
@@ -4317,7 +4340,7 @@ async function refreshSelectedToc() {
     await refresh()
     status.value = `已更新目录 ${ok}/${ids.length} 本`
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   } finally {
     busy.value = false
   }
@@ -4345,7 +4368,7 @@ async function addToShelf(): Promise<boolean> {
     status.value = '已加入书架'
     return true
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
     return false
   }
 }
@@ -4417,7 +4440,7 @@ async function openChapter(
   } catch (error) {
     const message = readableNetworkError(errorText(error))
     chapterError.value = `本章暂不可读：${message}。未下载的章节需要联网后阅读。`
-    status.value = message
+    setErrorStatus(message)
     return false
   } finally {
     busy.value = false
@@ -4520,7 +4543,7 @@ async function toggleBookmark() {
     await loadBookmarks()
     await loadNotes()
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   }
 }
 
@@ -4573,7 +4596,7 @@ async function addNote() {
     await loadNotes()
     status.value = '笔记已保存'
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   }
 }
 
@@ -4674,7 +4697,7 @@ async function saveUnderlines() {
     underlineOpen.value = false
     status.value = '已加划线'
   } catch (error) {
-    status.value = errorText(error)
+    setErrorStatus(errorText(error))
   }
 }
 
@@ -4697,7 +4720,7 @@ function continueReading() {
 /** 文本模式：沿用原有「继续阅读」逻辑，PDF 书也复用。 */
 function continueReadingText() {
   if (!chapters.value.length) {
-    status.value = '这本书还没有可读章节'
+    setErrorStatus('这本书还没有可读章节')
     return
   }
   const record = progress.value
@@ -4854,7 +4877,7 @@ async function openSwitchPanel() {
     }
     if (!currentBook.value?.id) {
       switchOpen.value = false
-      status.value = '加入书架失败，无法换源'
+      setErrorStatus('加入书架失败，无法换源')
       return
     }
     status.value = '已加入书架，正在搜索候选'
@@ -5397,6 +5420,7 @@ function flushReaderProgress() {
 
 function showReaderHint(text: string) {
   readerHint.value = text
+  readerHintLive.value = text
   if (readerHintTimer) clearTimeout(readerHintTimer)
   readerHintTimer = setTimeout(() => {
     readerHint.value = ''
@@ -6035,7 +6059,15 @@ onMounted(async () => {
           <span class="mo-brand-cn">墨读</span>
           <span class="mo-brand-en">MOREAD · DSH READER</span>
         </div>
-        <div class="mo-status">{{ status || (busy ? '加载中…' : '') }}</div>
+        <div
+          class="mo-status"
+          :class="{ 'mo-status-alert': statusAlert }"
+          :role="statusAlert && !inlineErrorVisible ? 'alert' : 'status'"
+          :aria-live="statusAlert ? (inlineErrorVisible ? 'off' : 'assertive') : 'polite'"
+          aria-atomic="true"
+        >
+          {{ statusAlert || status || (busy ? '加载中…' : '') }}
+        </div>
         <button class="mo-icon-btn" title="刷新" data-testid="refresh" @click="refresh">↻</button>
       </header>
 
@@ -8041,6 +8073,9 @@ onMounted(async () => {
         </transition>
 
         <div v-if="readerHint" class="mo-reader-hint" data-testid="reader-hint">{{ readerHint }}</div>
+        <div class="mo-sr-only" role="status" aria-live="polite" aria-atomic="true" data-testid="reader-hint-live">
+          {{ readerHintLive }}
+        </div>
 
         <transition name="mo-fade">
           <div v-if="dictPanelOpen" class="mo-sheet-mask" data-testid="reader-dict-mask" @click.self="closeReaderDict">
@@ -8793,6 +8828,20 @@ onMounted(async () => {
   text-overflow: ellipsis;
   white-space: nowrap;
   text-align: right;
+}
+.mo-status-alert {
+  color: #a8402e;
+}
+.mo-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 .mo-icon-btn {
   display: inline-flex;
@@ -10954,6 +11003,17 @@ textarea {
 .mo-fade-enter-from,
 .mo-fade-leave-to {
   opacity: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .mo-fade-enter-active,
+  .mo-fade-leave-active,
+  .mo-sheet,
+  .mo-drawer,
+  .mo-reader-hint,
+  .mo-auto-page,
+  .mo-cover {
+    transition: none !important;
+  }
 }
 .mo-note-form {
   display: flex;
