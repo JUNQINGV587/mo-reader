@@ -44,6 +44,7 @@ import {
   type ThemeColors,
 } from '../../core/reader/theme'
 import { exportFullShelf, exportLegadoShelf } from '../../core/reader/shelf-transfer'
+import { shelfLoadErrorMessage, shelfShowsEmpty } from '../../core/reader/shelf-load'
 import { IMPORT_UPLOAD_CHUNK_BYTES } from '../../core/reader/backup-constants'
 import {
   defaultReaderSettings,
@@ -157,6 +158,8 @@ const dictPanelActiveResult = computed(
 let dictPanelToken = 0
 
 const shelfBooks = ref<any[]>([])
+/** state/listSources/listBooks 失败时的可读原因；顶栏 status 之外单独给书架区一个错误态。 */
+const shelfError = ref('')
 const shelfSort = ref<'recent' | 'name' | 'progress'>('recent')
 const shelfGroup = ref('')
 const shelfGroupInput = ref('')
@@ -823,6 +826,8 @@ function errorText(error: unknown) {
 
 async function refresh() {
   busy.value = true
+  // 书架三件套都成功后才算数据可用；后续字典/设置失败不冒充书架错误。
+  let shelfLoaded = false
   try {
     const state = await call('state')
     version.value = state?.version ?? ''
@@ -830,6 +835,8 @@ async function refresh() {
     const [sourceResult, bookResult] = await Promise.all([call('listSources'), call('listBooks')])
     sources.value = sourceResult?.sources ?? []
     shelfBooks.value = bookResult?.books ?? []
+    shelfLoaded = true
+    shelfError.value = ''
     await loadDictRules()
     // 设置读取失败只在面板里提示，不阻塞书源/书架加载。
     await loadSettings()
@@ -842,6 +849,7 @@ async function refresh() {
     }
     status.value = `书源 ${sources.value.length} 个（启用 ${enabledCount.value}） · 书架 ${shelfBooks.value.length} 本`
   } catch (error) {
+    if (!shelfLoaded) shelfError.value = shelfLoadErrorMessage(errorText(error))
     status.value = errorText(error)
   } finally {
     busy.value = false
@@ -5463,14 +5471,22 @@ onMounted(async () => {
           </button>
         </div>
 
-        <div v-if="shelfBooks.length === 0" class="mo-empty">
+        <div v-if="shelfError" class="mo-load-error" data-testid="shelf-error" role="alert">
+          <p class="mo-load-error-title">书架加载失败</p>
+          <p class="muted mo-load-error-reason">{{ shelfError }}</p>
+          <button class="mo-btn" data-testid="shelf-error-retry" :disabled="busy" @click="refresh">
+            {{ busy ? '重试中…' : '重试' }}
+          </button>
+        </div>
+
+        <div v-if="shelfShowsEmpty(shelfBooks.length, shelfError)" class="mo-empty">
           <div class="mo-empty-glyph">书</div>
           <p class="mo-empty-title">书架还是空的</p>
           <p class="muted">先在「书源」导入书源，再去「搜索」找一本想读的书。</p>
           <button class="mo-btn" @click="view = 'sources'">去导入书源</button>
         </div>
 
-        <div v-else class="mo-shelf" data-testid="shelf">
+        <div v-else-if="shelfBooks.length" class="mo-shelf" data-testid="shelf">
           <button
             v-for="book in shelfSortedBooks"
             :key="book.id"
@@ -7932,6 +7948,30 @@ onMounted(async () => {
 }
 .mo-empty .mo-btn {
   margin-top: 10px;
+}
+.mo-load-error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  max-width: 100%;
+  padding: 14px 16px;
+  margin: 4px 0 10px;
+  border: 1px solid var(--mo-line);
+  border-radius: 10px;
+  background: var(--mo-paper-2);
+}
+.mo-load-error-title {
+  margin: 0;
+  font: 600 15px/1.3 'Songti SC', 'Noto Serif SC', serif;
+}
+.mo-load-error-reason {
+  margin: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.mo-load-error .mo-btn {
+  margin-top: 6px;
 }
 .mo-shelf {
   display: grid;
