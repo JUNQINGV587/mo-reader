@@ -57,6 +57,7 @@ import {
   type ShelfSkin,
 } from '../../core/reader/settings'
 import { dualColumnAvailability } from '../../core/reader/paginate'
+import { TOC_PAGE_SIZE, parseChapterJump, tocPageForIndex } from '../../core/reader/toc-page'
 import { AutoPageController } from '../../core/reader/auto-page'
 import { ReadingTimer, formatReadingDuration, localDateKey, shouldCountReading, type ReadingStats } from '../../core/reader/stats'
 import { KeepAwake } from '../../core/reader/wake-lock'
@@ -861,17 +862,31 @@ const searchScopeLabel = computed(() => {
   return `${enabledSources.value.length} 个启用源`
 })
 
-const TOC_PAGE_SIZE = 200
 const tocPage = ref(1)
+const tocLoadedPages = ref(1)
+const tocJumpValue = ref('')
+const tocJumpNotice = ref('')
 const tocFiltered = computed(() => {
   const key = tocFilter.value.trim()
   return key ? chapters.value.filter((chapter) => chapter.title.includes(key)) : chapters.value
 })
-const filteredChapters = computed(() => tocFiltered.value.slice(0, tocPage.value * TOC_PAGE_SIZE))
-const tocHasMore = computed(() => filteredChapters.value.length < tocFiltered.value.length)
+/** 当前显示窗口从第几章开始（0 起）。跳到当前章/章节号时只渲染目标页，不把前面的页全塞进 DOM。 */
+const tocWindowStart = computed(() => (tocPage.value - 1) * TOC_PAGE_SIZE)
+const filteredChapters = computed(() =>
+  tocFiltered.value.slice(tocWindowStart.value, tocWindowStart.value + tocLoadedPages.value * TOC_PAGE_SIZE),
+)
+const tocLoadedEnd = computed(() => tocWindowStart.value + filteredChapters.value.length)
+const tocHasMore = computed(() => tocLoadedEnd.value < tocFiltered.value.length)
 const tocTotal = computed(() => tocFiltered.value.length)
+const tocJumpBlockedReason = computed(() => {
+  if (!chapters.value.length) return '目录未加载'
+  if (!tocTotal.value) return '没有匹配章节'
+  return ''
+})
 watch(tocFilter, () => {
   tocPage.value = 1
+  tocLoadedPages.value = 1
+  tocJumpNotice.value = ''
 })
 
 async function call(method: string, args?: any) {
@@ -3768,6 +3783,9 @@ async function openBook(book: any) {
     progress.value = null
     tocFilter.value = ''
     tocPage.value = 1
+    tocLoadedPages.value = 1
+    tocJumpValue.value = ''
+    tocJumpNotice.value = ''
     view.value = 'detail'
     status.value = `${currentBook.value.name} · ${chapters.value.length} 章`
   } catch (error) {
@@ -3794,6 +3812,9 @@ async function openShelfBook(book: any) {
     await loadLocalPdfStatus(book)
     tocFilter.value = ''
     tocPage.value = 1
+    tocLoadedPages.value = 1
+    tocJumpValue.value = ''
+    tocJumpNotice.value = ''
     view.value = 'detail'
     status.value = `${book.name} · ${chapters.value.length} 章`
   } catch (error) {
@@ -5481,9 +5502,42 @@ function setTapZone(index: number, event: Event) {
   persistSettings()
 }
 
+/** 跳到当前章：按过滤后的下标算页码，只渲染目标页，不逐页加载。 */
 function scrollToCurrentChapter() {
+  if (!chapters.value.length) {
+    tocJumpNotice.value = '目录还没有加载完成'
+    return
+  }
+  if (!currentChapter.value) {
+    tocJumpNotice.value = '还没有打开章节'
+    return
+  }
+  const index = tocFiltered.value.indexOf(currentChapter.value)
+  if (index < 0) {
+    tocJumpNotice.value = '当前章不在搜索结果中'
+    return
+  }
+  tocJumpNotice.value = ''
+  tocPage.value = tocPageForIndex(index, TOC_PAGE_SIZE)
+  tocLoadedPages.value = 1
   nextTick(() => {
     const node = document.querySelector('.mo-drawer-list li.on')
+    node?.scrollIntoView({ block: 'center' })
+  })
+}
+
+/** 章节号跳页：按输入序号算页码并滚到该章；过滤时按过滤结果计算。 */
+function jumpToChapterNumber() {
+  const result = parseChapterJump(tocJumpValue.value, tocTotal.value, TOC_PAGE_SIZE)
+  if (!result.ok) {
+    tocJumpNotice.value = result.message
+    return
+  }
+  tocJumpNotice.value = ''
+  tocPage.value = result.page
+  tocLoadedPages.value = 1
+  nextTick(() => {
+    const node = document.querySelector(`[data-toc-index="${result.index}"]`)
     node?.scrollIntoView({ block: 'center' })
   })
 }
@@ -6552,15 +6606,31 @@ onMounted(async () => {
             <h3>目录</h3>
             <input v-model="tocFilter" class="mo-toc-filter" placeholder="搜索章节" />
           </div>
-          <p v-if="tocHasMore" class="muted">已显示 {{ filteredChapters.length }} / {{ tocTotal }} 章</p>
+          <form class="mo-toc-jump" novalidate @submit.prevent="jumpToChapterNumber">
+            <input
+              v-model="tocJumpValue"
+              class="mo-toc-filter mo-toc-jump-input"
+              data-testid="toc-jump-input"
+              type="text"
+              inputmode="numeric"
+              autocomplete="off"
+              :placeholder="tocJumpBlockedReason || '章节号'"
+              :title="tocJumpBlockedReason || `输入 1 到 ${tocTotal} 之间的章节号`"
+              :disabled="!tocTotal"
+              aria-label="跳到章节号"
+            />
+            <button class="mo-btn tiny" type="submit" :disabled="!tocTotal">跳转</button>
+            <span v-if="tocJumpNotice" class="mo-toc-jump-note" role="status">{{ tocJumpNotice }}</span>
+          </form>
+          <p v-if="tocHasMore" class="muted">已显示 {{ tocWindowStart + 1 }}–{{ tocLoadedEnd }} / 共 {{ tocTotal }} 章</p>
           <p v-if="chapterError" class="muted mo-chapter-error" data-testid="chapter-error">{{ chapterError }}</p>
           <ol class="mo-toc" data-testid="toc">
-            <li v-for="chapter in filteredChapters" :key="chapter.url || chapter.title" :class="{ volume: chapter.isVolume }">
+            <li v-for="(chapter, tocIndex) in filteredChapters" :key="chapter.url || chapter.title" :data-toc-index="tocWindowStart + tocIndex" :class="{ volume: chapter.isVolume }">
               <button v-if="!chapter.isVolume" data-testid="chapter" @click="openTocChapter(chapter)">{{ chapter.title }}</button>
               <span v-else>{{ chapter.title }}</span>
             </li>
           </ol>
-          <button v-if="tocHasMore" class="mo-btn" data-testid="toc-more" @click="tocPage += 1">加载更多</button>
+          <button v-if="tocHasMore" class="mo-btn" data-testid="toc-more" @click="tocLoadedPages += 1">加载更多</button>
         </div>
       </section>
 
@@ -8285,13 +8355,29 @@ onMounted(async () => {
               <button class="mo-icon-btn" @click="tocOpen = false">✕</button>
             </div>
             <input v-model="tocFilter" class="mo-filter" placeholder="搜索章节" />
+            <form class="mo-toc-jump" novalidate @submit.prevent="jumpToChapterNumber">
+              <input
+                v-model="tocJumpValue"
+                class="mo-filter mo-toc-jump-input"
+                data-testid="toc-jump-input"
+                type="text"
+                inputmode="numeric"
+                autocomplete="off"
+                :placeholder="tocJumpBlockedReason || '章节号'"
+                :title="tocJumpBlockedReason || `输入 1 到 ${tocTotal} 之间的章节号`"
+                :disabled="!tocTotal"
+                aria-label="跳到章节号"
+              />
+              <button class="mo-btn tiny" type="submit" :disabled="!tocTotal">跳转</button>
+              <span v-if="tocJumpNotice" class="mo-toc-jump-note" role="status">{{ tocJumpNotice }}</span>
+            </form>
             <ol class="mo-drawer-list">
-              <li v-for="chapter in filteredChapters" :key="chapter.url || chapter.title" :class="{ volume: chapter.isVolume, on: chapter === currentChapter }">
+              <li v-for="(chapter, tocIndex) in filteredChapters" :key="chapter.url || chapter.title" :data-toc-index="tocWindowStart + tocIndex" :class="{ volume: chapter.isVolume, on: chapter === currentChapter }">
                 <button v-if="!chapter.isVolume" @click="openChapter(chapter)">{{ chapter.title }}</button>
                 <span v-else>{{ chapter.title }}</span>
               </li>
             </ol>
-            <button v-if="tocHasMore" class="mo-btn" @click="tocPage += 1">加载更多（{{ filteredChapters.length }}/{{ tocTotal }}）</button>
+            <button v-if="tocHasMore" class="mo-btn" @click="tocLoadedPages += 1">加载更多（{{ tocLoadedEnd }}/{{ tocTotal }}）</button>
           </aside>
         </transition>
       </section>
@@ -9167,6 +9253,26 @@ onMounted(async () => {
   color: inherit;
   font: inherit;
   font-size: 12px;
+}
+.mo-toc-jump {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+.mo-toc-jump .mo-toc-jump-input {
+  width: 110px;
+}
+.mo-toc-jump-note {
+  color: #a8402e;
+  font-size: 12px;
+}
+@media (max-width: 720px) {
+  .mo-toc-jump .mo-toc-jump-input {
+    min-height: var(--mo-tap);
+    font-size: 16px;
+  }
 }
 .mo-toc {
   margin: 4px 0 0;
