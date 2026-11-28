@@ -311,6 +311,21 @@ const initialPage = ref(0)
 const tocFilter = ref('')
 const tocOpen = ref(false)
 const chrome = ref(true)
+
+/** 浮层触发按钮：关闭（Esc、✕ 或遮罩）后把焦点还回去，键盘用户不用重走一遍 Tab。 */
+const overlayTriggers = new Map<string, HTMLElement | null>()
+
+function rememberOverlayTrigger(name: string, event?: Event) {
+  const target = (event?.currentTarget as HTMLElement | null) ?? (document.activeElement as HTMLElement | null)
+  overlayTriggers.set(name, target)
+}
+
+function releaseOverlayTrigger(name: string) {
+  const trigger = overlayTriggers.get(name) ?? null
+  overlayTriggers.delete(name)
+  // 触发按钮还在（没被切走视图）才回焦，避免和关闭动画抢焦点。
+  if (trigger?.isConnected && view.value === 'reader') nextTick(() => trigger.focus())
+}
 const settingsOpen = ref(false)
 const customFonts = ref<Array<{ id: string; name: string; fileName: string; size: number }>>([])
 const activeFontFamily = ref('')
@@ -650,6 +665,22 @@ watch(tocOpen, (open) => {
 })
 watch(settingsOpen, (open) => {
   if (view.value === 'reader') setAutoPause('settings', open)
+})
+// 关闭浮层（Esc、✕、点遮罩）时把焦点还给触发按钮。
+watch(tocOpen, (open) => {
+  if (!open) releaseOverlayTrigger('toc')
+})
+watch(bookmarksOpen, (open) => {
+  if (!open) releaseOverlayTrigger('bookmarks')
+})
+watch(notesOpen, (open) => {
+  if (!open) releaseOverlayTrigger('notes')
+})
+watch(readerSearchOpen, (open) => {
+  if (!open) releaseOverlayTrigger('search')
+})
+watch(underlineOpen, (open) => {
+  if (!open) releaseOverlayTrigger('underline')
 })
 watch(
   () => effectiveSettings.value.autoPageSeconds,
@@ -4099,7 +4130,8 @@ async function jumpNote(note: any) {
   await openChapter(chapter, Number(note.page ?? 0))
 }
 
-function openUnderlines() {
+function openUnderlines(event?: Event) {
+  rememberOverlayTrigger('underline', event)
   underlineLines.value = (readerRef.value?.currentPageLines?.() ?? []).slice(0, 40)
   selectedUnderlines.value = []
   underlineOpen.value = true
@@ -4854,12 +4886,28 @@ function showReaderHint(text: string) {
   }, 4000)
 }
 
-function openReaderSearch() {
+function openToc(event?: Event) {
+  rememberOverlayTrigger('toc', event)
+  tocOpen.value = true
+}
+
+function openBookmarks(event?: Event) {
+  rememberOverlayTrigger('bookmarks', event)
+  bookmarksOpen.value = true
+}
+
+function openNotes(event?: Event) {
+  rememberOverlayTrigger('notes', event)
+  notesOpen.value = true
+}
+
+function openReaderSearch(event?: Event) {
   if (readerKind.value !== 'text') return
   if (!currentBook.value?.id) {
     showReaderHint('加入书架后可搜索')
     return
   }
+  rememberOverlayTrigger('search', event)
   readerSearchOpen.value = true
   readerSearchHint.value = ''
 }
@@ -7085,11 +7133,11 @@ onMounted(async () => {
                 <span>{{ readerTitle }}</span>
               </div>
               <button class="mo-icon-btn" :title="bookmarkedHere ? '删除书签' : '加书签'" data-testid="reader-bookmark" @click="toggleBookmark">{{ bookmarkedHere ? '★' : '☆' }}</button>
-              <button class="mo-icon-btn" title="书签列表" data-testid="reader-bookmarks" @click="bookmarksOpen = true">🔖</button>
-              <button v-if="readerKind === 'text'" class="mo-icon-btn" title="笔记与划线" data-testid="reader-notes" @click="notesOpen = true">✎</button>
+              <button class="mo-icon-btn" title="书签列表" data-testid="reader-bookmarks" @click="openBookmarks($event)">🔖</button>
+              <button v-if="readerKind === 'text'" class="mo-icon-btn" title="笔记与划线" data-testid="reader-notes" @click="openNotes($event)">✎</button>
               <button v-if="readerKind === 'text'" class="mo-icon-btn" title="段评" data-testid="reader-review" @click="openReview">💬</button>
-              <button v-if="readerKind === 'text'" class="mo-icon-btn" title="书内搜索" aria-label="书内搜索" data-testid="reader-search" @click="openReaderSearch">🔍</button>
-              <button class="mo-icon-btn" title="目录" data-testid="reader-toc" @click="tocOpen = true">☰</button>
+              <button v-if="readerKind === 'text'" class="mo-icon-btn" title="书内搜索" aria-label="书内搜索" data-testid="reader-search" @click="openReaderSearch($event)">🔍</button>
+              <button class="mo-icon-btn" title="目录" data-testid="reader-toc" @click="openToc($event)">☰</button>
               <button
                 v-if="isPdfBook && isPdfReadable"
                 class="mo-chrome-btn"
@@ -7111,7 +7159,7 @@ onMounted(async () => {
                 :title="speechBlockedReason || '朗读'"
                 @click="toggleSpeechPlay"
               >{{ speechStatus === 'idle' ? '朗读' : speechStatus === 'speaking' ? '暂停' : '继续' }}</button>
-              <button v-if="settings.menuItems.includes('toc')" class="mo-chrome-btn" @click="tocOpen = true">目录</button>
+              <button v-if="settings.menuItems.includes('toc')" class="mo-chrome-btn" @click="openToc($event)">目录</button>
               <button
                 v-if="currentBook && currentBook.origin !== 'local'"
                 class="mo-chrome-btn"
@@ -7608,7 +7656,7 @@ onMounted(async () => {
                 <textarea v-model="noteDraft" placeholder="写点什么…"></textarea>
                 <div class="mo-note-actions">
                   <button class="mo-btn" data-testid="note-save" :disabled="!noteDraft.trim()" @click="addNote">保存笔记</button>
-                  <button class="mo-btn" data-testid="note-underline" @click="openUnderlines">划线本页</button>
+                  <button class="mo-btn" data-testid="note-underline" @click="openUnderlines($event)">划线本页</button>
                 </div>
               </div>
               <p v-if="chapterNotes.length === 0" class="muted">本章还没有笔记或划线。</p>
