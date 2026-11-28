@@ -7426,7 +7426,6 @@ onMounted(async () => {
               tabindex="-1"
               @pointerdown.stop
               @click.stop
-              @keydown.esc="closeSettings"
               @keydown.tab="trapSettingsFocus"
             >
               <div class="mo-sheet-head">
