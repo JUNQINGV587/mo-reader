@@ -410,8 +410,125 @@ function rememberOverlayTrigger(name: string, event?: Event) {
 function releaseOverlayTrigger(name: string) {
   const trigger = overlayTriggers.get(name) ?? null
   overlayTriggers.delete(name)
-  // 触发按钮还在（没被切走视图）才回焦，避免和关闭动画抢焦点。
-  if (trigger?.isConnected && view.value === 'reader') nextTick(() => trigger.focus())
+  // 触发按钮还在（没被切走视图）才回焦；键盘用户关闭后不用重走一遍 Tab。
+  nextTick(() => {
+    clearDialogInert()
+    if (trigger?.isConnected) {
+      trigger.focus()
+      return
+    }
+    // 触发按钮已随视图卸载（例如切换页面）：回到当前主内容区，避免焦点落回 body。
+    document.querySelector<HTMLElement>('.mo-body')?.focus()
+  })
+}
+
+const tocPanelRef = ref<HTMLElement | null>(null)
+const bookmarksPanelRef = ref<HTMLElement | null>(null)
+const notesPanelRef = ref<HTMLElement | null>(null)
+const readerSearchPanelRef = ref<HTMLElement | null>(null)
+const underlinePanelRef = ref<HTMLElement | null>(null)
+const confirmPanelRef = ref<HTMLElement | null>(null)
+const dialogInerted = new Set<HTMLElement>()
+
+function focusableIn(root: HTMLElement): HTMLElement[] {
+  const nodes = Array.from(
+    root.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, summary, [tabindex]:not([tabindex="-1"])'),
+  )
+  return nodes.filter(
+    (node) =>
+      !node.hasAttribute('disabled') &&
+      !node.closest('[inert]') &&
+      !node.closest('details:not([open])') &&
+      node.getClientRects().length > 0,
+  )
+}
+
+function activeDialogPanel(): { name: string; root: HTMLElement } | null {
+  const candidates: Array<[string, boolean, HTMLElement | null]> = [
+    ['confirm', Boolean(pendingConfirm.value), confirmPanelRef.value],
+    ['underline', underlineOpen.value, underlinePanelRef.value],
+    ['search', readerSearchOpen.value, readerSearchPanelRef.value],
+    ['toc', tocOpen.value, tocPanelRef.value],
+    ['bookmarks', bookmarksOpen.value, bookmarksPanelRef.value],
+    ['notes', notesOpen.value, notesPanelRef.value],
+  ]
+  for (const [name, open, root] of candidates) {
+    if (open && root) return { name, root }
+  }
+  return null
+}
+
+function clearDialogInert() {
+  for (const node of dialogInerted) node.inert = false
+  dialogInerted.clear()
+}
+
+/**
+ * 把当前对话框之外的兄弟节点设为 inert：键盘 Tab 与读屏都不会再进入背景。
+ * 只走对话框到 .mo 根节点的祖先链，保留路径上的容器可聚焦。
+ */
+function syncDialogInert() {
+  clearDialogInert()
+  const active = activeDialogPanel()
+  if (!active) return
+  const scope = active.root.closest<HTMLElement>('.mo')
+  if (!scope) return
+  let node: HTMLElement = active.root
+  while (node !== scope) {
+    const parent = node.parentElement
+    if (!parent) break
+    for (const sibling of Array.from(parent.children)) {
+      if (sibling === node || !(sibling instanceof HTMLElement)) continue
+      if (sibling.contains(active.root)) continue
+      if (sibling.tagName === 'SCRIPT' || sibling.tagName === 'STYLE') continue
+      sibling.inert = true
+      dialogInerted.add(sibling)
+    }
+    node = parent
+  }
+}
+
+function focusDialogPanel(name: string) {
+  nextTick(() => {
+    const panel = activeDialogPanel()?.name === name ? activeDialogPanel()?.root : null
+    if (!panel) return
+    syncDialogInert()
+    const preferred =
+      name === 'search'
+        ? panel.querySelector<HTMLElement>('[data-testid="reader-search-input"]')
+        : name === 'notes'
+          ? panel.querySelector<HTMLElement>('textarea')
+          : null
+    const target = preferred ?? focusableIn(panel)[0] ?? panel
+    target.focus()
+  })
+}
+
+function trapDialogFocus(event: KeyboardEvent, name: string) {
+  const active = activeDialogPanel()
+  if (!active || active.name !== name) return
+  const root = active.root
+  const focusable = focusableIn(root)
+  if (focusable.length === 0) {
+    event.preventDefault()
+    root.focus()
+    return
+  }
+  const first = focusable[0]
+  const last = focusable[focusable.length - 1]
+  const current = document.activeElement
+  if (!root.contains(current)) {
+    event.preventDefault()
+    ;(event.shiftKey ? last : first).focus()
+    return
+  }
+  if (event.shiftKey && current === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && current === last) {
+    event.preventDefault()
+    first.focus()
+  }
 }
 const settingsOpen = ref(false)
 const customFonts = ref<Array<{ id: string; name: string; fileName: string; size: number }>>([])
@@ -699,28 +816,29 @@ function closeReaderOverlays(): boolean {
     closeSettings()
     return true
   }
-  if (tocOpen.value) {
-    tocOpen.value = false
-    return true
-  }
-  if (bookmarksOpen.value) {
-    bookmarksOpen.value = false
-    return true
-  }
-  if (notesOpen.value) {
-    notesOpen.value = false
+  // 先收最上层：划线是从笔记里打开的二级面板，Esc 不能先关掉下面的笔记。
+  if (underlineOpen.value) {
+    underlineOpen.value = false
     return true
   }
   if (readerSearchOpen.value) {
     readerSearchOpen.value = false
     return true
   }
-  if (dictPanelOpen.value) {
-    dictPanelOpen.value = false
+  if (notesOpen.value) {
+    notesOpen.value = false
     return true
   }
-  if (underlineOpen.value) {
-    underlineOpen.value = false
+  if (bookmarksOpen.value) {
+    bookmarksOpen.value = false
+    return true
+  }
+  if (tocOpen.value) {
+    tocOpen.value = false
+    return true
+  }
+  if (dictPanelOpen.value) {
+    dictPanelOpen.value = false
     return true
   }
   if (speechStatus.value !== 'idle') {
@@ -770,6 +888,10 @@ watch(readerSearchOpen, (open) => {
 })
 watch(underlineOpen, (open) => {
   if (!open) releaseOverlayTrigger('underline')
+})
+// 面板打开/关闭时同步背景 inert；次级面板（划线）关闭后焦点回到笔记里的触发按钮。
+watch([tocOpen, bookmarksOpen, notesOpen, readerSearchOpen, underlineOpen, pendingConfirm], () => {
+  nextTick(syncDialogInert)
 })
 watch(
   () => effectiveSettings.value.autoPageSeconds,
@@ -2835,6 +2957,7 @@ onUnmounted(() => {
   window.removeEventListener('keydown', onReaderEscape)
   window.removeEventListener('resize', syncViewportWidth)
   document.removeEventListener('focusin', keepPanelFieldVisible)
+  clearDialogInert()
   if (panelFocusTimer) clearTimeout(panelFocusTimer)
   document.removeEventListener('visibilitychange', onReaderVisibilityChange)
   window.speechSynthesis?.removeEventListener?.('voiceschanged', loadSpeechVoices)
@@ -4615,7 +4738,18 @@ function requestConfirm(config: PendingConfirm) {
 function restoreConfirmFocus() {
   const target = confirmReturnFocus
   confirmReturnFocus = null
-  void nextTick(() => target?.focus?.())
+  void nextTick(() => {
+    // 确认框可能盖在笔记/书签面板上；先解除背景 inert，再回焦到触发按钮。
+    clearDialogInert()
+    if (target?.isConnected) {
+      target.focus()
+      return
+    }
+    // 被删的那一行连同触发按钮一起卸载了：回到仍在打开的面板，或主内容区。
+    const panel = activeDialogPanel()?.root
+    const fallback = panel ? (focusableIn(panel)[0] ?? panel) : document.querySelector<HTMLElement>('.mo-body')
+    fallback?.focus()
+  })
 }
 
 function closeConfirm() {
@@ -4675,6 +4809,7 @@ function openUnderlines(event?: Event) {
   underlineLines.value = (readerRef.value?.currentPageLines?.() ?? []).slice(0, 40)
   selectedUnderlines.value = []
   underlineOpen.value = true
+  focusDialogPanel('underline')
 }
 
 async function saveUnderlines() {
@@ -5430,16 +5565,19 @@ function showReaderHint(text: string) {
 function openToc(event?: Event) {
   rememberOverlayTrigger('toc', event)
   tocOpen.value = true
+  focusDialogPanel('toc')
 }
 
 function openBookmarks(event?: Event) {
   rememberOverlayTrigger('bookmarks', event)
   bookmarksOpen.value = true
+  focusDialogPanel('bookmarks')
 }
 
 function openNotes(event?: Event) {
   rememberOverlayTrigger('notes', event)
   notesOpen.value = true
+  focusDialogPanel('notes')
 }
 
 function openReaderSearch(event?: Event) {
@@ -5451,6 +5589,7 @@ function openReaderSearch(event?: Event) {
   rememberOverlayTrigger('search', event)
   readerSearchOpen.value = true
   readerSearchHint.value = ''
+  focusDialogPanel('search')
 }
 
 function closeReaderSearch() {
@@ -5900,9 +6039,7 @@ async function resetSettingsSection(group: SettingsGroupKey) {
 function trapSettingsFocus(event: KeyboardEvent) {
   const root = settingsSheetRef.value
   if (!root) return
-  const focusable = Array.from(
-    root.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, summary, [tabindex]:not([tabindex="-1"])'),
-  ).filter((node) => !node.hasAttribute('disabled') && node.offsetParent !== null)
+  const focusable = focusableIn(root)
   if (focusable.length === 0) return
   const first = focusable[0]
   const last = focusable[focusable.length - 1]
@@ -6083,7 +6220,7 @@ onMounted(async () => {
       </nav>
     </template>
 
-    <main class="mo-body" :class="{ 'mo-body-reader': view === 'reader' }">
+    <main class="mo-body" tabindex="-1" :class="{ 'mo-body-reader': view === 'reader' }">
       <section v-if="view === 'shelf'" class="mo-pane">
         <div class="mo-section-head">
           <h2>书架</h2>
@@ -8141,9 +8278,20 @@ onMounted(async () => {
 
         <transition name="mo-fade">
           <div v-if="readerSearchOpen" class="mo-sheet-mask" data-testid="reader-search-mask" @click.self="closeReaderSearch">
-            <div class="mo-sheet mo-sheet-scroll mo-reader-search" data-testid="reader-search-panel" @pointerdown.stop @click.stop>
+            <div
+              ref="readerSearchPanelRef"
+              class="mo-sheet mo-sheet-scroll mo-reader-search"
+              data-testid="reader-search-panel"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="mo-reader-search-title"
+              tabindex="-1"
+              @pointerdown.stop
+              @click.stop
+              @keydown.tab="trapDialogFocus($event, 'search')"
+            >
               <div class="mo-sheet-head">
-                <strong>书内搜索</strong>
+                <strong id="mo-reader-search-title">书内搜索</strong>
                 <span class="muted">逐章查找正文</span>
                 <button class="mo-icon-btn" data-testid="reader-search-close" title="关闭" @click="closeReaderSearch">✕</button>
               </div>
@@ -8525,9 +8673,17 @@ onMounted(async () => {
 
         <transition name="mo-fade">
           <div v-if="bookmarksOpen" class="mo-sheet-mask" @click.self="bookmarksOpen = false">
-            <div class="mo-sheet mo-sheet-scroll">
+            <div
+              ref="bookmarksPanelRef"
+              class="mo-sheet mo-sheet-scroll"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="mo-bookmarks-title"
+              tabindex="-1"
+              @keydown.tab="trapDialogFocus($event, 'bookmarks')"
+            >
               <div class="mo-sheet-head">
-                <strong>书签</strong>
+                <strong id="mo-bookmarks-title">书签</strong>
                 <span class="muted">{{ bookmarks.length }} 个</span>
                 <button class="mo-icon-btn" @click="bookmarksOpen = false">✕</button>
               </div>
@@ -8547,9 +8703,17 @@ onMounted(async () => {
 
         <transition name="mo-fade">
           <div v-if="notesOpen" class="mo-sheet-mask" @click.self="notesOpen = false">
-            <div class="mo-sheet mo-sheet-scroll">
+            <div
+              ref="notesPanelRef"
+              class="mo-sheet mo-sheet-scroll"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="mo-notes-title"
+              tabindex="-1"
+              @keydown.tab="trapDialogFocus($event, 'notes')"
+            >
               <div class="mo-sheet-head">
-                <strong>笔记</strong>
+                <strong id="mo-notes-title">笔记</strong>
                 <span class="muted">{{ chapterNotes.length }} 条</span>
                 <button class="mo-icon-btn" @click="notesOpen = false">✕</button>
               </div>
@@ -8577,9 +8741,17 @@ onMounted(async () => {
 
         <transition name="mo-fade">
           <div v-if="underlineOpen" class="mo-sheet-mask" @click.self="underlineOpen = false">
-            <div class="mo-sheet mo-sheet-scroll">
+            <div
+              ref="underlinePanelRef"
+              class="mo-sheet mo-sheet-scroll"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="mo-underline-title"
+              tabindex="-1"
+              @keydown.tab="trapDialogFocus($event, 'underline')"
+            >
               <div class="mo-sheet-head">
-                <strong>划线本页</strong>
+                <strong id="mo-underline-title">划线本页</strong>
                 <span class="muted">已选 {{ selectedUnderlines.length }} 行</span>
                 <button class="mo-icon-btn" @click="underlineOpen = false">✕</button>
               </div>
@@ -8615,9 +8787,19 @@ onMounted(async () => {
         </transition>
 
         <transition name="mo-fade">
-          <aside v-if="tocOpen" class="mo-drawer" data-testid="reader-toc-drawer">
+          <aside
+            v-if="tocOpen"
+            ref="tocPanelRef"
+            class="mo-drawer"
+            data-testid="reader-toc-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="mo-toc-title"
+            tabindex="-1"
+            @keydown.tab="trapDialogFocus($event, 'toc')"
+          >
             <div class="mo-sheet-head">
-              <strong>目录</strong>
+              <strong id="mo-toc-title">目录</strong>
               <span class="muted">{{ chapters.length }} 章</span>
               <button class="mo-btn" data-testid="toc-current" @click="scrollToCurrentChapter">当前章</button>
               <button class="mo-icon-btn" @click="tocOpen = false">✕</button>
@@ -8750,6 +8932,7 @@ onMounted(async () => {
         @keydown.esc.stop.prevent="closeConfirm"
       >
         <div
+          ref="confirmPanelRef"
           class="mo-sheet mo-confirm-sheet"
           role="dialog"
           aria-modal="true"
@@ -8905,6 +9088,7 @@ onMounted(async () => {
   color: var(--mo-ink-3);
 }
 .mo-body {
+  outline: none;
   flex: 1;
   overflow: auto;
 }
