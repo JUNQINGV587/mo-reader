@@ -124,6 +124,12 @@ import {
   type WebdavTransferHost,
   type WebdavTransferJob,
 } from './webdav-transfer.js'
+import {
+  SearchJobCoordinator,
+  cleanupExpiredSearchJobs,
+  recoverInterruptedSearchJobs,
+  type SearchJobHost,
+} from './search-job.js'
 import { BACKUP_TOKEN_TTL_MS } from '../core/reader/backup.js'
 import {
   WEBDAV_PASSWORD_MAX,
@@ -322,6 +328,25 @@ function optionalStringArg(args: Args, name: string): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
+/**
+ * 搜索范围：scope 是参与搜索的书源 URL；兼容 { sourceUrls } 形态。
+ * null 表示全部启用书源，空数组表示一个源都不搜（与旧 searchBooks 语义一致）。
+ */
+function searchScopeOf(args: Args): string[] | null {
+  const raw = args?.scope
+  if (Array.isArray(raw)) {
+    return raw.filter((url): url is string => typeof url === 'string')
+  }
+  if (raw && typeof raw === 'object') {
+    const nested = (raw as { sourceUrls?: unknown }).sourceUrls
+    if (Array.isArray(nested)) return nested.filter((url): url is string => typeof url === 'string')
+  }
+  if (Array.isArray(args?.sourceUrls)) {
+    return args!.sourceUrls.filter((url): url is string => typeof url === 'string')
+  }
+  return null
+}
+
 function debugErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message || '调试失败'
   return String(error)
@@ -496,6 +521,9 @@ export class ReaderService extends TypertRemoteService {
   /** WebDAV 上传下载协调器（#133）：进度与取消复用 jobs 表。 */
   webdavTransferCoordinator: WebdavTransferCoordinator | null = null
 
+  /** 搜索作业协调器（#150）：复用 jobs 表，支持边搜边出、取消与关页恢复。 */
+  searchJobCoordinator: SearchJobCoordinator | null = null
+
   /** 媒体离线下载协调器（#112），按需创建；与文字下载共用作业表与暂停/重试语义。 */
   mediaDownloadsCoordinator: MediaDownloadCoordinator | null = null
 
@@ -546,9 +574,20 @@ export class ReaderService extends TypertRemoteService {
     } catch {
       // 作业恢复失败不应阻止服务启动。
     }
+    // 搜索作业（#150）也要收口：先由通用恢复把 running 标成 paused，再统一标为已中断。
+    try {
+      await recoverInterruptedSearchJobs(this.db.jobs)
+    } catch {
+      // 恢复失败不影响启动。
+    }
     // 导出产物只保留 24 小时：启动时扫一次，导出前再顺带清（不启定时器）。
     try {
       await cleanupExpiredExports(this.db.jobs)
+    } catch {
+      // 清理失败不影响启动。
+    }
+    try {
+      await cleanupExpiredSearchJobs(this.db.jobs)
     } catch {
       // 清理失败不影响启动。
     }
@@ -572,6 +611,11 @@ export class ReaderService extends TypertRemoteService {
     const ctx = this.ctx as any
     ctx.effect(
       () => async () => {
+        try {
+          await this.searchJobCoordinator?.shutdown()
+        } finally {
+          this.searchJobCoordinator = null
+        }
         try {
           await this.webdavTransferCoordinator?.shutdown()
         } finally {
@@ -968,6 +1012,65 @@ export class ReaderService extends TypertRemoteService {
       this.sweepCancelledSearches()
     }
     return { cancelled: true }
+  }
+
+  /**
+   * 发起搜索作业（#150）：立刻返回作业号，客户端按 500ms 轮询 getSearchJob 边搜边出。
+   * scope 为参与搜索的书源 URL；省略表示全部启用书源。
+   */
+  async startSearch(args: Args) {
+    const key = stringArg(args, 'key')
+    const scope = searchScopeOf(args)
+    const snapshot = await this.searchJobManager().start({ key, scope })
+    return { jobId: snapshot.jobId }
+  }
+
+  /** 读搜索作业快照；作业不存在或已过期返回 null，客户端据此回到普通搜索页。 */
+  async getSearchJob(args: Args) {
+    const jobId = optionalStringArg(args, 'jobId')
+    return this.searchJobManager().get(jobId || undefined)
+  }
+
+  /** 取消搜索作业：中断在途、不再启动未开始的源，返回保留已得书目的快照。 */
+  async cancelSearchJob(args: Args) {
+    const jobId = stringArg(args, 'jobId')
+    return this.searchJobManager().cancel(jobId)
+  }
+
+  private searchJobManager(): SearchJobCoordinator {
+    if (!this.searchJobCoordinator) {
+      this.searchJobCoordinator = new SearchJobCoordinator(this.searchJobHost())
+    }
+    return this.searchJobCoordinator
+  }
+
+  private searchJobHost(): SearchJobHost {
+    return {
+      db: () => this.requireDb(),
+      listSources: (scope) => this.searchJobSources(scope),
+      searchSource: (source, key, signal) => this.searchJobSource(source, key, signal),
+    }
+  }
+
+  /** 与旧 searchBooks 相同的启用/范围过滤，保证两种入口搜的是同一批源。 */
+  private searchJobSources(scope: string[] | null): BookSource[] {
+    const wanted = scope ? new Set(scope) : null
+    const sources: BookSource[] = []
+    for (const [, value] of this.requireDb().sources.entries()) {
+      const source = value as BookSource
+      if (source.enabled === false) continue
+      if (wanted && !wanted.has(source.bookSourceUrl)) continue
+      sources.push(source)
+    }
+    return sources
+  }
+
+  /** 抓取并解析单个书源；作业的取消信号会中断在途请求。 */
+  private async searchJobSource(source: BookSource, key: string, signal: AbortSignal) {
+    const request = buildSearchRequest(source, key, 1)
+    if (!request) throw new Error('书源没有搜索地址')
+    const raw = await this.fetch(request, source, signal)
+    return analyzeSearch(raw.text, source, raw.url)
   }
 
   /** 登记一次带 token 的搜索：若取消已先到，控制器直接处于中止态。 */
