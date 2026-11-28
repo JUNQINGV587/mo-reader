@@ -1,7 +1,7 @@
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
 import { DEFAULT_MENU_ITEMS, DEFAULT_TAP_ZONES, MENU_ITEMS } from '../core/reader/reader-config.js'
-import { READER_ALIGNS, READER_PAGE_ANIMATIONS } from '../core/reader/settings.js'
+import { READER_ALIGNS, READER_PAGE_ANIMATIONS, SHELF_SKINS } from '../core/reader/settings.js'
 
 /** 旧记录里的越界数字读时先夹到合法范围；类型不对则交给 zod 默认值。 */
 const clampNumber = (min: number, max: number, integer = false) => (value: unknown): number | undefined => {
@@ -197,6 +197,11 @@ export const ReaderDomain = defineDomain({
           clampNumber(0, Number.MAX_SAFE_INTEGER, true),
           z.number().int().min(0).default(0),
         ),
+        /** 书架皮肤（#140）：grid 封面网格 / list 简洁列表；只存在全局层。 */
+        shelfSkin: z.preprocess(
+          pickEnum(SHELF_SKINS, 'grid'),
+          z.enum(['grid', 'list']).default('grid'),
+        ),
         /** WebDAV 同步（#131）：地址、账号、密码只存服务端，读取设置时整组剔除。 */
         webdavUrl: z.string().max(2048).default(''),
         webdavUsername: z.string().max(200).default(''),
@@ -236,6 +241,7 @@ export const ReaderDomain = defineDomain({
       ttsContinuous: true,
       replaceRules: [],
       mediaQuotaBytes: 0,
+      shelfSkin: 'grid',
       webdavUrl: '',
       webdavUsername: '',
       webdavPassword: '',

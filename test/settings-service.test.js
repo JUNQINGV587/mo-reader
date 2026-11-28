@@ -220,3 +220,39 @@ test('全局恢复页面分区不清空自定义主题', async () => {
   assert.equal(reset.settings.customThemes.length, 1)
   assert.equal(getStored().customThemes.length, 1)
 })
+
+test('书架皮肤默认网格，保存后重新读取仍保持', async () => {
+  const { service, getStored, writeCount } = await makeService({ theme: 'system' })
+  const initial = await service.getSettings()
+  assert.equal(initial.settings.shelfSkin, 'grid')
+  const saved = await service.saveSettings({ settings: { shelfSkin: 'list' } })
+  assert.equal(saved.settings.shelfSkin, 'list')
+  assert.equal(getStored().shelfSkin, 'list')
+  // 刷新/重进插件 = 用同一份存储新建服务实例再读
+  const reloaded = await makeService(getStored())
+  assert.equal((await reloaded.service.getSettings()).settings.shelfSkin, 'list')
+  const back = await reloaded.service.saveSettings({ settings: { shelfSkin: 'grid' } })
+  assert.equal(back.settings.shelfSkin, 'grid')
+  assert.equal(reloaded.getStored().shelfSkin, 'grid')
+  assert.ok(writeCount() >= 1)
+  assert.ok(reloaded.writeCount() >= 1)
+})
+
+test('书架皮肤未知值回落网格，且不写进本书覆盖', async () => {
+  const { service, readConfigs } = await makeService({ theme: 'system' })
+  const global = await service.saveSettings({ settings: { shelfSkin: 'wall' } })
+  assert.equal(global.settings.shelfSkin, 'grid')
+  const book = await service.saveSettings({ bookId: 'b1', settings: { shelfSkin: 'list', fontSize: 30 } })
+  assert.equal(book.settings.shelfSkin, 'grid')
+  assert.equal(book.settings.fontSize, 30)
+  assert.equal('shelfSkin' in readConfigs.get('b1'), false)
+})
+
+test('书架皮肤在存储 schema 上只接受 grid/list', async () => {
+  const { ReaderDomain } = await import('../dist/server/storage.js')
+  const schema = ReaderDomain.global.schema
+  assert.equal(schema.parse({ shelfSkin: 'list' }).shelfSkin, 'list')
+  assert.equal(schema.parse({ shelfSkin: 'wall' }).shelfSkin, 'grid')
+  assert.equal(schema.parse({}).shelfSkin, 'grid')
+  assert.equal(ReaderDomain.global.initial.shelfSkin, 'grid')
+})

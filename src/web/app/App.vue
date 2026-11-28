@@ -54,6 +54,7 @@ import {
   presetSettingsPatch,
   type ReaderSettings,
   type SettingsGroupKey,
+  type ShelfSkin,
 } from '../../core/reader/settings'
 import { dualColumnAvailability } from '../../core/reader/paginate'
 import { AutoPageController } from '../../core/reader/auto-page'
@@ -909,6 +910,15 @@ function shelfProgress(book: any) {
   const percent = Math.round(simulatedProgress(book, Number(record.chapterIndex ?? 0)) * 100)
   const text = record.chapterTitle ? `读至 ${record.chapterTitle}` : `第 ${record.chapterIndex + 1} 章`
   return { percent, text: simulated ? `${text} · 模拟` : text }
+}
+
+/** 更新标记（#140）：优先显示最新章节名，其次章节总数；两者都没有就不显示。 */
+function shelfUpdateLabel(book: any): string {
+  const latest = String(book?.latestChapterTitle ?? '').trim()
+  if (latest) return `更新至 ${latest}`
+  const total = Number(book?.totalChapterNum) || 0
+  if (total > 0) return `更新至 ${total} 章`
+  return ''
 }
 
 const simulateOpen = ref(false)
@@ -2742,6 +2752,9 @@ function sortTime(book: any): number {
   const raw = Number(book?.lastReadAt) || (typeof book?.updatedAt === 'string' ? Date.parse(book.updatedAt) : Number(book?.updatedAt)) || 0
   return Number.isFinite(raw) ? raw : 0
 }
+
+/** 书架皮肤（#140）：改设置里的全局字段，切换后立即重排样式。 */
+const shelfSkin = computed<ShelfSkin>(() => settings.value.shelfSkin)
 
 const shelfSortedBooks = computed(() => {
   let list = [...shelfBooks.value]
@@ -5216,6 +5229,7 @@ function settingsDiff(base: ReaderSettings, current: ReaderSettings): Record<str
   const patch = diffReaderSettings(base, current) as Record<string, unknown>
   delete patch.customThemes
   delete patch.mediaQuotaBytes
+  delete patch.shelfSkin
   return patch
 }
 
@@ -5232,8 +5246,8 @@ async function loadSettings() {
   try {
     // 有书时始终取一次合并值，阅读页据此显示；全局作用域另取全局层供面板编辑。
     const bookStored: any = bookId ? await call('getSettings', { bookId }) : null
-    const stored: any =
-      bookId && scope === 'global' ? await call('getSettings', {}) : bookStored
+    // 没有打开书时也要读一次全局层：书架皮肤等全局设置只在书架页生效（#140）。
+    const stored: any = !bookId || scope === 'global' ? await call('getSettings', {}) : bookStored
     if (!stored?.settings) return
     bookOverrides.value = bookStored?.bookOverrides ?? {}
     settings.value = { ...defaultReaderSettings(), ...stored.settings } as ReaderSettings
@@ -5302,6 +5316,33 @@ async function runPersistSettings() {
     status.value = bookId ? '已保存到本书' : '已保存全局设置'
   } catch (error) {
     settingsError.value = `保存失败：${errorText(error)}`
+  }
+}
+
+/**
+ * 切换书架皮肤：书架不分全局/本书，一律写全局设置；
+ * 走保存队列，连续点两次时最后一次生效，刷新后仍保持。
+ */
+function setShelfSkin(skin: ShelfSkin) {
+  if (skin === settings.value.shelfSkin) return
+  settings.value.shelfSkin = skin
+  const run = () => runSetShelfSkin(skin)
+  settingsSaveChain = settingsSaveChain.then(run, run)
+}
+
+async function runSetShelfSkin(skin: ShelfSkin) {
+  // 队列里已有更新的选择时跳过这一轮，避免旧选择覆盖新选择。
+  if (settings.value.shelfSkin !== skin) return
+  try {
+    const result: any = await call('saveSettings', { settings: { shelfSkin: skin } })
+    if (result?.settings) {
+      const stored = { ...defaultReaderSettings(), ...result.settings } as ReaderSettings
+      settings.value.shelfSkin = stored.shelfSkin
+      settingsBaseline.value.shelfSkin = stored.shelfSkin
+    }
+    settingsError.value = ''
+  } catch (error) {
+    settingsError.value = `书架皮肤保存失败：${errorText(error)}`
   }
 }
 
@@ -5554,6 +5595,31 @@ onMounted(async () => {
           </div>
         </div>
 
+        <div class="mo-shelf-viewbar">
+          <div class="mo-skins" role="group" aria-label="书架皮肤">
+            <button
+              type="button"
+              class="mo-skin-btn"
+              :class="{ on: shelfSkin === 'grid' }"
+              :aria-pressed="shelfSkin === 'grid'"
+              data-testid="shelf-skin-grid"
+              @click="setShelfSkin('grid')"
+            >
+              网格
+            </button>
+            <button
+              type="button"
+              class="mo-skin-btn"
+              :class="{ on: shelfSkin === 'list' }"
+              :aria-pressed="shelfSkin === 'list'"
+              data-testid="shelf-skin-list"
+              @click="setShelfSkin('list')"
+            >
+              列表
+            </button>
+          </div>
+        </div>
+
         <div class="mo-shelf-transfer">
           <span class="muted">书架迁移</span>
           <input
@@ -5600,7 +5666,7 @@ onMounted(async () => {
           <button class="mo-btn" @click="view = 'sources'">去导入书源</button>
         </div>
 
-        <div v-else-if="shelfBooks.length" class="mo-shelf" data-testid="shelf">
+        <div v-else-if="shelfBooks.length" :class="shelfSkin === 'list' ? 'mo-shelf-list' : 'mo-shelf'" data-testid="shelf">
           <button
             v-for="book in shelfSortedBooks"
             :key="book.id"
@@ -5621,12 +5687,20 @@ onMounted(async () => {
                 {{ selectedBookIds.has(book.id) ? '✓' : '' }}
               </span>
             </span>
-            <span class="mo-cover-name">{{ book.name }}</span>
-            <span class="mo-cover-meta">{{ book.author || '未知作者' }}</span>
+            <span class="mo-cover-name" :title="book.name">{{ book.name }}</span>
+            <span class="mo-cover-meta" :title="book.author || '未知作者'">{{ book.author || '未知作者' }}</span>
             <span class="mo-cover-progress">
               <i :style="{ width: `${shelfProgress(book)?.percent ?? 0}%` }" />
             </span>
             <span class="mo-cover-status">{{ shelfProgress(book)?.text ?? '未读' }}</span>
+            <span class="mo-cover-tags">
+              <span v-if="shelfUpdateLabel(book)" class="mo-cover-update" :title="shelfUpdateLabel(book)" data-testid="shelf-update">
+                {{ shelfUpdateLabel(book) }}
+              </span>
+              <span v-if="shelfSkin === 'list' && book.download?.downloaded" class="mo-cover-download">
+                已下 {{ book.download.downloaded }} 章
+              </span>
+            </span>
           </button>
         </div>
       </section>
@@ -8279,6 +8353,111 @@ onMounted(async () => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 书架皮肤（#140）：页头下方的两档切换，默认网格。 */
+.mo-shelf-viewbar {
+  display: flex;
+  align-items: center;
+  margin: -6px 0 14px;
+}
+.mo-skins {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--mo-line);
+  border-radius: 8px;
+  background: var(--mo-paper-2);
+}
+.mo-skin-btn {
+  min-width: 52px;
+  padding: 7px 14px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--mo-ink-2);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.mo-skin-btn.on {
+  background: var(--mo-accent);
+  color: #f6f2e6;
+}
+.mo-skin-btn:focus-visible {
+  outline: 2px solid var(--mo-accent);
+  outline-offset: 2px;
+}
+.mo-cover-tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 14px;
+  overflow: hidden;
+}
+.mo-cover-update,
+.mo-cover-download {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--mo-ink-3);
+}
+.mo-cover-download {
+  flex-shrink: 0;
+}
+/* 列表皮肤（#140）：一行一本，封面缩略图 + 书名/作者/进度/状态/标记，窄屏靠 minmax(0,1fr) 收口。 */
+.mo-shelf-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.mo-shelf-list .mo-cover-card {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  column-gap: 12px;
+  row-gap: 2px;
+  align-items: center;
+  min-width: 0;
+  padding: 10px 6px;
+  border-bottom: 1px solid var(--mo-line);
+}
+.mo-shelf-list .mo-cover {
+  grid-column: 1;
+  grid-row: 1 / 6;
+  align-self: start;
+  width: 44px;
+  height: 58px;
+  aspect-ratio: auto;
+  border-radius: 4px;
+}
+.mo-shelf-list .mo-cover-glyph {
+  font-size: 20px;
+}
+.mo-shelf-list .mo-cover-origin,
+.mo-shelf-list .mo-cover-badge {
+  display: none;
+}
+.mo-shelf-list .mo-cover-name,
+.mo-shelf-list .mo-cover-meta,
+.mo-shelf-list .mo-cover-progress,
+.mo-shelf-list .mo-cover-status,
+.mo-shelf-list .mo-cover-tags {
+  grid-column: 2;
+  min-width: 0;
+}
+.mo-shelf-list .mo-cover-name {
+  margin-top: 0;
+}
+.mo-shelf-list .mo-cover-tags {
+  min-height: 0;
+}
+@media (max-width: 720px) {
+  .mo-skin-btn {
+    min-height: 40px;
+  }
 }
 .mo-searchbar {
   display: flex;

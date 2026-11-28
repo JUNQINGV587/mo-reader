@@ -18,6 +18,9 @@ export type ReaderAlign = 'left' | 'justify'
 
 export type ReaderPageAnimation = 'none' | 'cover' | 'slide' | 'simulate' | 'scroll'
 
+/** 书架皮肤：封面网格 / 简洁列表；只保存在全局层。 */
+export type ShelfSkin = 'grid' | 'list'
+
 export interface ReaderPadding {
   left: number
   top: number
@@ -67,6 +70,8 @@ export interface ReaderSettings {
   replaceRules: ReaderReplaceRule[]
   /** 媒体缓存配额（字节）；只保存在全局层。 */
   mediaQuotaBytes: number
+  /** 书架皮肤；只保存在全局层，默认封面网格。 */
+  shelfSkin: ShelfSkin
 }
 
 /** 每书覆盖层可以改的字段；主题只存 id，自定义主题列表与媒体配额属于全局。 */
@@ -81,7 +86,7 @@ export const BOOK_OVERRIDE_FIELDS = [
 
 export const READER_SETTING_FIELDS = [
   ...BOOK_OVERRIDE_FIELDS,
-  'customThemes', 'mediaQuotaBytes',
+  'customThemes', 'mediaQuotaBytes', 'shelfSkin',
 ] as const satisfies readonly (keyof ReaderSettings)[]
 
 export type SettingsGroupKey = 'layout' | 'page' | 'operate' | 'speak' | 'replace'
@@ -120,6 +125,8 @@ export const READER_ALIGNS: ReaderAlign[] = ['left', 'justify']
 
 export const READER_PAGE_ANIMATIONS: ReaderPageAnimation[] = ['none', 'cover', 'slide', 'simulate', 'scroll']
 
+export const SHELF_SKINS: ShelfSkin[] = ['grid', 'list']
+
 /** 一套全新的默认设置；每次返回独立副本，调用方可放心修改。 */
 export function defaultReaderSettings(): ReaderSettings {
   const fallbackPreset = READER_PRESETS[0]!
@@ -155,6 +162,7 @@ export function defaultReaderSettings(): ReaderSettings {
     ttsContinuous: true,
     replaceRules: [],
     mediaQuotaBytes: 0,
+    shelfSkin: 'grid',
   }
 }
 
@@ -333,6 +341,7 @@ export function normalizeReaderSettings(
     ttsContinuous: boolOr(source.ttsContinuous, defaults.ttsContinuous),
     replaceRules: normalizeReplaceRules(source.replaceRules),
     mediaQuotaBytes: clampInt(source.mediaQuotaBytes, 0, Number.MAX_SAFE_INTEGER, defaults.mediaQuotaBytes),
+    shelfSkin: enumOr(source.shelfSkin, SHELF_SKINS, defaults.shelfSkin),
   }
   return withUnknownFields(settings, source, READER_SETTING_FIELDS)
 }
@@ -349,6 +358,7 @@ const NUMBER_SETTING_FIELDS = [
 const ENUM_SETTING_FIELDS: Record<string, readonly string[]> = {
   align: READER_ALIGNS,
   pageAnimation: READER_PAGE_ANIMATIONS,
+  shelfSkin: SHELF_SKINS,
 }
 
 /** 校验 patch 里某个字段是否可归一；不可归一的字段直接不写，避免坏值覆盖旧值。 */
@@ -421,9 +431,10 @@ export function normalizeBookOverrides(
   if (Array.isArray(patchSource.tapZones) && patchSource.tapZones.length === 9) {
     patch.tapZones = sanitizeTapZones(patchSource.tapZones).zones
   }
-  // 自定义主题列表与媒体配额只存在全局层，旧覆盖记录里出现的也丢弃
+  // 自定义主题列表、媒体配额与书架皮肤只存在全局层，旧覆盖记录里出现的也丢弃
   delete (patch as Record<string, unknown>).customThemes
   delete (patch as Record<string, unknown>).mediaQuotaBytes
+  delete (patch as Record<string, unknown>).shelfSkin
   return patch
 }
 

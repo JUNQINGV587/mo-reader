@@ -287,3 +287,18 @@ test('恢复本节默认不含自定义主题（页面分区也不清空主题�
   const speak = defaultGroupSettings('speak')
   assert.deepEqual(Object.keys(speak).sort(), ['ttsContinuous', 'ttsRate', 'ttsVoice'])
 })
+
+test('书架皮肤默认网格，只认 grid/list，非法值回落', () => {
+  assert.equal(defaultReaderSettings().shelfSkin, 'grid')
+  assert.equal(normalizeReaderSettings({}).shelfSkin, 'grid')
+  assert.equal(normalizeReaderSettings({ shelfSkin: 'list' }).shelfSkin, 'list')
+  assert.equal(normalizeReaderSettings({ shelfSkin: 'cover' }).shelfSkin, 'grid')
+  assert.equal(normalizeReaderSettings({ shelfSkin: 3 }).shelfSkin, 'grid')
+  assert.equal(normalizeReaderSettingsPatch({ shelfSkin: 'list' }).shelfSkin, 'list')
+  assert.equal('shelfSkin' in normalizeReaderSettingsPatch({ shelfSkin: 'wall' }), false)
+  // 书架皮肤是全局字段：本书覆盖层不认，旧覆盖记录里的也丢弃
+  assert.equal('shelfSkin' in normalizeBookOverrides({ shelfSkin: 'list' }), false)
+  assert.equal(mergeReaderSettings({ shelfSkin: 'list' }, { shelfSkin: 'grid' }).shelfSkin, 'list')
+  assert.deepEqual(diffReaderSettings({ shelfSkin: 'grid' }, { shelfSkin: 'list' }), { shelfSkin: 'list' })
+  assert.deepEqual(diffReaderSettings({ shelfSkin: 'grid' }, { shelfSkin: 'grid' }), {})
+})
