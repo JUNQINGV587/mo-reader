@@ -6148,8 +6148,8 @@ onMounted(async () => {
 
         <div class="mo-card">
           <h3 class="mo-card-title">导入书源</h3>
-          <p class="muted">粘贴「阅读」书源 JSON，或选择书源文件（.json，单个或数组）。</p>
-          <textarea v-model="importText" data-testid="import-text" rows="5" placeholder='[{"bookSourceUrl":"https://…","bookSourceName":"…"}]' />
+          <p class="muted">粘贴书源 JSON 或地址，也可选 .json 文件。</p>
+          <textarea v-model="importText" data-testid="import-text" rows="5" placeholder='https://…/sources.json 或 [{"bookSourceUrl":"https://…","bookSourceName":"…"}]' />
           <div class="mo-row">
             <label class="mo-file" title="选择 Legado 书源 JSON 文件">
               <input type="file" accept=".json,application/json" data-testid="import-file" @change="onImportFile" />

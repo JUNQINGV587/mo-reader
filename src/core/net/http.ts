@@ -17,6 +17,8 @@ export interface FetchOptions {
   timeoutMs?: number;
   /** 调用方取消（如搜索取消）：与单跳超时取先到者。 */
   signal?: AbortSignal;
+  /** 响应体字节上限；超过立即中止读取，避免导入书源这类信任度低的来源撑爆内存。 */
+  maxBytes?: number;
 }
 
 export interface FetchResult {
@@ -87,17 +89,20 @@ export async function fetchText(rawUrl: string, options: FetchOptions = {}): Pro
 
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
-      if (!location) return finish(response, url);
+      if (!location) return finish(response, url, options.maxBytes);
       url = await assertPublicHttpUrl(normalizeDuplicateSlashes(new URL(location, url).toString()));
       continue;
     }
-    return finish(response, url);
+    return finish(response, url, options.maxBytes);
   }
   throw new Error('重定向次数过多');
 }
 
-async function finish(response: Response, url: URL): Promise<FetchResult> {
-  const buffer = Buffer.from(await response.arrayBuffer());
+async function finish(response: Response, url: URL, maxBytes?: number): Promise<FetchResult> {
+  const buffer =
+    maxBytes === undefined
+      ? Buffer.from(await response.arrayBuffer())
+      : await readBodyLimited(response, maxBytes);
   const contentType = response.headers.get('content-type') ?? '';
   const text = iconv.decode(buffer, detectCharset(buffer, contentType));
   return { url: url.toString(), status: response.status, text, contentType };

@@ -299,6 +299,12 @@ const SOURCE_CHECK_TIMEOUT_MS = 5000
 const SOURCE_CHECK_TIMEOUT_MIN_MS = 500
 const SOURCE_CHECK_TIMEOUT_MAX_MS = 30_000
 
+/** 导入书源的远程抓取上限：5 MB 响应体、默认 20 秒超时（测试可传更小的 timeoutMs）。 */
+const SOURCE_IMPORT_TIMEOUT_MS = 20_000
+const SOURCE_IMPORT_TIMEOUT_MIN_MS = 500
+const SOURCE_IMPORT_TIMEOUT_MAX_MS = 60_000
+const SOURCE_IMPORT_MAX_BYTES = 5 * 1024 * 1024
+
 interface SourceCheckResult {
   url: string
   ok: boolean
@@ -326,6 +332,47 @@ function checkErrorMessage(error: unknown): string {
     return error.message || '请求失败'
   }
   return String(error)
+}
+
+function clampImportTimeout(value: unknown): number {
+  const raw =
+    typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : SOURCE_IMPORT_TIMEOUT_MS
+  return Math.min(SOURCE_IMPORT_TIMEOUT_MAX_MS, Math.max(SOURCE_IMPORT_TIMEOUT_MIN_MS, raw))
+}
+
+/** 输入是 http/https 绝对地址时按远程书源处理。 */
+function isRemoteImportUrl(payload: string): boolean {
+  return /^https?:\/\//i.test(payload)
+}
+
+/** 抓取远程书源：走 fetchText 的 SSRF 守卫（含私网/DNS 复检）与逐跳重定向。 */
+async function downloadRemoteSources(url: string, timeoutMs: number): Promise<string> {
+  const result = await fetchText(url, {
+    timeoutMs,
+    maxBytes: SOURCE_IMPORT_MAX_BYTES,
+    headers: { Accept: 'application/json,*/*;q=0.8' },
+  })
+  if (result.status < 200 || result.status >= 300) {
+    throw new Error(`下载书源失败：HTTP ${result.status}`)
+  }
+  return result.text
+}
+
+/** 把传输层的裸错误换成可照做的中文；私网拒绝等已是中文的原样保留。 */
+function importDownloadError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error)
+  if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+    return new Error('下载书源超时，请检查网络或稍后重试')
+  }
+  if (message === '响应体过大') return new Error('书源文件超过 5 MB，无法导入')
+  if (
+    /fetch failed|failed to fetch|econnrefused|enotfound|etimedout|eai_again|socket hang up|networkerror/i.test(
+      message,
+    )
+  ) {
+    return new Error('下载书源失败，请检查网络或地址')
+  }
+  return error instanceof Error ? error : new Error(message)
 }
 
 async function checkOneSource(url: string, timeoutMs: number): Promise<SourceCheckResult> {
@@ -503,12 +550,20 @@ export class ReaderService extends TypertRemoteService {
   }
 
   async importSources(args: Args) {
-    const payload = stringArg(args, 'payload')
+    let payload = stringArg(args, 'payload')
+    const remote = isRemoteImportUrl(payload)
+    if (remote) {
+      try {
+        payload = await downloadRemoteSources(payload, clampImportTimeout(args?.timeoutMs))
+      } catch (error) {
+        throw importDownloadError(error)
+      }
+    }
     let parsed: unknown
     try {
       parsed = JSON.parse(payload)
     } catch {
-      throw new Error('不是合法的 JSON')
+      throw new Error(remote ? '下载的内容不是合法的 JSON' : '不是合法的 JSON')
     }
 
     const list = Array.isArray(parsed)
