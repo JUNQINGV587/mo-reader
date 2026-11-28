@@ -136,6 +136,7 @@ import {
   type WebdavConfig,
 } from '../core/webdav/config.js'
 import { WebdavClient, type WebdavFetch } from '../core/webdav/client.js'
+import { deleteExportArtifact, listExportArtifacts } from './export-files.js'
 import {
   EXPORT_KIND,
   ExportCoordinator,
@@ -1781,6 +1782,33 @@ export class ReaderService extends TypertRemoteService {
     await clearAllChapterCache(mediaRoot())
     if (keys.length) await db.downloadEntries.deleteMany(keys)
     return { removed: keys.length }
+  }
+
+  /** 存储页的导出成品：文件名、大小、时间，进行中的标记成不可删。 */
+  async listExportFiles() {
+    return listExportArtifacts(this.requireDb().jobs, {
+      isBusy: (jobId) => this.exportJobBusyInMemory(jobId),
+    })
+  }
+
+  /** 删一个导出成品；只认导出目录里的单段文件名，正在导出/上传的拒绝。 */
+  async deleteExportFile(args: Args) {
+    const name = stringArg(args, 'name')
+    const result = await deleteExportArtifact(this.requireDb().jobs, name, {
+      isBusy: (jobId) => this.exportJobBusyInMemory(jobId),
+    })
+    if (result.kind === 'backup') this.backupCoordinator?.tickets.revoke(result.jobId)
+    return result
+  }
+
+  /** 协调器内存里刚建、还没落盘的作业也算占用，别删正在写的产物。 */
+  private exportJobBusyInMemory(jobId: string): boolean {
+    const live = [
+      this.backupCoordinator?.peek(jobId),
+      this.exportsCoordinator?.peek(jobId),
+      this.webdavTransferCoordinator?.peek(jobId),
+    ]
+    return live.some((job) => Boolean(job) && isActiveJob(String(job?.status ?? '')))
   }
 
   /** 存储页总览：三类缓存的实际占用 + 配额 + 按书明细（索引口径）。 */

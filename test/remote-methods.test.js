@@ -18,6 +18,7 @@ test('不接收入参的方法必须声明成零参数（否则参数个数会�
     'listBooks',
     'listFonts',
     'getStorageUsage',
+    'listExportFiles',
     'getReadingStats',
     'clearReadingStats',
     'clearAllMedia',
@@ -43,6 +44,13 @@ test('备份导出与导入方法注册给客户端，且都接收 args 对象',
     assert.ok(REMOTE_METHODS.includes(method), `${method} 不在 REMOTE_METHODS`)
     assert.ok(!ARGLESS_METHODS.includes(method), `${method} 需要接收 args 对象`)
   }
+})
+
+test('导出成品列表零参数，删除接收 args，且都在远端清单里', () => {
+  assert.ok(REMOTE_METHODS.includes('listExportFiles'))
+  assert.ok(REMOTE_METHODS.includes('deleteExportFile'))
+  assert.ok(ARGLESS_METHODS.includes('listExportFiles'), 'listExportFiles 应当零参数')
+  assert.ok(!ARGLESS_METHODS.includes('deleteExportFile'), 'deleteExportFile 需要接收 args 对象')
 })
 
 test('搜索与取消都注册给客户端，且都接收 args 对象', () => {

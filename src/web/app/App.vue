@@ -2023,6 +2023,14 @@ const storageClearAllOpen = ref(false)
 const storageClearAllBusy = ref(false)
 const storageClearAllCachesOpen = ref(false)
 const storageClearAllCachesBusy = ref(false)
+// 导出成品（#143）：存储页列出导出目录里的文件，可逐个删；进行中的不可删。
+const exportFiles = ref<any[]>([])
+const exportDeleteTarget = ref('')
+const exportDeleting = ref('')
+
+const exportFilesTotal = computed(() =>
+  exportFiles.value.reduce((sum, file) => sum + (Number(file?.size) || 0), 0),
+)
 
 const storageBooks = computed<any[]>(() =>
   Array.isArray(storageUsage.value?.books) ? storageUsage.value.books : [],
@@ -2048,6 +2056,45 @@ async function loadStorageUsage() {
     storageMessage.value = `统计失败：${errorText(error)}`
   } finally {
     storageBusy.value = false
+  }
+  await loadExportFiles()
+}
+
+/** 导出文件的修改时间：列表里只给「月-日 时:分」，一眼看出新旧。 */
+function formatExportTime(ms: number) {
+  const value = Number(ms) || 0
+  if (!value) return ''
+  const date = new Date(value)
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+async function loadExportFiles() {
+  try {
+    const result = await call('listExportFiles')
+    exportFiles.value = Array.isArray(result?.files) ? result.files : []
+    if (exportDeleteTarget.value && !exportFiles.value.some((file) => file.name === exportDeleteTarget.value)) {
+      exportDeleteTarget.value = ''
+    }
+  } catch (error) {
+    exportFiles.value = []
+    exportDeleteTarget.value = ''
+    storageMessage.value = `导出文件读取失败：${errorText(error)}`
+  }
+}
+
+/** 逐个删除导出成品：页内二次确认，删完重新取用量，总量与「我的」摘要一起变。 */
+async function deleteExportFile(name: string) {
+  exportDeleting.value = name
+  try {
+    await call('deleteExportFile', { name })
+    exportDeleteTarget.value = ''
+    await loadStorageUsage()
+    storageMessage.value = '已删除导出文件'
+  } catch (error) {
+    storageMessage.value = `删除失败：${errorText(error)}`
+  } finally {
+    exportDeleting.value = ''
   }
 }
 
@@ -7072,6 +7119,53 @@ onMounted(async () => {
               <strong>{{ formatBytes(storageUsage?.exports?.bytes || 0) }}</strong>
               <span class="muted">{{ storageUsage?.exports?.files || 0 }} 个文件</span>
             </div>
+          </div>
+        </div>
+
+        <div class="mo-card" data-testid="storage-exports">
+          <div class="mo-card-head">
+            <h3 class="mo-card-title">导出文件</h3>
+            <span class="muted">{{ exportFiles.length }} 个 · {{ formatBytes(exportFilesTotal) }}</span>
+          </div>
+          <p v-if="exportFiles.length === 0" class="muted">还没有导出文件。导出完成后会出现在这里。</p>
+          <div
+            v-for="file in exportFiles"
+            :key="file.name"
+            class="mo-storage-book"
+            :data-testid="`export-file-${file.name}`"
+          >
+            <span class="mo-storage-name">{{ file.displayName }}</span>
+            <span class="muted">{{ formatBytes(file.size) }} · {{ formatExportTime(file.mtimeMs) }}</span>
+            <template v-if="exportDeleteTarget === file.name">
+              <span class="muted">删后不能恢复</span>
+              <button
+                class="mo-btn danger"
+                :disabled="exportDeleting === file.name"
+                :data-testid="`export-file-confirm-${file.name}`"
+                @click="deleteExportFile(file.name)"
+              >
+                {{ exportDeleting === file.name ? '删除中…' : '确认删除' }}
+              </button>
+              <button
+                class="mo-btn"
+                :disabled="exportDeleting === file.name"
+                :data-testid="`export-file-cancel-${file.name}`"
+                @click="exportDeleteTarget = ''"
+              >
+                取消
+              </button>
+            </template>
+            <button
+              v-else
+              class="mo-btn"
+              :disabled="!file.deletable"
+              :title="file.reason || '删除这个文件'"
+              :data-testid="`export-file-delete-${file.name}`"
+              @click="exportDeleteTarget = file.name"
+            >
+              删除
+            </button>
+            <span v-if="!file.deletable" class="muted">{{ file.reason }}</span>
           </div>
         </div>
 

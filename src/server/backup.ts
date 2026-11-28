@@ -145,6 +145,11 @@ export class BackupTicketStore {
     this.tickets.clear()
   }
 
+  /** 删产物后立刻作废该作业的旧下载链接，避免点旧链接打开半份文件。 */
+  revoke(jobId: string): void {
+    this.dropForJob(jobId)
+  }
+
   private dropForJob(jobId: string): void {
     for (const [token, entry] of this.tickets) {
       if (entry.jobId === jobId) this.tickets.delete(token)
