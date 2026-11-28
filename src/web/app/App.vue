@@ -2885,9 +2885,10 @@ async function importSources() {
   importMessage.value = ''
   try {
     const result = await call('importSources', { payload: importText.value })
+    const failures = (result.errors ?? []).map((item: any) => item.message).filter(Boolean)
     importMessage.value =
       `导入 ${result.total} 条：新增 ${result.added}，更新 ${result.updated}` +
-      (result.errors?.length ? `，失败 ${result.errors.length}（${result.errors[0].message}）` : '')
+      (failures.length ? `，失败 ${failures.length} 条：${failures.join('；')}` : '')
     importText.value = ''
     await refresh()
   } catch (error) {

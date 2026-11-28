@@ -12,6 +12,7 @@ import {
   type AggregatableBook,
 } from '../core/reader/stats.js'
 import { parseSource, type BookSource } from '../core/model/source.js'
+import { formatSourceError, formatSourceImportError } from '../core/model/source-errors.js'
 import { dictRuleKey, parseDictRule, type DictRule } from '../core/model/dict.js'
 import { AnalyzeRule } from '../core/rules/analyze-rule.js'
 import { withJsLogs } from '../core/rules/js.js'
@@ -698,19 +699,24 @@ export class ReaderService extends TypertRemoteService {
     let updated = 0
     const errors: Array<{ url: string; message: string }> = []
 
-    for (const item of list) {
+    for (const [index, item] of list.entries()) {
+      const url = typeof (item as any)?.bookSourceUrl === 'string' ? (item as any).bookSourceUrl : ''
+      let source: BookSource
       try {
-        const source = parseSource(item)
+        source = parseSource(item)
+      } catch (error) {
+        errors.push({ url, message: formatSourceImportError(index, error) })
+        continue
+      }
+      try {
         const key = sourceKey(source.bookSourceUrl)
         const existed = this.requireDb().sources.get(key) !== undefined
         await this.requireDb().sources.put(key, { ...source, id: key })
         if (existed) updated += 1
         else added += 1
       } catch (error) {
-        errors.push({
-          url: typeof (item as any)?.bookSourceUrl === 'string' ? (item as any).bookSourceUrl : '',
-          message: error instanceof Error ? error.message : String(error),
-        })
+        const reason = error instanceof Error ? error.message : String(error)
+        errors.push({ url, message: `第 ${index + 1} 条：保存失败：${reason}` })
       }
     }
     return { added, updated, total: list.length, errors }
@@ -718,7 +724,12 @@ export class ReaderService extends TypertRemoteService {
 
   async saveSource(args: Args) {
     const raw = args?.source
-    const source = parseSource(raw)
+    let source: BookSource
+    try {
+      source = parseSource(raw)
+    } catch (error) {
+      throw new Error(formatSourceError(error))
+    }
     const key = sourceKey(source.bookSourceUrl)
     await this.requireDb().sources.put(key, { ...source, id: key })
     return { source: { ...source, id: key } }
