@@ -45,6 +45,7 @@ import {
 } from '../../core/reader/theme'
 import { exportFullShelf, exportLegadoShelf } from '../../core/reader/shelf-transfer'
 import { shelfLoadErrorMessage, shelfShowsEmpty } from '../../core/reader/shelf-load'
+import { readableNetworkError } from '../../core/net-error'
 import { IMPORT_UPLOAD_CHUNK_BYTES } from '../../core/reader/backup-constants'
 import {
   defaultReaderSettings,
@@ -3407,7 +3408,7 @@ async function openBook(book: any) {
     view.value = 'detail'
     status.value = `${currentBook.value.name} · ${chapters.value.length} 章`
   } catch (error) {
-    status.value = errorText(error)
+    status.value = readableNetworkError(errorText(error))
   } finally {
     busy.value = false
   }
@@ -3433,7 +3434,7 @@ async function openShelfBook(book: any) {
     view.value = 'detail'
     status.value = `${book.name} · ${chapters.value.length} 章`
   } catch (error) {
-    status.value = errorText(error)
+    status.value = readableNetworkError(errorText(error))
   } finally {
     busy.value = false
   }
@@ -3969,7 +3970,7 @@ async function openChapter(
     }
     return true
   } catch (error) {
-    const message = errorText(error)
+    const message = readableNetworkError(errorText(error))
     chapterError.value = `本章暂不可读：${message}。未下载的章节需要联网后阅读。`
     status.value = message
     return false
