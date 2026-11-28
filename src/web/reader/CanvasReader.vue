@@ -15,6 +15,12 @@ import {
 } from '../../core/reader/paginate'
 import { pageTurnFrame, resolvePageTurn, turnDurationMs } from '../../core/reader/page-turn'
 import { DEFAULT_TAP_ZONES, tapZoneIndex, tipText } from '../../core/reader/reader-config'
+import {
+  gestureModeFor,
+  LONG_PRESS_MS,
+  LONG_PRESS_TOLERANCE,
+  resolveReaderGesture,
+} from '../../core/reader/swipe-gesture'
 import { isDarkColor, type ThemeColors } from '../../core/reader/theme'
 import { TurnAnimator } from '../../core/reader/turn-animator'
 import type { TurnCancelReason, TurnState } from '../../core/reader/turn-animator'
@@ -147,15 +153,16 @@ let layoutFrame = 0
 let settingsTimer = 0
 const SETTINGS_DEBOUNCE_MS = 120
 
-const LONG_PRESS_MS = 500
-const LONG_PRESS_TOLERANCE = 10
-
 interface PressState {
   pointerId: number
   startX: number
   startY: number
   x: number
   y: number
+  /** 按下时刻（performance.now），抬起时算手势时长 */
+  startedAt: number
+  /** 长按计时器已触发：松手不再判定滑动 */
+  longPressed: boolean
   timer: number
 }
 
@@ -168,6 +175,9 @@ const ACCENT = '#3d6b53'
 const effectiveAnimation = computed<Turn>(() =>
   resolvePageTurn(props.animation, { reducedMotion: reducedMotion.value, inkMode: props.inkMode }),
 )
+
+/** 手势模式跟着实际翻页形态走：scroll 纵向过渡，其余形态都按分页翻页。 */
+const gestureMode = computed(() => gestureModeFor(effectiveAnimation.value))
 
 const palette = computed<ThemeColors>(() => {
   if (props.inkMode) {
@@ -862,14 +872,25 @@ function selectionAt(clientX: number, clientY: number): ReaderSelection | null {
 }
 
 function clearPress() {
-  if (press) window.clearTimeout(press.timer)
+  if (press) {
+    window.clearTimeout(press.timer)
+    press.timer = 0
+  }
   press = null
+}
+
+/** 移动超过长按容差后只停掉计时器，保留按下点给抬手时判定滑动。 */
+function cancelLongPressTimer() {
+  if (!press || press.timer === 0) return
+  window.clearTimeout(press.timer)
+  press.timer = 0
 }
 
 function finishLongPress() {
   const active = press
-  if (!active) return
-  clearPress()
+  if (!active || active.longPressed) return
+  cancelLongPressTimer()
+  active.longPressed = true
   swallowClick = true
   const selection = selectionAt(active.x, active.y)
   if (selection) emit('select', selection)
@@ -886,23 +907,57 @@ function onCanvasPointerDown(event: PointerEvent) {
     startY: event.clientY,
     x: event.clientX,
     y: event.clientY,
+    startedAt: performance.now(),
+    longPressed: false,
     timer: window.setTimeout(finishLongPress, LONG_PRESS_MS),
   }
 }
 
 function onWindowPointerMove(event: PointerEvent) {
   if (!press || event.pointerId !== press.pointerId) return
-  if (Math.hypot(event.clientX - press.startX, event.clientY - press.startY) > LONG_PRESS_TOLERANCE) {
-    clearPress()
-    return
-  }
   press.x = event.clientX
   press.y = event.clientY
+  if (press.longPressed || press.timer === 0) return
+  if (Math.hypot(event.clientX - press.startX, event.clientY - press.startY) > LONG_PRESS_TOLERANCE) {
+    cancelLongPressTimer()
+  }
 }
 
 function onWindowPointerEnd(event: PointerEvent) {
-  if (!press || event.pointerId !== press.pointerId) return
+  const active = press
+  if (!active || event.pointerId !== active.pointerId) return
+  // 被系统手势打断时只放弃本次判定，不按位移翻页
+  if (event.type === 'pointercancel') {
+    clearPress()
+    return
+  }
+  const durationMs = performance.now() - active.startedAt
+  const dx = event.clientX - active.startX
+  const dy = event.clientY - active.startY
+  const moved = Math.hypot(dx, dy)
+
+  // 长按已触发：松手不翻页；长按后再移动按取消处理
+  if (active.longPressed) {
+    clearPress()
+    swallowClick = true
+    return
+  }
+
+  const gesture = resolveReaderGesture({ dx, dy, durationMs, mode: gestureMode.value })
+  if (gesture === 'longpress') {
+    // 浏览器把 500ms 计时器压后时，由抬手补齐一次选词
+    active.x = event.clientX
+    active.y = event.clientY
+    finishLongPress()
+    clearPress()
+    swallowClick = true
+    return
+  }
   clearPress()
+  // 超过长按容差的移动不再当作点按，避免滑动误触九区动作
+  if (moved > LONG_PRESS_TOLERANCE) swallowClick = true
+  if (gesture === 'next') next()
+  else if (gesture === 'prev') prev()
 }
 
 function onCanvasContextMenu(event: MouseEvent) {
@@ -1122,7 +1177,8 @@ defineExpose({
   width: 100%;
   height: 100%;
   cursor: pointer;
-  touch-action: manipulation;
+  /* 手势由 pointer 事件自行判定；避免浏览器接管平移/缩放手势后发出 pointercancel */
+  touch-action: none;
   -webkit-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;
