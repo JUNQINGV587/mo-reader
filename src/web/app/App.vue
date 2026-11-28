@@ -6677,9 +6677,11 @@ onMounted(async () => {
               <span v-if="hasExplore(source)" class="mo-tag soft">发现</span>
               <span v-if="needsLogin(source)" class="mo-tag warn">需登录</span>
               <span v-else-if="source.enabledCookieJar" class="mo-tag soft">Cookie</span>
-              <button class="mo-btn tiny" :disabled="busy" title="导出为 Legado JSON" data-testid="source-export" @click="exportSource(source)">导出</button>
-              <button class="mo-icon-btn" title="编辑" data-testid="source-edit" @click="beginEdit(source)">✎</button>
-              <button class="mo-icon-btn danger" title="删除" @click="removeSource(source)">✕</button>
+              <div class="mo-source-actions">
+                <button class="mo-btn tiny" :disabled="busy" title="导出为 Legado JSON" data-testid="source-export" @click="exportSource(source)">导出</button>
+                <button class="mo-icon-btn" title="编辑" data-testid="source-edit" @click="beginEdit(source)">✎</button>
+                <button class="mo-icon-btn danger" title="删除" @click="removeSource(source)">✕</button>
+              </div>
             </li>
           </ul>
           <div v-if="sourcePageCount > 1" class="mo-pager">
@@ -8400,6 +8402,8 @@ onMounted(async () => {
   /* 全面屏安全区：面板、抽屉、阅读底栏与播放器共用这一套变量。 */
   --mo-safe-top: env(safe-area-inset-top, 0px);
   --mo-safe-bottom: env(safe-area-inset-bottom, 0px);
+  /* 手机触控目标：按钮、目录项、列表项统一按 44 CSS px 作为最小可点尺寸。 */
+  --mo-tap: 44px;
   --mo-sheet-pad-bottom: calc(26px + var(--mo-safe-bottom));
   --mo-drawer-pad-bottom: calc(18px + var(--mo-safe-bottom));
   display: flex;
@@ -9447,6 +9451,12 @@ textarea {
 .mo-sources li:last-child {
   border-bottom: 0;
 }
+.mo-source-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
 .mo-form-row {
   display: flex;
   gap: 10px;
@@ -10042,6 +10052,60 @@ textarea {
     width: 44px;
     height: 44px;
     flex-shrink: 0;
+  }
+  .mo-btn,
+  .mo-skin-btn,
+  .mo-chip {
+    min-height: var(--mo-tap);
+  }
+  .mo-chrome-btn {
+    min-width: var(--mo-tap);
+    min-height: var(--mo-tap);
+    padding: 10px 12px;
+  }
+  .mo-toc button {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    min-height: var(--mo-tap);
+  }
+  .mo-bookmark-jump {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    min-height: var(--mo-tap);
+    padding: 6px 4px;
+  }
+  .mo-drawer-list li {
+    padding: 0;
+  }
+  .mo-drawer-list li.volume {
+    padding: 10px 0 4px;
+  }
+  .mo-drawer-list button {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    min-height: var(--mo-tap);
+  }
+  .mo-chip {
+    display: inline-flex;
+    align-items: center;
+  }
+  .mo-sources li {
+    flex-wrap: wrap;
+  }
+  .mo-sources li .mo-switch {
+    flex: 1 1 200px;
+    min-height: var(--mo-tap);
+  }
+  .mo-sources li .mo-btn.tiny {
+    min-height: var(--mo-tap);
+  }
+  .mo-source-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
   .mo-status {
     font-size: 11px;
