@@ -101,6 +101,22 @@ const busy = ref(false)
 const cacheBusy = ref(false)
 const exportBusy = ref(false)
 
+type PendingConfirm = {
+  kind: 'source' | 'books' | 'bookmark' | 'note'
+  title: string
+  message: string
+  confirmText: string
+  source?: any
+  bookIds?: string[]
+  bookmark?: any
+  note?: any
+}
+const pendingConfirm = ref<PendingConfirm | null>(null)
+const confirmBusy = ref(false)
+const confirmError = ref('')
+const confirmCancelButton = ref<HTMLButtonElement | null>(null)
+let confirmReturnFocus: HTMLElement | null = null
+
 const sources = ref<any[]>([])
 const importText = ref('')
 const rssSources = ref<any[]>([])
@@ -3168,13 +3184,15 @@ async function toggleSource(source: any) {
   }
 }
 
-async function removeSource(source: any) {
-  try {
-    await call('deleteSources', { urls: [source.bookSourceUrl] })
-    await refresh()
-  } catch (error) {
-    status.value = errorText(error)
-  }
+function removeSource(source: any) {
+  const name = source?.bookSourceName || source?.bookSourceUrl || '这个书源'
+  requestConfirm({
+    kind: 'source',
+    title: '删除书源',
+    message: `确定删除书源「${name}」吗？删除后需要重新导入才能使用。`,
+    confirmText: '删除书源',
+    source,
+  })
 }
 
 function toggleSelectSource(source: any) {
@@ -4174,20 +4192,23 @@ function onShelfBookClick(book: any) {
   void openShelfBook(book)
 }
 
-async function removeSelectedBooks() {
+function removeSelectedBooks() {
   const ids = [...selectedBookIds.value]
   if (!ids.length) return
-  busy.value = true
-  try {
-    await call('removeBooks', { ids })
-    exitShelfSelect()
-    await refresh()
-    status.value = `移出书架 ${ids.length} 本`
-  } catch (error) {
-    status.value = errorText(error)
-  } finally {
-    busy.value = false
-  }
+  const names = ids
+    .map((id) => shelfBooks.value.find((book) => book.id === id)?.name)
+    .filter((name): name is string => typeof name === 'string' && name.length > 0)
+  const message =
+    names.length === 1
+      ? `确定把《${names[0]}》移出书架吗？`
+      : `确定把选中的 ${ids.length} 本书移出书架吗？`
+  requestConfirm({
+    kind: 'books',
+    title: '移出书架',
+    message,
+    confirmText: '移出书架',
+    bookIds: ids,
+  })
 }
 
 function onShelfPointerDown(book: any) {
@@ -4446,8 +4467,7 @@ async function toggleBookmark() {
         Number(item.page) === initialPage.value,
     )
     if (existing) {
-      await call('deleteBookmark', { id: existing.id })
-      status.value = '已删除书签'
+      askDeleteBookmark(existing)
     } else {
       await call('saveBookmark', {
         bookId: currentBook.value.id,
@@ -4465,15 +4485,35 @@ async function toggleBookmark() {
   }
 }
 
-async function removeBookmark(bookmark: any) {
-  try {
-    await call('deleteBookmark', { id: bookmark.id })
-    await loadBookmarks()
-    await loadNotes()
-    status.value = '已删除书签'
-  } catch (error) {
-    status.value = errorText(error)
-  }
+function askDeleteBookmark(bookmark: any) {
+  const chapter = bookmark?.chapterTitle || `第 ${Number(bookmark?.chapterIndex ?? 0) + 1} 章`
+  const page = `第 ${Number(bookmark?.page ?? 0) + 1} 页`
+  requestConfirm({
+    kind: 'bookmark',
+    title: '删除书签',
+    message: `确定删除「${chapter} · ${page}」这个书签吗？`,
+    confirmText: '删除书签',
+    bookmark,
+  })
+}
+
+function removeBookmark(bookmark: any) {
+  askDeleteBookmark(bookmark)
+}
+
+function askDeleteNote(note: any) {
+  const label = note?.type === 'underline' ? '划线' : '笔记'
+  const preview = String(
+    note?.type === 'underline' ? note?.quote || note?.content : note?.content || note?.quote || '',
+  ).trim()
+  const short = preview.length > 30 ? `${preview.slice(0, 30)}…` : preview
+  requestConfirm({
+    kind: 'note',
+    title: `删除${label}`,
+    message: short ? `确定删除「${short}」这条${label}吗？` : `确定删除这条${label}吗？`,
+    confirmText: `删除${label}`,
+    note,
+  })
 }
 
 async function addNote() {
@@ -4498,13 +4538,65 @@ async function addNote() {
   }
 }
 
-async function removeNote(note: any) {
+function removeNote(note: any) {
+  askDeleteNote(note)
+}
+
+function requestConfirm(config: PendingConfirm) {
+  if (confirmBusy.value) return
+  if (!pendingConfirm.value) confirmReturnFocus = document.activeElement as HTMLElement | null
+  pendingConfirm.value = { ...config, bookIds: config.bookIds ? [...config.bookIds] : undefined }
+  confirmError.value = ''
+  void nextTick(() => confirmCancelButton.value?.focus())
+}
+
+function restoreConfirmFocus() {
+  const target = confirmReturnFocus
+  confirmReturnFocus = null
+  void nextTick(() => target?.focus?.())
+}
+
+function closeConfirm() {
+  if (confirmBusy.value) return
+  pendingConfirm.value = null
+  confirmError.value = ''
+  restoreConfirmFocus()
+}
+
+async function acceptConfirm() {
+  const target = pendingConfirm.value
+  if (!target || confirmBusy.value) return
+  confirmBusy.value = true
+  confirmError.value = ''
   try {
-    await call('deleteNote', { id: note.id })
-    await loadNotes()
-    status.value = '已删除笔记'
+    if (target.kind === 'source') {
+      const name = target.source?.bookSourceName || target.source?.bookSourceUrl || '书源'
+      const sourceKey = target.source?.id || target.source?.bookSourceUrl
+      await call('deleteSources', { urls: [sourceKey] })
+      await refresh()
+      status.value = `已删除书源「${name}」`
+    } else if (target.kind === 'books') {
+      const ids = target.bookIds ?? []
+      await call('removeBooks', { ids })
+      exitShelfSelect()
+      await refresh()
+      status.value = `移出书架 ${ids.length} 本`
+    } else if (target.kind === 'bookmark') {
+      await call('deleteBookmark', { id: target.bookmark.id })
+      await loadBookmarks()
+      await loadNotes()
+      status.value = '已删除书签'
+    } else if (target.kind === 'note') {
+      await call('deleteNote', { id: target.note.id })
+      await loadNotes()
+      status.value = '已删除笔记'
+    }
+    pendingConfirm.value = null
+    restoreConfirmFocus()
   } catch (error) {
-    status.value = errorText(error)
+    confirmError.value = errorText(error)
+  } finally {
+    confirmBusy.value = false
   }
 }
 
@@ -6751,7 +6843,7 @@ onMounted(async () => {
               <div class="mo-source-actions">
                 <button class="mo-btn tiny" :disabled="busy" title="导出为 Legado JSON" data-testid="source-export" @click="exportSource(source)">导出</button>
                 <button class="mo-icon-btn" title="编辑" data-testid="source-edit" @click="beginEdit(source)">✎</button>
-                <button class="mo-icon-btn danger" title="删除" @click="removeSource(source)">✕</button>
+                <button class="mo-icon-btn danger" title="删除" data-testid="source-delete" @click="removeSource(source)">✕</button>
               </div>
             </li>
           </ul>
@@ -8271,7 +8363,7 @@ onMounted(async () => {
                     {{ item.chapterTitle || `第 ${Number(item.chapterIndex) + 1} 章` }}
                     <span class="muted">· 第 {{ Number(item.page) + 1 }} 页</span>
                   </button>
-                  <button class="mo-icon-btn" title="删除" @click="removeBookmark(item)">✕</button>
+                  <button class="mo-icon-btn" title="删除" data-testid="bookmark-delete" @click="removeBookmark(item)">✕</button>
                 </li>
               </ul>
             </div>
@@ -8301,7 +8393,7 @@ onMounted(async () => {
                     <template v-else>{{ item.quote || '笔记' }}<span class="muted"> · {{ item.content }}</span></template>
                     <span class="muted"> · 第 {{ Number(item.page) + 1 }} 页</span>
                   </button>
-                  <button class="mo-icon-btn" title="删除" @click="removeNote(item)">✕</button>
+                  <button class="mo-icon-btn" title="删除" data-testid="note-delete" @click="removeNote(item)">✕</button>
                 </li>
               </ul>
             </div>
@@ -8473,6 +8565,37 @@ onMounted(async () => {
         </transition>
 
     </main>
+
+    <transition name="mo-fade">
+      <div
+        v-if="pendingConfirm"
+        class="mo-sheet-mask mo-confirm-mask"
+        data-testid="confirm-mask"
+        @click.self="closeConfirm"
+        @keydown.esc.stop.prevent="closeConfirm"
+      >
+        <div
+          class="mo-sheet mo-confirm-sheet"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="mo-confirm-title"
+          aria-describedby="mo-confirm-message"
+        >
+          <div class="mo-sheet-head">
+            <strong id="mo-confirm-title">{{ pendingConfirm.title }}</strong>
+            <button class="mo-icon-btn" aria-label="取消确认" :disabled="confirmBusy" @click="closeConfirm">✕</button>
+          </div>
+          <p id="mo-confirm-message" class="mo-confirm-message" data-testid="confirm-message">{{ pendingConfirm.message }}</p>
+          <p v-if="confirmError" class="mo-confirm-error" role="alert" data-testid="confirm-error">{{ confirmError }}</p>
+          <div class="mo-confirm-actions">
+            <button ref="confirmCancelButton" class="mo-btn" data-testid="confirm-cancel" :disabled="confirmBusy" @click="closeConfirm">取消</button>
+            <button class="mo-btn danger" data-testid="confirm-ok" :disabled="confirmBusy" @click="acceptConfirm">
+              {{ confirmBusy ? '处理中…' : pendingConfirm.confirmText }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </transition>
   </div>
 </template>
 
@@ -10019,6 +10142,30 @@ textarea {
   max-height: 78vh;
   max-height: 78dvh;
   overflow-y: auto;
+}
+.mo-confirm-mask {
+  z-index: 6;
+}
+.mo-confirm-sheet {
+  max-width: 520px;
+  margin: 0 auto;
+}
+.mo-confirm-message {
+  margin: 0 0 18px;
+  color: var(--mo-ink-2);
+  font-size: 14px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.mo-confirm-error {
+  margin: -6px 0 14px;
+  color: #a8402e;
+  font-size: 13px;
+}
+.mo-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
 }
 /* 设置面板：移动端底部、桌面右侧；分区可折叠 */
 .mo-settings-mask {
