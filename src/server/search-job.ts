@@ -53,7 +53,7 @@ export interface SearchJob {
   bookCount: number
   books: MergedSearchBook[]
   failures: SearchJobFailure[]
-  skipped: SearchJobSkipped[]
+  skippedSources: SearchJobSkipped[]
   cancelled: boolean
   error: string
   createdAt: number
@@ -73,7 +73,7 @@ export interface SearchJobSnapshot {
   books: MergedSearchBook[]
   failures: SearchJobFailure[]
   /** 范围里已停用或已删除、本次没有参与抓取的书源。 */
-  skipped: SearchJobSkipped[]
+  skippedSources: SearchJobSkipped[]
   cancelled: boolean
   error: string
   createdAt: number
@@ -121,7 +121,7 @@ function snapshotOf(job: SearchJob): SearchJobSnapshot {
     failures: [...job.failures]
       .sort((left, right) => (left.sourceIndex ?? 0) - (right.sourceIndex ?? 0))
       .map((failure) => ({ ...failure })),
-    skipped: (job.skipped ?? []).map((item) => ({ ...item })),
+    skippedSources: (job.skippedSources ?? []).map((item) => ({ ...item })),
     cancelled: job.cancelled,
     error: job.error,
     createdAt: job.createdAt,
@@ -174,7 +174,7 @@ export class SearchJobCoordinator {
       bookCount: 0,
       books: [],
       failures: [],
-      skipped: this.skippedSources(scope, sources),
+      skippedSources: this.collectSkippedSources(scope, sources),
       cancelled: false,
       error: '',
       createdAt: now,
@@ -362,7 +362,7 @@ export class SearchJobCoordinator {
   }
 
   /** 范围里已停用或已删除的书源：只记入 skipped 提示，不参与抓取也不计入总源数。 */
-  private skippedSources(scope: string[] | null, sources: BookSource[]): SearchJobSkipped[] {
+  private collectSkippedSources(scope: string[] | null, sources: BookSource[]): SearchJobSkipped[] {
     if (!scope) return []
     const available = new Set(sources.map((source) => source.bookSourceUrl))
     const skipped: SearchJobSkipped[] = []

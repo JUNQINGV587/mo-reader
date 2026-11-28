@@ -38,8 +38,16 @@ const pickMenuItems = (value: unknown): string[] => {
 
 const identified = z.object({ id: z.string().min(1).max(4096) }).passthrough()
 
-/** 下载/导出等后台作业：服务重启后据它恢复暂停态，故记录需带完整进度字段。 */
-const jobRecord = z
+/** 搜索作业里被跳过的书源；只存在于 kind=search 的作业记录。 */
+const jobSkippedSource = z
+  .object({
+    bookSourceUrl: z.string().max(8192).default(''),
+    sourceName: z.string().max(4096).default(''),
+    reason: z.string().max(4096).default(''),
+  })
+  .passthrough()
+
+const jobRecordObject = z
   .object({
     id: z.string().min(1).max(4096),
     kind: z.string().min(1).max(80).default('download'),
@@ -53,12 +61,32 @@ const jobRecord = z
     completed: z.number().int().min(0).default(0),
     failed: z.number().int().min(0).default(0),
     skipped: z.number().int().min(0).default(0),
+    skippedSources: z.array(jobSkippedSource).optional(),
     bytes: z.number().int().min(0).default(0),
     error: z.string().max(4096).default(''),
     createdAt: z.number().int().min(0).default(0),
     updatedAt: z.number().int().min(0).default(0),
   })
   .passthrough()
+
+/**
+ * 旧搜索作业把跳过源存在 skipped 数组里，和下载作业的 skipped 数字冲突（#151 的遗留记录）。
+ * 读盘时迁到 skippedSources，避免一条旧记录让整个 mo_reader 域无法激活。
+ */
+function migrateJobRecord(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+  const record = value as Record<string, unknown>
+  if (!Array.isArray(record.skipped)) return value
+  const { skipped, ...rest } = record
+  return {
+    ...rest,
+    skipped: 0,
+    skippedSources: Array.isArray(rest.skippedSources) ? rest.skippedSources : skipped,
+  }
+}
+
+/** 下载/导出等后台作业：服务重启后据它恢复暂停态，故记录需带完整进度字段。 */
+const jobRecord = z.preprocess(migrateJobRecord, jobRecordObject)
 
 /**
  * 已下载章节的索引：只记「哪一章、多少字节、什么时候下的」，正文仍只在文字缓存文件里。

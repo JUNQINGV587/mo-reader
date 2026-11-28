@@ -277,14 +277,14 @@ test('失败源按搜索源顺序排列，不随完成时序跳', async () => {
     assert.deepEqual(final.failures.map((item) => item.sourceName), ['源0', '源1', '源2'])
     assert.deepEqual(final.failures.map((item) => item.sourceIndex), [0, 1, 2])
     assert.equal(final.doneSources, 3)
-    assert.equal(final.skipped.length, 0)
+    assert.equal(final.skippedSources.length, 0)
   } finally {
     await service.searchJobCoordinator?.shutdown?.()
     await closeServer(server)
   }
 })
 
-test('旧快照失败项没有 sourceIndex 时保持原顺序，skipped 为空', async () => {
+test('旧快照失败项没有 sourceIndex 时保持原顺序，skippedSources 为空', async () => {
   const db = newDb()
   const now = Date.now()
   await db.jobs.put('search-legacy-done', {
@@ -314,7 +314,7 @@ test('旧快照失败项没有 sourceIndex 时保持原顺序，skipped 为空',
     assert.ok(snapshot)
     assert.deepEqual(snapshot.failures.map((item) => item.sourceName), ['源B', '源A'], '缺失下标时保留持久化顺序')
     assert.equal(snapshot.failures.some((item) => 'sourceIndex' in item), false)
-    assert.deepEqual(snapshot.skipped, [])
+    assert.deepEqual(snapshot.skippedSources, [])
   } finally {
     await service.searchJobCoordinator?.shutdown?.()
   }
@@ -345,11 +345,11 @@ test('范围内已停用或已删除的书源跳过并给出提示', async () =>
     assert.equal(final.failures.length, 0, '停用/删除不算失败源')
     assert.equal(final.bookCount, 1)
     assert.deepEqual(
-      final.skipped.map((item) => item.bookSourceUrl),
+      final.skippedSources.map((item) => item.bookSourceUrl),
       [disabled.bookSourceUrl, deleted.bookSourceUrl],
       '跳过项按范围顺序排列',
     )
-    for (const item of final.skipped) {
+    for (const item of final.skippedSources) {
       assert.equal(item.sourceName, item.bookSourceUrl, '源已不在库里时用 URL 兜底')
       assert.equal(item.reason, '书源已停用或已删除')
     }
@@ -400,7 +400,7 @@ test('只重试失败源，结果与首次结果合并后不丢不重', async ()
     assert.equal(retry.totalSources, 1, '重试只跑失败源子集')
     assert.equal(retry.doneSources, 1)
     assert.equal(retry.failures.length, 0, '重试成功后不再有失败源')
-    assert.equal(retry.skipped.length, 0)
+    assert.equal(retry.skippedSources.length, 0)
     assert.equal(hits.get('/s0/search'), hitsBeforeRetry.s0, '重试不应再请求已成功的源')
     assert.equal(hits.get('/s2/search'), hitsBeforeRetry.s2, '重试不应再请求已成功的源')
     assert.equal(hits.get('/s1/search'), 2, '失败源被重试一次')

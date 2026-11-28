@@ -3446,7 +3446,7 @@ function applySearchSnapshot(snapshot: any) {
     searchMergeMode.value && snapshot.status === 'cancelled'
       ? mergeFailureLists(searchBaseFailures.value, failures)
       : failures
-  searchSkipped.value = Array.isArray(snapshot.skipped) ? snapshot.skipped : []
+  searchSkipped.value = Array.isArray(snapshot.skippedSources) ? snapshot.skippedSources : []
   searching.value = snapshot.status === 'running'
   if (snapshot.status === 'running') {
     status.value = searchProgressText(snapshot)
