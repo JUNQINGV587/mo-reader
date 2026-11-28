@@ -136,7 +136,7 @@ onUnmounted(destroyHls)
   align-items: center;
   width: 100%;
   height: 100%;
-  padding: 16px;
+  padding: 16px 16px calc(16px + var(--mo-safe-bottom, env(safe-area-inset-bottom, 0px)));
   background: #101114;
 }
 .mo-video-head {

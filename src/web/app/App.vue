@@ -340,6 +340,7 @@ const dualColumnAvailable = computed(() =>
   dualColumnAvailability(viewportWidth.value, settings.value.padding),
 )
 let settingsPersistTimer: ReturnType<typeof setTimeout> | null = null
+let panelFocusTimer: ReturnType<typeof setTimeout> | undefined
 const readerRef = ref<any>(null)
 const initialPage = ref(0)
 const tocFilter = ref('')
@@ -2765,6 +2766,8 @@ onUnmounted(() => {
   }
   window.removeEventListener('keydown', onReaderEscape)
   window.removeEventListener('resize', syncViewportWidth)
+  document.removeEventListener('focusin', keepPanelFieldVisible)
+  if (panelFocusTimer) clearTimeout(panelFocusTimer)
   document.removeEventListener('visibilitychange', onReaderVisibilityChange)
   window.speechSynthesis?.removeEventListener?.('voiceschanged', loadSpeechVoices)
   clearSpeechVoiceWait()
@@ -5782,9 +5785,27 @@ function syncViewportWidth() {
   viewportWidth.value = window.innerWidth
 }
 
+/**
+ * 手机键盘弹出后，面板里的输入框可能被挡住。
+ * 只处理 sheet/drawer 内的文本输入，聚焦后等键盘稳定，再把输入框滚到可视区中间。
+ */
+function keepPanelFieldVisible(event: FocusEvent) {
+  const target = event.target
+  if (!(target instanceof HTMLElement)) return
+  if (!target.matches('input, textarea, select')) return
+  if (target instanceof HTMLInputElement && ['range', 'checkbox', 'radio', 'file'].includes(target.type)) return
+  if (!target.closest('.mo-sheet, .mo-drawer')) return
+  if (panelFocusTimer) clearTimeout(panelFocusTimer)
+  panelFocusTimer = setTimeout(() => {
+    if (document.activeElement !== target) return
+    target.scrollIntoView({ block: 'center', inline: 'nearest' })
+  }, 260)
+}
+
 onMounted(async () => {
   window.addEventListener('keydown', onReaderEscape)
   window.addEventListener('resize', syncViewportWidth)
+  document.addEventListener('focusin', keepPanelFieldVisible)
   syncViewportWidth()
   document.addEventListener('visibilitychange', onReaderVisibilityChange)
   window.addEventListener('focus', syncReadingTimer)
@@ -8376,6 +8397,11 @@ onMounted(async () => {
   --mo-line: #e7e0d1;
   --mo-accent: #3d6b53;
   --mo-accent-soft: #e9efe9;
+  /* 全面屏安全区：面板、抽屉、阅读底栏与播放器共用这一套变量。 */
+  --mo-safe-top: env(safe-area-inset-top, 0px);
+  --mo-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --mo-sheet-pad-bottom: calc(26px + var(--mo-safe-bottom));
+  --mo-drawer-pad-bottom: calc(18px + var(--mo-safe-bottom));
   display: flex;
   flex-direction: column;
   position: relative;
@@ -9704,7 +9730,7 @@ textarea {
 .mo-reader-hint {
   position: absolute;
   left: 50%;
-  bottom: 84px;
+  bottom: calc(84px + var(--mo-safe-bottom));
   transform: translateX(-50%);
   max-width: 82%;
   padding: 8px 14px;
@@ -9720,7 +9746,7 @@ textarea {
 .mo-auto-page {
   position: absolute;
   left: 50%;
-  bottom: 12px;
+  bottom: calc(12px + var(--mo-safe-bottom));
   transform: translateX(-50%);
   display: flex;
   align-items: center;
@@ -9798,6 +9824,9 @@ textarea {
   pointer-events: auto;
   backdrop-filter: blur(6px);
 }
+.mo-chrome-top {
+  padding-top: calc(10px + var(--mo-safe-top));
+}
 .mo-chrome-title {
   flex: 1;
   display: flex;
@@ -9821,7 +9850,7 @@ textarea {
 .mo-chrome-bottom {
   flex-wrap: wrap;
   justify-content: space-around;
-  padding: 12px 14px;
+  padding: 12px 14px calc(12px + var(--mo-safe-bottom));
 }
 .mo-chrome-today {
   font-size: 12px;
@@ -9854,13 +9883,14 @@ textarea {
 }
 .mo-sheet {
   width: 100%;
-  padding: 18px 22px 26px;
+  padding: 18px 22px var(--mo-sheet-pad-bottom);
   border-radius: 14px 14px 0 0;
   background: var(--mo-paper-2);
   color: var(--mo-ink);
 }
 .mo-sheet-scroll {
   max-height: 78vh;
+  max-height: 78dvh;
   overflow-y: auto;
 }
 /* 设置面板：移动端底部、桌面右侧；分区可折叠 */
@@ -9871,7 +9901,6 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding-bottom: calc(26px + env(safe-area-inset-bottom));
 }
 .mo-settings-sheet:focus-visible {
   outline: 2px solid var(--mo-accent);
@@ -9991,6 +10020,7 @@ textarea {
 @media (max-width: 720px) {
   .mo-settings-sheet {
     max-height: 82vh;
+    max-height: 82dvh;
   }
   .mo-settings-sheet .mo-slider input,
   .mo-settings-sheet .mo-theme-row button,
@@ -10346,7 +10376,7 @@ textarea {
   right: 0;
   bottom: 0;
   width: min(420px, 88vw);
-  padding: 18px 20px;
+  padding: 18px 20px var(--mo-drawer-pad-bottom);
   background: var(--mo-paper-2);
   color: var(--mo-ink);
   box-shadow: -16px 0 40px rgba(0, 0, 0, 0.24);

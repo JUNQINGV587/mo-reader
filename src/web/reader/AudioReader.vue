@@ -138,7 +138,7 @@ onUnmounted(destroyHls)
   justify-content: center;
   width: 100%;
   height: 100%;
-  padding: 24px;
+  padding: 24px 24px calc(24px + var(--mo-safe-bottom, env(safe-area-inset-bottom, 0px)));
   background: var(--mo-paper, #f8f5ee);
 }
 .mo-audio-card {
