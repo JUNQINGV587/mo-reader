@@ -9199,13 +9199,37 @@ textarea {
   .mo-settings-sheet .mo-input {
     font-size: 16px;
   }
+  .mo-head {
+    gap: 10px;
+    padding: 10px 14px 8px;
+  }
+  .mo-brand-en {
+    display: none;
+  }
+  .mo-icon-btn {
+    width: 44px;
+    height: 44px;
+    flex-shrink: 0;
+  }
+  .mo-status {
+    font-size: 11px;
+    line-height: 1.45;
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+  }
   .mo-nav {
-    padding: 0 14px;
+    padding: 0 10px;
+    gap: 2px 8px;
   }
   .mo-nav button {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 12px 4px;
     font-size: 13px;
+    text-align: center;
   }
-  .mo-profile .mo-section-head {
+  .mo-section-head {
     flex-wrap: wrap;
   }
   .mo-bar-track {
