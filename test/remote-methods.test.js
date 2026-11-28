@@ -60,6 +60,13 @@ test('搜索与取消都注册给客户端，且都接收 args 对象', () => {
   }
 })
 
+test('搜索作业三个方法注册给客户端，且都接收 args 对象', () => {
+  for (const method of ['startSearch', 'getSearchJob', 'cancelSearchJob']) {
+    assert.ok(REMOTE_METHODS.includes(method), `${method} 不在 REMOTE_METHODS`)
+    assert.ok(!ARGLESS_METHODS.includes(method), `${method} 需要接收 args 对象`)
+  }
+})
+
 test('WebDAV 配置方法注册给客户端：读取零参数，保存与连通测试都接收 args', () => {
   assert.ok(REMOTE_METHODS.includes('getWebdavConfig'))
   assert.ok(REMOTE_METHODS.includes('saveWebdavConfig'))

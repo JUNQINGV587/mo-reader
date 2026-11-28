@@ -176,10 +176,11 @@ let longPressFired = false
 
 const searchKey = ref('')
 const searching = ref(false)
-/** 当前这次搜索的 token：响应回来时用它判断是否已被取消或被新搜索取代。 */
-let activeSearchToken = ''
-/** 已点取消的 token：即便结果迟到也不再改「已取消搜索」提示。 */
-let cancelledSearchToken = ''
+/** 当前搜索作业号：由 startSearch 返回，关页重开后从 localStorage 读回来接作业。 */
+const searchJobId = ref('')
+const searchJob = ref<any>(null)
+let searchPollTimer: ReturnType<typeof setInterval> | null = null
+const SEARCH_JOB_KEY = 'mo-reader-search-job'
 const books = ref<any[]>([])
 const searchErrors = ref<any[]>([])
 const searchScope = ref('')
@@ -2704,6 +2705,11 @@ async function deleteMediaDownloaded() {
 }
 
 watch(view, (next) => {
+  if (next === 'search') {
+    if (searchJobId.value) void refreshSearchJob()
+  } else {
+    stopSearchTimer()
+  }
   if (next === 'detail') {
     void loadActiveDownload()
     void loadActiveMedia()
@@ -2725,6 +2731,7 @@ onUnmounted(() => {
   stopExportTimer()
   stopBackupTimer()
   stopWebdavTransferTimer()
+  stopSearchTimer()
   if (settingsPersistTimer) clearTimeout(settingsPersistTimer)
   if (autoPageTimer) {
     clearInterval(autoPageTimer)
@@ -3312,67 +3319,184 @@ function debugCountText(result: any): string {
   return `条目 ${count}`
 }
 
-function newSearchToken(): string {
-  try {
-    return crypto.randomUUID()
-  } catch {
-    // 老 WebView 没有 randomUUID，退回时间戳 + 随机数。
-    return `search-${Date.now()}-${Math.random().toString(36).slice(2)}`
-  }
-}
-
 /** 结果按「书名 + 作者」合并；服务端已合并时这里幂等兜底，老服务端也不重复。 */
 function mergeSearchList(list: any[]): any[] {
   if (!Array.isArray(list) || !list.length) return []
   return dedupeSearchResults(list) as any[]
 }
 
-async function search() {
-  const key = searchKey.value.trim()
-  if (!key) return
-  const token = newSearchToken()
-  activeSearchToken = token
-  cancelledSearchToken = ''
-  searching.value = true
-  books.value = []
-  searchErrors.value = []
+/** 轮询文案固定为「已搜 N/M 源、已得 K 本、失败 S 源」，K 取当前展示的去重书目数。 */
+function searchProgressText(job: any): string {
+  const done = Number(job?.doneSources) || 0
+  const total = Number(job?.totalSources) || 0
+  const failed = Array.isArray(job?.failures) ? job.failures.length : 0
+  // 「已得」取服务端去重后的书目数，与整批搜索结果一致；精确书名只影响列表展示。
+  const found = Number(job?.bookCount)
+  const count = Number.isFinite(found) ? found : books.value.length
+  return `已搜 ${done}/${total} 源、已得 ${count} 本、失败 ${failed} 源`
+}
+
+function rememberSearchJob(jobId: string) {
   try {
-    const args: any = { key, page: 1, token }
-    if (scopedSourceUrls.value) args.sourceUrls = scopedSourceUrls.value
-    const result = await call('searchBooks', args)
-    // 已被新搜索取代：丢弃这次响应。
-    if (activeSearchToken !== token) return
-    let list = mergeSearchList(result.books ?? [])
-    if (searchExact.value) list = list.filter((book: any) => String(book.name ?? '').trim() === key.trim())
-    books.value = list
-    searchErrors.value = result.errors ?? []
-    if (cancelledSearchToken === token || result.cancelled === true) {
-      // 保留取消前已抓到的结果，但不覆盖「已取消搜索」提示。
-      status.value = '已取消搜索'
-      return
-    }
-    rememberSearch(key)
-    status.value = `搜索到 ${books.value.length} 本，失败 ${searchErrors.value.length} 个源`
-  } catch (error) {
-    if (activeSearchToken !== token) return
-    status.value = cancelledSearchToken === token ? '已取消搜索' : errorText(error)
-  } finally {
-    if (activeSearchToken === token) searching.value = false
+    localStorage.setItem(SEARCH_JOB_KEY, jobId)
+  } catch {
+    // 隐私模式下 localStorage 可能不可用
   }
 }
 
-/** 取消搜索：先让界面回空闲态，再通知服务端中断在途请求、停掉未开始的书源。 */
+function forgetSearchJob() {
+  try {
+    localStorage.removeItem(SEARCH_JOB_KEY)
+  } catch {
+    // 隐私模式下 localStorage 可能不可用
+  }
+}
+
+function storedSearchJobId(): string {
+  try {
+    return localStorage.getItem(SEARCH_JOB_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+function stopSearchTimer() {
+  if (searchPollTimer) {
+    clearInterval(searchPollTimer)
+    searchPollTimer = null
+  }
+}
+
+/** 作业进行中且停留在搜索页时每 500ms 拉一次快照；离开搜索页或作业结束就停。 */
+function syncSearchTimer() {
+  const running = searchJob.value?.status === 'running'
+  if (!running || view.value !== 'search') {
+    stopSearchTimer()
+    return
+  }
+  if (!searchPollTimer) searchPollTimer = setInterval(() => void refreshSearchJob(), 500)
+}
+
+/** 用服务端快照覆盖界面（不累加）；精确书名过滤只影响展示的列表。 */
+function applySearchSnapshot(snapshot: any) {
+  if (!snapshot) return
+  searchJob.value = snapshot
+  const key = String(snapshot.key ?? searchKey.value ?? '').trim()
+  let list = mergeSearchList(snapshot.books ?? [])
+  if (searchExact.value) list = list.filter((book: any) => String(book.name ?? '').trim() === key)
+  books.value = list
+  searchErrors.value = Array.isArray(snapshot.failures) ? snapshot.failures : []
+  searching.value = snapshot.status === 'running'
+  if (snapshot.status === 'running') {
+    status.value = searchProgressText(snapshot)
+    return
+  }
+  stopSearchTimer()
+  if (snapshot.status === 'cancelled' || snapshot.cancelled === true) {
+    status.value = '已取消搜索'
+    forgetSearchJob()
+    return
+  }
+  if (snapshot.status === 'failed') {
+    status.value = snapshot.error || snapshot.stageText || '搜索已中断'
+    forgetSearchJob()
+    return
+  }
+  if (snapshot.status === 'done') {
+    status.value = `搜索到 ${books.value.length} 本，失败 ${searchErrors.value.length} 个源`
+    rememberSearch(key)
+    forgetSearchJob()
+  }
+}
+
+async function refreshSearchJob(jobId = searchJobId.value) {
+  if (!jobId) return
+  try {
+    const snapshot: any = await call('getSearchJob', { jobId })
+    if (searchJobId.value !== jobId) return
+    if (!snapshot) {
+      // 下一次搜索会清掉上一份终态快照；此时安静回到空闲态。
+      stopSearchTimer()
+      searchJob.value = null
+      searchJobId.value = ''
+      searching.value = false
+      forgetSearchJob()
+      return
+    }
+    applySearchSnapshot(snapshot)
+    syncSearchTimer()
+  } catch (error) {
+    if (searchJobId.value !== jobId) return
+    stopSearchTimer()
+    searching.value = false
+    status.value = errorText(error)
+  }
+}
+
+async function search() {
+  const key = searchKey.value.trim()
+  if (!key) return
+  stopSearchTimer()
+  // 上一次作业还在跑就先取消，避免新搜索开始时旧作业仍在占用书源。
+  if (searchJobId.value && searchJob.value?.status === 'running') {
+    try {
+      await call('cancelSearchJob', { jobId: searchJobId.value })
+    } catch {
+      // 取消失败不阻塞新搜索
+    }
+  }
+  searchJobId.value = ''
+  searchJob.value = null
+  searching.value = true
+  books.value = []
+  searchErrors.value = []
+  status.value = '搜索中…'
+  try {
+    const args: any = { key }
+    if (scopedSourceUrls.value) args.scope = [...scopedSourceUrls.value]
+    const started: any = await call('startSearch', args)
+    const jobId = String(started?.jobId || '')
+    if (!jobId) throw new Error('搜索作业没有返回作业号')
+    searchJobId.value = jobId
+    rememberSearchJob(jobId)
+    await refreshSearchJob(jobId)
+    syncSearchTimer()
+  } catch (error) {
+    searching.value = false
+    status.value = errorText(error)
+  }
+}
+
+/** 取消搜索：中断在途请求、停掉未开始的源，并保留已得书目。 */
 async function cancelSearch() {
-  if (!searching.value) return
-  const token = activeSearchToken
-  cancelledSearchToken = token
+  const jobId = searchJobId.value
+  if (!jobId || !searching.value) return
+  stopSearchTimer()
   searching.value = false
   status.value = '已取消搜索'
   try {
-    await call('cancelSearch', { token })
+    const snapshot: any = await call('cancelSearchJob', { jobId })
+    if (searchJobId.value !== jobId) return
+    if (snapshot) applySearchSnapshot(snapshot)
+    else forgetSearchJob()
   } catch {
     // 服务端不可达时也不该卡在「搜索中」，界面已经回到空闲态。
   }
+}
+
+/** 关页重开：按持久化的作业号接回，进行中继续轮询，终态直接展示。 */
+async function restoreSearchJob() {
+  const jobId = storedSearchJobId()
+  if (!jobId) return
+  searchJobId.value = jobId
+  await refreshSearchJob(jobId)
+  const snapshot = searchJob.value
+  if (!snapshot) {
+    forgetSearchJob()
+    return
+  }
+  if (!searchKey.value) searchKey.value = String(snapshot.key || '')
+  syncSearchTimer()
 }
 
 function rememberSearch(key: string) {
@@ -5572,6 +5696,7 @@ onMounted(async () => {
   }
   void loadBattery()
   await refresh()
+  void restoreSearchJob()
   void loadReadingStats()
   syncReadingTimer()
   void loadRssSources()
@@ -5769,6 +5894,7 @@ onMounted(async () => {
           </button>
           <button v-if="searching" class="mo-btn" data-testid="search-cancel" @click="cancelSearch">取消</button>
         </div>
+        <p v-if="searchJob && searching" class="muted" data-testid="search-progress">{{ searchProgressText(searchJob) }}</p>
         <div class="mo-search-scope">
           <select v-model="searchScope" class="mo-select" aria-label="搜索范围">
             <option value="">全部启用源</option>
@@ -5808,8 +5934,8 @@ onMounted(async () => {
 
         <div v-if="searchErrors.length" class="mo-errors">
           <p class="muted">{{ searchErrors.length }} 个书源检索失败</p>
-          <p v-for="error in searchErrors.slice(0, 5)" :key="error.sourceUrl" class="muted">
-            {{ error.sourceUrl }}：{{ error.message }}
+          <p v-for="error in searchErrors.slice(0, 5)" :key="error.bookSourceUrl || error.sourceUrl || error.sourceName" class="muted">
+            {{ error.sourceName || error.bookSourceUrl || error.sourceUrl }}：{{ error.error || error.message }}
           </p>
         </div>
       </section>
