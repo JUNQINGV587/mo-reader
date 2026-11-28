@@ -5,6 +5,7 @@ import ComicReader from '../reader/ComicReader.vue'
 import PdfReader from '../reader/PdfReader.vue'
 import AudioReader from '../reader/AudioReader.vue'
 import VideoReader from '../reader/VideoReader.vue'
+import StatePanel from './StatePanel.vue'
 import { simulatedChapterCount, simulatedProgress } from '../../core/reader/simulate'
 import {
   buildSpeechPlan,
@@ -120,6 +121,7 @@ let confirmReturnFocus: HTMLElement | null = null
 const sources = ref<any[]>([])
 const importText = ref('')
 const rssSources = ref<any[]>([])
+const rssImportInput = ref<HTMLTextAreaElement | null>(null)
 const rssImportText = ref('')
 const rssMessage = ref('')
 const rssBusy = ref(false)
@@ -193,6 +195,10 @@ let longPressFired = false
 
 const searchKey = ref('')
 const searching = ref(false)
+/** 当前这次搜索是否已正常结束（用于区分「还没搜」与「搜完 0 本」）。 */
+const searchFinished = ref(false)
+/** 搜索作业启动/轮询失败时的可读原因；失败时不能显示「没有找到」。 */
+const searchFailure = ref('')
 /** 当前搜索作业号：由 startSearch 返回，关页重开后从 localStorage 读回来接作业。 */
 const searchJobId = ref('')
 const searchJob = ref<any>(null)
@@ -229,6 +235,14 @@ const searchSkippedText = computed(() =>
     .map((item: any) => String(item?.sourceName || item?.bookSourceUrl || '').trim())
     .filter(Boolean)
     .join('、'),
+)
+/** 搜完仍是 0 本、且没有失败源：这才是真正的「没有找到」。 */
+const searchEmpty = computed(
+  () => searchFinished.value && !searching.value && !searchFailure.value && books.value.length === 0 && searchErrors.value.length === 0,
+)
+/** 搜完仍是 0 本、但有源失败：显示错误态，不能误报「没有找到」。 */
+const searchAllFailed = computed(
+  () => searchFinished.value && !searching.value && books.value.length === 0 && searchErrors.value.length > 0,
 )
 
 const exploreSources = ref<any[]>([])
@@ -3486,21 +3500,28 @@ function applySearchSnapshot(snapshot: any) {
   searchSkipped.value = Array.isArray(snapshot.skippedSources) ? snapshot.skippedSources : []
   searching.value = snapshot.status === 'running'
   if (snapshot.status === 'running') {
+    searchFinished.value = false
     status.value = searchProgressText(snapshot)
     return
   }
   stopSearchTimer()
   if (snapshot.status === 'cancelled' || snapshot.cancelled === true) {
+    searchFinished.value = false
+    searchFailure.value = ''
     status.value = searchMergeMode.value ? '已取消重试' : '已取消搜索'
     forgetSearchJob()
     return
   }
   if (snapshot.status === 'failed') {
-    status.value = snapshot.error || snapshot.stageText || '搜索已中断'
+    searchFinished.value = false
+    searchFailure.value = snapshot.error || snapshot.stageText || '搜索已中断'
+    status.value = searchFailure.value
     forgetSearchJob()
     return
   }
   if (snapshot.status === 'done') {
+    searchFinished.value = true
+    searchFailure.value = ''
     status.value = `搜索到 ${books.value.length} 本，失败 ${searchErrors.value.length} 个源`
     rememberSearch(key)
     forgetSearchJob()
@@ -3527,7 +3548,8 @@ async function refreshSearchJob(jobId = searchJobId.value) {
     if (searchJobId.value !== jobId) return
     stopSearchTimer()
     searching.value = false
-    status.value = errorText(error)
+    searchFailure.value = readableNetworkError(errorText(error))
+    status.value = searchFailure.value
   }
 }
 
@@ -3545,6 +3567,8 @@ async function search() {
   }
   searchJobId.value = ''
   searchJob.value = null
+  searchFinished.value = false
+  searchFailure.value = ''
   searching.value = true
   books.value = []
   searchErrors.value = []
@@ -3567,7 +3591,8 @@ async function search() {
     syncSearchTimer()
   } catch (error) {
     searching.value = false
-    status.value = errorText(error)
+    searchFailure.value = readableNetworkError(errorText(error))
+    status.value = searchFailure.value
   }
 }
 
@@ -3594,6 +3619,8 @@ async function retryFailedSources() {
   searchSkipped.value = []
   searchJobId.value = ''
   searchJob.value = null
+  searchFinished.value = false
+  searchFailure.value = ''
   searching.value = true
   searchErrors.value = []
   status.value = `重试 ${urls.length} 个失败源…`
@@ -3611,8 +3638,18 @@ async function retryFailedSources() {
     searchMergeBase.value = []
     searchErrors.value = searchBaseFailures.value.slice()
     searchFailuresOpen.value = true
-    status.value = errorText(error)
+    searchFailure.value = readableNetworkError(errorText(error))
+    status.value = searchFailure.value
   }
+}
+
+/** 重试当前搜索：作业还在跑就只重新拉快照，否则按当前关键词与范围重搜。 */
+function retrySearch() {
+  if (searchJobId.value && searchJob.value?.status === 'running') {
+    void refreshSearchJob()
+    return
+  }
+  void search()
 }
 
 /** 取消搜索：中断在途请求、停掉未开始的源，并保留已得书目。 */
@@ -3621,6 +3658,8 @@ async function cancelSearch() {
   if (!jobId || !searching.value) return
   stopSearchTimer()
   searching.value = false
+  searchFinished.value = false
+  searchFailure.value = ''
   status.value = searchMergeMode.value ? '已取消重试' : '已取消搜索'
   try {
     const snapshot: any = await call('cancelSearchJob', { jobId })
@@ -3693,13 +3732,13 @@ async function loadExploreGroups(force = false) {
       return {
         source,
         categories: [],
-        error: `${source?.bookSourceName || source?.bookSourceUrl || '未知书源'}：${errorText(item.reason)}`,
+        error: `${source?.bookSourceName || source?.bookSourceUrl || '未知书源'}：${readableNetworkError(errorText(item.reason))}`,
       }
     })
     status.value = `发现 ${list.length} 个书源`
   } catch (error) {
     exploreGroups.value = []
-    exploreError.value = errorText(error)
+    exploreError.value = readableNetworkError(errorText(error))
     status.value = exploreError.value
   } finally {
     exploreLoading.value = false
@@ -3757,7 +3796,7 @@ async function loadExplorePage(page: number, replace: boolean) {
     exploreHasMore.value = Boolean(result?.hasMore)
     status.value = `${exploreActive.value.name} · ${exploreBooks.value.length} 本`
   } catch (error) {
-    exploreError.value = errorText(error)
+    exploreError.value = readableNetworkError(errorText(error))
     exploreHasMore.value = false
     status.value = exploreError.value
   } finally {
@@ -5894,6 +5933,12 @@ async function importRssSources() {
   }
 }
 
+/** 订阅空态里的「导入订阅源」：把焦点送到上方导入框，手机上会同时滚到键盘上方。 */
+function focusRssImport() {
+  rssImportInput.value?.scrollIntoView({ block: 'center' })
+  rssImportInput.value?.focus()
+}
+
 async function removeRssSource(source: any) {
   try {
     await call('deleteRssSource', { id: source.id })
@@ -6102,20 +6147,28 @@ onMounted(async () => {
           </button>
         </div>
 
-        <div v-if="shelfError" class="mo-load-error" data-testid="shelf-error" role="alert">
-          <p class="mo-load-error-title">书架加载失败</p>
-          <p class="muted mo-load-error-reason">{{ shelfError }}</p>
+        <StatePanel
+          v-if="shelfError"
+          kind="error"
+          glyph="!"
+          title="书架加载失败"
+          :message="shelfError"
+          data-testid="shelf-error"
+        >
           <button class="mo-btn" data-testid="shelf-error-retry" :disabled="busy" @click="refresh">
             {{ busy ? '重试中…' : '重试' }}
           </button>
-        </div>
+        </StatePanel>
 
-        <div v-if="shelfShowsEmpty(shelfBooks.length, shelfError)" class="mo-empty">
-          <div class="mo-empty-glyph">书</div>
-          <p class="mo-empty-title">书架还是空的</p>
-          <p class="muted">先在「书源」导入书源，再去「搜索」找一本想读的书。</p>
+        <StatePanel
+          v-if="shelfShowsEmpty(shelfBooks.length, shelfError)"
+          glyph="书"
+          title="书架还是空的"
+          message="先在「书源」导入书源，再去「搜索」找一本想读的书。"
+          data-testid="shelf-empty"
+        >
           <button class="mo-btn" @click="view = 'sources'">去导入书源</button>
-        </div>
+        </StatePanel>
 
         <div v-else-if="shelfBooks.length" :class="shelfSkin === 'list' ? 'mo-shelf-list' : 'mo-shelf'" data-testid="shelf">
           <button
@@ -6211,6 +6264,40 @@ onMounted(async () => {
           </button>
         </div>
 
+        <StatePanel v-if="searchFailure" kind="error" glyph="!" title="搜索中断" :message="searchFailure" data-testid="search-error">
+          <button class="mo-btn" data-testid="search-error-retry" :disabled="searching" @click="retrySearch">
+            {{ searching ? '重试中…' : '重试' }}
+          </button>
+        </StatePanel>
+        <StatePanel
+          v-else-if="searchAllFailed"
+          kind="error"
+          glyph="!"
+          title="没有成功获取书目"
+          :message="`${searchErrors.length} 个书源检索失败，可在下方展开查看原因，只重试失败源。`"
+          data-testid="search-all-failed"
+        >
+          <button
+            class="mo-btn"
+            data-testid="search-all-failed-retry"
+            :disabled="searching || retryableSourceUrls.length === 0"
+            @click="retryFailedSources"
+          >
+            {{ searching ? '重试中…' : '重试失败源' }}
+          </button>
+        </StatePanel>
+        <StatePanel
+          v-else-if="searchEmpty"
+          glyph="寻"
+          title="没有找到相关书籍"
+          :message="`没有在${searchScopeLabel}里找到「${searchKey.trim()}」，换个关键词或扩大范围再试。`"
+          data-testid="search-no-results"
+        >
+          <button class="mo-btn" data-testid="search-empty-retry" :disabled="searching" @click="search">
+            {{ searching ? '搜索中…' : '重试' }}
+          </button>
+        </StatePanel>
+
         <div v-if="searchErrors.length || searchSkipped.length" class="mo-errors">
           <template v-if="searchErrors.length">
             <div class="mo-failure-head">
@@ -6219,7 +6306,7 @@ onMounted(async () => {
                 {{ searchFailuresOpen ? '收起' : '展开' }}
               </button>
               <button
-                v-if="!searching && retryableSourceUrls.length"
+                v-if="!searching && !searchFailure && !searchAllFailed && retryableSourceUrls.length"
                 class="mo-btn"
                 data-testid="search-retry"
                 @click="retryFailedSources"
@@ -6253,21 +6340,48 @@ onMounted(async () => {
           </button>
         </div>
 
-        <p v-if="exploreError && exploreSources.length > 0 && !exploreActive" class="muted mo-explore-error">
-          发现加载失败：{{ exploreError }}
-        </p>
+        <StatePanel
+          v-if="exploreError && exploreSources.length > 0 && !exploreActive"
+          kind="error"
+          glyph="!"
+          title="发现加载失败"
+          :message="exploreError"
+          data-testid="explore-load-error"
+        >
+          <button class="mo-btn" :disabled="exploreLoading" data-testid="explore-error-retry" @click="loadExploreGroups(true)">
+            {{ exploreLoading ? '重试中…' : '重试' }}
+          </button>
+        </StatePanel>
 
         <div v-if="exploreLoading && exploreGroups.length === 0" class="mo-empty small">
-          <p class="muted">正在加载分类…</p>
+          <p class="muted" role="status">正在加载分类…</p>
         </div>
 
-        <div v-else-if="exploreSources.length === 0" class="mo-empty">
-          <div class="mo-empty-glyph">源</div>
-          <p class="mo-empty-title">还没有可发现的源</p>
-          <p class="muted">书源开启「发现」并填写发现地址后，这里就能按分类找书。</p>
-          <p v-if="exploreError" class="muted mo-explore-error">{{ exploreError }}</p>
+        <StatePanel
+          v-else-if="exploreSources.length === 0 && exploreError"
+          kind="error"
+          glyph="!"
+          title="发现加载失败"
+          :message="exploreError"
+          data-testid="explore-load-error-empty"
+        >
+          <button class="mo-btn" :disabled="exploreLoading" data-testid="explore-error-retry-empty" @click="loadExploreGroups(true)">
+            {{ exploreLoading ? '重试中…' : '重试' }}
+          </button>
+        </StatePanel>
+
+        <StatePanel
+          v-else-if="exploreSources.length === 0"
+          glyph="源"
+          title="还没有可发现的源"
+          message="书源开启「发现」并填写发现地址后，这里就能按分类找书。"
+          data-testid="explore-empty"
+        >
           <button class="mo-btn" data-testid="explore-goto-sources" @click="view = 'sources'">去书源</button>
-        </div>
+          <button class="mo-btn" :disabled="exploreLoading" data-testid="explore-empty-retry" @click="loadExploreGroups(true)">
+            {{ exploreLoading ? '重试中…' : '重新检查' }}
+          </button>
+        </StatePanel>
 
         <template v-else>
           <div v-for="section in exploreSections" :key="section.name" class="mo-explore-section">
@@ -6325,13 +6439,31 @@ onMounted(async () => {
                 <span class="mo-result-arrow">›</span>
               </button>
             </div>
-            <div v-else-if="!exploreBusy && !exploreError" class="mo-empty small">
-              <p class="muted">这个分类暂时没有书</p>
-            </div>
-
-            <div v-if="exploreError" class="mo-errors">
-              <p class="muted">加载失败：{{ exploreError }}</p>
-            </div>
+            <StatePanel
+              v-if="exploreError"
+              kind="error"
+              glyph="!"
+              compact
+              title="书目加载失败"
+              :message="exploreError"
+              data-testid="explore-books-error"
+            >
+              <button class="mo-btn" :disabled="exploreBusy" data-testid="explore-books-retry" @click="loadExplorePage(explorePage || 1, true)">
+                {{ exploreBusy ? '重试中…' : '重试' }}
+              </button>
+            </StatePanel>
+            <StatePanel
+              v-else-if="!exploreBusy && exploreBooks.length === 0"
+              compact
+              glyph="空"
+              title="这个分类暂时没有书"
+              message="换个分类，或稍后再试。"
+              data-testid="explore-books-empty"
+            >
+              <button class="mo-btn" :disabled="exploreBusy" data-testid="explore-books-empty-retry" @click="loadExplorePage(explorePage || 1, true)">
+                重试
+              </button>
+            </StatePanel>
 
             <div v-if="exploreHasMore && !exploreError" class="mo-explore-more">
               <button class="mo-btn" :disabled="exploreBusy" data-testid="explore-more" @click="loadExplorePage(explorePage + 1, false)">
@@ -7063,7 +7195,7 @@ onMounted(async () => {
         <div class="mo-card">
           <h3 class="mo-card-title">导入订阅源</h3>
           <p class="muted">粘贴「阅读」RssSource JSON，或选择文件；当前支持 RSS 2.0 / Atom。</p>
-          <textarea v-model="rssImportText" rows="4" placeholder='[{"sourceUrl":"https://…/rss.xml","sourceName":"…"}]' />
+          <textarea ref="rssImportInput" v-model="rssImportText" rows="4" data-testid="rss-import-text" placeholder='[{"sourceUrl":"https://…/rss.xml","sourceName":"…"}]' />
           <div class="mo-row">
             <label class="mo-file" title="选择订阅源 JSON">
               <input type="file" accept=".json,application/json" data-testid="rss-import-file" @change="onRssImportFile" />
@@ -7076,7 +7208,15 @@ onMounted(async () => {
 
         <div class="mo-card">
           <h3 class="mo-card-title">订阅源</h3>
-          <p v-if="rssSources.length === 0" class="muted">还没有订阅源。</p>
+          <StatePanel
+            v-if="rssSources.length === 0"
+            glyph="订"
+            title="还没有订阅源"
+            message="把「阅读」RssSource JSON 粘贴到上方，或选择文件导入，就能在这里追更。"
+            data-testid="rss-empty"
+          >
+            <button class="mo-btn" data-testid="rss-empty-import" @click="focusRssImport">导入订阅源</button>
+          </StatePanel>
           <ul v-else class="mo-sources">
             <li v-for="source in rssSources" :key="source.id" data-testid="rss-source">
               <button class="mo-source-name" @click="openRssSource(source)">{{ source.sourceName }}</button>
@@ -8776,6 +8916,71 @@ onMounted(async () => {
 }
 .mo-empty .mo-btn {
   margin-top: 10px;
+}
+/* 空态 / 错误态共用一套结构；四类场景只换文案与操作。 */
+.mo-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 44px 20px 36px;
+  text-align: center;
+}
+.mo-state.compact {
+  padding: 18px 12px;
+}
+.mo-state.error {
+  align-items: flex-start;
+  text-align: left;
+  padding: 16px 18px;
+  margin: 4px 0 12px;
+  border: 1px solid var(--mo-line);
+  border-radius: 12px;
+  background: var(--mo-paper-2);
+}
+.mo-state-glyph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  border: 1px solid var(--mo-line);
+  border-radius: 50%;
+  color: var(--mo-ink-3);
+  font: 28px/1 'Songti SC', serif;
+}
+.mo-state.error .mo-state-glyph {
+  width: 34px;
+  height: 34px;
+  color: #a8402e;
+  font: 18px/1 sans-serif;
+}
+.mo-state-title {
+  margin: 0;
+  font: 600 17px/1.4 'Songti SC', 'Noto Serif SC', serif;
+}
+.mo-state.compact .mo-state-title {
+  font-size: 15px;
+}
+.mo-state-message {
+  max-width: 460px;
+  margin: 0;
+  line-height: 1.7;
+}
+.mo-state.error .mo-state-message {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.mo-state-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+.mo-state.error .mo-state-actions {
+  justify-content: flex-start;
 }
 .mo-load-error {
   display: flex;
