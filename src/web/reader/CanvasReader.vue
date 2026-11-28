@@ -896,6 +896,25 @@ function finishLongPress() {
   if (selection) emit('select', selection)
 }
 
+/**
+ * 触屏长按会开查词面板，但松手时浏览器仍补发一次 click。
+ * 此时点击目标已变成刚出现的遮罩，会立刻把面板关掉；在捕获阶段吞掉这次 click。
+ */
+let clickSuppressTimer = 0
+function suppressNextClick() {
+  swallowClick = false
+  const handler = (event: Event) => {
+    window.clearTimeout(clickSuppressTimer)
+    window.removeEventListener('click', handler, true)
+    event.preventDefault()
+    event.stopPropagation()
+  }
+  window.addEventListener('click', handler, true)
+  clickSuppressTimer = window.setTimeout(() => {
+    window.removeEventListener('click', handler, true)
+  }, 1200)
+}
+
 function onCanvasPointerDown(event: PointerEvent) {
   if (!event.isPrimary) return
   if (event.pointerType === 'mouse' && event.button !== 0) return
@@ -939,7 +958,7 @@ function onWindowPointerEnd(event: PointerEvent) {
   // 长按已触发：松手不翻页；长按后再移动按取消处理
   if (active.longPressed) {
     clearPress()
-    swallowClick = true
+    suppressNextClick()
     return
   }
 
@@ -950,7 +969,7 @@ function onWindowPointerEnd(event: PointerEvent) {
     active.y = event.clientY
     finishLongPress()
     clearPress()
-    swallowClick = true
+    suppressNextClick()
     return
   }
   clearPress()
