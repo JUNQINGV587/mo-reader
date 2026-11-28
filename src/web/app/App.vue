@@ -3222,14 +3222,34 @@ async function runDebug() {
   debugResult.value = null
   try {
     const args: any = { sourceUrl: editing.value.bookSourceUrl, type: debugType.value }
-    if (debugType.value === 'search') args.key = debugInput.value.trim() || '测试'
-    else args.url = debugInput.value.trim()
+    const input = debugInput.value.trim()
+    if (debugType.value === 'search') args.key = input || '测试'
+    else if (input) args.url = input
     debugResult.value = await call('debugSource', args)
   } catch (error) {
-    debugResult.value = { error: errorText(error) }
+    debugResult.value = { kind: debugType.value, error: { message: errorText(error), stack: '' } }
   } finally {
     debugBusy.value = false
   }
+}
+
+function debugText(value: unknown, limit = 20000): string {
+  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2)
+  if (!text) return ''
+  return text.length > limit ? `${text.slice(0, limit)}\n…（已截断）` : text
+}
+
+function debugErrorText(error: any): string {
+  if (!error) return ''
+  return typeof error === 'string' ? error : error.message || ''
+}
+
+function debugCountText(result: any): string {
+  const kind = result?.kind || result?.type
+  const count = result?.count ?? 0
+  if (kind === 'search' || kind === 'explore') return `命中 ${count}`
+  if (kind === 'toc') return `章节 ${count}`
+  return `条目 ${count}`
 }
 
 function newSearchToken(): string {
@@ -6410,15 +6430,57 @@ onMounted(async () => {
             <div class="mo-row">
               <select v-model="debugType">
                 <option value="search">搜索</option>
+                <option value="explore">发现</option>
                 <option value="bookInfo">详情</option>
                 <option value="toc">目录</option>
                 <option value="content">正文</option>
               </select>
-              <input v-model="debugInput" :placeholder="debugType === 'search' ? '搜索词（默认「测试」）' : '页面 URL'" data-testid="debug-input" />
+              <input
+                v-model="debugInput"
+                :placeholder="debugType === 'search' ? '搜索词（默认「测试」）' : debugType === 'explore' ? '分类地址（可空）' : '页面 URL'"
+                data-testid="debug-input"
+              />
               <button class="mo-btn" :disabled="debugBusy" data-testid="debug-run" @click="runDebug">{{ debugBusy ? '调试中…' : '调试' }}</button>
             </div>
-            <p class="muted">调试使用已保存的书源，改完先保存。</p>
-            <pre v-if="debugResult" class="mo-debug-out" data-testid="debug-output">{{ JSON.stringify(debugResult, null, 2).slice(0, 20000) }}</pre>
+            <p class="muted">调试使用已保存的书源，改完先保存；发现不填地址时取第一个分类。</p>
+            <div v-if="debugResult" class="mo-debug-report" data-testid="debug-output">
+              <div class="mo-debug-head">
+                <strong>{{ debugResult.label || debugResult.kind || debugResult.type || '调试' }}</strong>
+                <span class="mo-debug-tag" :class="debugResult.error ? 'bad' : 'ok'">{{ debugResult.error ? '失败' : '成功' }}</span>
+                <span class="muted">{{ debugCountText(debugResult) }}</span>
+                <span class="muted">耗时 {{ debugResult.elapsedMs ?? 0 }} 毫秒</span>
+                <span v-if="debugResult.status" class="muted">HTTP {{ debugResult.status }}</span>
+                <span v-if="debugResult.rawTruncated" class="muted">原始返回已截断</span>
+              </div>
+              <div v-if="debugResult.request" class="mo-debug-line">
+                <span class="mo-debug-key">请求</span>
+                <code class="mo-debug-url">{{ debugResult.request.method }} {{ debugResult.request.url }}</code>
+              </div>
+              <details v-if="debugResult.request && debugResult.request.body" class="mo-debug-fold">
+                <summary>请求体</summary>
+                <pre class="mo-debug-pre">{{ debugResult.request.body }}</pre>
+              </details>
+              <div v-if="debugResult.error" class="mo-debug-error">
+                <p class="mo-debug-fail">失败环节：{{ debugResult.label || debugResult.kind || '未知' }}</p>
+                <p class="mo-debug-error-msg">{{ debugErrorText(debugResult.error) }}</p>
+                <details v-if="debugResult.error.stack" class="mo-debug-fold">
+                  <summary>错误栈</summary>
+                  <pre class="mo-debug-pre">{{ debugResult.error.stack }}</pre>
+                </details>
+              </div>
+              <details v-if="debugResult.logs && debugResult.logs.length" class="mo-debug-fold">
+                <summary>规则日志 {{ debugResult.logs.length }}</summary>
+                <pre class="mo-debug-pre">{{ debugResult.logs.join('\n') }}</pre>
+              </details>
+              <details v-if="debugResult.result !== null && debugResult.result !== undefined" class="mo-debug-fold" open>
+                <summary>解析结果</summary>
+                <pre class="mo-debug-pre">{{ debugText(debugResult.result) }}</pre>
+              </details>
+              <details v-if="debugResult.raw" class="mo-debug-fold">
+                <summary>原始返回 {{ debugResult.rawLength || 0 }} 字</summary>
+                <pre class="mo-debug-pre">{{ debugResult.raw }}</pre>
+              </details>
+            </div>
           </div>
         </div>
       </section>
@@ -8864,15 +8926,64 @@ textarea {
   padding-top: 10px;
   border-top: 1px dashed var(--mo-line);
 }
-.mo-debug-out {
-  max-height: 320px;
-  overflow: auto;
-  padding: 8px;
+.mo-debug-report {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+.mo-debug-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.mo-debug-tag {
+  padding: 0 6px;
+  border: 1px solid var(--mo-line);
+  border-radius: 4px;
+  font-size: 11px;
+}
+.mo-debug-tag.bad {
+  font-weight: 600;
+}
+.mo-debug-line {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.mo-debug-key {
+  flex: 0 0 auto;
+  color: var(--mo-ink-2);
+}
+.mo-debug-url {
+  font-size: 11px;
+  word-break: break-all;
+}
+.mo-debug-fold, .mo-debug-error {
+  padding: 6px 8px;
   border: 1px solid var(--mo-line);
   border-radius: 6px;
-  background: var(--mo-paper);
+}
+.mo-debug-fold > summary {
+  cursor: pointer;
+}
+.mo-debug-fail {
+  margin: 0 0 4px;
+  font-weight: 600;
+}
+.mo-debug-error-msg {
+  margin: 0;
+  word-break: break-all;
+}
+.mo-debug-pre {
+  margin: 6px 0 0;
+  max-height: 240px;
+  overflow: auto;
   font-size: 11px;
   white-space: pre-wrap;
+  word-break: break-all;
 }
 
 /* 字典规则 */

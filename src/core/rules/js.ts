@@ -27,6 +27,48 @@ export interface JsEnv {
   getElementsByRule?: (rule: string) => unknown[];
 }
 
+/**
+ * 同步收集 @js 日志的栈：只有书源调试显式打开时才有内容，平时不影响运行。
+ * 书源规则解析是同步的（VM 同步执行），因此用栈而不是异步上下文即可。
+ */
+const logSinks: string[][] = []
+
+/** 每条日志、每次调试最多保留的条数/长度：避免一次调试把大对象塞满返回。 */
+const LOG_MAX_ENTRIES = 50
+const LOG_MAX_CHARS = 1000
+
+/**
+ * 在同步执行 fn 期间收集 @js 的 log / java.log 输出到 logs。
+ * 即使 fn 抛错，已经产生的日志仍会留在 logs 里，便于调试失败规则。
+ */
+export function withJsLogs<T>(logs: string[], fn: () => T): T {
+  logSinks.push(logs)
+  try {
+    return fn()
+  } finally {
+    logSinks.pop()
+  }
+}
+
+function recordLog(value: unknown): void {
+  const sink = logSinks[logSinks.length - 1]
+  if (sink && sink.length < LOG_MAX_ENTRIES) {
+    sink.push(logText(value))
+  }
+  console.log('[mo-reader/source]', value)
+}
+
+function logText(value: unknown): string {
+  if (typeof value === 'string') return value.slice(0, LOG_MAX_CHARS)
+  if (value instanceof Error) return (value.stack || value.message).slice(0, LOG_MAX_CHARS)
+  try {
+    const text = JSON.stringify(value)
+    return (text ?? String(value)).slice(0, LOG_MAX_CHARS)
+  } catch {
+    return String(value).slice(0, LOG_MAX_CHARS)
+  }
+}
+
 const USER_AGENT = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/124.0 Mobile';
 
 /** 同步执行书源 JS；返回脚本最后一个表达式的值。 */
@@ -98,7 +140,7 @@ function createSandbox(env: JsEnv): Record<string, unknown> {
     urlEncode: (value: string) => encodeURIComponent(String(value)),
     urlDecode: (value: string) => decodeURIComponent(String(value)),
     getCookie: () => '',
-    log: (value: unknown) => console.log('[mo-reader/source]', value),
+    log: (value: unknown) => recordLog(value),
 
     java: {
       // 阅读的 JsExtensions 把常用函数也挂在 java 上（书源里常见 java.md5Encode / java.ajax）。
@@ -117,7 +159,7 @@ function createSandbox(env: JsEnv): Record<string, unknown> {
       getElements: (rule: string) => env.getElementsByRule?.(String(rule)) ?? [],
       longToast: () => {},
       toast: () => {},
-      log: (value: unknown) => console.log('[mo-reader/source]', value),
+      log: (value: unknown) => recordLog(value),
       webView: () => {
         throw new Error('WebView 在 Web 版不可用')
       },
@@ -142,7 +184,7 @@ function createSandbox(env: JsEnv): Record<string, unknown> {
       lang: {
         System: {
           currentTimeMillis: () => Date.now(),
-          out: { println: (value: unknown) => console.log(value) },
+          out: { println: (value: unknown) => recordLog(value) },
         },
         String,
       },

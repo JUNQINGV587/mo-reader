@@ -14,6 +14,7 @@ import {
 import { parseSource, type BookSource } from '../core/model/source.js'
 import { dictRuleKey, parseDictRule, type DictRule } from '../core/model/dict.js'
 import { AnalyzeRule } from '../core/rules/analyze-rule.js'
+import { withJsLogs } from '../core/rules/js.js'
 import { analyzeExplore, parseExploreCategories } from '../core/source/explore.js'
 import { isExploreEnabled } from '../core/source/filter.js'
 import { parseRssSources } from '../core/rss/source.js'
@@ -272,6 +273,82 @@ function webdavDraftFromArgs(args: Args | undefined, stored: WebdavConfig): Webd
 
 function sameRequest(a: RequestSpec, b: RequestSpec): boolean {
   return a.url === b.url && a.method === b.method && (a.body ?? '') === (b.body ?? '')
+}
+
+const DEBUG_KIND_LABELS: Record<string, string> = {
+  search: '搜索',
+  explore: '发现',
+  bookInfo: '详情',
+  toc: '目录',
+  content: '正文',
+}
+
+/** 原始返回最多回传 200k 字符；result 是独立字段，不受这段截断影响。 */
+const DEBUG_RAW_LIMIT = 200_000
+
+interface DebugRequestSummary {
+  method: string
+  url: string
+  body?: string
+}
+
+interface DebugReport {
+  /** 旧字段：保持与旧前端一致。 */
+  type: string
+  /** 环节标识（search/explore/bookInfo/toc/content），失败时即失败环节。 */
+  kind: string
+  /** 环节名，前端直接展示。 */
+  label: string
+  /** 命中/条目数：搜索与发现为书目数，目录为章节数，详情/正文为 0 或 1。 */
+  count: number
+  elapsedMs: number
+  /** 请求摘要（method/url/body），请求尚未发出也能看到。 */
+  request: DebugRequestSummary | null
+  status: number | null
+  /** 最终地址（跟随重定向后）。 */
+  url: string
+  result: unknown
+  raw: string
+  rawLength: number
+  rawTruncated: boolean
+  /** @js 规则执行日志（log / java.log），失败时也保留已产生的部分。 */
+  logs: string[]
+  error: { message: string; stack: string } | null
+}
+
+function optionalStringArg(args: Args, name: string): string {
+  const value = args?.[name]
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function debugErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message || '调试失败'
+  return String(error)
+}
+
+function debugErrorStack(error: unknown): string {
+  if (error instanceof Error) return error.stack ?? error.name + ': ' + error.message
+  return ''
+}
+
+/** 各环节的「命中/条目数」：搜索、发现、目录是数组长度，详情/正文是单条。 */
+function debugCount(kind: string, result: unknown): number {
+  if (kind === 'search' || kind === 'explore' || kind === 'toc') {
+    return Array.isArray(result) ? result.length : 0
+  }
+  if (kind === 'bookInfo') {
+    const info = result as { name?: unknown } | null
+    return info && typeof info.name === 'string' && info.name ? 1 : 0
+  }
+  if (kind === 'content') {
+    return typeof result === 'string' && result.trim() ? 1 : 0
+  }
+  return 0
+}
+
+function requireRequest(request: RequestSpec | null): RequestSpec {
+  if (!request) throw new Error('无法生成请求地址')
+  return request
 }
 
 /** 直链响应头声明为 HLS：改走 playlist 下载，避免把 playlist 文本当成媒体文件落盘。 */
@@ -2129,38 +2206,90 @@ export class ReaderService extends TypertRemoteService {
     return { supported: true, counts: parsed.counts, keys: parsed.keys, url: raw.url }
   }
 
+  /**
+   * 调试一个书源环节：请求、抓取、解析都复用线上链路，只额外收集耗时、
+   * 命中数、原始返回与错误栈。失败也返回报告（不抛错），并标明环节。
+   */
   async debugSource(args: Args) {
-    const source = this.getSource(stringArg(args, 'sourceUrl'))
-    const type = stringArg(args, 'type')
+    const kind = stringArg(args, 'type')
+    const report: DebugReport = {
+      type: kind,
+      kind,
+      label: DEBUG_KIND_LABELS[kind] ?? '未知',
+      count: 0,
+      elapsedMs: 0,
+      request: null,
+      status: null,
+      url: '',
+      result: null,
+      raw: '',
+      rawLength: 0,
+      rawTruncated: false,
+      logs: [],
+      error: null,
+    }
     const started = Date.now()
-    let request: RequestSpec | null = null
+    const logs = report.logs
 
-    if (type === 'search') {
-      request = buildSearchRequest(source, stringArg(args, 'key'), 1)
-    } else {
-      const url = stringArg(args, 'url')
-      if (type === 'bookInfo' || type === 'toc' || type === 'content') {
-        request = buildRequest(url, { baseUrl: source.bookSourceUrl, source })
+    try {
+      const source = this.getSource(stringArg(args, 'sourceUrl'))
+      const request = withJsLogs(logs, () => this.buildDebugRequest(kind, source, args))
+      report.request = {
+        method: request.method,
+        url: request.url,
+        ...(request.body ? { body: request.body } : {}),
       }
+      const raw = await this.fetch(request, source)
+      report.status = raw.status
+      report.url = raw.url
+      report.rawLength = raw.text.length
+      report.rawTruncated = raw.text.length > DEBUG_RAW_LIMIT
+      report.raw = raw.text.slice(0, DEBUG_RAW_LIMIT)
+      report.result = withJsLogs(logs, () => this.parseDebugResult(kind, source, raw.text, raw.url))
+      report.count = debugCount(kind, report.result)
+      // 非 2xx 时解析结果通常为空：标成失败，避免 400/404 页面显示「成功」。
+      if (raw.status < 200 || raw.status >= 300) {
+        report.error = { message: `HTTP ${raw.status}`, stack: '' }
+      }
+    } catch (error) {
+      report.error = { message: debugErrorMessage(error), stack: debugErrorStack(error) }
     }
-    if (!request) throw new Error('无法生成请求地址')
+    report.elapsedMs = Date.now() - started
+    return report
+  }
 
-    const raw = await this.fetch(request, source)
-    let result: unknown = null
-    if (type === 'search') result = analyzeSearch(raw.text, source, raw.url)
-    else if (type === 'bookInfo') result = analyzeBookInfo(raw.text, source, raw.url, raw.url)
-    else if (type === 'toc') result = analyzeToc(raw.text, source, raw.url)
-    else if (type === 'content') result = analyzeContent(raw.text, source, raw.url)
-
-    return {
-      type,
-      request: { url: request.url, method: request.method },
-      status: raw.status,
-      url: raw.url,
-      elapsedMs: Date.now() - started,
-      raw: raw.text.slice(0, 200_000),
-      result,
+  /** 按环节生成请求；发现环节未填地址时取 exploreUrl 的第一个分类，与发现页一致。 */
+  private buildDebugRequest(kind: string, source: BookSource, args: Args): RequestSpec {
+    if (kind === 'search') {
+      const request = buildSearchRequest(source, optionalStringArg(args, 'key') || '测试', 1)
+      if (!request) throw new Error('书源没有搜索地址')
+      return request
     }
+    if (kind === 'explore') {
+      const categoryUrl = optionalStringArg(args, 'url')
+      if (categoryUrl) return requireRequest(buildExploreRequest(source, categoryUrl, 1))
+      if (!source.exploreUrl || !source.exploreUrl.trim()) throw new Error('书源没有发现分类')
+      const categories = parseExploreCategories(source.exploreUrl, source.bookSourceUrl, { source })
+      const first = categories[0]
+      if (!first) throw new Error('未解析到发现分类')
+      return requireRequest(buildExploreRequest(source, first.url, 1))
+    }
+    if (kind === 'bookInfo' || kind === 'toc' || kind === 'content') {
+      const url = optionalStringArg(args, 'url')
+      if (!url) throw new Error('缺少页面 URL')
+      return requireRequest(buildRequest(url, { baseUrl: source.bookSourceUrl, source }))
+    }
+    throw new Error('未知环节：' + kind)
+  }
+
+  /** 解析结果复用线上函数，保证调试看到的形状与实际阅读一致。 */
+  private parseDebugResult(kind: string, source: BookSource, text: string, url: string): unknown {
+    if (kind === 'search') return analyzeSearch(text, source, url)
+    if (kind === 'explore') return analyzeExplore(text, source, url)
+    if (kind === 'bookInfo') return analyzeBookInfo(text, source, url, url)
+    if (kind === 'toc') return analyzeToc(text, source, url)
+    if (kind === 'content') return analyzeContent(text, source, url)
+    throw new Error('未知环节：' + kind)
   }
 
   async importLocalBook(args: Args) {
