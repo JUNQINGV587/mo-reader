@@ -39,6 +39,32 @@ test('同一本书多个来源只留一条，主记录取首个来源并保留�
   )
 })
 
+test('重试结果与首次结果合并去重：不清空、不重复', () => {
+  const first = dedupeSearchResults([
+    book('完美世界', '辰东', 'https://a', 'https://a/1'),
+    book('遮天', '辰东', 'https://c', 'https://c/2'),
+  ])
+  // 重试只跑了之前失败的源：同一本书从新源回来，还多一本新书。
+  const retry = dedupeSearchResults([
+    book('完美世界', '辰东', 'https://b', 'https://b/9', { intro: '一粒尘可填海' }),
+    book('凡人修仙传', '忘语', 'https://b', 'https://b/3'),
+  ])
+  const merged = dedupeSearchResults([...first, ...retry])
+  assert.equal(merged.length, 3)
+  assert.deepEqual(
+    merged.map((item) => item.name).sort(),
+    ['凡人修仙传', '完美世界', '遮天'].sort(),
+  )
+  const wanmei = merged.find((item) => item.name === '完美世界')
+  assert.equal(wanmei.sourceCount, 2, '同书两个来源合并成一条')
+  assert.equal(wanmei.intro, '一粒尘可填海', '重试来源补上主记录缺失的字段')
+  assert.equal(new Set(merged.map((item) => searchBookKey(item.name, item.author))).size, merged.length)
+  // 下一次轮询再合并一次（幂等）仍然稳定。
+  const again = dedupeSearchResults(merged)
+  assert.equal(again.length, 3)
+  assert.equal(again.find((item) => item.name === '完美世界').sourceCount, 2)
+})
+
 test('同书名不同作者不合并', () => {
   const merged = dedupeSearchResults([
     book('完美世界', '辰东', 'https://a', 'https://a/1'),

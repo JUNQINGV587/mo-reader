@@ -49,13 +49,26 @@ const ruleSearch = {
   intro: 'class.intro@text',
 }
 
-/** 书源搜索服务：按路径延迟响应，用来制造「先完成一源、后排队的源陆续完成」的现场。 */
-async function startSearchServer({ items, delayFor = () => 0, hold = () => false }) {
+/** 书源搜索服务：按路径延迟响应，用来制造「先完成一源、后排队的源陆续完成」的现场；abortFor 命中的请求直接断开，用来制造可控的失败源。 */
+async function startSearchServer({
+  items,
+  delayFor = () => 0,
+  hold = () => false,
+  abortFor = () => false,
+  abortDelayFor = () => 0,
+}) {
   const hits = new Map()
   const server = http.createServer((request, response) => {
     const url = new URL(request.url ?? '/', 'http://127.0.0.1')
     hits.set(url.pathname, (hits.get(url.pathname) ?? 0) + 1)
     if (hold(url.pathname)) return
+    if (abortFor(url.pathname)) {
+      setTimeout(() => {
+        request.destroy()
+        response.destroy()
+      }, Math.max(0, abortDelayFor(url.pathname)))
+      return
+    }
     setTimeout(() => {
       if (response.writableEnded || response.destroyed) return
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
@@ -233,6 +246,209 @@ test('失败源单列失败项，其余源继续完成', async () => {
       progress.some((item) => item.status === 'running' && item.doneSources > 0 && item.doneSources < 3),
       '轮询期间应能看到部分源完成的中间快照',
     )
+  } finally {
+    await service.searchJobCoordinator?.shutdown?.()
+    await closeServer(server)
+  }
+})
+
+test('失败源按搜索源顺序排列，不随完成时序跳', async () => {
+  // 三个源都失败，失败完成的先后顺序是 源1 → 源2 → 源0，快照里必须仍按 源0 → 源1 → 源2 展示。
+  const { server, origin } = await startSearchServer({
+    items: () => [],
+    abortFor: () => true,
+    abortDelayFor: (path) => (path === '/s0/search' ? 500 : path === '/s1/search' ? 10 : 250),
+  })
+  const service = await createService(origin, 3)
+  try {
+    const { jobId } = await service.startSearch({ key: '完美世界' })
+    const arrivalOrder = []
+    const final = await waitForJob(service, jobId, (snapshot) => {
+      for (const item of snapshot.failures) {
+        if (!arrivalOrder.includes(item.sourceName)) arrivalOrder.push(item.sourceName)
+      }
+      const indexes = snapshot.failures.map((item) => item.sourceIndex)
+      assert.deepEqual(indexes, [...indexes].sort((left, right) => left - right), '每次快照的失败项都按源下标升序')
+      return snapshot.status === 'done'
+    })
+    assert.ok(final, '作业应在超时前完成')
+    assert.equal(final.status, 'done')
+    assert.deepEqual(arrivalOrder, ['源1', '源2', '源0'], '失败实际完成顺序与源顺序不同')
+    assert.deepEqual(final.failures.map((item) => item.sourceName), ['源0', '源1', '源2'])
+    assert.deepEqual(final.failures.map((item) => item.sourceIndex), [0, 1, 2])
+    assert.equal(final.doneSources, 3)
+    assert.equal(final.skipped.length, 0)
+  } finally {
+    await service.searchJobCoordinator?.shutdown?.()
+    await closeServer(server)
+  }
+})
+
+test('旧快照失败项没有 sourceIndex 时保持原顺序，skipped 为空', async () => {
+  const db = newDb()
+  const now = Date.now()
+  await db.jobs.put('search-legacy-done', {
+    id: 'search-legacy-done',
+    kind: 'search',
+    status: 'done',
+    stage: 'done',
+    stageText: '搜索完成',
+    key: '完美世界',
+    scope: null,
+    doneSources: 2,
+    totalSources: 2,
+    bookCount: 0,
+    books: [],
+    failures: [
+      { sourceName: '源B', bookSourceUrl: 'https://b', error: '连接失败' },
+      { sourceName: '源A', bookSourceUrl: 'https://a', error: '超时' },
+    ],
+    cancelled: false,
+    error: '',
+    createdAt: now - 1000,
+    updatedAt: now - 1000,
+  })
+  const service = await createServiceFromDb(db)
+  try {
+    const snapshot = await service.getSearchJob({ jobId: 'search-legacy-done' })
+    assert.ok(snapshot)
+    assert.deepEqual(snapshot.failures.map((item) => item.sourceName), ['源B', '源A'], '缺失下标时保留持久化顺序')
+    assert.equal(snapshot.failures.some((item) => 'sourceIndex' in item), false)
+    assert.deepEqual(snapshot.skipped, [])
+  } finally {
+    await service.searchJobCoordinator?.shutdown?.()
+  }
+})
+
+test('范围内已停用或已删除的书源跳过并给出提示', async () => {
+  const { server, origin } = await startSearchServer({
+    items: () => [{ name: '完美世界', author: '辰东', bookUrl: '/s0/book/1' }],
+  })
+  const service = await createService(origin, 3)
+  try {
+    const { sources } = await service.listSources()
+    const byName = new Map(sources.map((source) => [source.bookSourceName, source]))
+    const kept = byName.get('源0')
+    const disabled = byName.get('源1')
+    const deleted = byName.get('源2')
+    await service.setSourcesEnabled({ ids: [disabled.id], enabled: false })
+    await service.deleteSources({ urls: [deleted.id] })
+
+    const { jobId } = await service.startSearch({
+      key: '完美世界',
+      scope: [kept.bookSourceUrl, disabled.bookSourceUrl, deleted.bookSourceUrl],
+    })
+    const final = await waitForJob(service, jobId, (snapshot) => snapshot.status === 'done')
+    assert.ok(final, '作业应在超时前完成')
+    assert.equal(final.totalSources, 1, '被跳过的源不计入总源数')
+    assert.equal(final.doneSources, 1)
+    assert.equal(final.failures.length, 0, '停用/删除不算失败源')
+    assert.equal(final.bookCount, 1)
+    assert.deepEqual(
+      final.skipped.map((item) => item.bookSourceUrl),
+      [disabled.bookSourceUrl, deleted.bookSourceUrl],
+      '跳过项按范围顺序排列',
+    )
+    for (const item of final.skipped) {
+      assert.equal(item.sourceName, item.bookSourceUrl, '源已不在库里时用 URL 兜底')
+      assert.equal(item.reason, '书源已停用或已删除')
+    }
+  } finally {
+    await service.searchJobCoordinator?.shutdown?.()
+    await closeServer(server)
+  }
+})
+
+test('只重试失败源，结果与首次结果合并后不丢不重', async () => {
+  let flakyAttempts = 0
+  const { server, origin, hits } = await startSearchServer({
+    items: (path) => {
+      if (path === '/s0/search') return [{ name: '完美世界', author: '辰东', bookUrl: '/s0/book/1' }]
+      if (path === '/s1/search') {
+        return [
+          { name: '完美世界', author: '辰东', bookUrl: '/s1/book/9', intro: '一粒尘可填海' },
+          { name: '凡人修仙传', author: '忘语', bookUrl: '/s1/book/3' },
+        ]
+      }
+      return [{ name: '遮天', author: '辰东', bookUrl: '/s2/book/2' }]
+    },
+    // 第一次搜索时源1 断连失败，重试时恢复正常。
+    abortFor: (path) => {
+      if (path !== '/s1/search') return false
+      flakyAttempts += 1
+      return flakyAttempts === 1
+    },
+  })
+  const service = await createService(origin, 3)
+  try {
+    const firstStarted = await service.startSearch({ key: '完美世界' })
+    const first = await waitForJob(service, firstStarted.jobId, (snapshot) => snapshot.status === 'done')
+    assert.equal(first.status, 'done')
+    assert.equal(first.failures.length, 1)
+    assert.equal(first.failures[0].sourceName, '源1')
+    assert.equal(first.failures[0].sourceIndex, 1)
+    assert.equal(first.bookCount, 2)
+
+    const hitsBeforeRetry = { s0: hits.get('/s0/search'), s2: hits.get('/s2/search') }
+    // 与前端一致：只把失败项的 bookSourceUrl 重新交给 startSearch。
+    const retryStarted = await service.startSearch({
+      key: '完美世界',
+      sourceUrls: [first.failures[0].bookSourceUrl],
+    })
+    const retry = await waitForJob(service, retryStarted.jobId, (snapshot) => snapshot.status === 'done')
+    assert.equal(retry.status, 'done')
+    assert.equal(retry.totalSources, 1, '重试只跑失败源子集')
+    assert.equal(retry.doneSources, 1)
+    assert.equal(retry.failures.length, 0, '重试成功后不再有失败源')
+    assert.equal(retry.skipped.length, 0)
+    assert.equal(hits.get('/s0/search'), hitsBeforeRetry.s0, '重试不应再请求已成功的源')
+    assert.equal(hits.get('/s2/search'), hitsBeforeRetry.s2, '重试不应再请求已成功的源')
+    assert.equal(hits.get('/s1/search'), 2, '失败源被重试一次')
+
+    const { dedupeSearchResults } = await import('../dist/core/source/search-results.js')
+    const merged = dedupeSearchResults([...first.books, ...retry.books])
+    assert.equal(merged.length, 3, '旧结果不清空，新结果去重并入')
+    assert.deepEqual(
+      merged.map((item) => item.name).sort(),
+      ['凡人修仙传', '完美世界', '遮天'].sort(),
+    )
+    assert.equal(new Set(merged.map(bookKey)).size, merged.length, '合并后同书同作者只有一条')
+    const wanmei = merged.find((item) => item.name === '完美世界')
+    assert.equal(wanmei.sourceCount, 2)
+    assert.equal(wanmei.intro, '一粒尘可填海', '重试来源补上主记录缺失的字段')
+  } finally {
+    await service.searchJobCoordinator?.shutdown?.()
+    await closeServer(server)
+  }
+})
+
+test('取消重试保留已得结果，已合并书目不受影响', async () => {
+  const { server, origin } = await startSearchServer({
+    items: (path) =>
+      path === '/s1/search'
+        ? [{ name: '凡人修仙传', author: '忘语', bookUrl: '/s1/book/3' }]
+        : [{ name: '完美世界', author: '辰东', bookUrl: '/s2/book/1' }],
+    hold: (path) => path === '/s2/search',
+  })
+  const service = await createService(origin, 3)
+  try {
+    const base = [{ name: '完美世界', author: '辰东', bookUrl: 'https://base/book/1', sources: [], sourceCount: 1 }]
+    const { jobId } = await service.startSearch({
+      key: '完美世界',
+      sourceUrls: [origin + '/s1', origin + '/s2'],
+    })
+    const running = await waitForJob(service, jobId, (snapshot) => snapshot.doneSources >= 1 && snapshot.bookCount >= 1)
+    assert.equal(running.status, 'running')
+    const cancelled = await service.cancelSearchJob({ jobId })
+    assert.equal(cancelled.status, 'cancelled')
+    assert.equal(cancelled.failures.length, 0, '中断不应记成失败源')
+    assert.ok(cancelled.books.length >= 1, '取消重试保留重试已得书目')
+
+    const { dedupeSearchResults } = await import('../dist/core/source/search-results.js')
+    const merged = dedupeSearchResults([...base, ...cancelled.books])
+    assert.ok(merged.some((item) => item.name === '完美世界'))
+    assert.ok(merged.some((item) => item.name === '凡人修仙传'))
+    assert.equal(new Set(merged.map(bookKey)).size, merged.length)
   } finally {
     await service.searchJobCoordinator?.shutdown?.()
     await closeServer(server)
